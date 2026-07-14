@@ -106,12 +106,14 @@ Profiles are expanded by the client before RPC. Launch environment precedence
 is:
 
 ```text
-client snapshot or clean base < Profile < explicit new options
+client snapshot or clean base < Profile < explicit launch options
 ```
 
 The default environment is a snapshot of the invoking client, never the
 daemon's startup environment. `--clean-env` starts from a minimal runtime base;
-`--pass-env`, `--env`, and `--unset-env` modify that creation-only environment.
+`--pass-env`, `--env`, and `--unset-env` modify the environment used by `new`
+or `restart`. Values are freshly supplied for every process launch and are not
+persisted for later replay.
 
 Environment values travel in RPC memory rather than argv and are not directly
 serialized into Session records, `list`, `show`, events, Profiles, or error
@@ -152,6 +154,8 @@ escape hatch. Raw PTY bytes require an explicit request.
 16. A second attach is rejected unless `--steal` transfers the exclusive lease.
 17. Every public event matches the versioned v1 event enum and carries
     `schema_version`.
+18. Restart preserves Session identity, provider context, and execution
+    sequence while accepting only stopped or failed Sessions.
 
 ## Design decisions
 
@@ -172,6 +176,10 @@ single local runtime.
 An alias is reserved while its Session is starting, idle, busy, blocked,
 canceling, or stopping. Stopped and failed Sessions release it;
 history stays addressable by Session ID.
+
+Restart atomically reclaims that alias. If a newer active Session already owns
+it, restart fails with `ALIAS_IN_USE` instead of silently renaming either
+Session.
 
 ### JSON is the default control-plane format
 

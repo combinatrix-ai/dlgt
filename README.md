@@ -93,6 +93,7 @@ The command returns a Session ID such as `ses_7K3M9Q2X`:
 ```bash
 dlgt wait ses_7K3M9Q2X --timeout 15m
 dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "Review the revision"
+dlgt restart ses_7K3M9Q2X
 dlgt show ses_7K3M9Q2X
 dlgt scrollback ses_7K3M9Q2X --lines 100
 dlgt attach ses_7K3M9Q2X

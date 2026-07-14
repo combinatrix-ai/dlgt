@@ -44,6 +44,7 @@ fn run() -> Result<()> {
     match command {
         "server" => command_server(&args[1..]),
         "new" => command_new(&args[1..]),
+        "restart" => command_restart(&args[1..]),
         "send" => command_send(&args[1..]),
         "wait" => command_wait(&args[1..]),
         "cancel" => command_cancel(&args[1..]),
@@ -191,6 +192,25 @@ fn command_send(args: &[String]) -> Result<()> {
     } else if parsed.one("--timeout").is_some() {
         bail!("--timeout requires --wait");
     }
+    print_success(result, parsed.flag("--pretty"))
+}
+
+fn command_restart(args: &[String]) -> Result<()> {
+    let parsed = Args::parse(args, &["--pretty", "--clean-env"])?;
+    let session = parsed.one_positional("Session selector")?;
+    let environment = launch_environment(&parsed, None)?;
+    let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
+    let result = client::call(
+        "session.restart",
+        json!({
+            "session": session,
+            "startup_timeout_ms": parsed.one("--startup-timeout")
+                .map(parse_duration).transpose()?.unwrap_or(Duration::from_secs(60)).as_millis(),
+            "environment": environment,
+            "rows": rows,
+            "cols": cols,
+        }),
+    )?;
     print_success(result, parsed.flag("--pretty"))
 }
 
@@ -656,7 +676,7 @@ fn exit_status(code: &str) -> i32 {
 
 fn print_usage() {
     println!(
-        "dlgt - persistent local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session, optionally with its first prompt\n  send         Send work to an existing idle Session\n  wait         Wait for the current or latest execution\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  rpc          Use JSONL RPC"
+        "dlgt - persistent local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session, optionally with its first prompt\n  restart      Restart a stopped Session\n  send         Send work to an existing idle Session\n  wait         Wait for the current or latest execution\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  rpc          Use JSONL RPC"
     );
 }
 
@@ -667,6 +687,9 @@ fn print_command_usage(command: &str) -> Result<()> {
         }
         "new" => {
             "dlgt new - create a Session, optionally with its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] [-- <PROMPT>]\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Harness-specific option (repeatable)\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --wait                         Wait for the initial prompt to finish\n  --timeout <DURATION>           Required with --wait\n  --stdin                        Read the initial prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+        }
+        "restart" => {
+            "dlgt restart - restart a stopped Session and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "send" => {
             "dlgt send - send work to an existing idle Session\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> [OPTIONS] [-- <PROMPT>]\n\nOPTIONS\n  --wait                 Wait for the prompt to finish\n  --timeout <DURATION>   Required with --wait\n  --stdin                Read the prompt from stdin\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"

@@ -90,6 +90,30 @@ while "$binary" show @smoke >/dev/null 2>&1; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
 
+# Restart preserves the Session identity, provider binding, and execution sequence.
+"$binary" restart "$session_id" >"$state_dir/restart.json" &
+restart_pid=$!
+attempt=0
+while ! "$binary" show "$session_id" | grep -q '"state":"starting"\|"state":"running"'; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
+done
+printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"}' \
+  | "$binary" hook emit "$session_id" claude
+wait "$restart_pid"
+grep -q "\"id\":\"$session_id\"" "$state_dir/restart.json"
+"$binary" send "$session_id" -- after-restart >/dev/null
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-2","user_prompt":"after-restart"}' \
+  | "$binary" hook emit "$session_id" claude
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-2","last_assistant_message":"resumed"}' \
+  | "$binary" hook emit "$session_id" claude
+"$binary" wait "$session_id" --timeout 2s | grep -q '"execution_seq":2'
+"$binary" events "$session_id" | grep -q '"type":"session.restarting"'
+"$binary" stop "$session_id" --force >/dev/null
+attempt=0
+while "$binary" show @smoke >/dev/null 2>&1; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
+done
+
 # Exact aliases are reusable after terminal stop, while the old Session ID remains readable.
 "$binary" new --title reused --alias @smoke --harness claude --cwd "$repo_root" \
   --env DLGT_FAKE_EXIT_AFTER=2 >"$state_dir/reused.json" &
@@ -104,6 +128,15 @@ done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session-2"}' \
   | "$binary" hook emit "$reused_id" claude
 wait "$new_pid"
+"$binary" show "$session_id" | grep -q '"state":"stopped"'
+
+# Restart never steals an alias that a newer active Session owns.
+set +e
+alias_json=$("$binary" restart "$session_id")
+alias_status=$?
+set -e
+test "$alias_status" -eq 1
+printf '%s\n' "$alias_json" | grep -q '"code":"ALIAS_IN_USE"'
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
 
 # Unexpected provider death creates a durable failed result in bounded time.

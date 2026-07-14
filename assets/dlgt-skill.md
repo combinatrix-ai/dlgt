@@ -13,6 +13,8 @@ conveniences and may be reused after a Session stops.
 ## Rules
 
 - Create only with `new`; `send` never creates or selects another Session.
+- Restart a stopped or failed Session with `restart`; retain the immutable
+  Session ID because terminal aliases may have been reused.
 - Keep one active execution per Session. `SESSION_BUSY` means retry after the
   current execution terminalizes; dlgt never queues prompts.
 - Always give `wait` an explicit `--timeout`. A timeout does not cancel work.
@@ -33,6 +35,7 @@ session=$(dlgt new --title "review" --profile fable-review --cwd . \
 dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "Address the findings"
 dlgt wait ses_7K3M9Q2X --timeout 15m
 dlgt cancel ses_7K3M9Q2X
+dlgt restart ses_7K3M9Q2X
 dlgt show ses_7K3M9Q2X
 dlgt events ses_7K3M9Q2X --follow
 dlgt scrollback ses_7K3M9Q2X --lines 100

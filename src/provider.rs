@@ -69,6 +69,7 @@ pub struct LaunchOptions<'a> {
     pub cwd: &'a Path,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
+    pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
 }
 
@@ -94,12 +95,16 @@ pub fn codex_program() -> PathBuf {
 pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path) -> CommandSpec {
     let program =
         std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from);
-    let mut args = vec![
+    let mut args = Vec::new();
+    if let Some(provider_id) = options.resume_provider_id {
+        args.extend(["resume".to_owned(), provider_id.to_owned()]);
+    }
+    args.extend([
         "--remote".to_owned(),
         format!("unix://{}", socket_path.display()),
         "--no-alt-screen".to_owned(),
         "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-    ];
+    ]);
     if let Some(model) = options.model {
         args.extend(["--model".to_owned(), model.to_owned()]);
     }
@@ -241,6 +246,9 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     if let Some(effort) = options.effort {
         args.extend(["--effort".to_owned(), effort.to_owned()]);
     }
+    if let Some(provider_id) = options.resume_provider_id {
+        args.extend(["--resume".to_owned(), provider_id.to_owned()]);
+    }
     Ok(CommandSpec {
         program,
         args,
@@ -309,6 +317,7 @@ mod tests {
             cwd: Path::new("/tmp"),
             model: Some("claude-4-5-haiku-latest"),
             effort: Some("high"),
+            resume_provider_id: None,
             environment: &environment,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
@@ -331,6 +340,7 @@ mod tests {
                 cwd: Path::new("/tmp"),
                 model: None,
                 effort: Some("xhigh"),
+                resume_provider_id: None,
                 environment: &environment,
             },
             Path::new("/tmp/dlgt.sock"),
@@ -364,6 +374,7 @@ mod tests {
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
+            resume_provider_id: None,
             environment: &environment,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
@@ -382,6 +393,43 @@ mod tests {
             .semantic_input("first\nsecond")
             .unwrap_or_else(|error| panic!("failed to frame prompt: {error}"));
         assert_eq!(input, b"\x1b[200~first\nsecond\x1b[201~\r");
+    }
+
+    #[test]
+    fn provider_commands_resume_the_stored_conversation() {
+        let environment = std::collections::HashMap::new();
+        let claude = command_spec(&LaunchOptions {
+            agent: Agent::Claude,
+            session_id: "ses_1",
+            alias: "@worker",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            resume_provider_id: Some("claude-session"),
+            environment: &environment,
+        })
+        .unwrap_or_else(|error| panic!("failed to build Claude command: {error}"));
+        assert!(
+            claude
+                .args
+                .windows(2)
+                .any(|args| args == ["--resume", "claude-session"])
+        );
+
+        let codex = codex_remote_tui_command(
+            &LaunchOptions {
+                agent: Agent::Codex,
+                session_id: "ses_1",
+                alias: "@worker",
+                cwd: Path::new("/tmp"),
+                model: None,
+                effort: None,
+                resume_provider_id: Some("codex-thread"),
+                environment: &environment,
+            },
+            Path::new("/tmp/dlgt.sock"),
+        );
+        assert_eq!(&codex.args[..2], ["resume", "codex-thread"]);
     }
 
     #[test]

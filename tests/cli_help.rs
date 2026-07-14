@@ -9,6 +9,7 @@ fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std
     let commands = [
         "server",
         "new",
+        "restart",
         "send",
         "wait",
         "cancel",

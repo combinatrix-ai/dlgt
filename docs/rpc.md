@@ -36,6 +36,7 @@ terminate the stdio proxy.
 
 ```text
 session.create        Create a Session, optionally with an initial prompt
+session.restart       Restart a terminal Session and resume provider context
 session.send          Accept work on an existing idle Session
 session.wait          Wait for the bound current or latest execution
 session.cancel        Interrupt active work, bounded by timeout_ms
@@ -57,6 +58,7 @@ alias. The following parameter shapes are stable for v1:
 | Method | Parameters |
 | --- | --- |
 | `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
 | `session.send` | `session`, `prompt` |
 | `session.wait` | `session`, positive `timeout_ms` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
@@ -127,12 +129,16 @@ connection closes.
 {"schema_version":1,"seq":105,"type":"session.blocked","session_id":"ses_7K3M9Q2X","execution_seq":1,"reason":"user_input"}
 {"schema_version":1,"seq":106,"type":"session.resumed","session_id":"ses_7K3M9Q2X","execution_seq":1}
 {"schema_version":1,"seq":107,"type":"session.idle","session_id":"ses_7K3M9Q2X","execution_seq":1,"result_status":"completed"}
+{"schema_version":1,"seq":108,"type":"session.stopped","session_id":"ses_7K3M9Q2X"}
+{"schema_version":1,"seq":109,"type":"session.restarting","session_id":"ses_7K3M9Q2X"}
+{"schema_version":1,"seq":110,"type":"session.ready","session_id":"ses_7K3M9Q2X"}
 ```
 
 The complete v1 event type set is:
 
 ```text
 session.created
+session.restarting
 session.ready
 session.busy
 session.blocked

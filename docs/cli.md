@@ -104,6 +104,7 @@ USAGE
 
 DELEGATION
   new          Create a new Session, optionally with its first prompt
+  restart      Restart a stopped Session
   send         Send work to an existing idle Session
   wait         Wait for the Session's current or latest execution
   cancel       Interrupt the Session's active execution
@@ -215,6 +216,36 @@ dlgt new \
 ```
 
 The response contains the final result instead of exposing an execution ID.
+
+## `restart`
+
+```text
+dlgt restart <SESSION_ID>
+  [--startup-timeout <DURATION>]
+  [--clean-env]
+  [--pass-env <KEY>]...
+  [--env <KEY=VALUE>]...
+  [--unset-env <KEY>]...
+  [--pretty]
+```
+
+`restart` starts a stopped or failed Session again while preserving its dlgt
+Session ID, durable history, execution sequence, and provider conversation.
+Codex resumes the stored thread and Claude resumes the stored conversation.
+
+Rules:
+
+- The target must be an immutable Session ID. A terminal Session's alias may
+  already belong to a newer active Session.
+- The Session must be `stopped` or `failed` and must have a stored provider
+  conversation ID. Active Sessions are rejected with `SESSION_UNAVAILABLE`.
+- If another active Session now owns the old alias, restart fails with
+  `ALIAS_IN_USE`; it never renames either Session implicitly.
+- Startup is bounded by `--startup-timeout`, which defaults to 60 seconds.
+- Launch environment values are freshly supplied by the invoking client and
+  are not recovered from durable storage.
+- Existing results, events, raw output, and scrollback remain readable; new
+  executions continue the same monotonic `execution_seq`.
 
 ## `send`
 
@@ -389,6 +420,7 @@ dlgt list [--all] [--pretty]
 dlgt show <SESSION_ID|@ALIAS> [--pretty]
 dlgt attach <SESSION_ID|@ALIAS> [--steal]
 dlgt stop <SESSION_ID|@ALIAS> [--force]
+dlgt restart <SESSION_ID> [environment options]
 ```
 
 - `list` returns active Sessions.
@@ -530,7 +562,7 @@ pass_env = ["PATH", "HOME", "SSH_AUTH_SOCK"]
 Environment precedence:
 
 ```text
-client snapshot or clean base < Profile < explicit new options
+client snapshot or clean base < Profile < explicit launch options
 ```
 
 - Default launch environment is a snapshot of the invoking client's
@@ -539,7 +571,8 @@ client snapshot or clean base < Profile < explicit new options
 - `--pass-env KEY` copies one client value with `--clean-env`.
 - `--env KEY=VALUE` sets or overrides a value.
 - `--unset-env KEY` removes a value.
-- Environment options are creation-only.
+- Environment options apply when creating or restarting a Session. Values are
+  freshly snapshotted for each process launch and are never stored for replay.
 - Launch environment values are passed in RPC memory, never argv, and are never
   directly serialized into Session records, `list`, `show`, `events`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its

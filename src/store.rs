@@ -170,6 +170,16 @@ impl Store {
         Ok(updated == 1)
     }
 
+    pub fn restart_session(&self, id: &str) -> Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE sessions SET
+             state = 'starting', pid = NULL, active_turn_id = NULL, updated_at_ms = ?2
+             WHERE id = ?1 AND state IN ('stopped', 'failed')",
+            params![id, now_ms()],
+        )?;
+        Ok(updated == 1)
+    }
+
     pub fn set_session_state(&self, id: &str, state: &str) -> Result<bool> {
         let updated = self.connection.execute(
             "UPDATE sessions SET state = ?2, updated_at_ms = ?3
@@ -723,6 +733,50 @@ mod tests {
                 .id,
             "ses_new"
         );
+    }
+
+    #[test]
+    fn terminal_session_can_restart_without_losing_identity() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
+        let store = Store::open(&directory.path().join("state.db"))
+            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        store
+            .insert_session(&NewSession {
+                id: "ses_1",
+                alias: "@worker",
+                title: "worker",
+                agent: "codex",
+                cwd: "/tmp",
+                model: Some("gpt-test"),
+                effort: Some("high"),
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        mark_ready(&store, "ses_1");
+        store
+            .set_session_provider_id("ses_1", "provider-thread")
+            .unwrap_or_else(|error| panic!("failed to bind provider: {error}"));
+        store
+            .set_session_stopped("ses_1")
+            .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
+
+        assert!(
+            store
+                .restart_session("ses_1")
+                .unwrap_or_else(|error| panic!("failed to restart session: {error}"))
+        );
+        let session = store
+            .get_session("ses_1")
+            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
+            .unwrap_or_else(|| panic!("session missing"));
+        assert_eq!(session.state, "starting");
+        assert_eq!(session.id, "ses_1");
+        assert_eq!(session.alias, "@worker");
+        assert_eq!(
+            session.provider_session_id.as_deref(),
+            Some("provider-thread")
+        );
+        assert!(!store.restart_session("ses_1").unwrap_or(false));
     }
 
     #[test]

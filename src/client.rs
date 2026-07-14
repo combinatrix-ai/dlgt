@@ -261,6 +261,7 @@ fn public_rpc_method(method: &str) -> bool {
     matches!(
         method,
         "session.create"
+            | "session.restart"
             | "session.send"
             | "session.wait"
             | "session.cancel"

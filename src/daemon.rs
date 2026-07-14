@@ -227,6 +227,7 @@ impl Daemon {
                 Ok(json!({"stopping": true}))
             }
             "session.create" => self.create_session(params),
+            "session.restart" => self.restart_session(params),
             "session.list" => {
                 let include_all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
                 let sessions = self.lock_store()?.list_sessions()?;
@@ -323,6 +324,7 @@ impl Daemon {
             cwd: &cwd,
             model,
             effort,
+            resume_provider_id: None,
             environment: &environment,
         };
 
@@ -425,6 +427,162 @@ impl Daemon {
             }
         }
         Ok(response)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn restart_session(&self, params: &Value) -> Result<Value> {
+        let session = self.resolve_session(params_string(params, "session")?)?;
+        if !matches!(session.state.as_str(), "stopped" | "failed") {
+            bail!("session is unavailable in state {}", session.state);
+        }
+        if self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .contains_key(&session.id)
+        {
+            bail!(
+                "session is unavailable while its previous process is still active: {}",
+                session.id
+            );
+        }
+        let provider_id = session
+            .provider_session_id
+            .as_deref()
+            .context("session is unavailable because it has no provider conversation to resume")?;
+        let agent = Agent::parse(&session.agent)?;
+        let cwd = PathBuf::from(&session.cwd)
+            .canonicalize()
+            .context("session cwd does not exist")?;
+        if !cwd.is_dir() {
+            bail!("session cwd is not a directory: {}", cwd.display());
+        }
+        let environment = params
+            .get("environment")
+            .and_then(Value::as_object)
+            .context("missing launch environment snapshot")?
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (key.clone(), value.to_owned()))
+                    .with_context(|| format!("environment value for {key:?} must be a string"))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let rows = params_u16(params, "rows", 24)?;
+        let cols = params_u16(params, "cols", 80)?;
+        let startup_timeout = Duration::from_millis(
+            params
+                .get("startup_timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(60_000)
+                .min(300_000),
+        );
+        let startup_deadline = Instant::now() + startup_timeout;
+
+        prepare_workspace(agent, &cwd)?;
+        if !self.lock_store()?.restart_session(&session.id)? {
+            bail!("session is unavailable in state {}", session.state);
+        }
+        {
+            let store = self.lock_store()?;
+            store.set_terminal_size(&session.id, rows, cols)?;
+            store.record_event(
+                Some(&session.id),
+                None,
+                "session.restarting",
+                &json!({"provider_session_id": provider_id}),
+            )?;
+        }
+        let options = LaunchOptions {
+            agent,
+            session_id: &session.id,
+            alias: &session.alias,
+            cwd: &cwd,
+            model: session.model.as_deref(),
+            effort: session.effort.as_deref(),
+            resume_provider_id: Some(provider_id),
+            environment: &environment,
+        };
+        let runtime = match agent {
+            Agent::Claude => command_spec(&options)
+                .and_then(|spec| self.spawn_claude_runtime(&session.id, &spec, rows, cols)),
+            Agent::Codex => self.spawn_codex_runtime(&options, rows, cols, startup_timeout),
+        };
+        let runtime = match runtime {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let store = self.lock_store()?;
+                store.set_session_failed(&session.id)?;
+                store.record_event(
+                    Some(&session.id),
+                    None,
+                    "session.failed",
+                    &json!({"error": error.to_string()}),
+                )?;
+                return Err(error).context("session restart launch failed");
+            }
+        };
+        let pid = runtime.pid();
+        self.sessions
+            .write()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .insert(session.id.clone(), Arc::clone(&runtime));
+        let store = self.lock_store()?;
+        if !store.set_session_running(&session.id, pid)? {
+            drop(store);
+            self.sessions
+                .write()
+                .map_err(|_| anyhow!("session map lock poisoned"))?
+                .remove(&session.id);
+            let _ = runtime.force_stop();
+            bail!("restart launch exited before the Session became ready");
+        }
+        store.record_event(
+            Some(&session.id),
+            None,
+            "session.started",
+            &json!({"agent": agent.as_str(), "pid": pid, "restart": true}),
+        )?;
+        if agent == Agent::Codex {
+            store.set_session_state(&session.id, "idle")?;
+            store.record_event(
+                Some(&session.id),
+                None,
+                "session.ready",
+                &json!({"provider_session_id": provider_id}),
+            )?;
+        }
+        drop(store);
+        if agent == Agent::Codex {
+            let remaining = startup_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = runtime.force_stop();
+                self.lock_store()?.set_session_failed(&session.id)?;
+                bail!("restart launch timed out before the Session became ready");
+            }
+            if let Err(error) = runtime.wait_for_input_ready(remaining) {
+                let _ = runtime.force_stop();
+                self.lock_store()?.set_session_failed(&session.id)?;
+                return Err(error).context("restarted Codex PTY did not become input-ready");
+            }
+        }
+        let current = loop {
+            let current = self.resolve_session(&session.id)?;
+            if current.state == "idle" {
+                break current;
+            }
+            if matches!(current.state.as_str(), "stopped" | "failed") {
+                bail!("restart launch failed before the Session became ready");
+            }
+            if Instant::now() >= startup_deadline {
+                let _ = runtime.force_stop();
+                self.lock_store()?.set_session_failed(&session.id)?;
+                bail!("restart launch timed out before the Session became ready");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        Ok(json!({"session": public_session(&current)}))
     }
 
     fn spawn_claude_runtime(
@@ -531,6 +689,14 @@ impl Daemon {
                 return Err(error).context("Codex remote TUI did not create a thread");
             }
         };
+        if let Some(expected) = options.resume_provider_id
+            && provider_thread_id != expected
+        {
+            let _ = view.force_stop();
+            bail!(
+                "resumed Codex provider conversation mismatch: expected {expected}, got {provider_thread_id}"
+            );
+        }
         Ok(Arc::new(AgentRuntime::Codex {
             control,
             provider_thread_id,
@@ -1875,6 +2041,7 @@ fn generate_alias(title: &str) -> String {
 fn normalize_event_type(kind: &str) -> Option<&'static str> {
     match kind {
         "session.created" => Some("session.created"),
+        "session.restarting" => Some("session.restarting"),
         "session.ready" => Some("session.ready"),
         "turn.started" => Some("session.busy"),
         "session.blocked" => Some("session.blocked"),
