@@ -3,9 +3,7 @@ import { withBase } from "vitepress";
 
 const heroImage = withBase("/delegate-to-the-competition.png");
 const installCodex = 'codex "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
-const installClaude = 'claude -p "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
-const useCodex = 'codex "Create a great game. Ask Claude to review it."';
-const useClaude = 'claude -p "Think of 10 funny jokes. Ask Codex to review them."';
+const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 </script>
 
 <template>
@@ -39,27 +37,17 @@ const useClaude = 'claude -p "Think of 10 funny jokes. Ask Codex to review them.
         <h2>Install once. Ask naturally.</h2>
         <p>Give either harness the repository. After that, delegation is part of the prompt.</p>
       </header>
-      <div class="command-pair">
-        <article>
-          <div class="command-label"><span>From Codex</span><code>interactive</code></div>
+      <div class="command-lines">
+        <div class="command-line">
+          <strong>Codex</strong>
           <pre><code>{{ installCodex }}</code></pre>
-        </article>
-        <article>
-          <div class="command-label"><span>From Claude</span><code>print mode</code></div>
+        </div>
+        <div class="command-line">
+          <strong>Claude</strong>
           <pre><code>{{ installClaude }}</code></pre>
-        </article>
+        </div>
       </div>
-      <div class="then">Then</div>
-      <div class="command-pair command-pair-use">
-        <article>
-          <div class="command-label"><span>Codex asks Claude</span></div>
-          <pre><code>{{ useCodex }}</code></pre>
-        </article>
-        <article>
-          <div class="command-label"><span>Claude asks Codex</span></div>
-          <pre><code>{{ useClaude }}</code></pre>
-        </article>
-      </div>
+      <p class="after-install">Then ask either agent naturally. dlgt handles the handoff.</p>
     </section>
 
     <section class="how-it-works">
