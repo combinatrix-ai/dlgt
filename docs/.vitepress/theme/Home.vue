@@ -14,7 +14,10 @@ const useClaude = 'claude -p "Think of 10 funny jokes. Ask Codex to review them.
       <div class="hero-copy">
         <p class="eyebrow">Cross-harness delegation</p>
         <h1><span>Let agents delegate</span><span>to the competition.</span></h1>
-        <p class="hero-lede">Codex wasn't built to delegate to Claude. Claude wasn't built to delegate to Codex. dlgt was.</p>
+        <p class="hero-lede">
+          <span class="hero-lede-line">Codex wasn't built to delegate to Claude.</span>
+          <span class="hero-lede-line">Claude wasn't built to delegate to Codex. <span class="hero-lede-keep">dlgt was.</span></span>
+        </p>
         <div class="hero-actions">
           <a class="primary-action" href="#quick-start">Quick Start</a>
           <a class="secondary-action" href="https://github.com/combinatrix-ai/dlgt">View on GitHub</a>
