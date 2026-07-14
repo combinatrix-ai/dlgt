@@ -1,0 +1,27 @@
+[package]
+name = "dlgt"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+libc = "0.2"
+portable-pty = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml_edit = "0.25"
+tungstenite = "0.28"
+uuid = { version = "1", features = ["v4"] }
+vt100 = "0.16"
+
+[dev-dependencies]
+tempfile = "3"
