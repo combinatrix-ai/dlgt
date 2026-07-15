@@ -154,8 +154,9 @@ escape hatch. Raw PTY bytes require an explicit request.
 16. A second attach is rejected unless `--steal` transfers the exclusive lease.
 17. Every public event matches the versioned v1 event enum and carries
     `schema_version`.
-18. Restart preserves Session identity, provider context, and execution
-    sequence while accepting only stopped or failed Sessions.
+18. Restart preserves Session identity, alias ownership, provider context, and
+    execution sequence. Active work becomes a durable interrupted result before
+    the replacement process starts.
 
 ## Design decisions
 

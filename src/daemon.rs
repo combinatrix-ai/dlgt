@@ -432,20 +432,18 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     fn restart_session(&self, params: &Value) -> Result<Value> {
         let session = self.resolve_session(params_string(params, "session")?)?;
-        if !matches!(session.state.as_str(), "stopped" | "failed") {
+        if matches!(
+            session.state.as_str(),
+            "starting" | "stopping" | "restarting"
+        ) {
             bail!("session is unavailable in state {}", session.state);
         }
-        if self
+        let previous_runtime = self
             .sessions
             .read()
             .map_err(|_| anyhow!("session map lock poisoned"))?
-            .contains_key(&session.id)
-        {
-            bail!(
-                "session is unavailable while its previous process is still active: {}",
-                session.id
-            );
-        }
+            .get(&session.id)
+            .cloned();
         let provider_id = session
             .provider_session_id
             .as_deref()
@@ -481,7 +479,7 @@ impl Daemon {
         let startup_deadline = Instant::now() + startup_timeout;
 
         prepare_workspace(agent, &cwd)?;
-        if !self.lock_store()?.restart_session(&session.id)? {
+        if !self.lock_store()?.begin_session_restart(&session.id)? {
             bail!("session is unavailable in state {}", session.state);
         }
         {
@@ -493,6 +491,49 @@ impl Daemon {
                 "session.restarting",
                 &json!({"provider_session_id": provider_id}),
             )?;
+        }
+        if let Some(runtime) = previous_runtime {
+            self.attach_leases
+                .lock()
+                .map_err(|_| anyhow!("attach lease lock poisoned"))?
+                .remove(&session.id);
+            let _ = runtime.force_stop();
+            loop {
+                let active = self
+                    .sessions
+                    .read()
+                    .map_err(|_| anyhow!("session map lock poisoned"))?
+                    .contains_key(&session.id);
+                if !active {
+                    break;
+                }
+                if Instant::now() >= startup_deadline {
+                    bail!("restart launch timed out while stopping the previous process");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            let store = self.lock_store()?;
+            if let Some(turn_id) = store.interrupt_active_turn(
+                &session.id,
+                "session restarted before execution completed",
+            )? {
+                store.record_event(
+                    Some(&session.id),
+                    Some(&turn_id),
+                    "turn.interrupted",
+                    &json!({"error": "session restarted before execution completed"}),
+                )?;
+            }
+            store.finish_session_restart_stop(&session.id)?;
+        }
+        if !self.lock_store()?.start_restarted_session(&session.id)? {
+            bail!("session left restarting state before launch");
+        }
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.lock_store()?.set_session_failed(&session.id)?;
+            bail!("restart launch timed out before starting the replacement process");
         }
         let options = LaunchOptions {
             agent,
@@ -507,7 +548,7 @@ impl Daemon {
         let runtime = match agent {
             Agent::Claude => command_spec(&options)
                 .and_then(|spec| self.spawn_claude_runtime(&session.id, &spec, rows, cols)),
-            Agent::Codex => self.spawn_codex_runtime(&options, rows, cols, startup_timeout),
+            Agent::Codex => self.spawn_codex_runtime(&options, rows, cols, remaining),
         };
         let runtime = match runtime {
             Ok(runtime) => runtime,
@@ -1530,9 +1571,20 @@ fn end_hook_session(store: &Store, session: &SessionRecord) -> Result<HookOutcom
             &json!({"error": reason}),
         )?;
     }
-    store.set_session_stopped(&session.id)?;
+    let restarting = store
+        .get_session(&session.id)?
+        .is_some_and(|current| current.state == "restarting");
+    if restarting {
+        store.finish_session_restart_stop(&session.id)?;
+    } else {
+        store.set_session_stopped(&session.id)?;
+    }
     Ok(HookOutcome {
-        kind: "session.stopped",
+        kind: if restarting {
+            "provider.session_ended_for_restart"
+        } else {
+            "session.stopped"
+        },
         turn_id,
     })
 }
@@ -1833,11 +1885,19 @@ fn persist_session_exit(
 ) {
     if let Ok(store) = store.lock() {
         let session = store.get_session(session_id).ok().flatten();
-        let intentional = session
+        let restarting = session
             .as_ref()
-            .is_some_and(|session| matches!(session.state.as_str(), "stopping" | "stopped"));
+            .is_some_and(|session| session.state == "restarting");
+        let intentional = session.as_ref().is_some_and(|session| {
+            matches!(
+                session.state.as_str(),
+                "stopping" | "stopped" | "restarting"
+            )
+        });
         persist_exit_result(&store, session.as_ref(), exit_code, intentional);
-        let terminal = if intentional {
+        let terminal = if restarting {
+            store.finish_session_restart_stop(session_id)
+        } else if intentional {
             store.set_session_stopped(session_id)
         } else {
             store.set_session_failed(session_id)
@@ -1848,7 +1908,9 @@ fn persist_session_exit(
         if let Err(error) = store.record_event(
             Some(session_id),
             None,
-            if intentional {
+            if restarting {
+                "provider.exited_for_restart"
+            } else if intentional {
                 "session.stopped"
             } else {
                 "session.failed"

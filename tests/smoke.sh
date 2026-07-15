@@ -84,13 +84,8 @@ grep -q '"schema_version":1' "$state_dir/follow.jsonl"
 "$binary" harnesses | grep -q '"codex"'
 "$binary" skill | grep -q '^name: dlgt$'
 
-"$binary" stop "$session_id" --force >/dev/null
-attempt=0
-while "$binary" show @smoke >/dev/null 2>&1; do
-  attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
-done
-
-# Restart preserves the Session identity, provider binding, and execution sequence.
+# Restart interrupts active work while preserving identity, provider binding, and history.
+"$binary" send "$session_id" -- interrupted-by-restart >/dev/null
 "$binary" restart "$session_id" >"$state_dir/restart.json" &
 restart_pid=$!
 attempt=0
@@ -101,12 +96,14 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"
   | "$binary" hook emit "$session_id" claude
 wait "$restart_pid"
 grep -q "\"id\":\"$session_id\"" "$state_dir/restart.json"
+"$binary" show "$session_id" | grep -q '"execution_seq":2'
+"$binary" show "$session_id" | grep -q '"status":"interrupted"'
 "$binary" send "$session_id" -- after-restart >/dev/null
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-2","user_prompt":"after-restart"}' \
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-3","user_prompt":"after-restart"}' \
   | "$binary" hook emit "$session_id" claude
-printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-2","last_assistant_message":"resumed"}' \
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-3","last_assistant_message":"resumed"}' \
   | "$binary" hook emit "$session_id" claude
-"$binary" wait "$session_id" --timeout 2s | grep -q '"execution_seq":2'
+"$binary" wait "$session_id" --timeout 2s | grep -q '"execution_seq":3'
 "$binary" events "$session_id" | grep -q '"type":"session.restarting"'
 "$binary" stop "$session_id" --force >/dev/null
 attempt=0

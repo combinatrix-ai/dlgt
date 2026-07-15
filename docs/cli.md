@@ -104,7 +104,7 @@ USAGE
 
 DELEGATION
   new          Create a new Session, optionally with its first prompt
-  restart      Restart a stopped Session
+  restart      Restart a Session
   send         Send work to an existing idle Session
   wait         Wait for the Session's current or latest execution
   cancel       Interrupt the Session's active execution
@@ -229,18 +229,25 @@ dlgt restart <SESSION_ID>
   [--pretty]
 ```
 
-`restart` starts a stopped or failed Session again while preserving its dlgt
-Session ID, durable history, execution sequence, and provider conversation.
-Codex resumes the stored thread and Claude resumes the stored conversation.
+`restart` replaces a Session's provider process while preserving its dlgt
+Session ID, alias, durable history, execution sequence, and provider
+conversation. Codex resumes the stored thread and Claude resumes the stored
+conversation.
 
 Rules:
 
-- The target must be an immutable Session ID. A terminal Session's alias may
-  already belong to a newer active Session.
-- The Session must be `stopped` or `failed` and must have a stored provider
-  conversation ID. Active Sessions are rejected with `SESSION_UNAVAILABLE`.
+- Active `idle`, `busy`, and `blocked` Sessions may be restarted, as may
+  terminal `stopped` and `failed` Sessions. An active execution is durably
+  completed as `interrupted` before the replacement process starts.
+- `starting`, `stopping`, and `restarting` Sessions reject a second lifecycle
+  operation with `SESSION_UNAVAILABLE`.
+- The Session must have a stored provider conversation ID.
+- A terminal Session should be addressed by immutable Session ID because its
+  alias may already belong to a newer active Session.
 - If another active Session now owns the old alias, restart fails with
   `ALIAS_IN_USE`; it never renames either Session implicitly.
+- Restarting an active Session keeps its alias reserved throughout the process
+  replacement.
 - Startup is bounded by `--startup-timeout`, which defaults to 60 seconds.
 - Launch environment values are freshly supplied by the invoking client and
   are not recovered from durable storage.

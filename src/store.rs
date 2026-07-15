@@ -170,11 +170,30 @@ impl Store {
         Ok(updated == 1)
     }
 
-    pub fn restart_session(&self, id: &str) -> Result<bool> {
+    pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
         let updated = self.connection.execute(
             "UPDATE sessions SET
-             state = 'starting', pid = NULL, active_turn_id = NULL, updated_at_ms = ?2
-             WHERE id = ?1 AND state IN ('stopped', 'failed')",
+             state = 'restarting', updated_at_ms = ?2
+             WHERE id = ?1 AND state NOT IN ('starting', 'stopping', 'restarting')",
+            params![id, now_ms()],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub fn finish_session_restart_stop(&self, id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions SET pid = NULL, active_turn_id = NULL, updated_at_ms = ?2
+             WHERE id = ?1 AND state = 'restarting'",
+            params![id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn start_restarted_session(&self, id: &str) -> Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE sessions SET state = 'starting', pid = NULL,
+             active_turn_id = NULL, updated_at_ms = ?2
+             WHERE id = ?1 AND state = 'restarting'",
             params![id, now_ms()],
         )?;
         Ok(updated == 1)
@@ -183,7 +202,7 @@ impl Store {
     pub fn set_session_state(&self, id: &str, state: &str) -> Result<bool> {
         let updated = self.connection.execute(
             "UPDATE sessions SET state = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state NOT IN ('stopped', 'failed')",
+             WHERE id = ?1 AND state NOT IN ('stopped', 'failed', 'stopping', 'restarting')",
             params![id, state, now_ms()],
         )?;
         Ok(updated == 1)
@@ -762,21 +781,90 @@ mod tests {
 
         assert!(
             store
-                .restart_session("ses_1")
+                .begin_session_restart("ses_1")
                 .unwrap_or_else(|error| panic!("failed to restart session: {error}"))
         );
         let session = store
             .get_session("ses_1")
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
-        assert_eq!(session.state, "starting");
+        assert_eq!(session.state, "restarting");
         assert_eq!(session.id, "ses_1");
         assert_eq!(session.alias, "@worker");
         assert_eq!(
             session.provider_session_id.as_deref(),
             Some("provider-thread")
         );
-        assert!(!store.restart_session("ses_1").unwrap_or(false));
+        assert!(!store.begin_session_restart("ses_1").unwrap_or(false));
+        assert!(
+            store
+                .start_restarted_session("ses_1")
+                .unwrap_or_else(|error| panic!("failed to start restarted session: {error}"))
+        );
+        assert_eq!(
+            store
+                .get_session("ses_1")
+                .unwrap_or_else(|error| panic!("failed to read restarted session: {error}"))
+                .unwrap_or_else(|| panic!("restarted session missing"))
+                .state,
+            "starting"
+        );
+    }
+
+    #[test]
+    fn active_session_can_enter_restart_without_releasing_its_alias() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
+        let store = Store::open(&directory.path().join("state.db"))
+            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        store
+            .insert_session(&NewSession {
+                id: "ses_1",
+                alias: "@worker",
+                title: "worker",
+                agent: "claude",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        mark_ready(&store, "ses_1");
+
+        assert!(
+            store
+                .begin_session_restart("ses_1")
+                .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
+        );
+        assert_eq!(
+            store
+                .get_session("@worker")
+                .unwrap_or_else(|error| panic!("failed to resolve reserved alias: {error}"))
+                .unwrap_or_else(|| panic!("reserved alias missing"))
+                .state,
+            "restarting"
+        );
+        assert!(!store.set_session_state("ses_1", "idle").unwrap_or(true));
+        assert_eq!(
+            store
+                .get_session("ses_1")
+                .unwrap_or_else(|error| panic!("failed to reread restarting session: {error}"))
+                .unwrap_or_else(|| panic!("restarting session missing"))
+                .state,
+            "restarting"
+        );
+        assert!(
+            store
+                .insert_session(&NewSession {
+                    id: "ses_2",
+                    alias: "@worker",
+                    title: "other",
+                    agent: "codex",
+                    cwd: "/tmp",
+                    model: None,
+                    effort: None,
+                })
+                .is_err()
+        );
     }
 
     #[test]

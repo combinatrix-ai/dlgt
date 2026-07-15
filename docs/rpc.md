@@ -36,7 +36,7 @@ terminate the stdio proxy.
 
 ```text
 session.create        Create a Session, optionally with an initial prompt
-session.restart       Restart a terminal Session and resume provider context
+session.restart       Replace a Session process and resume provider context
 session.send          Accept work on an existing idle Session
 session.wait          Wait for the bound current or latest execution
 session.cancel        Interrupt active work, bounded by timeout_ms
@@ -86,7 +86,7 @@ failure data. Provider turn IDs and internal execution row IDs are excluded.
 The public state set is:
 
 ```text
-starting  idle  busy  blocked  canceling  stopping  stopped  failed
+starting  idle  busy  blocked  canceling  stopping  restarting  stopped  failed
 ```
 
 Every accepted execution receives a per-Session monotonic `execution_seq`.

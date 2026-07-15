@@ -13,8 +13,8 @@ conveniences and may be reused after a Session stops.
 ## Rules
 
 - Create only with `new`; `send` never creates or selects another Session.
-- Restart a stopped or failed Session with `restart`; retain the immutable
-  Session ID because terminal aliases may have been reused.
+- Restart any stable Session with `restart`. Active work becomes interrupted;
+  retain the immutable Session ID because terminal aliases may have been reused.
 - Keep one active execution per Session. `SESSION_BUSY` means retry after the
   current execution terminalizes; dlgt never queues prompts.
 - Always give `wait` an explicit `--timeout`. A timeout does not cancel work.
