@@ -41,7 +41,7 @@ const tickerPairs = [...pairs, pairs[0]];
         </div>
       </div>
       <figure class="hero-visual">
-        <img :src="heroImage" width="625" height="500" alt="Reject the agent fleet. Let Sol and Fable review each other." />
+        <img :src="heroImage" width="966" height="731" alt="Reject the agent fleet. Let Sol and Fable review each other." />
       </figure>
     </section>
 
