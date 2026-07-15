@@ -1,4 +1,8 @@
-# dlgt
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/dlgt-lockup-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/dlgt-lockup-light.png">
+  <img alt="dlgt" src="assets/dlgt-lockup-light.png" width="246">
+</picture>
 
 > Let agents delegate to the competition.
 
