@@ -23,7 +23,18 @@ fn main() {
         let code = failure.map_or("INVALID_ARGUMENT", |failure| failure.code.as_str());
         let message =
             failure.map_or_else(|| format!("{error:#}"), |failure| failure.message.clone());
-        let response = json!({"ok":false,"error":{"code":code,"message":message}});
+        let mut error_json = json!({"code":code,"message":message});
+        if let Some(failure) = failure
+            && let Some(error_object) = error_json.as_object_mut()
+        {
+            if let Some(session_id) = &failure.session_id {
+                error_object.insert("session_id".to_owned(), json!(session_id));
+            }
+            if let Some(provider_session_id) = &failure.provider_session_id {
+                error_object.insert("provider_session_id".to_owned(), json!(provider_session_id));
+            }
+        }
+        let response = json!({"ok":false,"error":error_json});
         println!("{response}");
         std::process::exit(exit_status(code));
     }

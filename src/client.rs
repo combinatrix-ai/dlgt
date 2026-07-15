@@ -17,6 +17,8 @@ use crate::raw_mode::{RawModeGuard, terminal_size};
 pub struct RpcFailure {
     pub code: String,
     pub message: String,
+    pub session_id: Option<String>,
+    pub provider_session_id: Option<String>,
 }
 
 impl std::fmt::Display for RpcFailure {
@@ -187,7 +189,19 @@ pub fn rpc_stdio() -> Result<()> {
             Ok(result) => Response::ok(request.id, result),
             Err(error) => error.downcast_ref::<RpcFailure>().map_or_else(
                 || Response::error(&request.id, "RPC_UNAVAILABLE", error.to_string()),
-                |failure| Response::error(&request.id, &failure.code, &failure.message),
+                |failure| {
+                    if let Some(session_id) = &failure.session_id {
+                        Response::session_error(
+                            &request.id,
+                            &failure.code,
+                            &failure.message,
+                            session_id,
+                            failure.provider_session_id.clone(),
+                        )
+                    } else {
+                        Response::error(&request.id, &failure.code, &failure.message)
+                    }
+                },
             ),
         };
         write_json_line(&mut stdout, &response)?;
@@ -251,6 +265,8 @@ fn decode_response(line: &str) -> Result<Value> {
         return Err(RpcFailure {
             code: error.code,
             message: error.message,
+            session_id: error.session_id,
+            provider_session_id: error.provider_session_id,
         }
         .into());
     }
@@ -367,7 +383,7 @@ fn filter_attach_input(input: &[u8], prefix: &mut bool) -> (Vec<u8>, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_attach_input;
+    use super::{RpcFailure, decode_response, filter_attach_input};
 
     #[test]
     fn detach_prefix_is_consumed_not_forwarded() {
@@ -394,5 +410,21 @@ mod tests {
         assert_eq!(forward, b"\x02d");
         assert!(!detach);
         assert!(!prefix);
+    }
+
+    #[test]
+    fn rpc_failure_preserves_session_correlation_ids() {
+        let result = decode_response(
+            r#"{"id":"req_1","error":{"code":"LAUNCH_FAILED","message":"failed","session_id":"ses_1","provider_session_id":"provider_1"}}"#,
+        );
+        let error = match result {
+            Ok(value) => panic!("expected RPC failure, got {value}"),
+            Err(error) => error,
+        };
+        let failure = error
+            .downcast_ref::<RpcFailure>()
+            .unwrap_or_else(|| panic!("RPC failure missing"));
+        assert_eq!(failure.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(failure.provider_session_id.as_deref(), Some("provider_1"));
     }
 }

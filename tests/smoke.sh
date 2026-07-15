@@ -40,6 +40,17 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"
 wait "$new_pid"
 grep -Eq '"id":"ses_[0-9A-Z]{8}"' "$state_dir/new.json"
 grep -q '"alias":"@smoke"' "$state_dir/new.json"
+grep -q '"provider_session_id":"provider-session"' "$state_dir/new.json"
+
+# Bounded launch failures retain the failed audit Session ID for diagnostics.
+set +e
+launch_failure_json=$("$binary" new --title launch-failure --alias @launch-failure \
+  --harness claude --cwd "$repo_root" --startup-timeout 50ms)
+launch_failure_status=$?
+set -e
+test "$launch_failure_status" -eq 1
+printf '%s\n' "$launch_failure_json" | grep -q '"code":"LAUNCH_FAILED"'
+printf '%s\n' "$launch_failure_json" | grep -Eq '"session_id":"ses_[0-9A-Z]{8}"'
 
 long_message=$(awk 'BEGIN { for (i = 0; i < 12000; i++) printf "x" }')
 send_json=$("$binary" send "$session_id" -- "$long_message")

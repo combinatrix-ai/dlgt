@@ -198,6 +198,8 @@ dlgt new \
     "id": "ses_7K3M9Q2X",
     "alias": "@run-review-361csx",
     "title": "run review",
+    "harness": "codex",
+    "provider_session_id": "019f6307-341e-7e81-8a33-7ab61e804345",
     "state": "busy"
   },
   "execution_seq": 1
@@ -626,6 +628,10 @@ INTERNAL               dlgt invariant or persistence failure
 
 Commands may add contextual fields, but must not overload one code with a
 different retry or human-action policy.
+
+`new` launch failures include the failed audit record's `session_id`. If Codex
+or Claude assigned its own session ID before the failure, the error also
+includes `provider_session_id` so provider-native logs can be correlated.
 
 ## Design and RPC contracts
 

@@ -22,6 +22,10 @@ pub struct Response {
 pub struct RpcError {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
 }
 
 impl Response {
@@ -44,6 +48,27 @@ impl Response {
             error: Some(RpcError {
                 code: code.into(),
                 message: message.into(),
+                session_id: None,
+                provider_session_id: None,
+            }),
+        }
+    }
+
+    pub fn session_error(
+        id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        session_id: impl Into<String>,
+        provider_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            result: None,
+            error: Some(RpcError {
+                code: code.into(),
+                message: message.into(),
+                session_id: Some(session_id.into()),
+                provider_session_id,
             }),
         }
     }
@@ -115,6 +140,30 @@ mod tests {
         let encoded = serde_json::to_value(Response::ok("req_1", json!({"ok": true})))
             .unwrap_or_else(|error| panic!("failed to encode response: {error}"));
         assert_eq!(encoded, json!({"id":"req_1","result":{"ok":true}}));
+    }
+
+    #[test]
+    fn session_error_includes_correlation_ids() {
+        let encoded = serde_json::to_value(Response::session_error(
+            "req_1",
+            "LAUNCH_FAILED",
+            "launch failed",
+            "ses_1",
+            Some("provider_1".to_owned()),
+        ))
+        .unwrap_or_else(|error| panic!("failed to encode response: {error}"));
+        assert_eq!(
+            encoded,
+            json!({
+                "id":"req_1",
+                "error":{
+                    "code":"LAUNCH_FAILED",
+                    "message":"launch failed",
+                    "session_id":"ses_1",
+                    "provider_session_id":"provider_1"
+                }
+            })
+        );
     }
 
     #[test]

@@ -214,7 +214,19 @@ impl Daemon {
         }
         let response = match self.dispatch(&request.method, &request.params) {
             Ok(result) => Response::ok(request.id, result),
-            Err(error) => Response::error(request.id, classify_error(&error), format!("{error:#}")),
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<SessionLaunchFailure>() {
+                    Response::session_error(
+                        request.id,
+                        classify_error(&error),
+                        format!("{error:#}"),
+                        &failure.session_id,
+                        failure.provider_session_id.clone(),
+                    )
+                } else {
+                    Response::error(request.id, classify_error(&error), format!("{error:#}"))
+                }
+            }
         };
         write_response(&mut stream, &response)
     }
@@ -352,7 +364,8 @@ impl Daemon {
                     "session.failed",
                     &json!({"error": error.to_string()}),
                 )?;
-                return Err(error);
+                drop(store);
+                return Err(self.session_launch_failure(&id, &error));
             }
         };
         let pid = runtime.pid();
@@ -371,7 +384,13 @@ impl Daemon {
                 .lock_store()?
                 .get_session(&id)?
                 .context("exited session not found")?;
-            return Ok(serde_json::to_value(session)?);
+            return Err(self.session_launch_failure(
+                &id,
+                &anyhow!(
+                    "launch failed before the Session became ready: state={}",
+                    session.state
+                ),
+            ));
         }
         store.record_event(
             Some(&id),
@@ -393,11 +412,17 @@ impl Daemon {
             let remaining = startup_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let _ = runtime.force_stop();
-                bail!("launch timed out before the Session became ready");
+                return Err(self.session_launch_failure(
+                    &id,
+                    &anyhow!("launch timed out before the Session became ready"),
+                ));
             }
             if let Err(error) = runtime.wait_for_input_ready(remaining) {
                 let _ = runtime.force_stop();
-                return Err(error).context("Codex PTY did not become input-ready");
+                return Err(self.session_launch_failure(
+                    &id,
+                    &error.context("Codex PTY did not become input-ready"),
+                ));
             }
         }
         let session = loop {
@@ -406,12 +431,18 @@ impl Daemon {
                 break current;
             }
             if matches!(current.state.as_str(), "stopped" | "failed") {
-                bail!("launch failed before the Session became ready");
+                return Err(self.session_launch_failure(
+                    &id,
+                    &anyhow!("launch failed before the Session became ready"),
+                ));
             }
             if Instant::now() >= startup_deadline {
                 let _ = runtime.force_stop();
                 self.lock_store()?.set_session_failed(&id)?;
-                bail!("launch timed out before the Session became ready");
+                return Err(self.session_launch_failure(
+                    &id,
+                    &anyhow!("launch timed out before the Session became ready"),
+                ));
             }
             std::thread::sleep(Duration::from_millis(25));
         };
@@ -422,11 +453,28 @@ impl Daemon {
                 Err(error) => {
                     let _ = runtime.force_stop();
                     self.lock_store()?.set_session_failed(&id)?;
-                    return Err(error).context("initial prompt acceptance failed");
+                    return Err(self.session_launch_failure(
+                        &id,
+                        &error.context("initial prompt acceptance failed"),
+                    ));
                 }
             }
         }
         Ok(response)
+    }
+
+    fn session_launch_failure(&self, session_id: &str, error: &anyhow::Error) -> anyhow::Error {
+        let provider_session_id = self
+            .lock_store()
+            .ok()
+            .and_then(|store| store.get_session(session_id).ok().flatten())
+            .and_then(|session| session.provider_session_id);
+        SessionLaunchFailure {
+            session_id: session_id.to_owned(),
+            provider_session_id,
+            message: format!("{error:#}"),
+        }
+        .into()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -678,17 +726,26 @@ impl Daemon {
         let event_store = Arc::clone(&self.store);
         let event_session_id = session_id.clone();
         let handler = Arc::new(move |message: Value| {
-            if message.get("method").and_then(Value::as_str) == Some("thread/started")
-                && let Some(thread_id) =
-                    message.pointer("/params/thread/id").and_then(Value::as_str)
-            {
-                let _ = thread_sender.send(thread_id.to_owned());
-            }
-            if let Ok(mut store) = event_store.lock()
-                && let Err(error) =
-                    apply_codex_notification(&mut store, &event_session_id, &message)
-            {
-                eprintln!("dlgt failed to apply Codex notification: {error:#}");
+            let started_thread_id = (message.get("method").and_then(Value::as_str)
+                == Some("thread/started"))
+            .then(|| {
+                message
+                    .pointer("/params/thread/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
+            if let Ok(mut store) = event_store.lock() {
+                match apply_codex_notification(&mut store, &event_session_id, &message) {
+                    Ok(()) => {
+                        if let Some(thread_id) = started_thread_id {
+                            let _ = thread_sender.send(thread_id);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("dlgt failed to apply Codex notification: {error:#}");
+                    }
+                }
             }
         });
         let control = CodexConnection::connect_with_environment(
@@ -2044,10 +2101,26 @@ fn public_session(session: &SessionRecord) -> Value {
         },
         "model": session.model,
         "effort": session.effort,
+        "provider_session_id": session.provider_session_id,
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
     })
 }
+
+#[derive(Debug)]
+struct SessionLaunchFailure {
+    session_id: String,
+    provider_session_id: Option<String>,
+    message: String,
+}
+
+impl std::fmt::Display for SessionLaunchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionLaunchFailure {}
 
 fn public_result(turn: &TurnRecord) -> Value {
     let status = turn.state.as_str();
@@ -2130,7 +2203,7 @@ mod tests {
 
     use super::{
         apply_codex_notification, apply_hook_event, generate_alias, generate_session_id,
-        public_result, validate_alias,
+        public_result, public_session, validate_alias,
     };
     use crate::store::{NewSession, Store};
 
@@ -2182,6 +2255,21 @@ mod tests {
         let alias = generate_alias("Run Review");
         assert!(alias.starts_with("@run-review-"));
         assert_eq!(alias.rsplit('-').next().map(str::len), Some(6));
+    }
+
+    #[test]
+    fn public_session_exposes_provider_session_id() {
+        let (_directory, store) = ready_store("codex");
+        store
+            .set_session_provider_id("ses_1", "provider_1")
+            .unwrap_or_else(|error| panic!("failed to bind provider session: {error}"));
+        let session = store
+            .get_session("ses_1")
+            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
+            .unwrap_or_else(|| panic!("session missing"));
+        let value = public_session(&session);
+        assert_eq!(value["id"], "ses_1");
+        assert_eq!(value["provider_session_id"], "provider_1");
     }
 
     #[test]

@@ -80,8 +80,10 @@ mutable client configuration.
 ## Session and result schemas
 
 A public Session contains its immutable ID, active alias and title, Harness,
-working directory, model selection, state, timing, and relevant process or
-failure data. Provider turn IDs and internal execution row IDs are excluded.
+working directory, model selection, state, timing, and the nullable
+`provider_session_id`. The provider session ID is the Codex thread ID or Claude
+session ID and correlates dlgt activity with provider-native logs and resume
+tools. Provider turn IDs and internal execution row IDs are excluded.
 
 The public state set is:
 
@@ -91,6 +93,8 @@ starting  idle  busy  blocked  canceling  stopping  restarting  stopped  failed
 
 Every accepted execution receives a per-Session monotonic `execution_seq`.
 This is correlation data, never an RPC selector or public resource ID.
+The returned Session state is a snapshot taken when the response is built; use
+lifecycle events or a later `session.read` for current state.
 
 A durable result has this shape:
 
@@ -217,7 +221,9 @@ INTERNAL               dlgt invariant or persistence failure
 ```
 
 Methods may add contextual error fields but must not overload a code with a
-different retry or human-action policy. CLI exit-status mapping is defined in
+different retry or human-action policy. `session.create` launch failures include
+the created `session_id` and include `provider_session_id` when the Harness
+assigned one before failing. CLI exit-status mapping is defined in
 [CLI](cli.md#exit-statuses).
 
 ## Security boundary
