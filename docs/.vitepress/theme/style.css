@@ -51,6 +51,21 @@ body { background: var(--dlgt-paper); }
 .hero-lede { margin-top: 30px !important; max-width: 46rem; font-size: clamp(1.05rem, 1.4vw, 1.32rem); line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 72%, transparent); }
 .hero-lede-line { display: block; }
 .hero-lede-keep { white-space: nowrap; }
+.pair-ticker { display: flex; align-items: baseline; gap: 12px; margin-top: 26px !important; font: 700 0.92rem/1.2 var(--vp-font-family-mono); letter-spacing: 0.02em; }
+.pair-ticker-mark { color: var(--dlgt-accent); }
+.pair-ticker-window { display: block; height: 1.2em; overflow: hidden; }
+.pair-ticker-strip { display: block; animation: pair-roll 13.6s ease infinite; }
+.pair-ticker-item { display: block; height: 1.2em; white-space: nowrap; }
+.pair-ticker-arrow { color: var(--dlgt-accent); }
+.pair-ticker-effort { color: color-mix(in srgb, var(--dlgt-ink) 55%, transparent); }
+@keyframes pair-roll {
+  0%, 22% { transform: translateY(0); }
+  25%, 47% { transform: translateY(-1.2em); }
+  50%, 72% { transform: translateY(-2.4em); }
+  75%, 97% { transform: translateY(-3.6em); }
+  100% { transform: translateY(-4.8em); }
+}
+
 .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 36px; }
 .hero-actions a { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 22px; border: 1px solid var(--dlgt-ink); border-radius: 4px; font-weight: 700; text-decoration: none; transition: transform 180ms ease, background 180ms ease; }
 .hero-actions a:active { transform: translateY(1px); }
@@ -115,4 +130,5 @@ body { background: var(--dlgt-paper); }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   .hero-actions a, .docs-links a { transition: none; }
+  .pair-ticker-strip { animation: none; }
 }

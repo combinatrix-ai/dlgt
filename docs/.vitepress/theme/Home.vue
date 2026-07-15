@@ -5,7 +5,16 @@ const heroImage = withBase("/delegate-to-the-competition.png");
 const installCodex = 'codex "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
-const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol to review them."';
+const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."';
+
+const pairs = [
+  { from: "sol", to: "fable", effort: "high" },
+  { from: "fable", to: "sol", effort: "xhigh" },
+  { from: "fable", to: "luna", effort: "xhigh" },
+  { from: "sol", to: "luna", effort: "xhigh" },
+];
+// Repeat the first pair at the end so the CSS keyframe loop wraps seamlessly.
+const tickerPairs = [...pairs, pairs[0]];
 </script>
 
 <template>
@@ -17,6 +26,14 @@ const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. A
         <p class="hero-lede">
           <span class="hero-lede-line">Codex wasn't built to delegate to Claude.</span>
           <span class="hero-lede-line">Claude wasn't built to delegate to Codex. <span class="hero-lede-keep">dlgt was.</span></span>
+        </p>
+        <p class="pair-ticker" aria-hidden="true">
+          <span class="pair-ticker-mark">▸</span>
+          <span class="pair-ticker-window">
+            <span class="pair-ticker-strip">
+              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">{{ pair.from }} <span class="pair-ticker-arrow">──▶</span> {{ pair.to }} <span class="pair-ticker-effort">· {{ pair.effort }}</span></span>
+            </span>
+          </span>
         </p>
         <div class="hero-actions">
           <a class="primary-action" href="#quick-start">Quick Start</a>
