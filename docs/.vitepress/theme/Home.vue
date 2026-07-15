@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { withBase } from "vitepress";
 
-const heroImage = withBase("/delegate-to-the-competition.png");
+const heroImage = withBase("/delegate-to-the-competition.jpg");
 const installCodex = 'codex "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
@@ -41,7 +41,7 @@ const tickerPairs = [...pairs, pairs[0]];
         </div>
       </div>
       <figure class="hero-visual">
-        <img :src="heroImage" width="1456" height="1088" alt="Reject the agent fleet. Let Sol and Fable review each other." />
+        <img :src="heroImage" width="625" height="500" alt="Reject the agent fleet. Let Sol and Fable review each other." />
       </figure>
     </section>
 

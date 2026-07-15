@@ -11,7 +11,7 @@ export default defineConfig({
     ["meta", { name: "theme-color", content: "#f04b23" }],
     ["meta", { property: "og:title", content: "dlgt" }],
     ["meta", { property: "og:description", content: "Let agents delegate to the competition." }],
-    ["meta", { property: "og:image", content: "https://combinatrix.ai/dlgt/delegate-to-the-competition.png" }],
+    ["meta", { property: "og:image", content: "https://combinatrix.ai/dlgt/delegate-to-the-competition.jpg" }],
   ],
   themeConfig: {
     logo: "/mark.svg",
