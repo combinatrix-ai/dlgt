@@ -35,15 +35,16 @@ body { background: var(--dlgt-paper); }
 .dlgt-home h1, .dlgt-home h2, .dlgt-home p { margin: 0; }
 
 .hero {
+  min-height: calc(100dvh - 64px);
   display: grid;
   grid-template-columns: minmax(0, 1.08fr) minmax(420px, 0.92fr);
-  align-items: start;
+  align-items: center;
   gap: clamp(24px, 2.5vw, 48px);
   max-width: 1800px;
   margin: 0 auto;
   padding: clamp(64px, 7vh, 88px) clamp(24px, 4vw, 72px);
 }
-.hero-copy { max-width: 100%; padding-top: 22px; container-type: inline-size; }
+.hero-copy { max-width: 100%; container-type: inline-size; }
 .eyebrow { color: var(--dlgt-accent); font: 700 0.76rem/1 var(--vp-font-family-mono); letter-spacing: 0.12em; text-transform: uppercase; }
 .hero h1 { margin-top: 22px; font-size: clamp(2.55rem, 10cqi, 6rem); line-height: 0.92; letter-spacing: -0.075em; }
 .hero h1 span { display: block; white-space: nowrap; }
