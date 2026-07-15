@@ -16,7 +16,7 @@ harness, and call the other side when it has something useful to add.
 
 `dlgt` fills that one gap. It lets Codex use Claude and Claude use Codex.
 
-![Reject the agent fleet. Let Sol and Fable review each other.](assets/delegate-to-the-competition.png)
+![I built an entire company with 47 AI agents. Hey Sol, ask Fable to review this.](assets/delegate-to-the-competition.png)
 
 ## Quick Start
 
