@@ -4,6 +4,8 @@ import { withBase } from "vitepress";
 const heroImage = withBase("/delegate-to-the-competition.png");
 const installCodex = 'codex "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
+const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
+const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol to review them."';
 </script>
 
 <template>
@@ -47,7 +49,17 @@ const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt an
           <pre><code>{{ installClaude }}</code></pre>
         </div>
       </div>
-      <p class="after-install">Then ask either agent naturally. dlgt handles the handoff.</p>
+      <p class="after-install">Then ask either agent normally.</p>
+      <div class="command-lines example-lines">
+        <div class="command-line">
+          <strong>Codex</strong>
+          <pre><code>{{ exampleCodex }}</code></pre>
+        </div>
+        <div class="command-line">
+          <strong>Claude</strong>
+          <pre><code>{{ exampleClaude }}</code></pre>
+        </div>
+      </div>
     </section>
 
     <section class="how-it-works">
@@ -66,7 +78,6 @@ const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt an
       <a href="/dlgt/cli"><span>Use it</span><strong>CLI reference</strong><small>Commands, options, models, and profiles</small></a>
       <a href="/dlgt/design"><span>Understand it</span><strong>Design</strong><small>Lifecycle, storage, safety, and boundaries</small></a>
       <a href="/dlgt/rpc"><span>Build on it</span><strong>Local RPC</strong><small>JSONL methods, schemas, events, and errors</small></a>
-      <a href="/dlgt/orchestrator-landscape"><span>Place it</span><strong>Why not a fleet?</strong><small>Where dlgt ends and orchestration begins</small></a>
     </section>
   </main>
 </template>

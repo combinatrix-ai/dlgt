@@ -35,7 +35,6 @@ body { background: var(--dlgt-paper); }
 .dlgt-home h1, .dlgt-home h2, .dlgt-home p { margin: 0; }
 
 .hero {
-  min-height: calc(100dvh - 64px);
   display: grid;
   grid-template-columns: minmax(0, 1.08fr) minmax(420px, 0.92fr);
   align-items: start;
@@ -74,6 +73,7 @@ body { background: var(--dlgt-paper); }
 .command-line pre { min-width: 0; margin: 0; padding: 0; overflow: visible; background: transparent; }
 .command-line code { color: var(--dlgt-ink); font-size: clamp(0.78rem, 1.1vw, 0.9rem); white-space: pre-wrap; overflow-wrap: anywhere; }
 .after-install { margin-top: 24px !important; color: color-mix(in srgb, var(--dlgt-ink) 67%, transparent); }
+.example-lines { margin-top: 18px; }
 
 .how-it-works { display: grid; grid-template-columns: 0.8fr 1.2fr; gap: clamp(48px, 8vw, 128px); max-width: 1240px; margin: 0 auto; padding: 0 24px clamp(96px, 12vw, 180px); }
 .section-copy p { margin-top: 22px; font-size: 1.25rem; color: var(--dlgt-accent); font-weight: 700; }
@@ -84,6 +84,7 @@ body { background: var(--dlgt-paper); }
 
 .docs-links { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--dlgt-line); }
 .docs-links a { min-height: 240px; display: flex; flex-direction: column; padding: clamp(30px, 5vw, 70px); color: var(--dlgt-ink) !important; border-right: 1px solid var(--dlgt-line); border-bottom: 1px solid var(--dlgt-line); transition: background 180ms ease; }
+.docs-links a:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .docs-links a:hover { background: var(--dlgt-accent); color: #16130f !important; }
 .docs-links span { font: 700 0.76rem/1 var(--vp-font-family-mono); text-transform: uppercase; letter-spacing: 0.1em; }
 .docs-links strong { margin-top: auto; font-size: clamp(1.8rem, 3.2vw, 3.6rem); line-height: 1; letter-spacing: -0.05em; }
