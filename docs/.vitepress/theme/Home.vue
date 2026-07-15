@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, onMounted, ref } from "vue";
 import { withBase } from "vitepress";
 
 const heroImage = withBase("/delegate-to-the-competition.jpg");
@@ -7,14 +8,38 @@ const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt an
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
 const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."';
 
-const pairs = [
-  { from: "sol", to: "fable", effort: "high" },
-  { from: "fable", to: "sol", effort: "xhigh" },
-  { from: "fable", to: "luna", effort: "xhigh" },
-  { from: "sol", to: "luna", effort: "xhigh" },
+// Every pair crosses providers, and each target only shows effort levels its
+// harness actually accepts (sol supports ultra; the others top out at max).
+const delegations = [
+  { from: "sol", to: "fable", efforts: ["max", "xhigh"] },
+  { from: "fable", to: "sol", efforts: ["ultra", "max", "xhigh"] },
+  { from: "fable", to: "luna", efforts: ["max", "xhigh"] },
+  { from: "sol", to: "sonnet", efforts: ["max", "xhigh"] },
 ];
+
+// Static list for SSR; reshuffled with random efforts after mount.
+const pairs = ref([
+  { from: "fable", to: "sol", effort: "ultra" },
+  { from: "sol", to: "fable", effort: "max" },
+  { from: "fable", to: "luna", effort: "xhigh" },
+  { from: "sol", to: "sonnet", effort: "max" },
+]);
+
+onMounted(() => {
+  const shuffled = [...delegations];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  pairs.value = shuffled.map(d => ({
+    from: d.from,
+    to: d.to,
+    effort: d.efforts[Math.floor(Math.random() * d.efforts.length)],
+  }));
+});
+
 // Repeat the first pair at the end so the CSS keyframe loop wraps seamlessly.
-const tickerPairs = [...pairs, pairs[0]];
+const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
 </script>
 
 <template>
