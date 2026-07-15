@@ -66,7 +66,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
         </div>
       </div>
       <figure class="hero-visual">
-        <img :src="heroImage" width="966" height="731" alt="Reject the agent fleet. Let Sol and Fable review each other." />
+        <img :src="heroImage" width="604" height="459" alt="Reject the agent fleet. Let Sol and Fable review each other." />
       </figure>
     </section>
 
