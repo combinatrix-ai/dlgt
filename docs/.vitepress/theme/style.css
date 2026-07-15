@@ -51,7 +51,7 @@ body { background: var(--dlgt-paper); }
 .hero-lede { margin-top: 30px !important; max-width: 46rem; font-size: clamp(1.05rem, 1.4vw, 1.32rem); line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 72%, transparent); }
 .hero-lede-line { display: block; }
 .hero-lede-keep { white-space: nowrap; }
-.pair-ticker { display: flex; align-items: baseline; gap: 12px; margin-top: 26px !important; font: 700 0.92rem/1.2 var(--vp-font-family-mono); letter-spacing: 0.02em; }
+.pair-ticker { display: flex; align-items: baseline; gap: 12px; margin-top: 26px !important; font: 700 0.92rem/1.2 var(--vp-font-family-mono); letter-spacing: 0.02em; line-height: 1.2 !important; /* .vp-doc p sets line-height: 28px, which would overflow the 1.2em ticker rows */ }
 .pair-ticker-mark { color: var(--dlgt-accent); }
 .pair-ticker-window { display: block; height: 1.2em; overflow: hidden; }
 .pair-ticker-strip { display: block; animation: pair-roll 13.6s ease infinite; }
