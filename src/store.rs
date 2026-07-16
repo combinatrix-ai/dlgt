@@ -32,6 +32,7 @@ pub struct NewSession<'a> {
     pub cwd: &'a str,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
+    pub harness_options: &'a [String],
 }
 
 impl Store {
@@ -63,6 +64,7 @@ impl Store {
                    state TEXT NOT NULL,
                    model TEXT,
                    effort TEXT,
+                   harness_options_json TEXT NOT NULL DEFAULT '[]',
                    terminal_rows INTEGER NOT NULL DEFAULT 24,
                    terminal_cols INTEGER NOT NULL DEFAULT 80,
                    provider_session_id TEXT,
@@ -118,6 +120,7 @@ impl Store {
                    ON turns(session_id, execution_seq);",
             )
             .context("failed to migrate SQLite schema")?;
+        ensure_session_harness_options_column(&connection)?;
         Ok(Self { connection })
     }
 
@@ -141,10 +144,13 @@ impl Store {
 
     pub fn insert_session(&self, session: &NewSession<'_>) -> Result<()> {
         let now = now_ms();
+        let harness_options_json = serde_json::to_string(session.harness_options)
+            .context("failed to serialize harness options")?;
         self.connection.execute(
             "INSERT INTO sessions (
-               id, alias, title, agent, cwd, state, model, effort, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'starting', ?6, ?7, ?8, ?8)",
+               id, alias, title, agent, cwd, state, model, effort,
+               harness_options_json, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'starting', ?6, ?7, ?8, ?9, ?9)",
             params![
                 session.id,
                 session.alias,
@@ -153,6 +159,7 @@ impl Store {
                 session.cwd,
                 session.model,
                 session.effort,
+                harness_options_json,
                 now
             ],
         )?;
@@ -265,7 +272,8 @@ impl Store {
     pub fn get_session(&self, selector: &str) -> Result<Option<SessionRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT id, alias, title, agent, cwd, state, model, effort,
-                    provider_session_id, active_turn_id, pid, created_at_ms, updated_at_ms
+                    harness_options_json, provider_session_id, active_turn_id, pid,
+                    created_at_ms, updated_at_ms
              FROM sessions WHERE id = ?1 OR
                (alias = ?1 AND state NOT IN ('stopped', 'failed'))
              ORDER BY created_at_ms DESC LIMIT 1",
@@ -279,7 +287,8 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT id, alias, title, agent, cwd, state, model, effort,
-                    provider_session_id, active_turn_id, pid, created_at_ms, updated_at_ms
+                    harness_options_json, provider_session_id, active_turn_id, pid,
+                    created_at_ms, updated_at_ms
              FROM sessions ORDER BY created_at_ms DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
@@ -584,8 +593,12 @@ impl Store {
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let harness_options_json: String = row.get(8)?;
+    let harness_options = serde_json::from_str(&harness_options_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     let pid = row
-        .get::<_, Option<i64>>(10)?
+        .get::<_, Option<i64>>(11)?
         .and_then(|value| u32::try_from(value).ok());
     Ok(SessionRecord {
         id: row.get(0)?,
@@ -596,12 +609,30 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         state: row.get(5)?,
         model: row.get(6)?,
         effort: row.get(7)?,
-        provider_session_id: row.get(8)?,
-        active_turn_id: row.get(9)?,
+        harness_options,
+        provider_session_id: row.get(9)?,
+        active_turn_id: row.get(10)?,
         pid,
-        created_at_ms: row.get(11)?,
-        updated_at_ms: row.get(12)?,
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
     })
+}
+
+fn ensure_session_harness_options_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "harness_options_json" {
+            return Ok(());
+        }
+    }
+    connection
+        .execute(
+            "ALTER TABLE sessions ADD COLUMN harness_options_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )
+        .context("failed to add sessions.harness_options_json")?;
+    Ok(())
 }
 
 fn turn_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
@@ -666,6 +697,49 @@ mod tests {
     }
 
     #[test]
+    fn migrates_existing_sessions_to_empty_harness_options() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
+        let path = directory.path().join("state.db");
+        let connection = rusqlite::Connection::open(&path)
+            .unwrap_or_else(|error| panic!("failed to create legacy store: {error}"));
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   alias TEXT NOT NULL,
+                   title TEXT NOT NULL,
+                   agent TEXT NOT NULL,
+                   cwd TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   model TEXT,
+                   effort TEXT,
+                   terminal_rows INTEGER NOT NULL DEFAULT 24,
+                   terminal_cols INTEGER NOT NULL DEFAULT 80,
+                   provider_session_id TEXT,
+                   active_turn_id TEXT,
+                   pid INTEGER,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO sessions (
+                   id, alias, title, agent, cwd, state, created_at_ms, updated_at_ms
+                 ) VALUES ('ses_legacy', '@legacy', 'legacy', 'claude', '/tmp',
+                           'stopped', 1, 1);",
+            )
+            .unwrap_or_else(|error| panic!("failed to initialize legacy store: {error}"));
+        drop(connection);
+
+        let store = Store::open(&path)
+            .unwrap_or_else(|error| panic!("failed to migrate legacy store: {error}"));
+        let session = store
+            .get_session("ses_legacy")
+            .unwrap_or_else(|error| panic!("failed to read migrated session: {error}"))
+            .unwrap_or_else(|| panic!("migrated session missing"));
+        assert!(session.harness_options.is_empty());
+    }
+
+    #[test]
     fn persists_session_turn_event_and_input() {
         let directory = tempfile::tempdir()
             .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
@@ -680,6 +754,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -722,6 +797,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_old");
@@ -737,6 +813,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to reuse alias: {error}"));
         let archived = store
@@ -760,15 +837,17 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
         let store = Store::open(&directory.path().join("state.db"))
             .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let harness_options = vec!["permission-mode=auto".to_owned()];
         store
             .insert_session(&NewSession {
                 id: "ses_1",
                 alias: "@worker",
                 title: "worker",
-                agent: "codex",
+                agent: "claude",
                 cwd: "/tmp",
                 model: Some("gpt-test"),
                 effort: Some("high"),
+                harness_options: &harness_options,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -791,6 +870,7 @@ mod tests {
         assert_eq!(session.state, "restarting");
         assert_eq!(session.id, "ses_1");
         assert_eq!(session.alias, "@worker");
+        assert_eq!(session.harness_options, harness_options);
         assert_eq!(
             session.provider_session_id.as_deref(),
             Some("provider-thread")
@@ -826,6 +906,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -862,6 +943,7 @@ mod tests {
                     cwd: "/tmp",
                     model: None,
                     effort: None,
+                    harness_options: &[],
                 })
                 .is_err()
         );
@@ -882,6 +964,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -915,6 +998,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store
@@ -950,6 +1034,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -974,6 +1059,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(
@@ -1000,6 +1086,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -1038,6 +1125,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -1084,6 +1172,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "ses_1");
@@ -1137,6 +1226,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store

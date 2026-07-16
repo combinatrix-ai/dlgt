@@ -17,6 +17,7 @@ trap cleanup EXIT INT TERM
 
 export DLGT_HOME="$state_dir"
 export DLGT_CLAUDE_BIN="$repo_root/tests/fixtures/fake-agent.sh"
+export DLGT_FAKE_ARGS_FILE="$state_dir/fake-args.log"
 
 "$binary" server --foreground >"$state_dir/server.log" 2>&1 &
 server_pid=$!
@@ -26,7 +27,8 @@ while [ ! -S "$state_dir/dlgt.sock" ]; do
 done
 
 # `new` is readiness-bounded. Start it while the fixture emits the authoritative hook.
-"$binary" new --title smoke --alias @smoke --harness claude --cwd "$repo_root" >"$state_dir/new.json" &
+"$binary" new --title smoke --alias @smoke --harness claude --cwd "$repo_root" \
+  --harness-option permission-mode=auto >"$state_dir/new.json" &
 new_pid=$!
 attempt=0
 session_id=
@@ -41,6 +43,7 @@ wait "$new_pid"
 grep -Eq '"id":"ses_[0-9A-Z]{8}"' "$state_dir/new.json"
 grep -q '"alias":"@smoke"' "$state_dir/new.json"
 grep -q '"provider_session_id":"provider-session"' "$state_dir/new.json"
+grep -q -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE"
 
 # Bounded launch failures retain the failed audit Session ID for diagnostics.
 set +e
@@ -97,6 +100,7 @@ grep -q '"schema_version":1' "$state_dir/follow.jsonl"
 
 # Restart interrupts active work while preserving identity, provider binding, and history.
 "$binary" send "$session_id" -- interrupted-by-restart >/dev/null
+option_count_before=$(grep -c -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE")
 "$binary" restart "$session_id" >"$state_dir/restart.json" &
 restart_pid=$!
 attempt=0
@@ -106,6 +110,8 @@ done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"}' \
   | "$binary" hook emit "$session_id" claude
 wait "$restart_pid"
+option_count_after=$(grep -c -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE")
+test "$option_count_after" -gt "$option_count_before"
 grep -q "\"id\":\"$session_id\"" "$state_dir/restart.json"
 "$binary" show "$session_id" | grep -q '"execution_seq":2'
 "$binary" show "$session_id" | grep -q '"status":"interrupted"'

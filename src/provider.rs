@@ -72,6 +72,7 @@ pub struct LaunchOptions<'a> {
     pub cwd: &'a Path,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
+    pub harness_options: &'a [String],
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
 }
@@ -247,7 +248,6 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     let hook_command = hook_command(options)?;
     let settings = claude_hook_settings(&hook_command);
     let mut args = vec![
-        "--dangerously-skip-permissions".to_owned(),
         "--name".to_owned(),
         options.alias.trim_start_matches('@').to_owned(),
         "--settings".to_owned(),
@@ -259,6 +259,7 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     if let Some(effort) = options.effort {
         args.extend(["--effort".to_owned(), effort.to_owned()]);
     }
+    args.extend(claude_harness_args(options.harness_options)?);
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["--resume".to_owned(), provider_id.to_owned()]);
     }
@@ -268,6 +269,31 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         cwd: options.cwd.to_path_buf(),
         environment: claude_environment(options.environment),
     })
+}
+
+fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
+    options
+        .iter()
+        .map(|option| {
+            let (key, value) = option
+                .split_once('=')
+                .context("harness option requires KEY=VALUE")?;
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            {
+                bail!("invalid harness option key {key:?}");
+            }
+            if value.is_empty() {
+                bail!("harness option {key:?} requires a non-empty value");
+            }
+            if matches!(key, "name" | "settings" | "model" | "effort" | "resume") {
+                bail!("harness option {key:?} is managed by dlgt");
+            }
+            Ok(format!("--{key}={value}"))
+        })
+        .collect()
 }
 
 fn claude_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {
@@ -328,7 +354,7 @@ mod tests {
     };
 
     #[test]
-    fn claude_is_interactive_and_skips_permission_prompts() {
+    fn claude_is_interactive_and_uses_provider_permission_defaults() {
         let environment =
             std::collections::HashMap::from([("DISABLE_AUTOUPDATER".to_owned(), "0".to_owned())]);
         let spec = command_spec(&LaunchOptions {
@@ -338,14 +364,16 @@ mod tests {
             cwd: Path::new("/tmp"),
             model: Some("claude-4-5-haiku-latest"),
             effort: Some("high"),
+            harness_options: &[],
             resume_provider_id: None,
             environment: &environment,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(
-            spec.args
+            !spec
+                .args
                 .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
+                .any(|arg| arg.starts_with("--dangerously-skip-permissions"))
         );
         assert!(!spec.args.iter().any(|arg| arg == "--print"));
         assert_eq!(
@@ -368,6 +396,7 @@ mod tests {
                 cwd: Path::new("/tmp"),
                 model: None,
                 effort: Some("xhigh"),
+                harness_options: &[],
                 resume_provider_id: None,
                 environment: &environment,
             },
@@ -421,6 +450,7 @@ mod tests {
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
+            harness_options: &[],
             resume_provider_id: None,
             environment: &environment,
         })
@@ -452,6 +482,7 @@ mod tests {
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
+            harness_options: &[],
             resume_provider_id: Some("claude-session"),
             environment: &environment,
         })
@@ -471,6 +502,7 @@ mod tests {
                 cwd: Path::new("/tmp"),
                 model: None,
                 effort: None,
+                harness_options: &[],
                 resume_provider_id: Some("codex-thread"),
                 environment: &environment,
             },
@@ -482,6 +514,55 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["resume", "codex-thread"])
         );
+    }
+
+    #[test]
+    fn claude_passes_explicit_harness_options() {
+        let environment = std::collections::HashMap::new();
+        let options = vec![
+            "permission-mode=auto".to_owned(),
+            "dangerously-skip-permissions=true".to_owned(),
+        ];
+        let spec = command_spec(&LaunchOptions {
+            agent: Agent::Claude,
+            session_id: "ses_1",
+            alias: "@worker",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            harness_options: &options,
+            resume_provider_id: None,
+            environment: &environment,
+        })
+        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
+        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions=true")
+        );
+    }
+
+    #[test]
+    fn claude_rejects_harness_options_managed_by_dlgt() {
+        let environment = std::collections::HashMap::new();
+        let options = vec!["settings={}".to_owned()];
+        let result = command_spec(&LaunchOptions {
+            agent: Agent::Claude,
+            session_id: "ses_1",
+            alias: "@worker",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            harness_options: &options,
+            resume_provider_id: None,
+            environment: &environment,
+        });
+        let error = match result {
+            Ok(_) => panic!("managed harness option should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("managed by dlgt"));
     }
 
     #[test]

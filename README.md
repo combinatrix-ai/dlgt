@@ -138,8 +138,13 @@ Store reusable launch profiles in `~/.config/dlgt/config.toml`, or point
 harness = "claude"
 model = "claude-fable-5"
 effort = "high"
+harness_options = ["permission-mode=auto"]
 clean_env = true
 ```
+
+Claude Code uses its own permission default unless a Profile or
+`--harness-option KEY=VALUE` explicitly selects another mode. dlgt does not
+pass `--dangerously-skip-permissions` by default.
 
 Set `DLGT_HOME` to relocate the SQLite database and Unix socket. Set
 `DLGT_SOCKET` to override only the socket.

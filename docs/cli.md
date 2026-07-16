@@ -166,6 +166,12 @@ Rules:
 - `--title` is required and may be non-unique.
 - A Profile or Harness must resolve the Harness selection.
 - Model and effort are optional. Omission selects the provider default.
+- Claude permission handling uses Claude Code's provider default. dlgt does not
+  enable `--dangerously-skip-permissions` implicitly.
+- `--harness-option KEY=VALUE` explicitly adds `--KEY=VALUE` to Claude Code.
+  It is repeatable, stored with the Session, and reused by `restart`. Options
+  whose arguments are managed by dlgt are rejected. Codex does not currently
+  accept Harness options.
 - `--startup-timeout` is optional and defaults to 60 seconds, but startup is
   never unbounded.
 - If a prompt is supplied, Session creation and acceptance of the first prompt
@@ -182,6 +188,24 @@ Rules:
   Session is returned.
 
 Example:
+
+```bash
+dlgt new \
+  --title "trusted Claude worker" \
+  --harness claude \
+  --harness-option permission-mode=auto \
+  --cwd .
+```
+
+The unsafe bypass remains available only when deliberately requested:
+
+```bash
+dlgt new \
+  --title "unrestricted Claude worker" \
+  --harness claude \
+  --harness-option dangerously-skip-permissions=true \
+  --cwd .
+```
 
 ```bash
 dlgt new \
@@ -564,6 +588,7 @@ RPC so the daemon does not need to reread mutable configuration.
 harness = "claude"
 model = "best"
 effort = "high"
+harness_options = ["permission-mode=auto"]
 clean_env = true
 pass_env = ["PATH", "HOME", "SSH_AUTH_SOCK"]
 ```
@@ -573,6 +598,9 @@ Environment precedence:
 ```text
 client snapshot or clean base < Profile < explicit launch options
 ```
+
+Profile `harness_options` are followed by explicit `--harness-option` values.
+They configure the provider CLI rather than the launch environment.
 
 - Default launch environment is a snapshot of the invoking client's
   environment, never the daemon's startup environment.

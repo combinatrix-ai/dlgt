@@ -291,6 +291,23 @@ impl Daemon {
         }
         let model = params.get("model").and_then(Value::as_str);
         let effort = params.get("effort").and_then(Value::as_str);
+        let harness_options = match params.get("harness_options") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(options)) => options
+                .iter()
+                .map(|option| {
+                    option
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("harness option must be a string")
+                })
+                .collect::<Result<Vec<_>>>()
+                .context("invalid harness_options")?,
+            Some(_) => bail!("harness_options must be an array"),
+        };
+        if agent == Agent::Codex && !harness_options.is_empty() {
+            bail!("harness options are currently supported only for Claude");
+        }
         let environment = params
             .get("environment")
             .and_then(Value::as_object)
@@ -317,6 +334,7 @@ impl Daemon {
                 cwd: &cwd.to_string_lossy(),
                 model,
                 effort,
+                harness_options: &harness_options,
             });
             match inserted {
                 Ok(()) => break,
@@ -336,6 +354,7 @@ impl Daemon {
             cwd: &cwd,
             model,
             effort,
+            harness_options: &harness_options,
             resume_provider_id: None,
             environment: &environment,
         };
@@ -590,6 +609,7 @@ impl Daemon {
             cwd: &cwd,
             model: session.model.as_deref(),
             effort: session.effort.as_deref(),
+            harness_options: &session.harness_options,
             resume_provider_id: Some(provider_id),
             environment: &environment,
         };
@@ -2221,6 +2241,7 @@ mod tests {
                 cwd: "/tmp",
                 model: None,
                 effort: None,
+                harness_options: &[],
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(

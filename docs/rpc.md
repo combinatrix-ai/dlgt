@@ -57,7 +57,7 @@ alias. The following parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
 | `session.send` | `session`, `prompt` |
 | `session.wait` | `session`, positive `timeout_ms` |
@@ -76,6 +76,13 @@ alias. The following parameter shapes are stable for v1:
 Profiles are expanded by the client. `profile.list` is implemented by the
 stdio proxy rather than delegated to the daemon, so the daemon does not reread
 mutable client configuration.
+
+`harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
+The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
+and persists the array so `session.restart` reuses the same launch behavior.
+Claude Code's own permission default applies when the array is omitted; dlgt
+does not implicitly enable `--dangerously-skip-permissions`. Codex Harness
+options are not currently supported.
 
 ## Session and result schemas
 

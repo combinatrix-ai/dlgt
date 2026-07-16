@@ -152,6 +152,7 @@ fn command_new(args: &[String]) -> Result<()> {
             .and_then(|value| value.get("effort"))
             .and_then(Value::as_str)
     });
+    let harness_options = launch_harness_options(&parsed, profile.as_ref())?;
     let environment = launch_environment(&parsed, profile.as_ref())?;
     let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
     let mut result = client::call(
@@ -163,6 +164,7 @@ fn command_new(args: &[String]) -> Result<()> {
             "cwd": cwd,
             "model": model,
             "effort": effort,
+            "harness_options": harness_options,
             "prompt": prompt,
             "startup_timeout_ms": parsed.one("--startup-timeout")
                 .map(parse_duration).transpose()?.unwrap_or(Duration::from_secs(60)).as_millis(),
@@ -587,6 +589,25 @@ fn launch_environment(parsed: &Args, profile: Option<&Value>) -> Result<Map<Stri
         .collect())
 }
 
+fn launch_harness_options(parsed: &Args, profile: Option<&Value>) -> Result<Vec<String>> {
+    let mut options = Vec::new();
+    if let Some(value) = profile.and_then(|profile| profile.get("harness_options")) {
+        for option in value
+            .as_array()
+            .context("profile harness_options must be an array")?
+        {
+            options.push(
+                option
+                    .as_str()
+                    .context("profile harness_options entries must be strings")?
+                    .to_owned(),
+            );
+        }
+    }
+    options.extend(parsed.many("--harness-option").map(str::to_owned));
+    Ok(options)
+}
+
 fn load_profiles() -> Result<Map<String, Value>> {
     let path = std::env::var_os("DLGT_CONFIG").map_or_else(
         || {
@@ -697,7 +718,7 @@ fn print_command_usage(command: &str) -> Result<()> {
             "dlgt server - run or stop the local daemon\n\nUSAGE\n  dlgt server [--foreground]\n  dlgt server stop\n\nOPTIONS\n  --foreground   Run in the foreground\n  -h, --help     Print this help"
         }
         "new" => {
-            "dlgt new - create a Session, optionally with its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] [-- <PROMPT>]\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Harness-specific option (repeatable)\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --wait                         Wait for the initial prompt to finish\n  --timeout <DURATION>           Required with --wait\n  --stdin                        Read the initial prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt new - create a Session, optionally with its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] [-- <PROMPT>]\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option (repeatable)\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --wait                         Wait for the initial prompt to finish\n  --timeout <DURATION>           Required with --wait\n  --stdin                        Read the initial prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "restart" => {
             "dlgt restart - replace a Session process and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
