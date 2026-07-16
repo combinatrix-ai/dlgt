@@ -3,8 +3,8 @@ import { computed, onMounted, ref } from "vue";
 import { withBase } from "vitepress";
 
 const heroImage = withBase("/delegate-to-the-competition.jpg");
-const installCodex = 'codex "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
-const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
+const installCodex = 'codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"';
+const installClaude = 'claude "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"';
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
 const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."';
 const exampleEffort = 'codex -m gpt-5.6-sol "Make the CLI faster. Have Luna do it at xhigh effort."';
@@ -70,7 +70,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
         </div>
       </div>
       <figure class="hero-visual">
-        <img :src="heroImage" width="604" height="459" alt="Reject the agent fleet. Let Sol and Fable review each other." />
+        <img :src="heroImage" width="604" height="459" alt="I built an entire company with 47 AI agents. Hey Sol, ask Fable to review this." />
       </figure>
     </section>
 
@@ -111,7 +111,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
     <section id="quick-start" class="quick-start">
       <header>
         <h2>Install once. Ask naturally.</h2>
-        <p>Give either harness the repository. After that, delegation is part of the prompt.</p>
+        <p>Give either harness the install instructions. After that, delegation is part of the prompt.</p>
       </header>
       <div class="command-lines">
         <div class="command-line">
