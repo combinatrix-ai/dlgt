@@ -43,6 +43,24 @@ claude -p "Think of 10 funny jokes. Ask Codex to review them."
 No fleet to configure. No invented org chart. The harness you chose stays in
 charge and uses `dlgt` when it needs a counterpart.
 
+## Install
+
+Install the latest published `dlgt` release on macOS or Linux. The installer
+detects the platform, verifies the GitHub Release checksum, installs the
+user-writable binary, and registers the embedded skill for existing Codex or
+Claude user directories:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Install a specific release with `--version v<version>`, or choose skill
+registration explicitly with `--skill codex`, `--skill claude`, `--skill both`,
+or `--no-skill`. The normal installation path does not require Rust, Cargo, or
+a source checkout. See the [full installation instructions](https://combinatrix.ai/dlgt/installation-instruction)
+for supported targets and verification steps.
+
 ## What dlgt does
 
 `dlgt` runs Codex and Claude as durable, addressable local Sessions. Each
@@ -60,13 +78,7 @@ framework. It is the bridge between two competing harnesses.
 
 ## Direct CLI use
 
-Build the binary:
-
-```bash
-cargo build
-```
-
-Create a Claude Session and wait for its review:
+After installing `dlgt`, create a Claude Session and wait for its review:
 
 ```bash
 dlgt new \
@@ -124,12 +136,15 @@ Set `DLGT_HOME` to relocate the SQLite database and Unix socket. Set
 
 ## Build and verify
 
+Contributor builds must name the `dlgt` binary explicitly:
+
 ```bash
-cargo build
+cargo build --bin dlgt
+cargo build --release --bin dlgt
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build && tests/smoke.sh
+cargo build --bin dlgt && tests/smoke.sh
 npm ci
 npm run docs:build
 ```
