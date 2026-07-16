@@ -29,15 +29,15 @@ codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction to i
 From Claude:
 
 ```bash
-claude -p "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"
+claude "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"
 ```
 
 Then ask naturally:
 
 ```bash
-codex "Create a great game. Ask Claude to review it."
+codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."
 
-claude -p "Think of 10 funny jokes. Ask Codex to review them."
+claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."
 ```
 
 No fleet to configure. No invented org chart. The harness you chose stays in
@@ -76,6 +76,16 @@ active execution.
 `dlgt` is not a planner, company simulator, workflow language, or multi-agent
 framework. It is the bridge between two competing harnesses.
 
+## Why not the DIY routes
+
+- **`tmux send-keys`** — the leader polls `capture-pane` and burns tokens on
+  screen dumps, or you script UI heuristics that break on a spinner.
+- **`claude -p` / `codex exec`** — every call is a cold start that throws away
+  context, and headless runs sometimes aren't covered by your subscription.
+- **`dlgt`** — completion is a lifecycle event, follow-ups keep their Session
+  context, the managed PTY returns JSON instead of screen scrapes, and it runs
+  on the plan you already pay for.
+
 ## Direct CLI use
 
 After installing `dlgt`, create a Claude Session and wait for its review:
@@ -84,7 +94,7 @@ After installing `dlgt`, create a Claude Session and wait for its review:
 dlgt new \
   --title "Claude review" \
   --harness claude \
-  --model claude-fable-4-5 \
+  --model claude-fable-5 \
   --effort high \
   --cwd . \
   --wait \
@@ -126,7 +136,7 @@ Store reusable launch profiles in `~/.config/dlgt/config.toml`, or point
 ```toml
 [profiles.fable-review]
 harness = "claude"
-model = "claude-fable-4-5"
+model = "claude-fable-5"
 effort = "high"
 clean_env = true
 ```
