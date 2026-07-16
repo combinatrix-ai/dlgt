@@ -3,6 +3,11 @@ name = "dlgt"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "dlgt"
+
+[[bin]]
+name = "dlgt"
+path = "src/main.rs"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
