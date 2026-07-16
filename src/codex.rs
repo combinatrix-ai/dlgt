@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, client};
 
-use crate::provider::codex_program;
+use crate::provider::{codex_app_server_args, codex_program};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
@@ -453,7 +453,7 @@ fn spawn_app_server(
         command.env_clear().envs(environment);
     }
     let mut child = command
-        .args(["app-server", "--listen", &endpoint])
+        .args(codex_app_server_args(&endpoint))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 static CODEX_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
+const CODEX_UPDATE_SUPPRESSION: &str = "check_for_update_on_startup=false";
+const CLAUDE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
@@ -95,7 +98,7 @@ pub fn codex_program() -> PathBuf {
 pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path) -> CommandSpec {
     let program =
         std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from);
-    let mut args = Vec::new();
+    let mut args = vec!["--config".to_owned(), CODEX_UPDATE_SUPPRESSION.to_owned()];
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["resume".to_owned(), provider_id.to_owned()]);
     }
@@ -120,6 +123,16 @@ pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path)
         cwd: options.cwd.to_path_buf(),
         environment: options.environment.clone(),
     }
+}
+
+pub(crate) fn codex_app_server_args(endpoint: &str) -> Vec<String> {
+    vec![
+        "--config".to_owned(),
+        CODEX_UPDATE_SUPPRESSION.to_owned(),
+        "app-server".to_owned(),
+        "--listen".to_owned(),
+        endpoint.to_owned(),
+    ]
 }
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
@@ -253,8 +266,14 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         program,
         args,
         cwd: options.cwd.to_path_buf(),
-        environment: options.environment.clone(),
+        environment: claude_environment(options.environment),
     })
+}
+
+fn claude_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut environment = environment.clone();
+    environment.insert(CLAUDE_AUTOUPDATER_ENV.to_owned(), "1".to_owned());
+    environment
 }
 
 fn hook_command(options: &LaunchOptions<'_>) -> Result<String> {
@@ -304,12 +323,14 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Agent, LaunchOptions, codex_remote_tui_command, command_spec, trust_codex_workspace,
+        Agent, LaunchOptions, codex_app_server_args, codex_remote_tui_command, command_spec,
+        trust_codex_workspace,
     };
 
     #[test]
     fn claude_is_interactive_and_skips_permission_prompts() {
-        let environment = std::collections::HashMap::new();
+        let environment =
+            std::collections::HashMap::from([("DISABLE_AUTOUPDATER".to_owned(), "0".to_owned())]);
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
@@ -327,11 +348,18 @@ mod tests {
                 .any(|arg| arg == "--dangerously-skip-permissions")
         );
         assert!(!spec.args.iter().any(|arg| arg == "--print"));
+        assert_eq!(
+            spec.environment.get("DISABLE_AUTOUPDATER"),
+            Some(&"1".to_owned())
+        );
     }
 
     #[test]
     fn codex_remote_tui_keeps_the_primary_screen_visible_without_hooks() {
-        let environment = std::collections::HashMap::new();
+        let environment = std::collections::HashMap::from([(
+            "CODEX_HOME".to_owned(),
+            "/tmp/user-codex-home".to_owned(),
+        )]);
         let spec = codex_remote_tui_command(
             &LaunchOptions {
                 agent: Agent::Codex,
@@ -344,6 +372,10 @@ mod tests {
                 environment: &environment,
             },
             Path::new("/tmp/dlgt.sock"),
+        );
+        assert_eq!(
+            &spec.args[..2],
+            ["--config", "check_for_update_on_startup=false"]
         );
         assert!(
             spec.args
@@ -361,6 +393,21 @@ mod tests {
             spec.args
                 .iter()
                 .any(|arg| arg.contains("model_reasoning_effort"))
+        );
+        assert_eq!(spec.environment, environment);
+    }
+
+    #[test]
+    fn codex_app_server_suppresses_startup_update_prompts() {
+        assert_eq!(
+            codex_app_server_args("unix:///tmp/dlgt.sock"),
+            [
+                "--config",
+                "check_for_update_on_startup=false",
+                "app-server",
+                "--listen",
+                "unix:///tmp/dlgt.sock",
+            ]
         );
     }
 
@@ -429,7 +476,12 @@ mod tests {
             },
             Path::new("/tmp/dlgt.sock"),
         );
-        assert_eq!(&codex.args[..2], ["resume", "codex-thread"]);
+        assert!(
+            codex
+                .args
+                .windows(2)
+                .any(|args| args == ["resume", "codex-thread"])
+        );
     }
 
     #[test]

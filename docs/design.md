@@ -115,6 +115,13 @@ daemon's startup environment. `--clean-env` starts from a minimal runtime base;
 or `restart`. Values are freshly supplied for every process launch and are not
 persisted for later replay.
 
+After that expansion, dlgt applies non-configurable lifecycle safety overrides
+to its child Harness processes. Codex commands receive
+`check_for_update_on_startup=false`; Claude receives
+`DISABLE_AUTOUPDATER=1`. These overrides prevent updater UI from blocking the
+bounded readiness transition, take precedence over launch environment values,
+and do not mutate either provider's global configuration.
+
 Environment values travel in RPC memory rather than argv and are not directly
 serialized into Session records, `list`, `show`, events, Profiles, or error
 JSON. This is a metadata boundary, not an output redaction guarantee. Provider

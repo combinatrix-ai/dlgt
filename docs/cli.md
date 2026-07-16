@@ -582,6 +582,10 @@ client snapshot or clean base < Profile < explicit launch options
 - `--unset-env KEY` removes a value.
 - Environment options apply when creating or restarting a Session. Values are
   freshly snapshotted for each process launch and are never stored for replay.
+- dlgt applies final lifecycle safety overrides to owned Harness children:
+  `check_for_update_on_startup=false` for Codex and `DISABLE_AUTOUPDATER=1` for
+  Claude. They cannot be overridden per Session and do not change provider
+  global configuration.
 - Launch environment values are passed in RPC memory, never argv, and are never
   directly serialized into Session records, `list`, `show`, `events`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its
