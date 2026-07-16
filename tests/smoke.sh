@@ -16,8 +16,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 export DLGT_HOME="$state_dir"
+export HOME="$state_dir/home"
 export DLGT_CLAUDE_BIN="$repo_root/tests/fixtures/fake-agent.sh"
 export DLGT_FAKE_ARGS_FILE="$state_dir/fake-args.log"
+mkdir -p "$HOME"
 
 "$binary" server --foreground >"$state_dir/server.log" 2>&1 &
 server_pid=$!

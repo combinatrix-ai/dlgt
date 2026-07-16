@@ -168,6 +168,10 @@ Rules:
 - Model and effort are optional. Omission selects the provider default.
 - Claude permission handling uses Claude Code's provider default. dlgt does not
   enable `--dangerously-skip-permissions` implicitly.
+- Before launching either Harness, dlgt records the Session working directory
+  as trusted in that provider's local workspace state. For Claude this updates
+  `~/.claude.json` and suppresses only the workspace trust dialog; Claude's
+  normal tool permission mode still applies.
 - `--harness-option KEY=VALUE` explicitly adds `--KEY=VALUE` to Claude Code.
   It is repeatable, stored with the Session, and reused by `restart`. Options
   whose arguments are managed by dlgt are rejected. Codex does not currently

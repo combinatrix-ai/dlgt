@@ -122,6 +122,13 @@ to its child Harness processes. Codex commands receive
 bounded readiness transition, take precedence over launch environment values,
 and do not mutate either provider's global configuration.
 
+Before launch, dlgt marks the canonical Session working directory as trusted
+in the provider's local workspace state. Codex uses its `config.toml`; Claude
+uses the matching `projects` entry in `~/.claude.json`. Both updates preserve
+unrelated settings, use atomic replacement, default new files to mode 0600,
+and are idempotent. This suppresses the provider's workspace trust dialog but
+does not bypass Claude's tool permission mode.
+
 Environment values travel in RPC memory rather than argv and are not directly
 serialized into Session records, `list`, `show`, events, Profiles, or error
 JSON. This is a metadata boundary, not an output redaction guarantee. Provider

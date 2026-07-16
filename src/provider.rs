@@ -11,6 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
 static CODEX_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+static CLAUDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 const CODEX_UPDATE_SUPPRESSION: &str = "check_for_update_on_startup=false";
 const CLAUDE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
@@ -137,19 +138,85 @@ pub(crate) fn codex_app_server_args(endpoint: &str) -> Vec<String> {
 }
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
-    if agent == Agent::Codex {
-        let home = std::env::var_os("CODEX_HOME").map_or_else(
-            || {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|home| home.join(".codex"))
-                    .context("HOME is not set")
-            },
-            |home| Ok(PathBuf::from(home)),
-        )?;
-        trust_codex_workspace(&home, cwd)?;
+    match agent {
+        Agent::Codex => {
+            let home = std::env::var_os("CODEX_HOME").map_or_else(
+                || {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".codex"))
+                        .context("HOME is not set")
+                },
+                |home| Ok(PathBuf::from(home)),
+            )?;
+            trust_codex_workspace(&home, cwd)?;
+        }
+        Agent::Claude => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?;
+            trust_claude_workspace(&home, cwd)?;
+        }
     }
     Ok(())
+}
+
+fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
+    let _guard = CLAUDE_STATE_LOCK
+        .lock()
+        .map_err(|_| anyhow!("Claude state lock poisoned"))?;
+    fs::create_dir_all(home).with_context(|| format!("failed to create {}", home.display()))?;
+    let state_path = home.join(".claude.json");
+    let existing = match fs::read_to_string(&state_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", state_path.display()));
+        }
+    };
+    let mut state = serde_json::from_str::<serde_json::Value>(&existing)
+        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+    let root = state
+        .as_object_mut()
+        .context("Claude state root must be an object")?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .context("Claude state `projects` must be an object")?;
+    let cwd = cwd
+        .to_str()
+        .context("Claude workspace path is not valid UTF-8")?;
+    let project = projects
+        .entry(cwd)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .with_context(|| format!("Claude state project {cwd:?} must be an object"))?;
+    let is_trusted = project
+        .get("hasTrustDialogAccepted")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let onboarding_seen = project
+        .get("projectOnboardingSeenCount")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|count| count >= 1);
+    if is_trusted && onboarding_seen {
+        return Ok(());
+    }
+    project.insert(
+        "hasTrustDialogAccepted".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    if !onboarding_seen {
+        project.insert(
+            "projectOnboardingSeenCount".to_owned(),
+            serde_json::Value::Number(1.into()),
+        );
+    }
+    let mut contents =
+        serde_json::to_string_pretty(&state).context("failed to serialize Claude state")?;
+    contents.push('\n');
+    write_config_atomic(&state_path, &contents)
 }
 
 fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
@@ -176,7 +243,7 @@ fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
         return Ok(());
     }
     set_project_trusted(&mut document, cwd)?;
-    write_codex_config(&config_path, &document.to_string())
+    write_config_atomic(&config_path, &document.to_string())
 }
 
 fn set_project_trusted(document: &mut DocumentMut, cwd: &str) -> Result<()> {
@@ -209,9 +276,13 @@ fn project_is_trusted(document: &DocumentMut, cwd: &str) -> bool {
         == Some("trusted")
 }
 
-fn write_codex_config(path: &Path, contents: &str) -> Result<()> {
-    let parent = path.parent().context("Codex config has no parent")?;
-    let temporary = parent.join(format!(".config.toml.dlgt-{}.tmp", Uuid::new_v4().simple()));
+fn write_config_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().context("config path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("config file name is not valid UTF-8")?;
+    let temporary = parent.join(format!(".{name}.dlgt-{}.tmp", Uuid::new_v4().simple()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -350,7 +421,7 @@ mod tests {
 
     use super::{
         Agent, LaunchOptions, codex_app_server_args, codex_remote_tui_command, command_spec,
-        trust_codex_workspace,
+        trust_claude_workspace, trust_codex_workspace,
     };
 
     #[test]
@@ -569,6 +640,58 @@ mod tests {
     fn semantic_input_rejects_terminal_escape_injection() {
         assert!(Agent::Claude.semantic_input("unsafe\x1b[201~").is_err());
         assert!(Agent::Codex.semantic_input("safe").is_err());
+    }
+
+    #[test]
+    fn claude_workspace_trust_preserves_state_and_is_idempotent() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
+        let home = directory.path().join("home");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&home)
+            .unwrap_or_else(|error| panic!("failed to create Claude home: {error}"));
+        fs::create_dir_all(&workspace)
+            .unwrap_or_else(|error| panic!("failed to create workspace: {error}"));
+        let state_path = home.join(".claude.json");
+        fs::write(
+            &state_path,
+            r#"{"hasCompletedOnboarding":true,"projects":{"/other":{"custom":42}}}"#,
+        )
+        .unwrap_or_else(|error| panic!("failed to seed Claude state: {error}"));
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|error| panic!("failed to secure Claude state: {error}"));
+
+        trust_claude_workspace(&home, &workspace)
+            .unwrap_or_else(|error| panic!("failed to trust Claude workspace: {error}"));
+        let first = fs::read_to_string(&state_path)
+            .unwrap_or_else(|error| panic!("failed to read Claude state: {error}"));
+        let state: serde_json::Value = serde_json::from_str(&first)
+            .unwrap_or_else(|error| panic!("failed to parse Claude state: {error}"));
+        let workspace_key = workspace.to_string_lossy();
+        assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(state["projects"]["/other"]["custom"], 42);
+        assert_eq!(
+            state["projects"][workspace_key.as_ref()]["hasTrustDialogAccepted"],
+            true
+        );
+        assert_eq!(
+            state["projects"][workspace_key.as_ref()]["projectOnboardingSeenCount"],
+            1
+        );
+        assert_eq!(
+            fs::metadata(&state_path)
+                .unwrap_or_else(|error| panic!("failed to stat Claude state: {error}"))
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        trust_claude_workspace(&home, &workspace)
+            .unwrap_or_else(|error| panic!("failed to re-trust Claude workspace: {error}"));
+        let second = fs::read_to_string(&state_path)
+            .unwrap_or_else(|error| panic!("failed to reread Claude state: {error}"));
+        assert_eq!(first, second);
     }
 
     #[test]
