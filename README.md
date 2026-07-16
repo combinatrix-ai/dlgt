@@ -23,13 +23,13 @@ harness, and call the other side when it has something useful to add.
 From Codex:
 
 ```bash
-codex "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"
+codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"
 ```
 
 From Claude:
 
 ```bash
-claude -p "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"
+claude -p "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"
 ```
 
 Then ask naturally:
@@ -136,7 +136,8 @@ npm run docs:build
 
 ## Documentation
 
-- [Documentation site](https://combinatrix-ai.github.io/dlgt/)
+- [Documentation site](https://combinatrix.ai/dlgt/)
+- [Installation instructions](https://combinatrix.ai/dlgt/installation-instruction)
 - [CLI reference](docs/cli.md)
 - [Local RPC](docs/rpc.md)
 - [Design](docs/design.md)

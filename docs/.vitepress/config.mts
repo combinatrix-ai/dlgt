@@ -18,6 +18,7 @@ export default defineConfig({
     siteTitle: "dlgt",
     nav: [
       { text: "Quick Start", link: "/#quick-start" },
+      { text: "Installation", link: "/installation-instruction" },
       { text: "CLI", link: "/cli" },
       { text: "Design", link: "/design" },
       { text: "GitHub", link: "https://github.com/combinatrix-ai/dlgt" },
@@ -25,6 +26,7 @@ export default defineConfig({
     sidebar: [
       { text: "Start", items: [
         { text: "Why dlgt", link: "/" },
+        { text: "Installation", link: "/installation-instruction" },
         { text: "CLI reference", link: "/cli" },
       ] },
       { text: "Internals", items: [
