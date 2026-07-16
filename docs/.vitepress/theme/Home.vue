@@ -7,22 +7,25 @@ const installCodex = 'codex "Install https://github.com/combinatrix-ai/dlgt and 
 const installClaude = 'claude "Install https://github.com/combinatrix-ai/dlgt and make dlgt work"';
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
 const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."';
+const exampleEffort = 'codex -m gpt-5.6-sol "Make the CLI faster. Have Luna do it at xhigh effort."';
 
 // Every pair crosses providers, and each target only shows effort levels its
 // harness actually accepts (sol supports ultra; the others top out at max).
+// Tasks are fixed per pair so each target is asked for what it's best at;
+// keep them under ~20 chars so the nowrap ticker row fits a mobile viewport.
 const delegations = [
-  { from: "sol", to: "fable", efforts: ["max", "xhigh"] },
-  { from: "fable", to: "sol", efforts: ["ultra", "max", "xhigh"] },
-  { from: "fable", to: "luna", efforts: ["max", "xhigh"] },
-  { from: "sol", to: "sonnet", efforts: ["max", "xhigh"] },
+  { from: "sol", to: "fable", task: "review the UX copy", efforts: ["max", "xhigh"] },
+  { from: "fable", to: "sol", task: "design the API", efforts: ["ultra", "max", "xhigh"] },
+  { from: "fable", to: "luna", task: "rewrite the parser", efforts: ["max", "xhigh"] },
+  { from: "sol", to: "sonnet", task: "build the sidebar", efforts: ["max", "xhigh"] },
 ];
 
 // Static list for SSR; reshuffled with random efforts after mount.
 const pairs = ref([
-  { from: "fable", to: "sol", effort: "ultra" },
-  { from: "sol", to: "fable", effort: "max" },
-  { from: "fable", to: "luna", effort: "xhigh" },
-  { from: "sol", to: "sonnet", effort: "max" },
+  { from: "fable", to: "sol", effort: "ultra", task: "design the API" },
+  { from: "sol", to: "fable", effort: "max", task: "review the UX copy" },
+  { from: "fable", to: "luna", effort: "xhigh", task: "rewrite the parser" },
+  { from: "sol", to: "sonnet", effort: "max", task: "build the sidebar" },
 ]);
 
 onMounted(() => {
@@ -35,6 +38,7 @@ onMounted(() => {
     from: d.from,
     to: d.to,
     effort: d.efforts[Math.floor(Math.random() * d.efforts.length)],
+    task: d.task,
   }));
 });
 
@@ -56,7 +60,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
           <span class="pair-ticker-mark">▸</span>
           <span class="pair-ticker-window">
             <span class="pair-ticker-strip">
-              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">{{ pair.from }} <span class="pair-ticker-arrow">──▶</span> {{ pair.to }} <span class="pair-ticker-effort">· {{ pair.effort }}</span></span>
+              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">{{ pair.from }} <span class="pair-ticker-arrow">──▶</span> {{ pair.to }} <span class="pair-ticker-effort">· {{ pair.effort }}:</span> {{ pair.task }}</span>
             </span>
           </span>
         </p>
@@ -72,8 +76,36 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
 
     <section class="statement">
       <p>Every major harness already has subagents.</p>
-      <h2>The missing piece is the bridge.</h2>
-      <p>No AI CEO. No synthetic company. No fleet dashboard. Use the frontier model you like, then let it ask the other side for help.</p>
+      <h2>The missing piece is <span class="statement-strike">the bridge</span> <span class="statement-brand">dlgt</span>.</h2>
+      <p class="statement-lede">You've already tried the DIY routes. dlgt was built for this.</p>
+      <ul class="diy-routes">
+        <li>
+          <strong>tmux send-keys</strong>
+          <ul class="diy-points">
+            <li>Your agent polls capture-pane and burns tokens on screen dumps</li>
+            <li>Or you script UI heuristics that break on a spinner</li>
+          </ul>
+        </li>
+        <li>
+          <strong>claude -p / codex exec</strong>
+          <ul class="diy-points">
+            <li>A cold start on every call — context is thrown away</li>
+            <li>Headless runs sometimes aren't covered by your subscription</li>
+          </ul>
+        </li>
+        <li class="diy-dlgt">
+          <strong>dlgt</strong>
+          <div>
+            <p class="diy-lead">One job: your agent uses the competitor's agent.</p>
+            <ul class="diy-points diy-yes">
+              <li>Completion is a lifecycle event — done means done</li>
+              <li>Durable sessions — follow-ups keep their context</li>
+              <li>Managed PTY, JSON results — no scraping, no tmux</li>
+              <li>On the plan you already pay for</li>
+            </ul>
+          </div>
+        </li>
+      </ul>
     </section>
 
     <section id="quick-start" class="quick-start">
@@ -102,18 +134,13 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
           <pre><code>{{ exampleClaude }}</code></pre>
         </div>
       </div>
-    </section>
-
-    <section class="how-it-works">
-      <div class="section-copy">
-        <h2>dlgt has one job.</h2>
-        <p>Let an agent use a competitor's agent. Period.</p>
+      <p class="after-install">Bonus: naming an effort is also enough — native subagents can't choose theirs.</p>
+      <div class="command-lines example-lines">
+        <div class="command-line">
+          <strong>Codex</strong>
+          <pre><code>{{ exampleEffort }}</code></pre>
+        </div>
       </div>
-      <ol>
-        <li><strong>Your harness stays in charge.</strong><span>Codex or Claude keeps the main loop and your project context.</span></li>
-        <li><strong>dlgt owns the counterpart session.</strong><span>It starts, addresses, observes, and stops the other harness locally.</span></li>
-        <li><strong>The answer comes back.</strong><span>The leader reviews the result and decides what enters your work.</span></li>
-      </ol>
     </section>
 
     <section class="docs-links">
