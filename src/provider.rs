@@ -76,6 +76,7 @@ pub struct LaunchOptions<'a> {
     pub harness_options: &'a [String],
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
+    pub auto_approve: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +109,10 @@ pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path)
         "--remote".to_owned(),
         format!("unix://{}", socket_path.display()),
         "--no-alt-screen".to_owned(),
-        "--dangerously-bypass-approvals-and-sandbox".to_owned(),
     ]);
+    if options.auto_approve {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+    }
     if let Some(model) = options.model {
         args.extend(["--model".to_owned(), model.to_owned()]);
     }
@@ -317,7 +320,15 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     let program =
         std::env::var_os("DLGT_CLAUDE_BIN").map_or_else(|| PathBuf::from("claude"), PathBuf::from);
     let hook_command = hook_command(options)?;
-    let settings = claude_hook_settings(&hook_command);
+    let skip_permissions =
+        options.auto_approve && !has_permission_mode_option(options.harness_options);
+    let mut settings = claude_hook_settings(&hook_command);
+    if skip_permissions {
+        // Claude Code shows a blocking bypass-permissions acceptance dialog on
+        // every interactive start; setting this flag-settings key is the
+        // session-scoped way to accept it without touching user settings.
+        settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
+    }
     let mut args = vec![
         "--name".to_owned(),
         options.alias.trim_start_matches('@').to_owned(),
@@ -331,6 +342,9 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         args.extend(["--effort".to_owned(), effort.to_owned()]);
     }
     args.extend(claude_harness_args(options.harness_options)?);
+    if skip_permissions {
+        args.push("--dangerously-skip-permissions".to_owned());
+    }
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["--resume".to_owned(), provider_id.to_owned()]);
     }
@@ -365,6 +379,14 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
             Ok(format!("--{key}={value}"))
         })
         .collect()
+}
+
+fn has_permission_mode_option(options: &[String]) -> bool {
+    options.iter().any(|option| {
+        option
+            .split_once('=')
+            .is_some_and(|(key, _)| key == "permission-mode")
+    })
 }
 
 fn claude_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {
@@ -425,7 +447,7 @@ mod tests {
     };
 
     #[test]
-    fn claude_is_interactive_and_uses_provider_permission_defaults() {
+    fn claude_defaults_to_auto_approve() {
         let environment =
             std::collections::HashMap::from([("DISABLE_AUTOUPDATER".to_owned(), "0".to_owned())]);
         let spec = command_spec(&LaunchOptions {
@@ -438,19 +460,93 @@ mod tests {
             harness_options: &[],
             resume_provider_id: None,
             environment: &environment,
+            auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(
-            !spec
-                .args
+            spec.args
                 .iter()
-                .any(|arg| arg.starts_with("--dangerously-skip-permissions"))
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        let settings = settings_argument(&spec.args);
+        assert_eq!(
+            settings.get("skipDangerousModePermissionPrompt"),
+            Some(&serde_json::Value::Bool(true))
         );
         assert!(!spec.args.iter().any(|arg| arg == "--print"));
         assert_eq!(
             spec.environment.get("DISABLE_AUTOUPDATER"),
             Some(&"1".to_owned())
         );
+    }
+
+    #[test]
+    fn claude_no_auto_approve_omits_implicit_skip_permissions() {
+        let environment = std::collections::HashMap::new();
+        let spec = command_spec(&LaunchOptions {
+            agent: Agent::Claude,
+            session_id: "ses_1",
+            alias: "@worker",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            harness_options: &[],
+            resume_provider_id: None,
+            environment: &environment,
+            auto_approve: false,
+        })
+        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        assert!(
+            settings_argument(&spec.args)
+                .get("skipDangerousModePermissionPrompt")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_permission_mode_option_suppresses_implicit_auto_approve() {
+        let environment = std::collections::HashMap::new();
+        let options = vec!["permission-mode=auto".to_owned()];
+        let spec = command_spec(&LaunchOptions {
+            agent: Agent::Claude,
+            session_id: "ses_1",
+            alias: "@worker",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            harness_options: &options,
+            resume_provider_id: None,
+            environment: &environment,
+            auto_approve: true,
+        })
+        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
+        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        assert!(
+            settings_argument(&spec.args)
+                .get("skipDangerousModePermissionPrompt")
+                .is_none()
+        );
+    }
+
+    fn settings_argument(args: &[String]) -> serde_json::Value {
+        let index = args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap_or_else(|| panic!("missing --settings argument"));
+        serde_json::from_str(&args[index + 1])
+            .unwrap_or_else(|error| panic!("invalid settings JSON: {error}"))
     }
 
     #[test]
@@ -470,6 +566,7 @@ mod tests {
                 harness_options: &[],
                 resume_provider_id: None,
                 environment: &environment,
+                auto_approve: true,
             },
             Path::new("/tmp/dlgt.sock"),
         );
@@ -495,6 +592,32 @@ mod tests {
                 .any(|arg| arg.contains("model_reasoning_effort"))
         );
         assert_eq!(spec.environment, environment);
+    }
+
+    #[test]
+    fn codex_no_auto_approve_omits_bypass_flag() {
+        let environment = std::collections::HashMap::new();
+        let spec = codex_remote_tui_command(
+            &LaunchOptions {
+                agent: Agent::Codex,
+                session_id: "ses_1",
+                alias: "@worker",
+                cwd: Path::new("/tmp"),
+                model: None,
+                effort: None,
+                harness_options: &[],
+                resume_provider_id: None,
+                environment: &environment,
+                auto_approve: false,
+            },
+            Path::new("/tmp/dlgt.sock"),
+        );
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
     }
 
     #[test]
@@ -524,6 +647,7 @@ mod tests {
             harness_options: &[],
             resume_provider_id: None,
             environment: &environment,
+            auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         let settings = spec
@@ -556,6 +680,7 @@ mod tests {
             harness_options: &[],
             resume_provider_id: Some("claude-session"),
             environment: &environment,
+            auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build Claude command: {error}"));
         assert!(
@@ -576,6 +701,7 @@ mod tests {
                 harness_options: &[],
                 resume_provider_id: Some("codex-thread"),
                 environment: &environment,
+                auto_approve: true,
             },
             Path::new("/tmp/dlgt.sock"),
         );
@@ -604,6 +730,7 @@ mod tests {
             harness_options: &options,
             resume_provider_id: None,
             environment: &environment,
+            auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
@@ -628,6 +755,7 @@ mod tests {
             harness_options: &options,
             resume_provider_id: None,
             environment: &environment,
+            auto_approve: true,
         });
         let error = match result {
             Ok(_) => panic!("managed harness option should fail"),

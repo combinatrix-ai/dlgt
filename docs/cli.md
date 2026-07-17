@@ -152,6 +152,7 @@ dlgt new
   [--effort <LEVEL>]
   [--cwd <DIR>]
   [--harness-option <KEY=VALUE>]...
+  [--no-auto-approve]
   [--startup-timeout <DURATION>]
   [--clean-env]
   [--pass-env <KEY>]...
@@ -166,12 +167,17 @@ Rules:
 - `--title` is required and may be non-unique.
 - A Profile or Harness must resolve the Harness selection.
 - Model and effort are optional. Omission selects the provider default.
-- Claude permission handling uses Claude Code's provider default. dlgt does not
-  enable `--dangerously-skip-permissions` implicitly.
+- By default dlgt launches workers auto-approved:
+  `--dangerously-bypass-approvals-and-sandbox` for Codex and
+  `--dangerously-skip-permissions` for Claude, with Claude's blocking
+  bypass-permissions warning pre-accepted through session-scoped flag
+  settings. `--no-auto-approve` (or Profile `auto_approve = false`) keeps the
+  Harness's own approval prompts. An explicit `permission-mode=...` Harness
+  option also suppresses the implicit Claude flag.
 - Before launching either Harness, dlgt records the Session working directory
   as trusted in that provider's local workspace state. For Claude this updates
-  `~/.claude.json` and suppresses only the workspace trust dialog; Claude's
-  normal tool permission mode still applies.
+  `~/.claude.json` and suppresses only the workspace trust dialog; tool
+  permissions follow the auto-approve rule above.
 - `--harness-option KEY=VALUE` explicitly adds `--KEY=VALUE` to Claude Code.
   It is repeatable, stored with the Session, and reused by `restart`. Options
   whose arguments are managed by dlgt are rejected. Codex does not currently

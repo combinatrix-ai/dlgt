@@ -152,9 +152,9 @@ harness_options = ["permission-mode=auto"]
 clean_env = true
 ```
 
-Claude Code uses its own permission default unless a Profile or
-`--harness-option KEY=VALUE` explicitly selects another mode. dlgt does not
-pass `--dangerously-skip-permissions` by default.
+dlgt launches both Harnesses auto-approved by default so delegation never
+blocks on permission prompts. Opt out per Session with `--no-auto-approve` or
+per Profile with `auto_approve = false`.
 
 Set `DLGT_HOME` to relocate the SQLite database and Unix socket. Set
 `DLGT_SOCKET` to override only the socket.

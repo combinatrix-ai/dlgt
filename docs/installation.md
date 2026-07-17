@@ -129,6 +129,17 @@ This is the recommended container-image setup because it guarantees that both
 Harnesses receive the skill embedded in the binary actually placed in the
 image.
 
+### Note: delegation runs auto-approved
+
+The embedded skill lets an installed agent launch counterpart Sessions on its
+own. By default dlgt marks each Session working directory trusted and starts
+workers with approvals disabled
+(`--dangerously-bypass-approvals-and-sandbox` for Codex,
+`--dangerously-skip-permissions` for Claude), so a delegated worker can edit
+files and run commands there without asking. Install and delegate only in
+workspaces you trust, and use `--no-auto-approve` or a Profile with
+`auto_approve = false` to keep the Harness's own permission prompts.
+
 ## Verify the installation
 
 Run these checks in the shell where you will use dlgt:

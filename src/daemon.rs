@@ -308,6 +308,10 @@ impl Daemon {
         if agent == Agent::Codex && !harness_options.is_empty() {
             bail!("harness options are currently supported only for Claude");
         }
+        let auto_approve = params
+            .get("auto_approve")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let environment = params
             .get("environment")
             .and_then(Value::as_object)
@@ -335,6 +339,7 @@ impl Daemon {
                 model,
                 effort,
                 harness_options: &harness_options,
+                auto_approve,
             });
             match inserted {
                 Ok(()) => break,
@@ -357,6 +362,7 @@ impl Daemon {
             harness_options: &harness_options,
             resume_provider_id: None,
             environment: &environment,
+            auto_approve,
         };
 
         let startup_timeout = Duration::from_millis(
@@ -612,6 +618,7 @@ impl Daemon {
             harness_options: &session.harness_options,
             resume_provider_id: Some(provider_id),
             environment: &environment,
+            auto_approve: session.auto_approve,
         };
         let runtime = match agent {
             Agent::Claude => command_spec(&options)
@@ -2121,6 +2128,7 @@ fn public_session(session: &SessionRecord) -> Value {
         },
         "model": session.model,
         "effort": session.effort,
+        "auto_approve": session.auto_approve,
         "provider_session_id": session.provider_session_id,
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
@@ -2242,6 +2250,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
+                auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(

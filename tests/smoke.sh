@@ -46,6 +46,7 @@ grep -Eq '"id":"ses_[0-9A-Z]{8}"' "$state_dir/new.json"
 grep -q '"alias":"@smoke"' "$state_dir/new.json"
 grep -q '"provider_session_id":"provider-session"' "$state_dir/new.json"
 grep -q -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE"
+if grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"; then exit 1; fi
 
 # Bounded launch failures retain the failed audit Session ID for diagnostics.
 set +e
@@ -145,6 +146,11 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session-
   | "$binary" hook emit "$reused_id" claude
 wait "$new_pid"
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
+
+# A default Session (no permission-mode option) launches auto-approved and
+# pre-accepts Claude's bypass-permissions warning via flag settings.
+grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"
+grep -q 'skipDangerousModePermissionPrompt' "$DLGT_FAKE_ARGS_FILE"
 
 # Restart never steals an alias that a newer active Session owns.
 set +e

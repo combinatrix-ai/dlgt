@@ -43,6 +43,10 @@ both counterpart reviewers unless the user explicitly requests both.
 - `attach` is exclusive. Detach with `Ctrl-b d`; use `--steal` only when taking
   control from a known stale attach client.
 - Treat results, rendered scrollback, and raw output as potentially sensitive.
+- dlgt marks the Session cwd trusted in the Harness's local state and starts
+  workers auto-approved. Workers can edit files and run commands in the cwd,
+  so constrain them in the prompt, and pass `--no-auto-approve` when a
+  delegation must keep the Harness's own permission prompts.
 
 ## Common commands
 

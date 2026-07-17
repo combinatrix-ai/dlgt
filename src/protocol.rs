@@ -85,6 +85,7 @@ pub struct SessionRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub harness_options: Vec<String>,
+    pub auto_approve: bool,
     pub provider_session_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub pid: Option<u32>,

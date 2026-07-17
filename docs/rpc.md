@@ -57,7 +57,7 @@ alias. The following parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), optional `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
 | `session.send` | `session`, `prompt` |
 | `session.wait` | `session`, positive `timeout_ms` |
