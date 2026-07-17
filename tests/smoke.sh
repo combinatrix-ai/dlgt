@@ -147,10 +147,10 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session-
 wait "$new_pid"
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
 
-# A default Session (no permission-mode option) launches auto-approved and
-# pre-accepts Claude's bypass-permissions warning via flag settings.
-grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"
-grep -q 'skipDangerousModePermissionPrompt' "$DLGT_FAKE_ARGS_FILE"
+# A default Session adds --permission-mode=auto beyond the one explicit
+# harness option, and never the dangerous bypass flag.
+test "$(grep -c -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE")" -ge 2
+if grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"; then exit 1; fi
 
 # Restart never steals an alias that a newer active Session owns.
 set +e

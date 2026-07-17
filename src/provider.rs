@@ -320,15 +320,9 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     let program =
         std::env::var_os("DLGT_CLAUDE_BIN").map_or_else(|| PathBuf::from("claude"), PathBuf::from);
     let hook_command = hook_command(options)?;
-    let skip_permissions =
+    let auto_permission_mode =
         options.auto_approve && !has_permission_mode_option(options.harness_options);
-    let mut settings = claude_hook_settings(&hook_command);
-    if skip_permissions {
-        // Claude Code shows a blocking bypass-permissions acceptance dialog on
-        // every interactive start; setting this flag-settings key is the
-        // session-scoped way to accept it without touching user settings.
-        settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
-    }
+    let settings = claude_hook_settings(&hook_command);
     let mut args = vec![
         "--name".to_owned(),
         options.alias.trim_start_matches('@').to_owned(),
@@ -342,8 +336,8 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         args.extend(["--effort".to_owned(), effort.to_owned()]);
     }
     args.extend(claude_harness_args(options.harness_options)?);
-    if skip_permissions {
-        args.push("--dangerously-skip-permissions".to_owned());
+    if auto_permission_mode {
+        args.push("--permission-mode=auto".to_owned());
     }
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["--resume".to_owned(), provider_id.to_owned()]);
@@ -463,15 +457,12 @@ mod tests {
             auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
+        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
         assert!(
-            spec.args
+            !spec
+                .args
                 .iter()
                 .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-        let settings = settings_argument(&spec.args);
-        assert_eq!(
-            settings.get("skipDangerousModePermissionPrompt"),
-            Some(&serde_json::Value::Bool(true))
         );
         assert!(!spec.args.iter().any(|arg| arg == "--print"));
         assert_eq!(
@@ -500,19 +491,20 @@ mod tests {
             !spec
                 .args
                 .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
+                .any(|arg| arg.starts_with("--permission-mode"))
         );
         assert!(
-            settings_argument(&spec.args)
-                .get("skipDangerousModePermissionPrompt")
-                .is_none()
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
         );
     }
 
     #[test]
     fn claude_permission_mode_option_suppresses_implicit_auto_approve() {
         let environment = std::collections::HashMap::new();
-        let options = vec!["permission-mode=auto".to_owned()];
+        let options = vec!["permission-mode=plan".to_owned()];
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
@@ -526,27 +518,14 @@ mod tests {
             auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
+        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=plan"));
+        assert!(!spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
         assert!(
             !spec
                 .args
                 .iter()
                 .any(|arg| arg == "--dangerously-skip-permissions")
         );
-        assert!(
-            settings_argument(&spec.args)
-                .get("skipDangerousModePermissionPrompt")
-                .is_none()
-        );
-    }
-
-    fn settings_argument(args: &[String]) -> serde_json::Value {
-        let index = args
-            .iter()
-            .position(|arg| arg == "--settings")
-            .unwrap_or_else(|| panic!("missing --settings argument"));
-        serde_json::from_str(&args[index + 1])
-            .unwrap_or_else(|error| panic!("invalid settings JSON: {error}"))
     }
 
     #[test]

@@ -80,9 +80,9 @@ mutable client configuration.
 `harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
 The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
 and persists the array so `session.restart` reuses the same launch behavior.
-Claude Code's own permission default applies when the array is omitted; dlgt
-does not implicitly enable `--dangerously-skip-permissions`. Codex Harness
-options are not currently supported.
+When the array carries no `permission-mode` entry and `auto_approve` is true,
+dlgt adds `--permission-mode=auto`; `auto_approve: false` keeps Claude Code's
+own permission default. Codex Harness options are not currently supported.
 
 ## Session and result schemas
 

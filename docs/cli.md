@@ -169,11 +169,10 @@ Rules:
 - Model and effort are optional. Omission selects the provider default.
 - By default dlgt launches workers auto-approved:
   `--dangerously-bypass-approvals-and-sandbox` for Codex and
-  `--dangerously-skip-permissions` for Claude, with Claude's blocking
-  bypass-permissions warning pre-accepted through session-scoped flag
-  settings. `--no-auto-approve` (or Profile `auto_approve = false`) keeps the
-  Harness's own approval prompts. An explicit `permission-mode=...` Harness
-  option also suppresses the implicit Claude flag.
+  `--permission-mode=auto` for Claude. `--no-auto-approve` (or Profile
+  `auto_approve = false`) keeps the Harness's own approval prompts. An
+  explicit `permission-mode=...` Harness option replaces the implicit Claude
+  mode.
 - Before launching either Harness, dlgt records the Session working directory
   as trusted in that provider's local workspace state. For Claude this updates
   `~/.claude.json` and suppresses only the workspace trust dialog; tool
@@ -201,13 +200,13 @@ Example:
 
 ```bash
 dlgt new \
-  --title "trusted Claude worker" \
+  --title "prompting Claude worker" \
   --harness claude \
-  --harness-option permission-mode=auto \
+  --no-auto-approve \
   --cwd .
 ```
 
-The unsafe bypass remains available only when deliberately requested:
+The unsafe full bypass remains available only when deliberately requested:
 
 ```bash
 dlgt new \

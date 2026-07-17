@@ -135,7 +135,7 @@ The embedded skill lets an installed agent launch counterpart Sessions on its
 own. By default dlgt marks each Session working directory trusted and starts
 workers with approvals disabled
 (`--dangerously-bypass-approvals-and-sandbox` for Codex,
-`--dangerously-skip-permissions` for Claude), so a delegated worker can edit
+`--permission-mode=auto` for Claude), so a delegated worker can edit
 files and run commands there without asking. Install and delegate only in
 workspaces you trust, and use `--no-auto-approve` or a Profile with
 `auto_approve = false` to keep the Harness's own permission prompts.
