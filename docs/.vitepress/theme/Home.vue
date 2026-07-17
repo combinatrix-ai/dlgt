@@ -110,7 +110,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
 
     <section id="quick-start" class="quick-start">
       <header>
-        <h2>Install once. Ask naturally.</h2>
+        <h2><span>Install once.</span><span>Ask naturally.</span></h2>
         <p>Give either harness the install instructions. After that, delegation is part of the prompt.</p>
       </header>
       <div class="command-lines">

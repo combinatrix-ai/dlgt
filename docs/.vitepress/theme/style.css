@@ -96,6 +96,7 @@ body { background: var(--dlgt-paper); }
 .quick-start { max-width: 1240px; margin: 0 auto; padding: clamp(96px, 11vw, 160px) 24px; }
 .quick-start header { max-width: 760px; }
 .quick-start h2 { font-size: clamp(2.7rem, 5vw, 5rem); line-height: 0.95; letter-spacing: -0.06em; }
+.quick-start h2 span { display: block; white-space: nowrap; }
 .quick-start header p { margin-top: 18px; font-size: 1.16rem; color: color-mix(in srgb, var(--dlgt-ink) 67%, transparent); }
 .command-lines { margin-top: 48px; border-top: 1px solid var(--dlgt-line); }
 .command-line { display: grid; grid-template-columns: 88px minmax(0, 1fr); align-items: baseline; gap: 24px; padding: 22px 0; border-bottom: 1px solid var(--dlgt-line); }
