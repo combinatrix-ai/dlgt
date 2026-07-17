@@ -12,15 +12,16 @@ conveniences and may be reused after a Session stops.
 
 ## Exact delegation routes
 
-Use only the row matching the current leader. Pass both model and effort
-exactly; never silently substitute either value.
+Use only the row matching the current leader. Pass the model exactly; never
+silently substitute it. Pass `--effort` only when the user explicitly
+requested an effort level; otherwise omit it so the harness default applies.
 
-| Current leader | Requested work | Harness | Model | Effort |
-| --- | --- | --- | --- | --- |
-| Codex Sol | implementation by Luna | `codex` | `gpt-5.6-luna` | `xhigh` |
-| Codex Sol | review by Fable | `claude` | `claude-fable-5` | `high` |
-| Claude Fable | code-heavy implementation by Luna | `codex` | `gpt-5.6-luna` | `xhigh` |
-| Claude Fable | review by Sol | `codex` | `gpt-5.6-sol` | `xhigh` |
+| Current leader | Requested work | Harness | Model |
+| --- | --- | --- | --- |
+| Codex Sol | implementation by Luna | `codex` | `gpt-5.6-luna` |
+| Codex Sol | review by Fable | `claude` | `claude-fable-5` |
+| Claude Fable | code-heavy implementation by Luna | `codex` | `gpt-5.6-luna` |
+| Claude Fable | review by Sol | `codex` | `gpt-5.6-sol` |
 
 Tell every delegated worker not to delegate again. Give it a self-contained
 prompt with the project path, goal, deliverables, checks, edit/commit policy,
@@ -47,7 +48,7 @@ both counterpart reviewers unless the user explicitly requests both.
 
 ```bash
 created=$(dlgt new --title "Fable review" --alias @fable-review \
-  --harness claude --model claude-fable-5 --effort high --cwd . \
+  --harness claude --model claude-fable-5 --cwd . \
   -- "Review only; do not edit or delegate again. Report findings and trade-offs.")
 # Parse and retain .session.id from the JSON response. Use that immutable ID
 # for later commands rather than relying on the alias.
