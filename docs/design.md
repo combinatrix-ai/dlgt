@@ -152,6 +152,7 @@ modify the user's global hook configuration.
 | `UserPromptSubmit` | Match the pending prompt, bind provider turn data when present, and confirm `busy`. |
 | `Notification(permission_prompt)` | Preserve the active execution and enter `blocked`. |
 | `Notification(elicitation_dialog)` | Preserve the active execution and enter `blocked`. |
+| `Notification(idle_prompt)` | Evidence that Claude is waiting for input; after an interrupt it may be the only quiescence signal. |
 | `Stop` | Store `last_assistant_message`, terminalize the matching execution, and prove quiescence after cancel. |
 | `StopFailure` | Store sanitized failure data, terminalize the matching execution, and prove quiescence after cancel. |
 | `SessionEnd` | Finish explicit stop/restart handoff, or interrupt unfinished work and stop/fail the Session. |
@@ -180,7 +181,7 @@ human response path. The first accepted attach input moves `blocked` back to
 | Start or resume Session | app-server thread start/resume plus remote TUI readiness | CLI process plus `SessionStart` hook |
 | Start ordinary turn | `turn/start` | bracketed-paste prompt, settle, then Enter |
 | Steer active turn | `turn/steer` | Session-scoped hook bridge at model-request boundaries |
-| Cancel active turn | `turn/interrupt` | state-aware TUI interrupt, then wait for `Stop`/`StopFailure` or process exit |
+| Cancel active turn | `turn/interrupt` | state-aware TUI interrupt, then wait for interrupt quiescence evidence (see Cancel) |
 | Answer blocked input | provider response path through exclusive attach | exclusive attach input |
 | Restart process | stop old control/process generation, resume provider conversation, wait for readiness | stop old process generation, `--resume` provider session, wait for `SessionStart` |
 | Stop Session | close control and terminate owned process group | terminate owned process group |
@@ -299,9 +300,18 @@ caller wants process recovery, it invokes restart explicitly.
 ### Cancel, restart, attach, and stop
 
 Cancel affects only the active execution. Idle cancellation is idempotent.
-Codex quiescence comes from matching interrupted completion; Claude quiescence
-comes from matching `Stop`, `StopFailure`, or owned process exit. A timeout does
-not infer quiescence.
+Codex quiescence comes from matching interrupted completion.
+
+Claude interrupt quiescence is weaker. A dlgt-initiated TUI interrupt is a
+user interrupt from Claude's perspective, and Claude Code documents that manual
+interruption fires neither `Stop` nor `StopFailure`; `StopFailure` covers API
+errors only. Interrupt quiescence therefore comes from a matching
+`Notification(idle_prompt)`, from a `Stop`/`StopFailure` terminalizing a turn
+that finished on its own before the interrupt landed, or from owned process
+exit. Whether `idle_prompt` fires after an interrupt is not documented, so a
+Claude cancel may legitimately exhaust its bounded wait even though the turn
+was interrupted. A timeout still does not infer quiescence; the caller
+escalates with explicit restart.
 
 For a running Claude turn, the adapter uses the documented interrupt key. When
 Claude is `blocked`, `Esc` may first dismiss the permission or elicitation
@@ -445,8 +455,8 @@ diagnostics.
 
 Codex has semantic app-server methods for turn start, steer, and interrupt.
 Claude provides lifecycle hooks and an interactive input surface. dlgt exposes
-one intent model but documents weaker, boundary-delayed Claude steering instead
-of claiming identical guarantees.
+one intent model but documents weaker, boundary-delayed Claude steering and
+weaker Claude interrupt quiescence instead of claiming identical guarantees.
 
 ### Queue ownership belongs to dlgt
 
