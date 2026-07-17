@@ -47,8 +47,8 @@ charge and uses `dlgt` when it needs a counterpart.
 
 Install the latest published `dlgt` release on macOS or Linux. The installer
 detects the platform, verifies the GitHub Release checksum, installs the
-user-writable binary, and registers the embedded skill for existing Codex or
-Claude user directories:
+user-writable binary, and registers the embedded skill for every installed
+Codex or Claude harness:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh | sh
@@ -176,5 +176,12 @@ npm run docs:build
 Run `dlgt skill` to print the agent-facing contract embedded from
 [`assets/dlgt-skill.md`](assets/dlgt-skill.md). The binary has no runtime
 dependency on an installed skill directory.
+
+For a source-built or otherwise preinstalled binary, register that exact
+embedded skill without downloading another release:
+
+```bash
+sh install.sh --register-skills-from target/release/dlgt --skill both
+```
 
 The PTY and attach architecture is derived from the private `umux` project.

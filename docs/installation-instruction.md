@@ -4,7 +4,8 @@ This page installs the latest published dlgt release for Codex or Claude.
 The installer downloads a platform-specific binary from GitHub Releases,
 verifies its SHA-256 checksum, installs it as dlgt in a user-writable
 directory, and registers the embedded skill when a user-level Codex or Claude
-skill directory already exists.
+Harness is installed. Fresh Harness homes are created at the correct skill
+roots when needed.
 
 Normal users do not need Rust, Cargo, a compiler, or a source checkout. The
 published targets cover macOS and Linux on x86_64 and arm64, with both glibc
@@ -84,11 +85,12 @@ The installed binary is the canonical source of the skill:
 dlgt skill
 ~~~
 
-By default, the installer registers that output only in existing user-level
-Codex ($CODEX_HOME/skills/dlgt/ or ~/.codex/skills/dlgt/) and Claude
-(~/.claude/skills/dlgt/) roots. It does not create an unrelated harness
-directory during automatic registration. Select the intended harnesses
-explicitly when needed:
+By default, the installer detects installed `codex` and `claude` commands and
+registers the skill in their user-level roots: Codex uses
+`$CODEX_HOME/skills/dlgt/` (or `~/.codex/skills/dlgt/`) and Claude uses
+`~/.claude/skills/dlgt/`. Existing Harness homes are also recognized even when
+the command is not currently on `PATH`. Select the intended Harnesses
+explicitly when needed, especially in container images:
 
 ~~~sh
 curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh \
@@ -105,6 +107,18 @@ Skill updates are atomic. If an existing different SKILL.md is present, the
 installer preserves it beside the new copy with a timestamped .backup suffix.
 Start a new Codex or Claude session after registration so it refreshes its
 skill inventory.
+
+For a source-built or otherwise preinstalled binary, skip release download and
+register the skill from that exact executable:
+
+~~~sh
+cargo build --release --bin dlgt
+sh install.sh --register-skills-from target/release/dlgt --skill both
+~~~
+
+This is the recommended container-image setup because it guarantees that both
+Harnesses receive the skill embedded in the binary actually placed in the
+image.
 
 ## Verify the installation
 
@@ -123,6 +137,7 @@ If you explicitly registered a skill, compare it with the installed binary:
 skill_snapshot="$(mktemp)"
 dlgt skill >"$skill_snapshot"
 cmp -s "$skill_snapshot" "${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md"
+cmp -s "$skill_snapshot" "$HOME/.claude/skills/dlgt/SKILL.md"
 rm -f "$skill_snapshot"
 ~~~
 

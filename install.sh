@@ -4,6 +4,7 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh | sh
 #   sh install.sh --version v0.1.0 --skill codex
+#   sh install.sh --register-skills-from ./target/release/dlgt --skill both
 
 set -eu
 
@@ -26,6 +27,8 @@ Options:
   --version VERSION  Install VERSION (for example v0.1.0); default: latest
   --bin-dir DIR      Install into DIR; default: $DLGT_BIN_DIR or ~/.local/bin
   --skill MODE       Register the embedded skill: auto, none, codex, claude, or both
+  --register-skills-from BINARY
+                       Register skills from an existing dlgt binary; skip download
   --no-skill         Alias for --skill none
   -h, --help         Show this help
 EOF
@@ -191,11 +194,11 @@ register_skills() {
   case "$skill_mode" in
     none) return 0 ;;
     auto)
-      if [ -n "${CODEX_HOME:-}" ] || [ -d "$HOME/.codex" ]; then
+      if [ -n "${CODEX_HOME:-}" ] || [ -d "$HOME/.codex" ] || command -v codex >/dev/null 2>&1; then
         install_skill "${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md"
         registered=1
       fi
-      if [ -d "$HOME/.claude" ]; then
+      if [ -d "$HOME/.claude" ] || command -v claude >/dev/null 2>&1; then
         install_skill "$HOME/.claude/skills/dlgt/SKILL.md"
         registered=1
       fi
@@ -224,6 +227,7 @@ main() {
   requested_version="latest"
   bin_dir="${DLGT_BIN_DIR:-$HOME/.local/bin}"
   skill_mode="auto"
+  register_skills_from=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -242,6 +246,11 @@ main() {
         skill_mode="$2"
         shift 2
         ;;
+      --register-skills-from)
+        [ "$#" -ge 2 ] || die "--register-skills-from requires a value"
+        register_skills_from="$2"
+        shift 2
+        ;;
       --no-skill)
         skill_mode="none"
         shift
@@ -253,6 +262,14 @@ main() {
       *) die "unknown option '$1'; use --help for usage" ;;
     esac
   done
+
+  if [ -n "$register_skills_from" ]; then
+    [ -x "$register_skills_from" ] \
+      || die "dlgt binary is not executable: $register_skills_from"
+    installed_path="$register_skills_from"
+    register_skills "$skill_mode"
+    return 0
+  fi
 
   need_command curl
   need_command tar

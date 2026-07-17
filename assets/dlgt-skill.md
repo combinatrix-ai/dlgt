@@ -10,6 +10,24 @@ and be addressable from later commands. The only public runtime object is a
 Session. Retain the `ses_XXXXXXXX` returned by `new`; aliases are human
 conveniences and may be reused after a Session stops.
 
+## Exact delegation routes
+
+Use only the row matching the current leader. Pass both model and effort
+exactly; never silently substitute either value.
+
+| Current leader | Requested work | Harness | Model | Effort |
+| --- | --- | --- | --- | --- |
+| Codex Sol | implementation by Luna | `codex` | `gpt-5.6-luna` | `xhigh` |
+| Codex Sol | review by Fable | `claude` | `claude-fable-5` | `high` |
+| Claude Fable | code-heavy implementation by Luna | `codex` | `gpt-5.6-luna` | `xhigh` |
+| Claude Fable | review by Sol | `codex` | `gpt-5.6-sol` | `xhigh` |
+
+Tell every delegated worker not to delegate again. Give it a self-contained
+prompt with the project path, goal, deliverables, checks, edit/commit policy,
+and required final response. The leader inspects the actual result or shared
+filesystem diff and remains responsible for final verification. Do not run
+both counterpart reviewers unless the user explicitly requests both.
+
 ## Rules
 
 - Create only with `new`; `send` never creates or selects another Session.
@@ -28,9 +46,11 @@ conveniences and may be reused after a Session stops.
 ## Common commands
 
 ```bash
-session=$(dlgt new --title "review" --profile fable-review --cwd . \
-  -- "Review the current design")
-# Parse .session.id from the JSON response and retain it.
+created=$(dlgt new --title "Fable review" --alias @fable-review \
+  --harness claude --model claude-fable-5 --effort high --cwd . \
+  -- "Review only; do not edit or delegate again. Report findings and trade-offs.")
+# Parse and retain .session.id from the JSON response. Use that immutable ID
+# for later commands rather than relying on the alias.
 
 dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "Address the findings"
 dlgt wait ses_7K3M9Q2X --timeout 15m

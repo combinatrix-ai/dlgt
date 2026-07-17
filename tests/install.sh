@@ -68,6 +68,38 @@ if detect_target FreeBSD x86_64 auto >/dev/null 2>&1; then
   exit 1
 fi
 
+skill_test_directory="$checksum_test_directory/skill-registration"
+fake_bin="$skill_test_directory/bin"
+fake_home="$skill_test_directory/home"
+mkdir -p "$fake_bin" "$fake_home"
+fake_dlgt="$fake_bin/dlgt"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'if [ "$1" = skill ]; then' \
+  '  printf "%s\\n" "---" "name: dlgt" "description: test skill" "---"' \
+  'else' \
+  '  exit 1' \
+  'fi' > "$fake_dlgt"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/codex"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/claude"
+chmod 755 "$fake_dlgt" "$fake_bin/codex" "$fake_bin/claude"
+
+DLGT_INSTALLER_NO_MAIN=0 HOME="$fake_home" CODEX_HOME= PATH="$fake_bin:$PATH" \
+  sh "$installer" --register-skills-from "$fake_dlgt" --skill auto
+for skill_path in \
+  "$fake_home/.codex/skills/dlgt/SKILL.md" \
+  "$fake_home/.claude/skills/dlgt/SKILL.md"; do
+  [ -f "$skill_path" ] || {
+    printf 'auto registration missed %s\n' "$skill_path" >&2
+    exit 1
+  }
+  "$fake_dlgt" skill > "$skill_test_directory/expected-skill.md"
+  cmp -s "$skill_test_directory/expected-skill.md" "$skill_path" || {
+    printf 'registered skill differs from embedded skill: %s\n' "$skill_path" >&2
+    exit 1
+  }
+done
+
 for target in \
   aarch64-apple-darwin \
   x86_64-apple-darwin \
