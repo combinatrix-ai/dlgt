@@ -3,8 +3,8 @@ import { computed, onMounted, ref } from "vue";
 import { withBase } from "vitepress";
 
 const heroImage = withBase("/delegate-to-the-competition.jpg");
-const installCodex = 'codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"';
-const installClaude = 'claude "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"';
+const installCodex = 'codex "Read and follow https://combinatrix.ai/dlgt/installation to install dlgt for this harness"';
+const installClaude = 'claude "Read and follow https://combinatrix.ai/dlgt/installation to install dlgt for this harness"';
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
 const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."';
 const exampleEffort = 'codex -m gpt-5.6-sol "Make the CLI faster. Have Luna do it at xhigh effort."';

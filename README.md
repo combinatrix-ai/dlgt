@@ -23,13 +23,13 @@ harness, and call the other side when it has something useful to add.
 From Codex:
 
 ```bash
-codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
+codex "Read and follow https://combinatrix.ai/dlgt/installation. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
 ```
 
 From Claude:
 
 ```bash
-claude "Read and follow https://combinatrix.ai/dlgt/installation-instruction. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
+claude "Read and follow https://combinatrix.ai/dlgt/installation. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
 ```
 
 These are agent-executable installation instructions. The agent should not
@@ -68,7 +68,7 @@ embedded skill at both `${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md` and
 detection. Install a specific release with `--version v<version>`, or narrow
 registration explicitly with `--skill codex` or `--skill claude`. The normal
 installation path does not require Rust, Cargo, or a source checkout. See the
-[full installation instructions](https://combinatrix.ai/dlgt/installation-instruction)
+[full installation instructions](https://combinatrix.ai/dlgt/installation)
 for supported targets and verification steps.
 
 ## What dlgt does
@@ -177,7 +177,7 @@ npm run docs:build
 ## Documentation
 
 - [Documentation site](https://combinatrix.ai/dlgt/)
-- [Installation instructions](https://combinatrix.ai/dlgt/installation-instruction)
+- [Installation instructions](https://combinatrix.ai/dlgt/installation)
 - [CLI reference](docs/cli.md)
 - [Local RPC](docs/rpc.md)
 - [Design](docs/design.md)
