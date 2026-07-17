@@ -36,7 +36,9 @@ These are agent-executable installation instructions. The agent should not
 report completion after installing only the binary: the embedded skill must
 also match the copies installed for Codex and Claude.
 
-Then ask naturally:
+Then ask either agent normally — neither prompt mentions dlgt. The installed
+skill invokes it automatically, picks the counterpart model, and leaves effort
+to the harness default unless you request one:
 
 ```bash
 codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."
