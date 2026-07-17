@@ -1,6 +1,10 @@
 # Install dlgt
 
-This page installs the latest published dlgt release for Codex or Claude.
+This page is an agent-executable contract for installing the latest published
+dlgt release for Codex or Claude. When asked to follow it, do not report
+completion after installing only the binary. Completion requires verifying the
+binary and every requested installed skill copy.
+
 The installer downloads a platform-specific binary from GitHub Releases,
 verifies its SHA-256 checksum, installs it as dlgt in a user-writable
 directory, and registers the embedded skill when a user-level Codex or Claude
@@ -33,8 +37,13 @@ The recommended one-line install uses the checked-in installer and its
 HTTPS-only release downloads:
 
 ~~~sh
-curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh \
+  | sh -s -- --skill both
 ~~~
+
+Use `--skill both` when following this page from the README. It deterministically
+installs the embedded skill for Codex and Claude without relying on command or
+existing-directory detection.
 
 The default binary location is ~/.local/bin. The installer never requires
 sudo or writes a shell profile. If that directory is not already on PATH, add
@@ -49,7 +58,7 @@ For a reviewable install, download the script first and run it locally:
 ~~~sh
 curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh \
   -o /tmp/install-dlgt.sh
-sh /tmp/install-dlgt.sh
+sh /tmp/install-dlgt.sh --skill both
 rm -f /tmp/install-dlgt.sh
 ~~~
 
@@ -131,7 +140,8 @@ dlgt harnesses
 dlgt skill | grep -q '^name: dlgt$'
 ~~~
 
-If you explicitly registered a skill, compare it with the installed binary:
+The README installation is complete only when both installed copies match the
+skill embedded in the installed binary:
 
 ~~~sh
 skill_snapshot="$(mktemp)"

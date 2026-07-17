@@ -23,14 +23,18 @@ harness, and call the other side when it has something useful to add.
 From Codex:
 
 ```bash
-codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"
+codex "Read and follow https://combinatrix.ai/dlgt/installation-instruction. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
 ```
 
 From Claude:
 
 ```bash
-claude "Read and follow https://combinatrix.ai/dlgt/installation-instruction to install dlgt for this harness"
+claude "Read and follow https://combinatrix.ai/dlgt/installation-instruction. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
 ```
+
+These are agent-executable installation instructions. The agent should not
+report completion after installing only the binary: the embedded skill must
+also match the copies installed for Codex and Claude.
 
 Then ask naturally:
 
@@ -51,14 +55,18 @@ user-writable binary, and registers the embedded skill for every installed
 Codex or Claude harness:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh \
+  | sh -s -- --skill both
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Install a specific release with `--version v<version>`, or choose skill
-registration explicitly with `--skill codex`, `--skill claude`, `--skill both`,
-or `--no-skill`. The normal installation path does not require Rust, Cargo, or
-a source checkout. See the [full installation instructions](https://combinatrix.ai/dlgt/installation-instruction)
+The README uses `--skill both` deliberately so following it always installs the
+embedded skill at both `${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md` and
+`$HOME/.claude/skills/dlgt/SKILL.md`; it does not depend on automatic harness
+detection. Install a specific release with `--version v<version>`, or narrow
+registration explicitly with `--skill codex` or `--skill claude`. The normal
+installation path does not require Rust, Cargo, or a source checkout. See the
+[full installation instructions](https://combinatrix.ai/dlgt/installation-instruction)
 for supported targets and verification steps.
 
 ## What dlgt does
