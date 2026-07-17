@@ -50,7 +50,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
   <main class="dlgt-home">
     <section class="hero">
       <div class="hero-copy">
-        <p class="eyebrow">Cross-harness delegation</p>
+        <p class="eyebrow">Cross-harness delegation, <span class="hero-lede-keep">without the duct tape</span></p>
         <h1><span>Let agents delegate</span><span>to the competition.</span></h1>
         <p class="hero-lede">
           <span class="hero-lede-line">Codex wasn't built to delegate to Claude.</span>
