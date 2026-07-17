@@ -1,72 +1,330 @@
-# dlgt v1 design
+# dlgt design
 
-This document records the product boundary, invariants, provider lifecycle
-mapping, security model, acceptance criteria, and decisions behind the public
-contract. Command syntax belongs in [CLI](cli.md); public JSONL schemas belong
-in [RPC](rpc.md).
+This document is the normative design for the local `dlgt` runtime. It defines
+the Session lifecycle, the provider signals that establish state, and the
+semantics of operations and mid-turn intervention. Command syntax belongs in
+[CLI](cli.md); public JSONL schemas belong in [RPC](rpc.md).
+
+Backward compatibility with earlier drafts is not required.
 
 ## Product boundary
 
 `dlgt` is a local, single-binary runtime for persistent, addressable, and
-attachable Codex and Claude subagents. Its only public runtime object is the
-Session.
+attachable Codex and Claude subagents. `Session` is its only public runtime
+object.
 
-The v1 boundary is deliberately narrow:
+Each Session owns one provider conversation, one harness process set and its
+provider-specific control path, one PTY and rendered screen, and one serialized
+controller. SQLite stores Session state, internal executions, pending input,
+lifecycle events, results, input audit, bounded raw PTY bytes, and rendered
+scrollback.
 
-- one Rust binary containing the daemon and embedded skill;
-- one harness process, PTY, and screen per Session;
-- official provider lifecycle surfaces as the authority for readiness and
-  completion;
-- SQLite-backed state, events, results, input audit, bounded raw PTY retention,
-  and rendered scrollback;
-- no panes, splits, layouts, terminal picker, remote transport, arbitrary raw
-  provider arguments, orchestration DSL, plugin system, or server-side queue.
+Provider turns, steering messages, queued prompts, and delivery attempts are
+internal correlation records. They do not have public selectors and do not
+change the Session-only public object model.
 
-Provider turns and execution receipts may exist internally for correlation and
-persistence, but they are not public resources and do not have public IDs.
+The product boundary excludes panes, layouts, a terminal picker, remote
+transport, an orchestration DSL, and public Turn, Queue, Operation, or Delivery
+resources.
 
 ## Core invariants
 
-1. `new` always creates a new Session.
-2. `send` only addresses an existing Session.
-3. A Session has at most one active execution.
-4. Sending to a busy Session fails immediately with `SESSION_BUSY`.
-5. dlgt never queues a prompt for later execution.
-6. A Session has one controller. Concurrent sends are serialized so exactly one
-   may be accepted; cross-controller `cancel`, `stop`, and interactive input are
-   unsupported interference.
-7. Startup and wait operations are always bounded.
-8. A wait timeout never cancels the underlying execution.
-9. Provider lifecycle events, not PTY text, determine readiness and completion.
-10. Control-plane commands return JSON by default without a `--json` flag.
+1. `new` always creates a new Session; `send` never creates one.
+2. A Session has at most one active execution.
+3. Every accepted user turn receives a monotonically increasing
+   `execution_seq`. Steering does not create an execution sequence; an enqueued
+   prompt does when it is dispatched.
+4. State-changing commands, provider callbacks, queue dispatch, and attach
+   input are serialized per Session.
+5. The default send mode rejects busy work without side effects. Steering,
+   enqueueing, and replacement are explicit modes with distinct semantics.
+6. Provider lifecycle interfaces determine readiness, blocked state,
+   quiescence, and completion. PTY silence and screen content never do.
+7. Stale, duplicate, mismatched, or late provider events are diagnostic only;
+   they cannot mutate a newer execution or restart generation.
+8. Startup, wait, cancellation, and restart waits are bounded. A caller timeout
+   reports observation failure and does not silently cancel underlying work.
+9. Replacement means cancel, prove provider quiescence, then start a new turn
+   in the same provider conversation. It is not process restart.
+10. Attach is an exclusive input lease. Semantic operations cannot interleave
+    with an attached controller.
+11. Control-plane commands return JSON by default. Raw terminal streams are an
+    explicit exception.
 
-## Provider lifecycle
+## Session lifecycle
 
-Codex uses its private app-server connection:
-
-```text
-thread/started                    -> Session provider binding
-turn/started                      -> session.busy
-error, willRetry=true             -> provider.retrying
-turn/completed status=completed   -> durable result + session.idle
-turn/completed status=failed      -> durable failure + session.idle
-turn/completed status=interrupted -> durable interruption + session.idle
-```
-
-Claude uses Session-scoped lifecycle hooks:
+The public Session states are:
 
 ```text
-SessionStart      -> session.ready
-UserPromptSubmit  -> session.busy
-Stop              -> durable result + session.idle
-StopFailure       -> durable failure + session.idle
-SessionEnd        -> session.stopped
+starting  idle  busy  blocked  canceling  restarting  stopping  stopped  failed
 ```
 
-Provider IDs and internal execution records are retained privately to reject
-stale, duplicated, or unmatched lifecycle messages. They never become public
-identity. Loss of an authoritative provider transport fails closed: PTY
-silence, screen content, and a quiet window never prove completion.
+`canceling` includes the internal quiescing interval after an interrupt was
+requested but before the provider proved it can accept another turn.
+
+```text
+starting --provider ready------------------------------> idle
+starting --startup failure-----------------------------> failed
+
+idle --turn accepted-----------------------------------> busy
+busy --human input required----------------------------> blocked
+blocked --attach answer accepted-----------------------> busy
+busy|blocked --cancel or replace-----------------------> canceling
+canceling --matching provider quiescence---------------> idle
+
+busy --terminal result, no queued prompt---------------> idle
+busy --terminal result, queued prompt dispatched-------> busy
+
+starting|idle|busy|blocked|canceling --restart---------> restarting
+restarting --replacement provider ready---------------> idle or busy
+restarting --replacement failure----------------------> failed
+
+starting|idle|busy|blocked|canceling|restarting --stop-> stopping
+stopping --intentional provider exit------------------> stopped
+unexpected provider or control-transport loss---------> failed
+```
+
+The daemon may pass directly from one execution to the next without publishing
+an observable idle interval. It must nevertheless terminalize the old
+execution before assigning a new `execution_seq`.
+
+An accepted turn reserves its internal execution before provider delivery. If
+delivery fails, dlgt records a durable failed result and clears the reservation;
+it does not leave phantom busy work. Provider acceptance then binds the
+provider turn ID to that reservation.
+
+`blocked` retains the active execution. It means the provider needs a human
+answer, not that the execution completed or that another semantic prompt may
+start.
+
+Provider death during an active execution creates a durable failure or
+interruption before the Session becomes terminal. Explicit stop and restart
+own their process-exit transitions and are not misclassified as crashes.
+
+## State authority
+
+Lifecycle state has three sources, in descending authority:
+
+1. structured provider events from Codex app-server or Claude hooks;
+2. serialized dlgt control operations and provider-process exit;
+3. PTY input/output, used only for delivery, attach, rendering, and diagnosis.
+
+The rendered screen may help a human understand a failure, but text such as a
+prompt marker, spinner, or completion-looking sentence is never a state
+transition. Missing provider events fail closed: a live process remains busy,
+blocked, or canceling until authoritative evidence arrives; an unexpectedly
+dead process fails.
+
+## Codex lifecycle observation
+
+Codex uses a private app-server connection for semantic control and lifecycle
+notifications. Its remote TUI PTY exists for attach and presentation.
+
+| App-server signal | dlgt interpretation |
+| --- | --- |
+| `thread/started` | Bind and validate the Codex thread as `provider_session_id`; establish startup/resume readiness for the expected generation. |
+| `turn/started` | Match the bound thread and pending execution, bind `provider_turn_id`, and confirm `busy`. |
+| `turn/completed`, `completed` | Store the final assistant text, terminalize the execution successfully, then dispatch queued work or become `idle`. |
+| `turn/completed`, `failed` | Store the sanitized error, terminalize as failed, then dispatch queued work or become `idle`. |
+| `turn/completed`, `interrupted` | Prove interruption and provider quiescence. Preserve canceled/replaced intent when dlgt initiated it. |
+| retryable `error` | Record `provider.retrying`; remain `busy`. |
+| terminal `error` | Fail only the matching active execution. |
+| provider server request | Preserve the active execution and enter `blocked`. |
+| unexpected app-server/transport close | Terminalize active work and fail the Session. |
+
+Thread ID, turn ID, active `execution_seq`, and restart generation are checked
+before mutation. A wrong thread, wrong turn, duplicate terminal notification,
+or callback for an older generation is retained as an unmatched diagnostic
+event and otherwise ignored.
+
+The result returned by `turn/start` is dispatch acknowledgement. The matching
+notifications remain authoritative for continuing and terminal state.
+
+## Claude lifecycle observation
+
+Claude uses semantic PTY input for ordinary turns and Session-scoped lifecycle
+hooks for state. dlgt injects hooks into the child launch settings; it does not
+modify the user's global hook configuration.
+
+| Claude hook | dlgt interpretation |
+| --- | --- |
+| `SessionStart` | Bind and validate Claude `session_id` as `provider_session_id`; establish startup/resume readiness. |
+| `UserPromptSubmit` | Match the pending prompt, bind provider turn data when present, and confirm `busy`. |
+| `Notification(permission_prompt)` | Preserve the active execution and enter `blocked`. |
+| `Notification(elicitation_dialog)` | Preserve the active execution and enter `blocked`. |
+| `Stop` | Store `last_assistant_message`, terminalize the matching execution, and prove quiescence after cancel. |
+| `StopFailure` | Store sanitized failure data, terminalize the matching execution, and prove quiescence after cancel. |
+| `SessionEnd` | Finish explicit stop/restart handoff, or interrupt unfinished work and stop/fail the Session. |
+
+For dlgt-originated input, the daemon creates the execution before writing the
+prompt and marks the Session busy after a successful PTY write.
+`UserPromptSubmit` then confirms provider acceptance and must match the pending
+prompt when the hook supplies it. A human prompt entered through attach may
+create and bind the execution directly from `UserPromptSubmit`.
+
+Hook payloads must match the expected agent, provider session, active prompt or
+provider turn when supplied, and restart generation. Unmatched prompt, Stop,
+StopFailure, or SessionEnd callbacks cannot complete newer work.
+
+When Claude reports a permission or elicitation dialog, attach becomes the
+human response path. The first accepted attach input moves `blocked` back to
+`busy` without creating a new execution. A quiet screen never resolves
+`blocked`.
+
+## Operations
+
+### Provider mapping
+
+| Operation | Codex | Claude |
+| --- | --- | --- |
+| Start or resume Session | app-server thread start/resume plus remote TUI readiness | CLI process plus `SessionStart` hook |
+| Start ordinary turn | `turn/start` | bracketed-paste prompt, settle, then Enter |
+| Steer active turn | `turn/steer` | Session-scoped hook bridge at model-request boundaries |
+| Cancel active turn | `turn/interrupt` | state-aware TUI interrupt, then wait for `Stop`/`StopFailure` or process exit |
+| Answer blocked input | provider response path through exclusive attach | exclusive attach input |
+| Restart process | stop old control/process generation, resume provider conversation, wait for readiness | stop old process generation, `--resume` provider session, wait for `SessionStart` |
+| Stop Session | close control and terminate owned process group | terminate owned process group |
+
+Codex semantic operations never fall back to typing into its TUI. Claude
+semantic PTY writes use bracketed paste so prompt bytes are treated as one input
+and reject embedded terminal escape bytes. Enter is written separately after a
+short settle interval because large pastes may install asynchronously.
+
+Before an ordinary Claude turn, dlgt holds the Session controller, requires
+authoritative `idle`, sends one input-clear control, and rechecks that no
+lifecycle transition occurred before pasting. This removes drafts left by a
+detached human. It must not use double `Esc`, which opens rewind when the editor
+is already empty, or `Ctrl+S`, which may restore a prior stash.
+
+### Send modes
+
+The semantic send operation has an internally first-class mode:
+
+```text
+reject  steer  enqueue  replace
+```
+
+CLI flags and RPC fields may expose these names differently, but must preserve
+the following behavior.
+
+| Mode | Idle | Busy | Blocked/canceling | Durable pending record |
+| --- | --- | --- | --- | --- |
+| `reject` | Start a new execution. | `SESSION_BUSY`, no side effects. | Reject with the state-specific error. | No |
+| `steer` | `NO_ACTIVE_EXECUTION`. | Target the current execution. | Reject; steering cannot answer a human dialog or a turn already canceling. | Yes, until injected or target execution terminalizes |
+| `enqueue` | Dispatch immediately as a new execution. | Append a future user turn. | Append a future user turn, but do not resolve the current state. | Yes, FIFO |
+| `replace` | Start a new execution. | Atomically reserve replacement, cancel, await quiescence, then start it. | Replace blocked work; reject an already canceling/replacing Session. | Yes, until started or failed |
+
+All modes are decided under the per-Session controller lock. Concurrent
+operations cannot leapfrog an accepted enqueue or replacement. Enqueued prompts
+are dispatched FIFO, each with a fresh `execution_seq`. Failure of one queued
+execution does not discard later items unless an explicit queue-clearing
+operation says so.
+
+Pending enqueue and replacement records survive daemon restart. After recovery,
+dlgt first reconciles active provider state, then dispatches only work whose
+predecessor is durably terminal. Stopped and failed Sessions do not dispatch
+pending work until an explicit restart; explicit Session deletion may discard
+it. Ordinary process restart preserves the queue.
+
+### Steering
+
+Steering belongs to the active execution and never becomes a later user turn.
+It preserves `execution_seq` and ordering among steering messages accepted for
+that execution.
+
+Codex sends steering through app-server `turn/steer` with the bound thread and
+turn. A successful response means the provider accepted the input for the
+active turn; it does not mean the model followed it.
+
+Claude has no equivalent semantic control API. dlgt therefore keeps a
+Session-scoped steering inbox and installs a non-blocking hook bridge:
+
+1. `PostToolBatch` checks the inbox once after a complete parallel tool batch
+   and before the next model request. It is preferred over `PostToolUse`, whose
+   hooks may run concurrently and race while draining the same inbox.
+2. Pending text is returned as hook `additionalContext` for the next model
+   request.
+3. `Stop` is the final normal boundary. If steering remains pending for the
+   active execution, the hook blocks that Stop and returns the text as the
+   continuation reason.
+4. Hook handlers never long-poll. An empty inbox returns immediately.
+
+Claude steering is best effort and boundary-delayed. `additionalContext` is a
+system reminder, not a user message. Long thinking or text generation without
+a tool boundary cannot be interrupted by it, and a user interrupt does not fire
+`Stop`. A steering record is therefore scoped to its target `execution_seq` and
+expires when that execution terminalizes; it is never silently promoted into
+the next turn.
+
+Observability distinguishes:
+
+```text
+accepted  persisted by dlgt for the target execution
+injected  handed to app-server or emitted by the Claude hook bridge
+expired   target execution ended before injection
+```
+
+`injected` does not mean `acted_on`; provider compliance is not observable.
+
+### Enqueue
+
+Enqueue creates a future independent user turn. The daemon, not either
+provider, owns the queue. It does not use Codex `turn/steer` or Claude
+`additionalContext`.
+
+When the active execution terminalizes and the Session is otherwise usable,
+the daemon atomically claims the FIFO head, assigns the next `execution_seq`,
+and starts it through `turn/start` or Claude semantic PTY input. If dispatch
+fails, that queue item becomes a durable failed execution before later work is
+considered.
+
+### Replace
+
+Replace is one atomic intent even though provider cancellation and the new
+turn are asynchronous:
+
+```text
+reserve replacement
+cancel active execution
+wait for matching provider quiescence
+terminalize the replaced execution
+start replacement in the same provider conversation
+```
+
+A cancellation timeout returns `CANCEL_TIMEOUT` while the replacement remains
+reserved and the Session remains `canceling`; it does not start the replacement
+early. Process kill/restart is never an implicit consequence of replace. If the
+caller wants process recovery, it invokes restart explicitly.
+
+### Cancel, restart, attach, and stop
+
+Cancel affects only the active execution. Idle cancellation is idempotent.
+Codex quiescence comes from matching interrupted completion; Claude quiescence
+comes from matching `Stop`, `StopFailure`, or owned process exit. A timeout does
+not infer quiescence.
+
+For a running Claude turn, the adapter uses the documented interrupt key. When
+Claude is `blocked`, `Esc` may first dismiss the permission or elicitation
+dialog rather than interrupt the turn, so the adapter treats dialog dismissal
+and turn interruption as separate steps and continues waiting for lifecycle
+proof. It never declares cancellation from the key write itself. If semantic
+interruption cannot reach quiescence, cancel/replace times out and the caller
+may request an explicit process restart.
+
+Restart replaces the provider process/control generation while retaining the
+Session ID, alias, provider conversation ID when possible, execution sequence,
+and queued work. Active work receives a durable interrupted result before the
+replacement generation can dispatch new work.
+
+Attach grants one exclusive writer lease. While attached, semantic send modes
+are rejected with `SESSION_ATTACHED`; the attached human owns provider input.
+Detach does not prove that the provider input editor is empty, so Claude input
+must be normalized before a later semantic turn is submitted.
+
+Stop rejects new work, interrupts active work durably, terminates the owned
+process group, and releases the active alias after the Session reaches
+`stopped`. History and pending-work diagnostics remain addressable by immutable
+Session ID.
 
 ## Rendered scrollback and raw PTY
 
@@ -78,209 +336,165 @@ PTY bytes
   `-- VT parser -> scrollback --> scrollback --lines N
 ```
 
-Raw bytes are an explicit diagnostic capability because they are noisy, may
-contain terminal control sequences, and may contain provider-emitted secrets.
-Normal agent observation uses a headless VT emulator and rendered plain-text
-scrollback.
-
-Evidence from a 92-second Claude review Session shows why stripping ANSI bytes
-is insufficient:
-
-```text
-raw PTY bytes          59,841
-ANSI sequence bytes    23,182 (38.7%)
-ESC sequences           4,610
-CSI sequences           4,509
-carriage returns         4,130
-non-empty stripped rows    768
-unique stripped rows       336
-```
-
-Terminal applications move the cursor, erase lines, overwrite spinners, and
-repaint the screen. A VT emulator must interpret those operations; byte
-stripping would expose duplicate or false text.
+Terminal applications move cursors, erase lines, overwrite spinners, and
+repaint. A VT emulator must interpret those operations; stripping ANSI bytes
+would expose duplicate and false text. Raw bytes are an explicit diagnostic
+capability and may contain secrets. Normal observation uses rendered
+scrollback, lifecycle events, and durable results.
 
 ## Launch environment and security
 
-Profiles are expanded by the client before RPC. Launch environment precedence
-is:
+Profiles are expanded by the client before RPC:
 
 ```text
 client snapshot or clean base < Profile < explicit launch options
 ```
 
-The default environment is a snapshot of the invoking client, never the
-daemon's startup environment. `--clean-env` starts from a minimal runtime base;
-`--pass-env`, `--env`, and `--unset-env` modify the environment used by `new`
-or `restart`. Values are freshly supplied for every process launch and are not
-persisted for later replay.
+The invoking client's environment, not the daemon startup environment, is the
+default launch base. Launch environment values travel in RPC memory and are not
+serialized directly into Session metadata, events, Profiles, or errors.
+Provider output can still echo them, so results and terminal output remain
+sensitive.
 
-After that expansion, dlgt applies non-configurable lifecycle safety overrides
-to its child Harness processes. Codex commands receive
-`check_for_update_on_startup=false`; Claude receives
-`DISABLE_AUTOUPDATER=1`. These overrides prevent updater UI from blocking the
-bounded readiness transition, take precedence over launch environment values,
-and do not mutate either provider's global configuration.
+dlgt applies child-scoped lifecycle overrides without mutating global provider
+configuration: Codex receives `check_for_update_on_startup=false`; Claude
+receives `DISABLE_AUTOUPDATER=1`. It also marks the Session working directory as
+trusted in each provider's workspace state.
 
-Before launch, dlgt marks the canonical Session working directory as trusted
-in the provider's local workspace state. Codex uses its `config.toml`; Claude
-uses the matching `projects` entry in `~/.claude.json`. Both updates preserve
-unrelated settings, use atomic replacement, default new files to mode 0600,
-and are idempotent. This suppresses the provider's workspace trust dialog but
-does not bypass Claude's tool permission mode.
+Workers are auto-approved by default using the provider's supported bypass
+mode. An explicit Session/Profile opt-out keeps provider approval prompts, which
+then appear as `blocked` input. Lifecycle hooks and steering hooks are injected
+only into the owned child launch and coexist with user hooks.
 
-Environment values travel in RPC memory rather than argv and are not directly
-serialized into Session records, `list`, `show`, events, Profiles, or error
-JSON. This is a metadata boundary, not an output redaction guarantee. Provider
-output is untrusted and can deliberately echo environment values, so durable
-results, scrollback, and especially raw logs remain potentially sensitive.
+The local RPC socket is mode 0600. `rpc --stdio` exposes only the public method
+allowlist. Raw PTY bytes require explicit `logs --raw` access.
 
-The local RPC socket is mode 0600. `rpc --stdio` exposes only the documented
-public method allowlist; private provider and execution methods are not an
-escape hatch. Raw PTY bytes require an explicit request.
+## Events and results
+
+Events normalize lifecycle, actionable blocked state, queue ownership, and
+steering delivery; they do not pretend both providers offer equivalent token
+or message streams. Humans inspect live output with attach, agents use bounded
+scrollback, and wait returns the durable terminal result.
+
+At minimum, the event model distinguishes:
+
+```text
+session.ready        session.busy        session.blocked
+session.canceling    session.idle        session.restarting
+session.stopping     session.stopped     session.failed
+input.steer.accepted input.steer.injected input.steer.expired
+input.enqueue.accepted input.enqueue.started
+turn.completed       turn.failed         turn.interrupted
+provider.retrying    provider.unmatched
+```
+
+Every public event is versioned and ordered by a daemon sequence number.
 
 ## Acceptance criteria
 
-1. Two concurrent `send` calls to one idle Session produce exactly one accepted
-   execution and one side-effect-free `SESSION_BUSY` response.
-2. No accepted prompt remains queued behind another prompt.
-3. `new` with an initial prompt creates the Session and accepts the prompt
-   atomically, or reports one failure without a live half-created alias.
-4. Every startup attempt reaches ready or a terminal failure within its startup
-   deadline.
-5. `wait` requires a positive timeout, and timeout leaves the Session active.
-6. Every accepted execution receives a monotonic `execution_seq`; every
-   terminal result echoes it and contains `status` and `final_text`.
-7. Provider death during execution produces a durable failed result in bounded
-   time.
-8. Blocked input becomes observable without being misclassified as completion.
-9. `cancel` reaches provider quiescence or `CANCEL_TIMEOUT` within its deadline.
-10. A stopped Session releases its exact alias while its history remains
-    readable by Session ID.
-11. All control-plane success and error paths emit schema-valid JSON.
-12. Codex model discovery matches app-server `model/list`; Claude discovery is
-    explicitly marked partial.
-13. Rendered scrollback represents the VT screen and history without ANSI
-    control sequences or repeated spinner redraws.
-14. Raw PTY bytes are unavailable without explicit `logs --raw` access.
-15. Launch environment values never appear through direct metadata
-    serialization; tests do not claim that provider output cannot echo them.
-16. A second attach is rejected unless `--steal` transfers the exclusive lease.
-17. Every public event matches the versioned v1 event enum and carries
-    `schema_version`.
-18. Restart preserves Session identity, alias ownership, provider context, and
-    execution sequence. Active work becomes a durable interrupted result before
-    the replacement process starts.
+1. Two concurrent default sends to one idle Session yield one accepted
+   execution and one side-effect-free busy rejection.
+2. Two concurrent state-changing operations are serialized, and accepted queue
+   or replacement order is durable.
+3. `new` plus an initial prompt succeeds atomically or reports one failure
+   without a live half-created alias.
+4. Every startup reaches ready or terminal failure within its deadline.
+5. Every accepted execution receives exactly one `execution_seq` and one
+   durable terminal result.
+6. Provider death during execution produces a durable result and terminal
+   Session state in bounded time.
+7. Blocked input remains observable and is never inferred as completion.
+8. Cancel and replace never start new work before matching provider
+   quiescence.
+9. Steering never leaks into a later execution; enqueue never mutates the
+   active execution.
+10. Claude concurrent tool hooks cannot double-drain steering; Stop provides
+    the final normal injection boundary.
+11. Pending enqueue and replacement intent survive daemon/process restart and
+    never dispatch ahead of a nonterminal predecessor.
+12. Attach excludes semantic sends and a second writer unless ownership is
+    explicitly transferred.
+13. PTY silence, rendered text, and timeout are never accepted as lifecycle
+    proof.
+14. All control success and error paths emit schema-valid JSON, and every
+    public event carries `schema_version`.
+15. Raw PTY bytes are unavailable without explicit diagnostic access.
 
 ## Design decisions
 
-### Session creation belongs to `new`
+### Session remains the public address
 
-`send` never creates a missing Session. Common aliases can collide when several
-controllers share a daemon, and implicit creation would blur ownership. `new`
-generates a collision-resistant alias and returns the immutable Session ID.
+Callers operate on one durable Session identity. Internal execution, queue, and
+delivery rows exist for atomicity and audit, not as a second public API.
 
-### Alias and Session ID serve different roles
+### Steering and enqueue are different
 
-Aliases are readable terminal conveniences. Short Session IDs are immutable
-automation addresses and remain unambiguous after alias reuse. The eight
-unambiguous Crockford Base32 characters are protected by a local database
-uniqueness constraint and collision retry; a UUID would add little value for a
-single local runtime.
+Steering changes the current execution and expires with it. Enqueue creates a
+future execution and survives process recovery. Combining them under one
+"queue" concept would make ordering, cancellation, and result ownership
+ambiguous.
 
-An alias is reserved while its Session is starting, idle, busy, blocked,
-canceling, or stopping. Stopped and failed Sessions release it;
-history stays addressable by Session ID.
+### Replacement is not restart
 
-Restart atomically reclaims that alias. If a newer active Session already owns
-it, restart fails with `ALIAS_IN_USE` instead of silently renaming either
-Session.
+Replacement changes active work inside the same provider conversation. Restart
+replaces the provider process generation. Keeping them separate avoids using a
+process kill as routine flow control and preserves provider context and
+diagnostics.
 
-### JSON is the default control-plane format
+### Provider asymmetry is explicit
 
-dlgt is primarily an agent and automation control plane. One stable JSON shape
-avoids per-command `--json` flags, ambiguous tables, and fragile parsing. Raw
-terminal, text help, and streaming commands are explicit exceptions.
+Codex has semantic app-server methods for turn start, steer, and interrupt.
+Claude provides lifecycle hooks and an interactive input surface. dlgt exposes
+one intent model but documents weaker, boundary-delayed Claude steering instead
+of claiming identical guarantees.
 
-### Execution sequence is correlation, not identity
+### Queue ownership belongs to dlgt
 
-The supported ownership contract has one controller and at most one active
-execution per Session. `wait`, `cancel`, and `show` can therefore address the
-Session. A monotonic `execution_seq` correlates acceptance with a durable result
-without creating a public Turn or Operation resource.
+Future turns are durable daemon state. Provider-native steering queues are not
+used for enqueue because they belong to the active turn and have different
+completion semantics.
 
-### There is no server-side queue
+### Timeouts express bounded observation
 
-Hidden queueing makes prompts stale, complicates dependencies and cancellation,
-creates attach contention, and makes recovery harder. Sequential work is
-expressed by the controller:
+Startup, wait, cancellation, and restart waits are bounded. Timeout never
+manufactures completion, quiescence, or cancellation.
 
-```bash
-dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "First task"
-dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "Second task"
-```
+### Notifications are clients
 
-The agent retains conversational context; dlgt need not retain pending work.
+Arbitrary completion commands in the daemon create reentrancy, secret, and
+failure-policy problems. Consumers follow normalized events instead.
 
-### Timeouts express bounded ownership
+### Identifiers have distinct roles
 
-Startup always has a finite 60-second default. Wait duration expresses caller
-intent and is mandatory for `wait` and `--wait`. Cancellation is bounded by a
-30-second default with an optional override. A timeout observes state; it does
-not cancel the underlying execution.
+Aliases are readable active-session conveniences. Immutable Session IDs remain
+unambiguous after alias reuse. `execution_seq` correlates accepted work and
+results without creating a public Turn identity.
 
-### Notifications are clients, not daemon hooks
+### Idle cancel is idempotent
 
-Arbitrary daemon-executed completion commands introduce secret handling,
-reentrancy, and failure-policy problems. `events --follow` is the normalized
-extension point for desktop notifications, webhooks, and orchestrator wakeups.
+Canceling an idle Session succeeds with `canceled:false`. Waiting on a Session
+that has never accepted work remains `NO_RESULT`.
 
-### Events contain lifecycle, not generated text
+### Model discovery reflects provider capability
 
-Codex provides structured message deltas, while an attachable Claude Session
-exposes generated text through its PTY without an equivalent hook-backed
-stream. The public event API normalizes only lifecycle and actionable state
-that both Harnesses support. Humans inspect incremental output with `attach`;
-agents use bounded `scrollback`; `wait` returns the final result.
+Codex discovery uses app-server `model/list`. Claude discovery is explicitly
+partial because its interactive picker has no equivalent documented
+machine-readable API.
 
-### Attach is exclusive
+## Provider references
 
-v1 uses one attach writer. A second attach is rejected unless `--steal`
-explicitly transfers the lease, preventing interleaved terminal input and
-matching the single-controller model.
-
-### Titles are mandatory
-
-The title is the human description and source of the generated alias. Requiring
-it adds intentional friction at creation; automation uses the returned Session
-ID afterwards.
-
-### Idle cancellation is idempotent
-
-Canceling an idle Session succeeds with `canceled:false`, which keeps cleanup
-scripts simple. `NO_RESULT` remains a real error when waiting on a Session that
-has never accepted work.
-
-### Model discovery reflects provider capabilities
-
-Codex discovery uses app-server `model/list`. Claude Code has no equivalent
-documented machine-readable picker, so dlgt returns stable aliases and marks
-discovery partial. Model selection remains optional; provider defaults and
-Profiles are the normal path.
+- [Codex app-server](https://developers.openai.com/codex/app-server/)
+- [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- [Claude Code interactive mode](https://code.claude.com/docs/en/interactive-mode)
 
 ## Superseded concepts
 
-v1 intentionally removes these earlier draft concepts:
+The final design removes these earlier assumptions:
 
-- `start` as a separate Session-creation command;
-- `send` creating or reusing Sessions;
-- public Turn and Operation resources or IDs;
-- FIFO queues and queue positions;
-- `--enqueue`, `--after-success`, and `--fail-if-busy`;
-- optional or implicit wait deadlines;
-- default human-formatted control-plane output;
-- `logs --follow` as an agent observation surface;
-- a top-level `input-log` command;
-- permanent alias reservation after a Session stops.
-
-Backward compatibility with the superseded draft is not required.
+- every busy send must fail and no server-side queue may exist;
+- one overloaded queue operation can mean both steering and a future turn;
+- replacement should kill and restart the provider process;
+- PTY quietness or prompt text can prove readiness or completion;
+- public Turn, Queue, Operation, or Delivery resources are required;
+- provider implementations must pretend to offer identical steering strength;
+- optional or unbounded lifecycle waits are acceptable.
