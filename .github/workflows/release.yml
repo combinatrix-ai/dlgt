@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(cargo pkgid --package dlgt | sed 's/.*#dlgt@//')"
+          package_version="$(cargo pkgid --package dlgt | sed -E 's/.*#([^@]+@)?//')"
           test "$tag_version" = "$package_version" || {
             echo "dlgt tag $GITHUB_REF_NAME does not match Cargo package version $package_version" >&2
             exit 1

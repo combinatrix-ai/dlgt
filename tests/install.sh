@@ -115,7 +115,7 @@ done
 
 grep -F 'dlgt-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz' "$workflow" >/dev/null
 grep -F 'dlgt-${tag}-checksums.txt' "$workflow" >/dev/null
-grep -F 'cargo pkgid --package dlgt' "$workflow" >/dev/null
+grep -F "sed -E 's/.*#([^@]+@)?//'" "$workflow" >/dev/null
 grep -F 'cargo build --release --locked --target "${{ matrix.target }}" --bin dlgt' "$workflow" >/dev/null
 
 printf 'dlgt installer and release naming tests passed\n'
