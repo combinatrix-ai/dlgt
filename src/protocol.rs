@@ -16,6 +16,8 @@ pub struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +36,7 @@ impl Response {
             id: id.into(),
             result: Some(result),
             error: None,
+            info: None,
         }
     }
 
@@ -51,6 +54,7 @@ impl Response {
                 session_id: None,
                 provider_session_id: None,
             }),
+            info: None,
         }
     }
 
@@ -70,7 +74,15 @@ impl Response {
                 session_id: Some(session_id.into()),
                 provider_session_id,
             }),
+            info: None,
         }
+    }
+
+    pub fn with_info(mut self, info: Option<Value>) -> Self {
+        if self.error.is_none() {
+            self.info = info;
+        }
+        self
     }
 }
 
@@ -142,6 +154,18 @@ mod tests {
         let encoded = serde_json::to_value(Response::ok("req_1", json!({"ok": true})))
             .unwrap_or_else(|error| panic!("failed to encode response: {error}"));
         assert_eq!(encoded, json!({"id":"req_1","result":{"ok":true}}));
+    }
+
+    #[test]
+    fn successful_response_can_include_info() {
+        let response = Response::ok("req_1", json!([])).with_info(Some(json!({
+            "code": "UPDATE_AVAILABLE",
+            "latest_version": "0.2.0"
+        })));
+        let value = serde_json::to_value(response)
+            .unwrap_or_else(|error| panic!("failed to serialize response: {error}"));
+        assert_eq!(value["info"]["code"], "UPDATE_AVAILABLE");
+        assert!(value.get("error").is_none());
     }
 
     #[test]

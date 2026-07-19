@@ -9,15 +9,17 @@ Backward compatibility with earlier drafts is not required.
 
 ## Product boundary
 
-`dlgt` is a local, single-binary runtime for persistent, addressable, and
+`dlgt` is a local, single-binary runtime for live, addressable, and
 attachable Codex and Claude subagents. `Session` is its only public runtime
 object.
 
 Each Session owns one provider conversation, one harness process set and its
 provider-specific control path, one PTY and rendered screen, and one serialized
-controller. SQLite stores Session state, internal executions, pending input,
-lifecycle events, results, input audit, bounded raw PTY bytes, and rendered
-scrollback.
+controller. The owning version's daemon keeps Session state, executions,
+lifecycle events, results, bounded raw PTY bytes, and rendered scrollback in
+memory. When that daemon exits, its dlgt Session state disappears; the returned
+provider conversation ID remains the durable lookup and resume key in Codex or
+Claude.
 
 Provider turns, steering messages, queued prompts, and delivery attempts are
 internal correlation records. They do not have public selectors and do not
@@ -89,7 +91,7 @@ an observable idle interval. It must nevertheless terminalize the old
 execution before assigning a new `execution_seq`.
 
 An accepted turn reserves its internal execution before provider delivery. If
-delivery fails, dlgt records a durable failed result and clears the reservation;
+delivery fails, dlgt records a retained failed result and clears the reservation;
 it does not leave phantom busy work. Provider acceptance then binds the
 provider turn ID to that reservation.
 
@@ -97,7 +99,7 @@ provider turn ID to that reservation.
 answer, not that the execution completed or that another semantic prompt may
 start.
 
-Provider death during an active execution creates a durable failure or
+Provider death during an active execution creates a retained failure or
 interruption before the Session becomes terminal. Explicit stop and restart
 own their process-exit transitions and are not misclassified as crashes.
 
@@ -221,11 +223,11 @@ are dispatched FIFO, each with a fresh `execution_seq`. Failure of one queued
 execution does not discard later items unless an explicit queue-clearing
 operation says so.
 
-Pending enqueue and replacement records survive daemon restart. After recovery,
-dlgt first reconciles active provider state, then dispatches only work whose
-predecessor is durably terminal. Stopped and failed Sessions do not dispatch
-pending work until an explicit restart; explicit Session deletion may discard
-it. Ordinary process restart preserves the queue.
+Pending enqueue and replacement records live in the owning daemon. If that
+daemon exits, it stops its provider processes and discards the Session,
+execution, event, queue, and terminal-history state. The provider conversation
+ID returned to the caller remains available for provider-native lookup or
+resume.
 
 ### Steering
 
@@ -260,7 +262,7 @@ the next turn.
 Observability distinguishes:
 
 ```text
-accepted  persisted by dlgt for the target execution
+accepted  retained by dlgt for the target execution while its daemon lives
 injected  handed to app-server or emitted by the Claude hook bridge
 expired   target execution ended before injection
 ```
@@ -276,7 +278,7 @@ provider, owns the queue. It does not use Codex `turn/steer` or Claude
 When the active execution terminalizes and the Session is otherwise usable,
 the daemon atomically claims the FIFO head, assigns the next `execution_seq`,
 and starts it through `turn/start` or Claude semantic PTY input. If dispatch
-fails, that queue item becomes a durable failed execution before later work is
+fails, that queue item becomes a retained failed execution before later work is
 considered.
 
 ### Replace
@@ -323,7 +325,7 @@ may request an explicit process restart.
 
 Restart replaces the provider process/control generation while retaining the
 Session ID, alias, provider conversation ID when possible, execution sequence,
-and queued work. Active work receives a durable interrupted result before the
+and queued work. Active work receives a retained interrupted result before the
 replacement generation can dispatch new work.
 
 Attach grants one exclusive writer lease. While attached, semantic send modes
@@ -350,7 +352,7 @@ Terminal applications move cursors, erase lines, overwrite spinners, and
 repaint. A VT emulator must interpret those operations; stripping ANSI bytes
 would expose duplicate and false text. Raw bytes are an explicit diagnostic
 capability and may contain secrets. Normal observation uses rendered
-scrollback, lifecycle events, and durable results.
+scrollback, lifecycle events, and retained results.
 
 ## Launch environment and security
 
@@ -384,7 +386,7 @@ allowlist. Raw PTY bytes require explicit `logs --raw` access.
 Events normalize lifecycle, actionable blocked state, queue ownership, and
 steering delivery; they do not pretend both providers offer equivalent token
 or message streams. Humans inspect live output with attach, agents use bounded
-scrollback, and wait returns the durable terminal result.
+scrollback, and wait returns the retained terminal result.
 
 At minimum, the event model distinguishes:
 
@@ -405,13 +407,13 @@ Every public event is versioned and ordered by a daemon sequence number.
 1. Two concurrent default sends to one idle Session yield one accepted
    execution and one side-effect-free busy rejection.
 2. Two concurrent state-changing operations are serialized, and accepted queue
-   or replacement order is durable.
+   or replacement order is stable for the daemon lifetime.
 3. `new` plus an initial prompt succeeds atomically or reports one failure
    without a live half-created alias.
 4. Every startup reaches ready or terminal failure within its deadline.
 5. Every accepted execution receives exactly one `execution_seq` and one
-   durable terminal result.
-6. Provider death during execution produces a durable result and terminal
+   retained terminal result.
+6. Provider death during execution produces a retained result and terminal
    Session state in bounded time.
 7. Blocked input remains observable and is never inferred as completion.
 8. Cancel and replace never start new work before matching provider
@@ -420,8 +422,8 @@ Every public event is versioned and ordered by a daemon sequence number.
    active execution.
 10. Claude concurrent tool hooks cannot double-drain steering; Stop provides
     the final normal injection boundary.
-11. Pending enqueue and replacement intent survive daemon/process restart and
-    never dispatch ahead of a nonterminal predecessor.
+11. Daemon exit stops owned provider processes and discards all runtime-local
+    Session state; no work is recovered or dispatched after restart.
 12. Attach excludes semantic sends and a second writer unless ownership is
     explicitly transferred.
 13. PTY silence, rendered text, and timeout are never accepted as lifecycle
@@ -434,13 +436,14 @@ Every public event is versioned and ordered by a daemon sequence number.
 
 ### Session remains the public address
 
-Callers operate on one durable Session identity. Internal execution, queue, and
-delivery rows exist for atomicity and audit, not as a second public API.
+Callers operate on one live Session identity. Internal execution, queue, and
+delivery records exist for atomicity and observation, not as a second public
+API.
 
 ### Steering and enqueue are different
 
 Steering changes the current execution and expires with it. Enqueue creates a
-future execution and survives process recovery. Combining them under one
+future execution within the same daemon lifetime. Combining them under one
 "queue" concept would make ordering, cancellation, and result ownership
 ambiguous.
 
@@ -460,7 +463,7 @@ weaker Claude interrupt quiescence instead of claiming identical guarantees.
 
 ### Queue ownership belongs to dlgt
 
-Future turns are durable daemon state. Provider-native steering queues are not
+Future turns are in-memory daemon state. Provider-native steering queues are not
 used for enqueue because they belong to the active turn and have different
 completion semantics.
 

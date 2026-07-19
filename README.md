@@ -75,7 +75,7 @@ for supported targets and verification steps.
 
 ## What dlgt does
 
-`dlgt` runs Codex and Claude as durable, addressable local Sessions. Each
+`dlgt` runs Codex and Claude as live, addressable local Sessions. Each
 Session owns one harness process, one PTY, one terminal screen, and at most one
 active execution.
 
@@ -158,8 +158,10 @@ dlgt launches both Harnesses auto-approved by default so delegation never
 blocks on permission prompts. Opt out per Session with `--no-auto-approve` or
 per Profile with `auto_approve = false`.
 
-Set `DLGT_HOME` to relocate the SQLite database and Unix socket. Set
-`DLGT_SOCKET` to override only the socket.
+Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
+override only the current version's socket. Session state is held in memory by
+the daemon that owns the Harness processes; after that daemon exits, use the
+returned `provider_session_id` for provider-native lookup or resume.
 
 ## Build and verify
 

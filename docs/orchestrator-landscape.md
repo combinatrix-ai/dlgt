@@ -8,7 +8,7 @@ Research snapshot: 2026-07-14.
 an end-to-end agent orchestrator.
 
 It owns a Codex or Claude process, PTY, terminal screen, lifecycle state, and
-durable result. It exposes those through a small JSON-first CLI and local JSONL
+retained result. It exposes those through a small JSON-first CLI and local JSONL
 RPC. It deliberately does not decide what work should happen, decompose tasks,
 route dependencies, isolate branches, merge code, or coordinate a team.
 
@@ -77,7 +77,7 @@ and superficially easy to confuse.
 | Identity | Team + named peer | Immutable Session ID + active human alias |
 | Transport | Shared WAL-mode SQLite mailbox | Local mode-0600 Unix socket and JSONL RPC |
 | Process ownership | `spawn` launches an independent peer; agmsg explicitly does not manage it as a child | Daemon owns the harness process group, PTY, screen, controller, cancellation and stop |
-| Completion | A message or delivery event is coordination state, not proof that provider work completed | Official provider lifecycle terminalizes a durable execution result |
+| Completion | A message or delivery event is coordination state, not proof that provider work completed | Official provider lifecycle terminalizes a retained execution result |
 | Input | Agent-to-agent messages surfaced by hooks/monitor modes | Semantic `send` to an idle Session; Codex uses app-server `turn/start`, Claude uses guarded terminal input |
 | Concurrency | Multiple peers communicate through the shared floor | One controller and at most one active execution per Session; busy work is rejected, never queued |
 | History | Durable room/message history and replay | Session metadata, events, results, input audit, rendered scrollback and bounded raw PTY history |
@@ -142,7 +142,7 @@ boundary between those surfaces unusually explicit.
 
 ### 5. Minimal deployment and local data ownership
 
-dlgt is one Rust binary with an embedded agent skill, a local daemon, SQLite,
+dlgt is one Rust binary with an embedded agent skill, versioned local daemons,
 and a Unix socket. It does not require tmux, Node/Bun, a web application,
 Postgres, a task tracker, or a repository layout.
 
@@ -178,7 +178,7 @@ Suggested one-line category:
 
 Suggested longer description:
 
-> dlgt gives an orchestrator durable, addressable Codex and Claude Sessions
+> dlgt gives an orchestrator live, addressable Codex and Claude Sessions
 > with semantic input, provider-authoritative completion, structured events,
 > bounded waits, cancellation, scrollback, and live attach - without imposing a
 > task graph, worktree policy, queue, or UI.

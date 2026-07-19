@@ -736,9 +736,8 @@ mod tests {
             environment: &environment,
             auto_approve: true,
         });
-        let error = match result {
-            Ok(_) => panic!("managed harness option should fail"),
-            Err(error) => error,
+        let Err(error) = result else {
+            panic!("managed harness option should fail");
         };
         assert!(error.to_string().contains("managed by dlgt"));
     }

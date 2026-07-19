@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ pub struct SessionRuntime {
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     output: Arc<OutputState>,
+    alive: Arc<AtomicBool>,
     pid: Option<u32>,
 }
 
@@ -95,10 +97,13 @@ impl SessionRuntime {
             })
             .context("failed to start PTY output thread")?;
 
+        let alive = Arc::new(AtomicBool::new(true));
+        let wait_alive = Arc::clone(&alive);
         std::thread::Builder::new()
             .name("dlgt-child-wait".to_owned())
             .spawn(move || {
                 let exit_code = child.wait().map_or(1, |status| status.exit_code());
+                wait_alive.store(false, Ordering::Release);
                 on_exit(exit_code);
             })
             .context("failed to start child wait thread")?;
@@ -108,6 +113,7 @@ impl SessionRuntime {
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
             output,
+            alive,
             pid,
         }))
     }
@@ -205,6 +211,16 @@ impl SessionRuntime {
             Ok(())
         } else {
             Err(group_error).context("failed to force-stop agent process group")
+        }
+    }
+}
+
+impl Drop for SessionRuntime {
+    fn drop(&mut self) {
+        // The daemon owns every runtime. Dropping the daemon therefore also
+        // terminates the provider process group instead of orphaning it.
+        if self.alive.swap(false, Ordering::AcqRel) {
+            let _ = self.force_stop();
         }
     }
 }

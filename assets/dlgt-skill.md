@@ -1,14 +1,17 @@
 ---
 name: dlgt
-description: Create, address, observe, and control persistent Codex and Claude Sessions through one local runtime.
+description: Create, address, observe, and control live Codex and Claude Sessions through one local runtime.
 ---
 
 # dlgt
 
 Use `dlgt` when a Codex or Claude subagent should remain alive in an owned PTY
 and be addressable from later commands. The only public runtime object is a
-Session. Retain the `ses_XXXXXXXX` returned by `new`; aliases are human
-conveniences and may be reused after a Session stops.
+Session. Retain both `session.id` and `provider_session_id` from `new`:
+`session.id` addresses the live dlgt runtime while that version's daemon runs,
+and `provider_session_id` identifies the underlying Codex or Claude
+conversation for provider-native lookup or resume after dlgt exits. Aliases are
+human conveniences and may be reused after a Session stops.
 
 ## Exact delegation routes
 
@@ -47,6 +50,11 @@ both counterpart reviewers unless the user explicitly requests both.
 - `attach` is exclusive. Detach with `Ctrl-b d`; use `--steal` only when taking
   control from a known stale attach client.
 - Treat results, rendered scrollback, and raw output as potentially sensitive.
+- If a successful response contains `info.code: UPDATE_AVAILABLE`, tell the
+  user the current and latest versions and ask whether to run `dlgt update`.
+  Do not update dlgt or replace its binary and embedded Skills without explicit
+  confirmation. If the user already explicitly requested the update, do not
+  ask again.
 - dlgt marks the Session cwd trusted in the Harness's local state and starts
   workers auto-approved. Workers can edit files and run commands in the cwd,
   so constrain them in the prompt, and pass `--no-auto-approve` when a
@@ -70,6 +78,8 @@ dlgt events ses_7K3M9Q2X --follow
 dlgt scrollback ses_7K3M9Q2X --lines 100
 dlgt attach ses_7K3M9Q2X
 dlgt stop ses_7K3M9Q2X
+dlgt list --all-versions
+dlgt update
 ```
 
 Control-plane commands return compact JSON with `ok:true` or a structured

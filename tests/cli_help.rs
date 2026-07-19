@@ -8,6 +8,7 @@ fn dlgt(args: &[&str]) -> std::io::Result<std::process::Output> {
 fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std::error::Error>> {
     let commands = [
         "server",
+        "update",
         "new",
         "restart",
         "send",

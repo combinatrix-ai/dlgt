@@ -15,7 +15,7 @@ use tungstenite::{Message, WebSocket, client};
 
 use crate::provider::{codex_app_server_args, codex_program};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
 

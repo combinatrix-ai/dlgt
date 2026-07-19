@@ -8,6 +8,7 @@ mod raw_mode;
 mod session;
 mod skill;
 mod store;
+mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -71,6 +72,7 @@ fn run() -> Result<()> {
         "harnesses" => command_harnesses(&args[1..]),
         "rpc" => command_rpc(&args[1..]),
         "hook" => command_hook(&args[1..]),
+        "update" => command_update(&args[1..]),
         "skill" => {
             print!("{}", skill::TEXT);
             Ok(())
@@ -186,7 +188,7 @@ fn command_new(args: &[String]) -> Result<()> {
             "auto_approve": auto_approve,
             "prompt": prompt,
             "startup_timeout_ms": parsed.one("--startup-timeout")
-                .map(parse_duration).transpose()?.unwrap_or(Duration::from_secs(60)).as_millis(),
+                .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
             "environment": environment,
             "rows": rows,
             "cols": cols,
@@ -237,7 +239,7 @@ fn command_restart(args: &[String]) -> Result<()> {
         json!({
             "session": session,
             "startup_timeout_ms": parsed.one("--startup-timeout")
-                .map(parse_duration).transpose()?.unwrap_or(Duration::from_secs(60)).as_millis(),
+                .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
             "environment": environment,
             "rows": rows,
             "cols": cols,
@@ -273,12 +275,17 @@ fn command_cancel(args: &[String]) -> Result<()> {
 }
 
 fn command_list(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--all", "--pretty"])?;
+    let parsed = Args::parse(args, &["--all", "--all-versions", "--pretty"])?;
     parsed.no_positionals()?;
-    print_success(
-        json!({"sessions":client::call("session.list", json!({"all":parsed.flag("--all")}))?}),
-        parsed.flag("--pretty"),
-    )
+    let sessions = if parsed.flag("--all-versions") {
+        client::list_all_versions(parsed.flag("--all"))?
+    } else {
+        client::call("session.list", json!({"all":parsed.flag("--all")}))?
+            .as_array()
+            .context("invalid session list response")?
+            .clone()
+    };
+    print_success(json!({"sessions":sessions}), parsed.flag("--pretty"))
 }
 
 fn command_show(args: &[String]) -> Result<()> {
@@ -437,6 +444,12 @@ fn command_rpc(args: &[String]) -> Result<()> {
         bail!("rpc requires --stdio");
     }
     client::rpc_stdio()
+}
+
+fn command_update(args: &[String]) -> Result<()> {
+    let parsed = Args::parse(args, &["--pretty"])?;
+    parsed.no_positionals()?;
+    print_success(update::install_latest()?, parsed.flag("--pretty"))
 }
 
 fn command_hook(args: &[String]) -> Result<()> {
@@ -691,6 +704,9 @@ fn print_success(value: Value, pretty: bool) -> Result<()> {
         other => Map::from_iter([("value".to_owned(), other)]),
     };
     object.insert("ok".to_owned(), Value::Bool(true));
+    if let Some(info) = client::take_info() {
+        object.insert("info".to_owned(), info);
+    }
     let value = Value::Object(object);
     println!(
         "{}",
@@ -727,7 +743,7 @@ fn exit_status(code: &str) -> i32 {
 
 fn print_usage() {
     println!(
-        "dlgt - persistent local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session, optionally with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session\n  wait         Wait for the current or latest execution\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  rpc          Use JSONL RPC"
+        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session, optionally with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session\n  wait         Wait for the current or latest execution\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
     );
 }
 
@@ -735,6 +751,9 @@ fn print_command_usage(command: &str) -> Result<()> {
     let usage = match command {
         "server" => {
             "dlgt server - run or stop the local daemon\n\nUSAGE\n  dlgt server [--foreground]\n  dlgt server stop\n\nOPTIONS\n  --foreground   Run in the foreground\n  -h, --help     Print this help"
+        }
+        "update" => {
+            "dlgt update - install the latest release and embedded Skills\n\nUSAGE\n  dlgt update [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "new" => {
             "dlgt new - create a Session, optionally with its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] [-- <PROMPT>]\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --wait                         Wait for the initial prompt to finish\n  --timeout <DURATION>           Required with --wait\n  --stdin                        Read the initial prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
@@ -752,7 +771,7 @@ fn print_command_usage(command: &str) -> Result<()> {
             "dlgt cancel - interrupt the active execution\n\nUSAGE\n  dlgt cancel <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --timeout <DURATION>   Cancellation timeout (default: 30s)\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"
         }
         "list" | "ls" => {
-            "dlgt list - list Sessions\n\nUSAGE\n  dlgt list [--all] [--pretty]\n  dlgt ls [--all] [--pretty]\n\nOPTIONS\n  --all        Include terminal historical Sessions\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
+            "dlgt list - list Sessions\n\nUSAGE\n  dlgt list [--all] [--all-versions] [--pretty]\n  dlgt ls [--all] [--all-versions] [--pretty]\n\nOPTIONS\n  --all            Include terminal Sessions from live runtimes\n  --all-versions   Query every running dlgt version\n  --pretty         Pretty-print JSON output\n  -h, --help       Print this help"
         }
         "show" => {
             "dlgt show - show Session state and latest result\n\nUSAGE\n  dlgt show <SESSION_ID|@ALIAS> [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"

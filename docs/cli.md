@@ -8,7 +8,7 @@ invariants, lifecycle rationale, security model, and acceptance criteria.
 
 ## Product definition
 
-`dlgt` is a local, single-binary runtime for persistent, addressable, and
+`dlgt` is a local, single-binary runtime for live, addressable, and
 attachable Codex and Claude subagents.
 
 The only public runtime object is a **Session**:
@@ -22,7 +22,7 @@ Session
 ```
 
 Provider turns and execution receipts may remain internal for lifecycle
-correlation and persistence, but they are not public CLI resources and do not
+correlation while the daemon is alive, but they are not public CLI resources and do not
 have public IDs.
 
 Other terms:
@@ -43,7 +43,7 @@ ses_7K3M9Q2X
 ```
 
 The suffix is eight characters of unambiguous Crockford Base32. Generation is
-random, protected by a database uniqueness constraint, and retried on collision.
+random, protected by a runtime uniqueness check, and retried on collision.
 
 Aliases are for humans:
 
@@ -97,7 +97,7 @@ deterministic.
 ## Top-level help
 
 ```text
-dlgt - persistent local subagent runtime
+dlgt - local subagent runtime
 
 USAGE
   dlgt <COMMAND> [OPTIONS]
@@ -128,8 +128,27 @@ CONFIGURATION
 
 RUNTIME
   server       Run or stop the local daemon
+  update       Install the latest release and embedded Skills
   rpc          Use the JSONL RPC interface
 ```
+
+Each release uses its own socket at
+`$DLGT_HOME/run/<version>/dlgt.sock`. Normal commands address only the daemon
+for the invoking binary's version. `dlgt list --all-versions` queries every
+currently running version and annotates each Session with `runtime_version` and
+`runtime_socket`. Session state, results, events, and terminal history exist
+only while their owning daemon remains alive.
+
+Successful commands may include an optional non-error notice:
+
+```json
+{"ok":true,"sessions":[],"info":{"code":"UPDATE_AVAILABLE","current_version":"0.1.4","latest_version":"0.2.0","command":"dlgt update"}}
+```
+
+`dlgt update` downloads the latest published release through the checked-in
+installer, verifies its checksum, atomically replaces the current executable,
+and refreshes the embedded Codex and Claude Skills. Existing older-version
+daemons and their live Sessions continue on their versioned sockets.
 
 ## `new`
 
@@ -265,7 +284,7 @@ dlgt restart <SESSION_ID>
 ```
 
 `restart` replaces a Session's provider process while preserving its dlgt
-Session ID, alias, durable history, execution sequence, and provider
+Session ID, alias, retained history, execution sequence, and provider
 conversation. Codex resumes the stored thread and Claude resumes the stored
 conversation.
 
@@ -285,7 +304,7 @@ Rules:
   replacement.
 - Startup is bounded by `--startup-timeout`, which defaults to 60 seconds.
 - Launch environment values are freshly supplied by the invoking client and
-  are not recovered from durable storage.
+  are not retained for replay.
 - Existing results, events, raw output, and scrollback remain readable; new
   executions continue the same monotonic `execution_seq`.
 
@@ -355,14 +374,14 @@ dlgt send ses_7K3M9Q2X \
 }
 ```
 
-## Durable result
+## Retained result
 
 Every accepted execution receives a per-Session monotonic `execution_seq`.
 This number is returned by `new` or `send`, echoed by lifecycle events and the
-durable result, and never accepted as a CLI selector. It is correlation data,
+retained result, and never accepted as a CLI selector. It is correlation data,
 not a public execution resource or ID.
 
-The durable result shape is:
+The retained result shape is:
 
 ```json
 {
@@ -391,14 +410,14 @@ dlgt wait <SESSION_ID|@ALIAS> --timeout <DURATION>
 The timeout is required and positive.
 
 `wait` binds to the Session's active execution and `execution_seq` at request
-time. If the Session is already idle and has a latest durable result, it returns
+time. If the Session is already idle and has a latest retained result, it returns
 that result. If the Session has never accepted work, it returns `NO_RESULT`.
 
 Because a Session has one controller and no queue, the public contract does not
 need an addressable execution or Turn identifier. The non-addressable sequence
 number lets callers correlate acceptance and result without expanding the
 object model. Internally, dlgt may retain provider IDs to reject stale
-lifecycle events and persist history correctly.
+lifecycle events and retain bounded history correctly while the daemon lives.
 
 A wait timeout returns `WAIT_TIMEOUT` and leaves the Session busy:
 
@@ -458,7 +477,7 @@ dlgt must never infer completion from a quiet screen.
 ## Session commands
 
 ```text
-dlgt list [--all] [--pretty]
+dlgt list [--all] [--all-versions] [--pretty]
 dlgt show <SESSION_ID|@ALIAS> [--pretty]
 dlgt attach <SESSION_ID|@ALIAS> [--steal]
 dlgt stop <SESSION_ID|@ALIAS> [--force]
@@ -467,8 +486,10 @@ dlgt restart <SESSION_ID> [environment options]
 
 - `list` returns active Sessions.
 - `list --all` includes terminal historical Sessions.
+- `list --all-versions` queries every live versioned daemon socket and adds
+  `runtime_version` and `runtime_socket` to each Session.
 - `show` returns identity, Harness, model selection, state, current timing,
-  latest durable result, and relevant failure data.
+  latest retained result, and relevant failure data.
 - `attach` takes an exclusive input lease, replays the retained terminal view,
   and follows the live PTY. A second attach returns `ALREADY_ATTACHED` unless
   `--steal` explicitly transfers the lease. Detach with `Ctrl-b d`. Mirrored
@@ -644,7 +665,7 @@ The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
 5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ALIAS_IN_USE`, and
 `SESSION_UNAVAILABLE` use exit 1. `WAIT_TIMEOUT` and `CANCEL_TIMEOUT` use exit
-3. A Session stopped during `wait` produces a durable `interrupted` result and
+3. A Session stopped during `wait` produces a retained `interrupted` result and
 exit 2. Idle `cancel` is an idempotent exit-0 no-op.
 
 The stable v1 structured error-code families are:
@@ -664,7 +685,7 @@ CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 PROVIDER_FAILED        Provider terminalized work as failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
-INTERNAL               dlgt invariant or persistence failure
+INTERNAL               dlgt runtime invariant failure
 ```
 
 Commands may add contextual fields, but must not overload one code with a
