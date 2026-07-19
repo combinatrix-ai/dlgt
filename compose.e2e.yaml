@@ -1,0 +1,14 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: tests/docker/Dockerfile
+    working_dir: /workspace
+    environment:
+      DLGT_HOME: /tmp/dlgt
+      TERM: xterm-256color
+    volumes:
+      - .:/workspace
+      - ./.dlgt-e2e-home:/root
+    stdin_open: true
+    tty: true

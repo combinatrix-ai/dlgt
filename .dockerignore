@@ -1,0 +1,5 @@
+.git
+.dlgt-e2e-home
+docs/.vitepress
+node_modules
+target
