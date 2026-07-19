@@ -40,6 +40,10 @@ both counterpart reviewers unless the user explicitly requests both.
 - Use provider lifecycle state and `wait`, not PTY silence, as completion proof.
 - Use `scrollback` for bounded plain-text observation. Raw PTY bytes require the
   explicit diagnostic command `logs --raw`.
+- If a Session remains `starting` or `busy` without the expected lifecycle
+  event, inspect `events` and `scrollback`, then use `attach` when the screen
+  shows a first-run, authentication, trust, theme, or permission-mode prompt.
+  Complete the prompt, detach, and retry the delegated work in a fresh Session.
 - `attach` is exclusive. Detach with `Ctrl-b d`; use `--steal` only when taking
   control from a known stale attach client.
 - Treat results, rendered scrollback, and raw output as potentially sensitive.

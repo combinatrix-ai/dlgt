@@ -61,7 +61,6 @@ For a reviewable install, download the script first and run it locally:
 curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh \
   -o /tmp/install-dlgt.sh
 sh /tmp/install-dlgt.sh --skill both
-rm -f /tmp/install-dlgt.sh
 ~~~
 
 ## Install a specific version
@@ -157,11 +156,8 @@ The README installation is complete only when both installed copies match the
 skill embedded in the installed binary:
 
 ~~~sh
-skill_snapshot="$(mktemp)"
-dlgt skill >"$skill_snapshot"
-cmp -s "$skill_snapshot" "${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md"
-cmp -s "$skill_snapshot" "$HOME/.claude/skills/dlgt/SKILL.md"
-rm -f "$skill_snapshot"
+dlgt skill | cmp -s - "${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md"
+dlgt skill | cmp -s - "$HOME/.claude/skills/dlgt/SKILL.md"
 ~~~
 
 ### Verify delegation end to end
@@ -203,6 +199,22 @@ The command must return `ok: true` with a completed result containing
 verification succeeded. A launch failure, timeout, blocked Session, or missing
 result means verification did not pass.
 
+Codex and Claude may show first-run authentication, theme, security, trust, or
+permission-mode screens instead of accepting the delegated prompt. If a
+Session remains `starting` or `busy` without the expected lifecycle events,
+inspect it before retrying:
+
+~~~sh
+dlgt events <SESSION_ID>
+dlgt scrollback <SESSION_ID> --lines 100
+dlgt attach <SESSION_ID>
+~~~
+
+Use `attach` to complete the visible first-run prompt, then detach with
+`Ctrl-b d`, stop the incomplete verification Session, and retry with a fresh
+Session. Authentication requires the user; do not claim end-to-end success
+until a later delegation completes with `DLGT_OK`.
+
 The first client command starts the local dlgt daemon automatically. State
 and the Unix socket remain local under ~/.dlgt by default; use DLGT_HOME or
 DLGT_SOCKET to relocate them.
@@ -238,7 +250,8 @@ publishes the resulting target-named archives and checksums.
   the installer replaced a different skill.
 - **A Session cannot start:** verify the relevant codex or claude command and
   its authentication in the same shell. Set DLGT_CODEX_BIN or DLGT_CLAUDE_BIN
-  if the harness executable is not on PATH.
+  if the harness executable is not on PATH. Use `events`, `scrollback`, and
+  `attach` to identify first-run Harness UI that is waiting for input.
 
 Once these checks pass, the active harness can use the registered dlgt skill to
 create, address, wait for, and inspect persistent Sessions. See the
