@@ -113,7 +113,11 @@ pub fn run() -> Result<()> {
 
     if let Ok(sessions) = daemon.sessions.read() {
         for runtime in sessions.values() {
-            let _ = runtime.stop();
+            // Daemon shutdown is the ownership boundary: no provider process
+            // may outlive the runtime that created it. A graceful child-only
+            // stop can leave descendants alive, so terminate the whole PTY
+            // process group here.
+            let _ = runtime.force_stop();
         }
     }
     drop(listener);
