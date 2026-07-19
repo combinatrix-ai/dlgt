@@ -1,9 +1,11 @@
 # Install dlgt
 
 This page is an agent-executable contract for installing the latest published
-dlgt release for Codex or Claude. When asked to follow it, do not report
-completion after installing only the binary. Completion requires verifying the
-binary and every requested installed skill copy.
+dlgt release for Codex or Claude. It is also published as raw Markdown at
+https://combinatrix.ai/dlgt/installation.md for agents to fetch with curl. When
+asked to follow it, do not report completion after installing only the binary.
+Completion requires verifying the binary, every requested installed skill
+copy, and an end-to-end delegation to the counterpart Harness.
 
 The installer downloads a platform-specific binary from GitHub Releases,
 verifies its SHA-256 checksum, installs it as dlgt in a user-writable
@@ -161,6 +163,45 @@ cmp -s "$skill_snapshot" "${CODEX_HOME:-$HOME/.codex}/skills/dlgt/SKILL.md"
 cmp -s "$skill_snapshot" "$HOME/.claude/skills/dlgt/SKILL.md"
 rm -f "$skill_snapshot"
 ~~~
+
+### Verify delegation end to end
+
+Static checks are not sufficient. The installing agent must use dlgt to launch
+the counterpart Harness and confirm that it completes a simple delegated task:
+
+- When the installing agent is Codex, launch a Claude Session.
+- When the installing agent is Claude, launch a Codex Session.
+- Omit model and effort so the counterpart Harness uses its defaults.
+
+From Codex:
+
+~~~sh
+dlgt new \
+  --title "dlgt installation verification" \
+  --harness claude \
+  --cwd . \
+  --wait \
+  --timeout 5m \
+  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate."
+~~~
+
+From Claude:
+
+~~~sh
+dlgt new \
+  --title "dlgt installation verification" \
+  --harness codex \
+  --cwd . \
+  --wait \
+  --timeout 5m \
+  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate."
+~~~
+
+The command must return `ok: true` with a completed result containing
+`DLGT_OK`. Retain the returned Session ID, stop that verification Session with
+`dlgt stop <SESSION_ID>`, and only then report that installation and end-to-end
+verification succeeded. A launch failure, timeout, blocked Session, or missing
+result means verification did not pass.
 
 The first client command starts the local dlgt daemon automatically. State
 and the Unix socket remain local under ~/.dlgt by default; use DLGT_HOME or

@@ -23,18 +23,20 @@ harness, and call the other side when it has something useful to add.
 From Codex:
 
 ```bash
-codex "Read and follow https://combinatrix.ai/dlgt/installation. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
+codex "Install and verify dlgt. Fetch https://combinatrix.ai/dlgt/installation.md with curl and follow its instructions."
 ```
 
 From Claude:
 
 ```bash
-claude "Read and follow https://combinatrix.ai/dlgt/installation. Install dlgt and its embedded skill for both Codex and Claude with --skill both, then verify the binary and both installed SKILL.md files."
+claude "Install and verify dlgt. Fetch https://combinatrix.ai/dlgt/installation.md with curl and follow its instructions."
 ```
 
-These are agent-executable installation instructions. The agent should not
-report completion after installing only the binary: the embedded skill must
-also match the copies installed for Codex and Claude.
+These are agent-executable installation instructions. The same source powers
+the human-readable installation page and the raw Markdown guide fetched by the
+agent. The agent should not report completion after installing only the binary:
+the embedded skill must match the copies installed for Codex and Claude, and a
+counterpart Session must complete a simple delegated task through dlgt.
 
 Then ask either agent normally — neither prompt mentions dlgt. The installed
 skill invokes it automatically, picks the counterpart model, and leaves effort

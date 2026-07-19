@@ -1,4 +1,11 @@
+import { copyFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitepress";
+
+const installationSource = fileURLToPath(
+  new URL("../installation.md", import.meta.url),
+);
 
 export default defineConfig({
   title: "dlgt",
@@ -7,6 +14,12 @@ export default defineConfig({
   cleanUrls: true,
   lastUpdated: true,
   sitemap: { hostname: "https://combinatrix.ai/dlgt/" },
+  async buildEnd(siteConfig) {
+    await copyFile(
+      installationSource,
+      resolve(siteConfig.outDir, "installation.md"),
+    );
+  },
   head: [
     ["meta", { name: "theme-color", content: "#f04b23" }],
     ["meta", { property: "og:title", content: "dlgt" }],
