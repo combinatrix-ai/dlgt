@@ -379,11 +379,23 @@ fn dispatch_notification(
     terminal_turns: &Arc<Mutex<HashSet<String>>>,
     message: Value,
 ) {
-    if message.get("method").and_then(Value::as_str) == Some("turn/completed")
-        && let Some(turn_id) = message.pointer("/params/turn/id").and_then(Value::as_str)
-        && !mark_terminal_once(terminal_turns, turn_id)
-    {
-        return;
+    if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
+        let turn = message.pointer("/params/turn");
+        if turn
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed")
+            && turn
+                .and_then(final_agent_message_text)
+                .is_none_or(str::is_empty)
+        {
+            return;
+        }
+        if let Some(turn_id) = turn.and_then(|turn| turn.get("id")).and_then(Value::as_str)
+            && !mark_terminal_once(terminal_turns, turn_id)
+        {
+            return;
+        }
     }
     handler(message);
 }
@@ -414,18 +426,25 @@ fn terminal_turn(response: &Value, turn_id: &str) -> Option<Value> {
             match turn.get("status").and_then(Value::as_str) {
                 Some("failed" | "interrupted") => true,
                 Some("completed") => {
-                    turn.get("items")
-                        .and_then(Value::as_array)
-                        .is_some_and(|items| {
-                            items.iter().any(|item| {
-                                item.get("type").and_then(Value::as_str) == Some("agentMessage")
-                            })
-                        })
+                    final_agent_message_text(turn).is_some_and(|text| !text.is_empty())
                 }
                 _ => false,
             }
         })
         .cloned()
+}
+
+pub(crate) fn final_agent_message_text(turn: &Value) -> Option<&str> {
+    turn.get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        })
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
 }
 
 fn fail_pending(pending: &mut HashMap<u64, Sender<Result<Value, String>>>, message: &str) {
@@ -551,10 +570,81 @@ mod tests {
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let notification = json!({
             "method": "turn/completed",
-            "params": {"threadId": "thread", "turn": {"id": "turn", "status": "completed"}},
+            "params": {
+                "threadId": "thread",
+                "turn": {
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "done"}],
+                },
+            },
         });
         dispatch_notification(&handler, &terminal_turns, notification.clone());
         dispatch_notification(&handler, &terminal_turns, notification);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn incomplete_success_waits_for_reconciled_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let handler: NotificationHandler = Arc::new(move |_message| {
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+        });
+        let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
+        let incomplete = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {"id": "turn", "status": "completed", "items": []},
+            },
+        });
+        dispatch_notification(&handler, &terminal_turns, incomplete);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let empty_message = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": ""}],
+                },
+            },
+        });
+        dispatch_notification(&handler, &terminal_turns, empty_message);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let unfinished_final_message = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [
+                        {"type": "agentMessage", "text": "progress"},
+                        {"type": "agentMessage", "text": ""},
+                    ],
+                },
+            },
+        });
+        dispatch_notification(&handler, &terminal_turns, unfinished_final_message);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let reconciled = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "done"}],
+                },
+            },
+        });
+        dispatch_notification(&handler, &terminal_turns, reconciled);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
