@@ -6,11 +6,12 @@ import { defineConfig } from "vitepress";
 const installationSource = fileURLToPath(
   new URL("../installation.md", import.meta.url),
 );
+const siteBase = process.env.CF_PAGES === "1" ? "/" : "/dlgt/";
 
 export default defineConfig({
   title: "dlgt",
   description: "Let agents delegate to the competition.",
-  base: "/dlgt/",
+  base: siteBase,
   cleanUrls: true,
   lastUpdated: true,
   sitemap: { hostname: "https://combinatrix.ai/dlgt/" },

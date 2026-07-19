@@ -144,9 +144,9 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
     </section>
 
     <section class="docs-links">
-      <a href="/dlgt/cli"><span>Use it</span><strong>CLI reference</strong><small>Commands, options, models, and profiles</small></a>
-      <a href="/dlgt/design"><span>Understand it</span><strong>Design</strong><small>Lifecycle, storage, safety, and boundaries</small></a>
-      <a href="/dlgt/rpc"><span>Build on it</span><strong>Local RPC</strong><small>JSONL methods, schemas, events, and errors</small></a>
+      <a :href="withBase('/cli')"><span>Use it</span><strong>CLI reference</strong><small>Commands, options, models, and profiles</small></a>
+      <a :href="withBase('/design')"><span>Understand it</span><strong>Design</strong><small>Lifecycle, storage, safety, and boundaries</small></a>
+      <a :href="withBase('/rpc')"><span>Build on it</span><strong>Local RPC</strong><small>JSONL methods, schemas, events, and errors</small></a>
     </section>
   </main>
 </template>
