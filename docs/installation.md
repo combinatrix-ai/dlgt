@@ -63,6 +63,17 @@ curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh
 sh /tmp/install-dlgt.sh --skill both
 ~~~
 
+## Update an existing installation
+
+Run `dlgt update` after approving an update. It checks the latest GitHub
+release, replaces the current executable in its existing directory, and
+refreshes both embedded skill copies. Existing Sessions keep running on their
+original versioned daemon; later commands use the newly installed version.
+
+Machine-readable command responses may include an `info` object with code
+`UPDATE_AVAILABLE`. Agents should show the available version and ask the user
+before running `dlgt update`; the notice itself never installs anything.
+
 ## Install a specific version
 
 Pass a release tag or a bare semantic version. The installer normalizes a
@@ -254,5 +265,5 @@ publishes the resulting target-named archives and checksums.
   `attach` to identify first-run Harness UI that is waiting for input.
 
 Once these checks pass, the active harness can use the registered dlgt skill to
-create, address, wait for, and inspect persistent Sessions. See the
+create, address, wait for, and inspect live Sessions. See the
 [CLI reference](/cli) for the complete command contract.

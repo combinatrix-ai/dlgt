@@ -1,11 +1,10 @@
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use base64::Engine as _;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -13,10 +12,44 @@ use crate::protocol::InputRecord;
 use crate::protocol::{EventRecord, SessionRecord, TurnRecord};
 
 pub struct Store {
-    connection: Connection,
+    state: RefCell<MemoryState>,
 }
 
-const OUTPUT_CHUNK_LIMIT: i64 = 8192;
+const OUTPUT_CHUNK_LIMIT: usize = 8192;
+
+#[derive(Default)]
+struct MemoryState {
+    sessions: HashMap<String, StoredSession>,
+    turns: HashMap<String, TurnRecord>,
+    events: Vec<EventRecord>,
+    inputs: Vec<StoredInput>,
+    outputs: HashMap<String, VecDeque<OutputChunk>>,
+    next_event_seq: i64,
+    next_input_seq: i64,
+    next_output_seq: i64,
+}
+
+struct StoredSession {
+    record: SessionRecord,
+    terminal_rows: u16,
+    terminal_cols: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct StoredInput {
+    seq: i64,
+    session_id: String,
+    turn_id: Option<String>,
+    source: String,
+    data: Vec<u8>,
+    display: String,
+    created_at_ms: i64,
+}
+
+struct OutputChunk {
+    seq: i64,
+    data: Vec<u8>,
+}
 
 pub struct OutputPage {
     pub data: Vec<u8>,
@@ -36,328 +69,264 @@ pub struct NewSession<'a> {
     pub auto_approve: bool,
 }
 
+#[allow(
+    clippy::assigning_clones,
+    clippy::unnecessary_wraps,
+    clippy::unused_self
+)]
 impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("failed to secure {}", parent.display()))?;
+    pub fn new() -> Self {
+        Self {
+            state: RefCell::new(MemoryState::default()),
         }
-        let connection =
-            Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to secure {}", path.display()))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .context("failed to configure SQLite busy timeout")?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA foreign_keys=ON;
-                 CREATE TABLE IF NOT EXISTS sessions (
-                   id TEXT PRIMARY KEY,
-                   alias TEXT NOT NULL,
-                   title TEXT NOT NULL,
-                   agent TEXT NOT NULL,
-                   cwd TEXT NOT NULL,
-                   state TEXT NOT NULL,
-                   model TEXT,
-                   effort TEXT,
-                   harness_options_json TEXT NOT NULL DEFAULT '[]',
-                   auto_approve INTEGER NOT NULL DEFAULT 1,
-                   terminal_rows INTEGER NOT NULL DEFAULT 24,
-                   terminal_cols INTEGER NOT NULL DEFAULT 80,
-                   provider_session_id TEXT,
-                   active_turn_id TEXT,
-                   pid INTEGER,
-                   created_at_ms INTEGER NOT NULL,
-                   updated_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS turns (
-                   id TEXT PRIMARY KEY,
-                   session_id TEXT NOT NULL REFERENCES sessions(id),
-                   execution_seq INTEGER NOT NULL,
-                   prompt TEXT NOT NULL,
-                   state TEXT NOT NULL,
-                   provider_turn_id TEXT,
-                   final_message TEXT,
-                   error TEXT,
-                   created_at_ms INTEGER NOT NULL,
-                   started_at_ms INTEGER,
-                   completed_at_ms INTEGER
-                   ,usage_json TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS events (
-                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                   session_id TEXT,
-                   turn_id TEXT,
-                   kind TEXT NOT NULL,
-                   payload_json TEXT NOT NULL,
-                   created_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS inputs (
-                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                   session_id TEXT NOT NULL,
-                   turn_id TEXT,
-                   source TEXT NOT NULL,
-                   data BLOB NOT NULL,
-                   display TEXT NOT NULL,
-                   created_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS output_chunks (
-                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                   session_id TEXT NOT NULL,
-                   data BLOB NOT NULL,
-                   created_at_ms INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS events_session_seq
-                   ON events(session_id, seq);
-                 CREATE INDEX IF NOT EXISTS output_session_seq
-                   ON output_chunks(session_id, seq);
-                 CREATE UNIQUE INDEX IF NOT EXISTS active_session_alias
-                   ON sessions(alias) WHERE state NOT IN ('stopped', 'failed');
-                 CREATE UNIQUE INDEX IF NOT EXISTS execution_session_seq
-                   ON turns(session_id, execution_seq);",
-            )
-            .context("failed to migrate SQLite schema")?;
-        ensure_session_harness_options_column(&connection)?;
-        ensure_session_auto_approve_column(&connection)?;
-        Ok(Self { connection })
-    }
-
-    pub fn reconcile_after_restart(&self) -> Result<()> {
-        let now = now_ms();
-        self.connection.execute(
-            "UPDATE sessions SET
-             state = 'stopped', pid = NULL,
-             active_turn_id = NULL, updated_at_ms = ?1
-             WHERE state NOT IN ('stopped', 'failed')",
-            [now],
-        )?;
-        self.connection.execute(
-            "UPDATE turns SET state = 'interrupted', completed_at_ms = ?1,
-             error = COALESCE(error, 'dlgt daemon restarted')
-             WHERE state IN ('submitted', 'running')",
-            [now],
-        )?;
-        Ok(())
     }
 
     pub fn insert_session(&self, session: &NewSession<'_>) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.sessions.contains_key(session.id) {
+            bail!("session id already exists");
+        }
+        if state.sessions.values().any(|existing| {
+            existing.record.alias == session.alias && !terminal_session(&existing.record)
+        }) {
+            bail!("active session alias already exists");
+        }
         let now = now_ms();
-        let harness_options_json = serde_json::to_string(session.harness_options)
-            .context("failed to serialize harness options")?;
-        self.connection.execute(
-            "INSERT INTO sessions (
-               id, alias, title, agent, cwd, state, model, effort,
-               harness_options_json, auto_approve, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'starting', ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                session.id,
-                session.alias,
-                session.title,
-                session.agent,
-                session.cwd,
-                session.model,
-                session.effort,
-                harness_options_json,
-                session.auto_approve,
-                now
-            ],
-        )?;
+        state.sessions.insert(
+            session.id.to_owned(),
+            StoredSession {
+                record: SessionRecord {
+                    id: session.id.to_owned(),
+                    alias: session.alias.to_owned(),
+                    title: session.title.to_owned(),
+                    agent: session.agent.to_owned(),
+                    cwd: session.cwd.to_owned(),
+                    state: "starting".to_owned(),
+                    model: session.model.map(str::to_owned),
+                    effort: session.effort.map(str::to_owned),
+                    harness_options: session.harness_options.to_vec(),
+                    auto_approve: session.auto_approve,
+                    provider_session_id: None,
+                    active_turn_id: None,
+                    pid: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                },
+                terminal_rows: 24,
+                terminal_cols: 80,
+            },
+        );
         Ok(())
     }
 
     pub fn set_session_running(&self, id: &str, pid: Option<u32>) -> Result<bool> {
-        let updated = self.connection.execute(
-            "UPDATE sessions SET
-             state = CASE WHEN state = 'starting' THEN 'running' ELSE state END,
-             pid = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state IN ('starting', 'idle')",
-            params![id, pid.map(i64::from), now_ms()],
-        )?;
-        Ok(updated == 1)
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(id) else {
+            return Ok(false);
+        };
+        if !matches!(session.record.state.as_str(), "starting" | "idle") {
+            return Ok(false);
+        }
+        if session.record.state == "starting" {
+            session.record.state = "running".to_owned();
+        }
+        session.record.pid = pid;
+        session.record.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
-        let updated = self.connection.execute(
-            "UPDATE sessions SET
-             state = 'restarting', updated_at_ms = ?2
-             WHERE id = ?1 AND state NOT IN ('starting', 'stopping', 'restarting')",
-            params![id, now_ms()],
-        )?;
-        Ok(updated == 1)
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(id) else {
+            return Ok(false);
+        };
+        if matches!(
+            session.record.state.as_str(),
+            "starting" | "stopping" | "restarting"
+        ) {
+            return Ok(false);
+        }
+        session.record.state = "restarting".to_owned();
+        session.record.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub fn finish_session_restart_stop(&self, id: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sessions SET pid = NULL, active_turn_id = NULL, updated_at_ms = ?2
-             WHERE id = ?1 AND state = 'restarting'",
-            params![id, now_ms()],
-        )?;
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id)
+            && session.record.state == "restarting"
+        {
+            session.record.pid = None;
+            session.record.active_turn_id = None;
+            session.record.updated_at_ms = now_ms();
+        }
         Ok(())
     }
 
     pub fn start_restarted_session(&self, id: &str) -> Result<bool> {
-        let updated = self.connection.execute(
-            "UPDATE sessions SET state = 'starting', pid = NULL,
-             active_turn_id = NULL, updated_at_ms = ?2
-             WHERE id = ?1 AND state = 'restarting'",
-            params![id, now_ms()],
-        )?;
-        Ok(updated == 1)
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(id) else {
+            return Ok(false);
+        };
+        if session.record.state != "restarting" {
+            return Ok(false);
+        }
+        session.record.state = "starting".to_owned();
+        session.record.pid = None;
+        session.record.active_turn_id = None;
+        session.record.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub fn set_session_state(&self, id: &str, state: &str) -> Result<bool> {
-        let updated = self.connection.execute(
-            "UPDATE sessions SET state = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state NOT IN ('stopped', 'failed', 'stopping', 'restarting')",
-            params![id, state, now_ms()],
-        )?;
-        Ok(updated == 1)
+        let mut memory = self.state.borrow_mut();
+        let Some(session) = memory.sessions.get_mut(id) else {
+            return Ok(false);
+        };
+        if matches!(
+            session.record.state.as_str(),
+            "stopped" | "failed" | "stopping" | "restarting"
+        ) {
+            return Ok(false);
+        }
+        session.record.state = state.to_owned();
+        session.record.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub fn set_session_stopped(&self, id: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sessions SET
-             state = 'stopped', pid = NULL,
-             active_turn_id = NULL, updated_at_ms = ?2 WHERE id = ?1",
-            params![id, now_ms()],
-        )?;
+        set_terminal_session(&mut self.state.borrow_mut(), id, "stopped");
         Ok(())
     }
 
     pub fn set_session_failed(&self, id: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sessions SET
-             state = 'failed', pid = NULL,
-             active_turn_id = NULL, updated_at_ms = ?2 WHERE id = ?1",
-            params![id, now_ms()],
-        )?;
+        set_terminal_session(&mut self.state.borrow_mut(), id, "failed");
         Ok(())
     }
 
     pub fn set_session_provider_id(&self, id: &str, provider_id: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sessions SET provider_session_id = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![id, provider_id, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_active_turn(&self, session_id: &str, turn_id: Option<&str>) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sessions SET active_turn_id = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![session_id, turn_id, now_ms()],
-        )?;
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
+            session.record.provider_session_id = Some(provider_id.to_owned());
+            session.record.updated_at_ms = now_ms();
+        }
         Ok(())
     }
 
     pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sessions SET terminal_rows = ?2, terminal_cols = ?3, updated_at_ms = ?4 WHERE id = ?1",
-            params![session_id, rows, cols, now_ms()],
-        )?;
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.terminal_rows = rows;
+            session.terminal_cols = cols;
+            session.record.updated_at_ms = now_ms();
+        }
         Ok(())
     }
 
     pub fn terminal_size(&self, session_id: &str) -> Result<(u16, u16)> {
-        self.connection
-            .query_row(
-                "SELECT terminal_rows, terminal_cols FROM sessions WHERE id = ?1",
-                [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        self.state
+            .borrow()
+            .sessions
+            .get(session_id)
+            .map(|session| (session.terminal_rows, session.terminal_cols))
             .context("failed to read terminal size")
     }
 
     pub fn get_session(&self, selector: &str) -> Result<Option<SessionRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, alias, title, agent, cwd, state, model, effort,
-                    harness_options_json, auto_approve, provider_session_id, active_turn_id, pid,
-                    created_at_ms, updated_at_ms
-             FROM sessions WHERE id = ?1 OR
-               (alias = ?1 AND state NOT IN ('stopped', 'failed'))
-             ORDER BY created_at_ms DESC LIMIT 1",
-        )?;
-        statement
-            .query_row([selector], session_from_row)
-            .optional()
-            .context("failed to read session")
+        let state = self.state.borrow();
+        if let Some(session) = state.sessions.get(selector) {
+            return Ok(Some(session.record.clone()));
+        }
+        Ok(state
+            .sessions
+            .values()
+            .filter(|session| {
+                session.record.alias == selector && !terminal_session(&session.record)
+            })
+            .max_by_key(|session| session.record.created_at_ms)
+            .map(|session| session.record.clone()))
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, alias, title, agent, cwd, state, model, effort,
-                    harness_options_json, auto_approve, provider_session_id, active_turn_id, pid,
-                    created_at_ms, updated_at_ms
-             FROM sessions ORDER BY created_at_ms DESC",
-        )?;
-        let rows = statement.query_map([], session_from_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to list sessions")
+        let mut sessions = self
+            .state
+            .borrow()
+            .sessions
+            .values()
+            .map(|session| session.record.clone())
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at_ms));
+        Ok(sessions)
     }
 
     pub fn insert_turn(&mut self, id: &str, session_id: &str, prompt: &str) -> Result<TurnRecord> {
+        let mut state = self.state.borrow_mut();
+        if state.turns.contains_key(id) {
+            bail!("turn id already exists");
+        }
         let now = now_ms();
-        let transaction = self.connection.transaction()?;
-        let claimed = transaction.execute(
-            "UPDATE sessions SET active_turn_id = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND active_turn_id IS NULL AND state = 'idle'",
-            params![session_id, id, now],
-        )?;
-        if claimed == 0 {
+        let Some(session) = state.sessions.get(session_id) else {
+            bail!("session not found");
+        };
+        if session.record.active_turn_id.is_some() || session.record.state != "idle" {
             bail!("session already has an active turn or is not ready");
         }
-        let execution_seq: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(execution_seq), 0) + 1 FROM turns WHERE session_id = ?1",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        transaction.execute(
-            "INSERT INTO turns (id, session_id, execution_seq, prompt, state, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'submitted', ?5)",
-            params![id, session_id, execution_seq, prompt, now],
-        )?;
-        transaction.commit()?;
-        self.get_turn(id)?
-            .context("turn disappeared after insertion")
+        let execution_seq = state
+            .turns
+            .values()
+            .filter(|turn| turn.session_id == session_id)
+            .map(|turn| turn.execution_seq)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let turn = TurnRecord {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            execution_seq,
+            prompt: prompt.to_owned(),
+            state: "submitted".to_owned(),
+            provider_turn_id: None,
+            final_message: None,
+            error: None,
+            created_at_ms: now,
+            started_at_ms: None,
+            completed_at_ms: None,
+            usage: None,
+        };
+        state.turns.insert(id.to_owned(), turn.clone());
+        if let Some(session) = state.sessions.get_mut(session_id) {
+            session.record.active_turn_id = Some(id.to_owned());
+            session.record.updated_at_ms = now;
+        }
+        Ok(turn)
     }
 
     pub fn get_turn(&self, id: &str) -> Result<Option<TurnRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, session_id, execution_seq, prompt, state, provider_turn_id,
-                    final_message, error, created_at_ms, started_at_ms, completed_at_ms, usage_json
-             FROM turns WHERE id = ?1",
-        )?;
-        statement
-            .query_row([id], turn_from_row)
-            .optional()
-            .context("failed to read turn")
+        Ok(self.state.borrow().turns.get(id).cloned())
     }
 
     pub fn latest_turn(&self, session_id: &str) -> Result<Option<TurnRecord>> {
-        let id = self
-            .connection
-            .query_row(
-                "SELECT id FROM turns WHERE session_id = ?1 ORDER BY execution_seq DESC LIMIT 1",
-                [session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        id.map_or(Ok(None), |id| self.get_turn(&id))
+        Ok(self
+            .state
+            .borrow()
+            .turns
+            .values()
+            .filter(|turn| turn.session_id == session_id)
+            .max_by_key(|turn| turn.execution_seq)
+            .cloned())
     }
 
     pub fn mark_turn_started(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
-        let updated = self.connection.execute(
-            "UPDATE turns SET state = 'running', provider_turn_id = COALESCE(?2, provider_turn_id),
-             started_at_ms = COALESCE(started_at_ms, ?3)
-             WHERE id = ?1 AND state = 'submitted'",
-            params![id, provider_turn_id, now_ms()],
-        )?;
-        Ok(updated == 1)
+        let mut state = self.state.borrow_mut();
+        let Some(turn) = state.turns.get_mut(id) else {
+            return Ok(false);
+        };
+        if turn.state != "submitted" {
+            return Ok(false);
+        }
+        turn.state = "running".to_owned();
+        if turn.provider_turn_id.is_none() {
+            turn.provider_turn_id = provider_turn_id.map(str::to_owned);
+        }
+        turn.started_at_ms.get_or_insert_with(now_ms);
+        Ok(true)
     }
 
     pub fn complete_turn_if_matching(
@@ -380,7 +349,8 @@ impl Store {
         if !matches!(state, "completed" | "failed" | "interrupted") {
             bail!("invalid terminal turn state {state:?}");
         }
-        let turn = self.get_turn(id)?.context("turn not found")?;
+        let mut memory = self.state.borrow_mut();
+        let turn = memory.turns.get_mut(id).context("turn not found")?;
         if !matches!(turn.state.as_str(), "submitted" | "running")
             || provider_turn_id.is_some()
                 && turn.provider_turn_id.is_some()
@@ -388,59 +358,70 @@ impl Store {
         {
             return Ok(false);
         }
-        let updated = self.connection.execute(
-            "UPDATE turns SET state = ?2, provider_turn_id = COALESCE(?3, provider_turn_id),
-             final_message = ?4, error = ?5, completed_at_ms = ?6
-             WHERE id = ?1 AND state IN ('submitted', 'running')",
-            params![id, state, provider_turn_id, final_message, error, now_ms()],
-        )?;
-        if updated == 1 {
-            self.set_active_turn(&turn.session_id, None)?;
+        let session_id = turn.session_id.clone();
+        turn.state = state.to_owned();
+        if turn.provider_turn_id.is_none() {
+            turn.provider_turn_id = provider_turn_id.map(str::to_owned);
         }
-        Ok(updated == 1)
+        turn.final_message = final_message.map(str::to_owned);
+        turn.error = error.map(str::to_owned);
+        turn.completed_at_ms = Some(now_ms());
+        if let Some(session) = memory.sessions.get_mut(&session_id)
+            && session.record.active_turn_id.as_deref() == Some(id)
+        {
+            session.record.active_turn_id = None;
+            session.record.updated_at_ms = now_ms();
+        }
+        Ok(true)
     }
 
     pub fn interrupt_active_turn(&self, session_id: &str, error: &str) -> Result<Option<String>> {
-        let Some(session) = self.get_session(session_id)? else {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get(session_id) else {
             return Ok(None);
         };
-        let Some(turn_id) = session.active_turn_id else {
+        let Some(turn_id) = session.record.active_turn_id.clone() else {
             return Ok(None);
         };
-        let updated = self.connection.execute(
-            "UPDATE turns SET state = 'interrupted', error = ?2, completed_at_ms = ?3
-             WHERE id = ?1 AND state IN ('submitted', 'running')",
-            params![turn_id, error, now_ms()],
-        )?;
-        if updated == 1 {
-            self.set_active_turn(session_id, None)?;
-            Ok(Some(turn_id))
-        } else {
-            Ok(None)
+        let Some(turn) = state.turns.get_mut(&turn_id) else {
+            return Ok(None);
+        };
+        if !matches!(turn.state.as_str(), "submitted" | "running") {
+            return Ok(None);
         }
+        turn.state = "interrupted".to_owned();
+        turn.error = Some(error.to_owned());
+        turn.completed_at_ms = Some(now_ms());
+        if let Some(session) = state.sessions.get_mut(session_id) {
+            session.record.active_turn_id = None;
+            session.record.updated_at_ms = now_ms();
+        }
+        Ok(Some(turn_id))
     }
 
     pub fn cancel_turn(&mut self, id: &str) -> Result<bool> {
-        let turn = self.get_turn(id)?.context("turn not found")?;
-        let transaction = self.connection.transaction()?;
-        let updated = transaction.execute(
-            "UPDATE turns SET state = 'canceled', completed_at_ms = ?2
-             WHERE id = ?1 AND state IN ('submitted', 'running')",
-            params![id, now_ms()],
-        )?;
-        if updated == 1 {
-            transaction.execute(
-                "UPDATE sessions SET state = 'quiescing', updated_at_ms = ?3
-                 WHERE id = ?1 AND active_turn_id = ?2",
-                params![turn.session_id, id, now_ms()],
-            )?;
+        let mut state = self.state.borrow_mut();
+        let Some(turn) = state.turns.get_mut(id) else {
+            bail!("turn not found");
+        };
+        if !matches!(turn.state.as_str(), "submitted" | "running") {
+            return Ok(false);
         }
-        transaction.commit()?;
-        Ok(updated == 1)
+        turn.state = "canceled".to_owned();
+        turn.completed_at_ms = Some(now_ms());
+        let session_id = turn.session_id.clone();
+        if let Some(session) = state.sessions.get_mut(&session_id)
+            && session.record.active_turn_id.as_deref() == Some(id)
+        {
+            session.record.state = "quiescing".to_owned();
+            session.record.updated_at_ms = now_ms();
+        }
+        Ok(true)
     }
 
     pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
-        let turn = self.get_turn(id)?.context("turn not found")?;
+        let mut state = self.state.borrow_mut();
+        let turn = state.turns.get(id).context("turn not found")?;
         if turn.state != "canceled"
             || provider_turn_id.is_some()
                 && turn.provider_turn_id.is_some()
@@ -448,12 +429,19 @@ impl Store {
         {
             return Ok(false);
         }
-        let updated = self.connection.execute(
-            "UPDATE sessions SET active_turn_id = NULL, state = 'idle', updated_at_ms = ?3
-             WHERE id = ?1 AND active_turn_id = ?2 AND state = 'quiescing'",
-            params![turn.session_id, id, now_ms()],
-        )?;
-        Ok(updated == 1)
+        let session_id = turn.session_id.clone();
+        let Some(session) = state.sessions.get_mut(&session_id) else {
+            return Ok(false);
+        };
+        if session.record.active_turn_id.as_deref() != Some(id)
+            || session.record.state != "quiescing"
+        {
+            return Ok(false);
+        }
+        session.record.active_turn_id = None;
+        session.record.state = "idle".to_owned();
+        session.record.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub fn record_event(
@@ -463,12 +451,18 @@ impl Store {
         kind: &str,
         payload: &Value,
     ) -> Result<i64> {
-        self.connection.execute(
-            "INSERT INTO events (session_id, turn_id, kind, payload_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, turn_id, kind, payload.to_string(), now_ms()],
-        )?;
-        Ok(self.connection.last_insert_rowid())
+        let mut state = self.state.borrow_mut();
+        state.next_event_seq += 1;
+        let seq = state.next_event_seq;
+        state.events.push(EventRecord {
+            seq,
+            session_id: session_id.map(str::to_owned),
+            turn_id: turn_id.map(str::to_owned),
+            kind: kind.to_owned(),
+            payload: payload.clone(),
+            created_at_ms: now_ms(),
+        });
+        Ok(seq)
     }
 
     pub fn record_input(
@@ -478,34 +472,33 @@ impl Store {
         source: &str,
         data: &[u8],
     ) -> Result<i64> {
-        self.connection.execute(
-            "INSERT INTO inputs (session_id, turn_id, source, data, display, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                session_id,
-                turn_id,
-                source,
-                data,
-                display_bytes(data),
-                now_ms()
-            ],
-        )?;
-        Ok(self.connection.last_insert_rowid())
+        let mut state = self.state.borrow_mut();
+        state.next_input_seq += 1;
+        let seq = state.next_input_seq;
+        state.inputs.push(StoredInput {
+            seq,
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.map(str::to_owned),
+            source: source.to_owned(),
+            data: data.to_vec(),
+            display: display_bytes(data),
+            created_at_ms: now_ms(),
+        });
+        Ok(seq)
     }
 
     pub fn record_output(&self, session_id: &str, data: &[u8]) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO output_chunks (session_id, data, created_at_ms) VALUES (?1, ?2, ?3)",
-            params![session_id, data, now_ms()],
-        )?;
-        self.connection.execute(
-            "DELETE FROM output_chunks
-             WHERE session_id = ?1 AND seq <= (
-               SELECT seq FROM output_chunks
-               WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1 OFFSET ?2
-             )",
-            params![session_id, OUTPUT_CHUNK_LIMIT],
-        )?;
+        let mut state = self.state.borrow_mut();
+        state.next_output_seq += 1;
+        let seq = state.next_output_seq;
+        let chunks = state.outputs.entry(session_id.to_owned()).or_default();
+        chunks.push_back(OutputChunk {
+            seq,
+            data: data.to_vec(),
+        });
+        while chunks.len() > OUTPUT_CHUNK_LIMIT {
+            chunks.pop_front();
+        }
         Ok(())
     }
 
@@ -515,32 +508,26 @@ impl Store {
         after: i64,
         limit_bytes: usize,
     ) -> Result<OutputPage> {
-        let mut statement = self.connection.prepare(
-            "SELECT seq, data FROM output_chunks
-             WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
-        )?;
-        let mut rows = statement.query(params![session_id, after])?;
+        let state = self.state.borrow();
+        let chunks = state.outputs.get(session_id);
         let mut output = Vec::new();
         let mut next_after = after;
-        while let Some(row) = rows.next()? {
-            let seq: i64 = row.get(0)?;
-            let data: Vec<u8> = row.get(1)?;
-            if !output.is_empty() && output.len().saturating_add(data.len()) > limit_bytes {
+        for chunk in chunks
+            .into_iter()
+            .flatten()
+            .filter(|chunk| chunk.seq > after)
+        {
+            if !output.is_empty() && output.len().saturating_add(chunk.data.len()) > limit_bytes {
                 break;
             }
-            output.extend(data);
-            next_after = seq;
+            output.extend(&chunk.data);
+            next_after = chunk.seq;
             if output.len() >= limit_bytes {
                 break;
             }
         }
-        let has_more = self.connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM output_chunks WHERE session_id = ?1 AND seq > ?2
-             )",
-            params![session_id, next_after],
-            |row| row.get::<_, bool>(0),
-        )?;
+        let has_more =
+            chunks.is_some_and(|chunks| chunks.iter().any(|chunk| chunk.seq > next_after));
         Ok(OutputPage {
             data: output,
             next_after,
@@ -550,130 +537,51 @@ impl Store {
 
     #[cfg(test)]
     pub fn read_inputs(&self, session_id: &str, after: i64) -> Result<Vec<InputRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT seq, session_id, turn_id, source, data, display, created_at_ms
-             FROM inputs WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
-        )?;
-        let rows = statement.query_map(params![session_id, after], |row| {
-            let data: Vec<u8> = row.get(4)?;
-            Ok(InputRecord {
-                seq: row.get(0)?,
-                session_id: row.get(1)?,
-                turn_id: row.get(2)?,
-                source: row.get(3)?,
-                data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
-                display: row.get(5)?,
-                byte_len: data.len(),
-                created_at_ms: row.get(6)?,
+        Ok(self
+            .state
+            .borrow()
+            .inputs
+            .iter()
+            .filter(|input| input.session_id == session_id && input.seq > after)
+            .map(|input| InputRecord {
+                seq: input.seq,
+                session_id: input.session_id.clone(),
+                turn_id: input.turn_id.clone(),
+                source: input.source.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&input.data),
+                display: input.display.clone(),
+                byte_len: input.data.len(),
+                created_at_ms: input.created_at_ms,
             })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to read input log")
+            .collect())
     }
 
     pub fn read_events(&self, session_id: Option<&str>, after: i64) -> Result<Vec<EventRecord>> {
-        let sql = if session_id.is_some() {
-            "SELECT seq, session_id, turn_id, kind, payload_json, created_at_ms
-             FROM events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq"
-        } else {
-            "SELECT seq, session_id, turn_id, kind, payload_json, created_at_ms
-             FROM events WHERE ?1 IS NULL AND seq > ?2 ORDER BY seq"
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(params![session_id, after], |row| {
-            let payload_json: String = row.get(4)?;
-            Ok(EventRecord {
-                seq: row.get(0)?,
-                session_id: row.get(1)?,
-                turn_id: row.get(2)?,
-                kind: row.get(3)?,
-                payload: serde_json::from_str(&payload_json).unwrap_or(Value::Null),
-                created_at_ms: row.get(5)?,
+        Ok(self
+            .state
+            .borrow()
+            .events
+            .iter()
+            .filter(|event| {
+                event.seq > after
+                    && session_id.is_none_or(|id| event.session_id.as_deref() == Some(id))
             })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to read events")
+            .cloned()
+            .collect())
     }
 }
 
-fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let harness_options_json: String = row.get(8)?;
-    let harness_options = serde_json::from_str(&harness_options_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    let pid = row
-        .get::<_, Option<i64>>(12)?
-        .and_then(|value| u32::try_from(value).ok());
-    Ok(SessionRecord {
-        id: row.get(0)?,
-        alias: row.get(1)?,
-        title: row.get(2)?,
-        agent: row.get(3)?,
-        cwd: row.get(4)?,
-        state: row.get(5)?,
-        model: row.get(6)?,
-        effort: row.get(7)?,
-        harness_options,
-        auto_approve: row.get(9)?,
-        provider_session_id: row.get(10)?,
-        active_turn_id: row.get(11)?,
-        pid,
-        created_at_ms: row.get(13)?,
-        updated_at_ms: row.get(14)?,
-    })
+fn terminal_session(session: &SessionRecord) -> bool {
+    matches!(session.state.as_str(), "stopped" | "failed")
 }
 
-fn ensure_session_harness_options_column(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "harness_options_json" {
-            return Ok(());
-        }
+fn set_terminal_session(state: &mut MemoryState, id: &str, terminal_state: &str) {
+    if let Some(session) = state.sessions.get_mut(id) {
+        terminal_state.clone_into(&mut session.record.state);
+        session.record.pid = None;
+        session.record.active_turn_id = None;
+        session.record.updated_at_ms = now_ms();
     }
-    connection
-        .execute(
-            "ALTER TABLE sessions ADD COLUMN harness_options_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        )
-        .context("failed to add sessions.harness_options_json")?;
-    Ok(())
-}
-
-fn ensure_session_auto_approve_column(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "auto_approve" {
-            return Ok(());
-        }
-    }
-    connection
-        .execute(
-            "ALTER TABLE sessions ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 1",
-            [],
-        )
-        .context("failed to add sessions.auto_approve")?;
-    Ok(())
-}
-
-fn turn_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
-    Ok(TurnRecord {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        execution_seq: row.get(2)?,
-        prompt: row.get(3)?,
-        state: row.get(4)?,
-        provider_turn_id: row.get(5)?,
-        final_message: row.get(6)?,
-        error: row.get(7)?,
-        created_at_ms: row.get(8)?,
-        started_at_ms: row.get(9)?,
-        completed_at_ms: row.get(10)?,
-        usage: row
-            .get::<_, Option<String>>(11)?
-            .and_then(|value| serde_json::from_str(&value).ok()),
-    })
 }
 
 pub fn now_ms() -> i64 {
@@ -719,55 +627,8 @@ mod tests {
     }
 
     #[test]
-    fn migrates_existing_sessions_to_empty_harness_options() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let path = directory.path().join("state.db");
-        let connection = rusqlite::Connection::open(&path)
-            .unwrap_or_else(|error| panic!("failed to create legacy store: {error}"));
-        connection
-            .execute_batch(
-                "CREATE TABLE sessions (
-                   id TEXT PRIMARY KEY,
-                   alias TEXT NOT NULL,
-                   title TEXT NOT NULL,
-                   agent TEXT NOT NULL,
-                   cwd TEXT NOT NULL,
-                   state TEXT NOT NULL,
-                   model TEXT,
-                   effort TEXT,
-                   terminal_rows INTEGER NOT NULL DEFAULT 24,
-                   terminal_cols INTEGER NOT NULL DEFAULT 80,
-                   provider_session_id TEXT,
-                   active_turn_id TEXT,
-                   pid INTEGER,
-                   created_at_ms INTEGER NOT NULL,
-                   updated_at_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO sessions (
-                   id, alias, title, agent, cwd, state, created_at_ms, updated_at_ms
-                 ) VALUES ('ses_legacy', '@legacy', 'legacy', 'claude', '/tmp',
-                           'stopped', 1, 1);",
-            )
-            .unwrap_or_else(|error| panic!("failed to initialize legacy store: {error}"));
-        drop(connection);
-
-        let store = Store::open(&path)
-            .unwrap_or_else(|error| panic!("failed to migrate legacy store: {error}"));
-        let session = store
-            .get_session("ses_legacy")
-            .unwrap_or_else(|error| panic!("failed to read migrated session: {error}"))
-            .unwrap_or_else(|| panic!("migrated session missing"));
-        assert!(session.harness_options.is_empty());
-        assert!(session.auto_approve);
-    }
-
-    #[test]
-    fn persists_explicit_auto_approve_opt_out() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+    fn retains_explicit_auto_approve_opt_out() {
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -789,11 +650,8 @@ mod tests {
     }
 
     #[test]
-    fn persists_session_turn_event_and_input() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+    fn retains_session_turn_event_and_input() {
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -828,16 +686,36 @@ mod tests {
     }
 
     #[test]
+    fn unscoped_event_reads_include_session_events() {
+        let store = Store::new();
+        store
+            .record_event(Some("ses_1"), None, "session.started", &json!({}))
+            .unwrap_or_else(|error| panic!("failed to record session event: {error}"));
+        store
+            .record_event(None, None, "runtime.started", &json!({}))
+            .unwrap_or_else(|error| panic!("failed to record global event: {error}"));
+
+        let events = store
+            .read_events(None, 0)
+            .unwrap_or_else(|error| panic!("failed to read all events: {error}"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            store
+                .read_events(Some("ses_1"), 0)
+                .unwrap_or_else(|error| panic!("failed to read session events: {error}"))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn formats_control_bytes_without_losing_data() {
         assert_eq!(display_bytes(b"a\n\x1b"), "a\\n\\x1b");
     }
 
     #[test]
     fn stopped_session_releases_its_alias() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_old",
@@ -885,10 +763,7 @@ mod tests {
 
     #[test]
     fn terminal_session_can_restart_without_losing_identity() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let store = Store::new();
         let harness_options = vec!["permission-mode=auto".to_owned()];
         store
             .insert_session(&NewSession {
@@ -946,10 +821,7 @@ mod tests {
 
     #[test]
     fn active_session_can_enter_restart_without_releasing_its_alias() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1006,10 +878,7 @@ mod tests {
 
     #[test]
     fn process_exit_interrupts_active_turn() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1041,10 +910,7 @@ mod tests {
 
     #[test]
     fn output_reads_are_paginated() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1078,10 +944,7 @@ mod tests {
 
     #[test]
     fn only_one_turn_can_claim_a_session() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1104,10 +967,7 @@ mod tests {
 
     #[test]
     fn claude_cannot_claim_a_turn_before_session_start() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_claude",
@@ -1132,10 +992,7 @@ mod tests {
 
     #[test]
     fn stop_must_match_a_running_provider_turn() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1172,10 +1029,7 @@ mod tests {
 
     #[test]
     fn late_cancel_cannot_clear_a_newer_active_turn() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1220,10 +1074,7 @@ mod tests {
 
     #[test]
     fn active_cancel_waits_for_provider_quiescence() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let mut store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let mut store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -1275,10 +1126,7 @@ mod tests {
 
     #[test]
     fn terminal_session_cannot_be_resurrected() {
-        let directory = tempfile::tempdir()
-            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",

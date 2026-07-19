@@ -13,6 +13,14 @@ use crate::paths;
 use crate::protocol::{Request, Response};
 use crate::raw_mode::{RawModeGuard, terminal_size};
 
+static LAST_INFO: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+fn set_info(info: Option<Value>) {
+    if let Ok(mut slot) = LAST_INFO.lock() {
+        *slot = info;
+    }
+}
+
 #[derive(Debug)]
 pub struct RpcFailure {
     pub code: String,
@@ -47,7 +55,11 @@ pub fn call(method: &str, params: Value) -> Result<Value> {
 
 pub fn call_existing(method: &str, params: Value) -> Result<Value> {
     let socket = paths::socket_path()?;
-    let mut stream = UnixStream::connect(&socket)
+    call_socket(&socket, method, params)
+}
+
+fn call_socket(socket: &Path, method: &str, params: Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("dlgt server is not running at {}", socket.display()))?;
     let request = Request {
         id: format!("req_{}", Uuid::new_v4().simple()),
@@ -60,6 +72,40 @@ pub fn call_existing(method: &str, params: Value) -> Result<Value> {
         .read_line(&mut line)
         .context("failed to read daemon response")?;
     decode_response(&line)
+}
+
+pub fn list_all_versions(include_all: bool) -> Result<Vec<Value>> {
+    let mut sessions = Vec::new();
+    let current_socket = paths::socket_path()?;
+    let mut current_info = None;
+    for socket in paths::runtime_sockets()? {
+        let Ok(ping) = call_socket(&socket, "server.ping", json!({})) else {
+            continue;
+        };
+        let Some(version) = ping.get("version").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(result) = call_socket(&socket, "session.list", json!({"all":include_all})) else {
+            continue;
+        };
+        let runtime_info = take_info();
+        if socket == current_socket {
+            current_info = runtime_info;
+        }
+        let Some(runtime_sessions) = result.as_array() else {
+            continue;
+        };
+        for session in runtime_sessions {
+            let mut session = session.clone();
+            if let Some(object) = session.as_object_mut() {
+                object.insert("runtime_version".to_owned(), json!(version));
+                object.insert("runtime_socket".to_owned(), json!(socket));
+            }
+            sessions.push(session);
+        }
+    }
+    set_info(current_info);
+    Ok(sessions)
 }
 
 pub fn attach(selector: &str, steal: bool) -> Result<()> {
@@ -186,7 +232,7 @@ pub fn rpc_stdio() -> Result<()> {
         } else {
             call(&request.method, request.params)
         } {
-            Ok(result) => Response::ok(request.id, result),
+            Ok(result) => Response::ok(request.id, result).with_info(take_info()),
             Err(error) => error.downcast_ref::<RpcFailure>().map_or_else(
                 || Response::error(&request.id, "RPC_UNAVAILABLE", error.to_string()),
                 |failure| {
@@ -261,6 +307,9 @@ fn decode_response(line: &str) -> Result<Value> {
         bail!("dlgt server closed the connection without a response");
     }
     let response: Response = serde_json::from_str(line).context("invalid daemon response")?;
+    if let Ok(mut info) = LAST_INFO.lock() {
+        info.clone_from(&response.info);
+    }
     if let Some(error) = response.error {
         return Err(RpcFailure {
             code: error.code,
@@ -271,6 +320,10 @@ fn decode_response(line: &str) -> Result<Value> {
         .into());
     }
     response.result.context("daemon response had no result")
+}
+
+pub fn take_info() -> Option<Value> {
+    LAST_INFO.lock().ok()?.take()
 }
 
 fn public_rpc_method(method: &str) -> bool {

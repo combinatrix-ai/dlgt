@@ -22,6 +22,16 @@ Success:
 {"id":"req_1","result":{"execution_seq":1,"result":{"status":"completed","final_text":"done"}}}
 ```
 
+A successful non-streaming response may also carry an informational notice
+without changing the result:
+
+```json
+{"id":"req_1","result":[],"info":{"code":"UPDATE_AVAILABLE","current_version":"0.1.4","latest_version":"0.2.0","command":"dlgt update"}}
+```
+
+`info` is advisory. Clients should present it separately from the result, and
+must obtain user confirmation before acting on `UPDATE_AVAILABLE`.
+
 Failure:
 
 ```json
@@ -41,7 +51,7 @@ session.send          Accept work on an existing idle Session
 session.wait          Wait for the bound current or latest execution
 session.cancel        Interrupt active work, bounded by timeout_ms
 session.list          List active or all Sessions
-session.read          Read Session state and latest durable result
+session.read          Read live Session state and latest retained result
 session.stop          Stop the Harness process group
 event.read            Read normalized versioned lifecycle events
 event.subscribe       Stream normalized lifecycle events
@@ -79,7 +89,7 @@ mutable client configuration.
 
 `harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
 The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
-and persists the array so `session.restart` reuses the same launch behavior.
+and retains the array so `session.restart` reuses the same launch behavior.
 When the array carries no `permission-mode` entry and `auto_approve` is true,
 dlgt adds `--permission-mode=auto`; `auto_approve: false` keeps Claude Code's
 own permission default. Codex Harness options are not currently supported.
@@ -103,7 +113,7 @@ This is correlation data, never an RPC selector or public resource ID.
 The returned Session state is a snapshot taken when the response is built; use
 lifecycle events or a later `session.read` for current state.
 
-A durable result has this shape:
+A retained result has this shape:
 
 ```json
 {
@@ -123,7 +133,7 @@ empty. Other terminal states may include partial text and provide a structured
 error. Usage is nullable because provider support differs.
 
 `session.wait` binds to the active execution and sequence at request time. If
-the Session is idle, it returns the latest durable result; if no execution has
+the Session is idle, it returns the latest retained result; if no execution has
 ever been accepted, it fails with `NO_RESULT`. A timeout does not cancel work.
 
 ## Lifecycle events
@@ -224,7 +234,7 @@ CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 PROVIDER_FAILED        Provider terminalized work as failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
-INTERNAL               dlgt invariant or persistence failure
+INTERNAL               dlgt runtime invariant failure
 ```
 
 Methods may add contextual error fields but must not overload a code with a

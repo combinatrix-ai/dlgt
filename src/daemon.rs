@@ -22,9 +22,11 @@ use crate::provider::{
 };
 use crate::session::SessionRuntime;
 use crate::store::{NewSession, Store};
+use crate::update;
 
 const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
+const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 pub fn run() -> Result<()> {
     let socket_path = paths::socket_path()?;
@@ -43,13 +45,13 @@ pub fn run() -> Result<()> {
             .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
     }
 
-    let store = Store::open(&paths::database_path()?)?;
-    store.reconcile_after_restart()?;
+    let store = Store::new();
     let daemon = Arc::new(Daemon {
         store: Arc::new(Mutex::new(store)),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
         shutting_down: AtomicBool::new(false),
+        update_notice: RwLock::new(None),
     });
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
@@ -59,6 +61,19 @@ pub fn run() -> Result<()> {
         .set_nonblocking(true)
         .context("failed to make server socket nonblocking")?;
 
+    let update_daemon = Arc::clone(&daemon);
+    std::thread::Builder::new()
+        .name("dlgt-update-check".to_owned())
+        .spawn(move || {
+            if let Some(notice) = update::check_for_update()
+                && let Ok(mut stored) = update_daemon.update_notice.write()
+            {
+                *stored = Some(notice);
+            }
+        })
+        .context("failed to start update check")?;
+
+    let mut empty_since = Instant::now();
     while !daemon.shutting_down.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _address)) => {
@@ -83,17 +98,35 @@ pub fn run() -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error).context("failed to accept RPC connection"),
         }
+        let empty = daemon
+            .sessions
+            .read()
+            .map_or(true, |sessions| sessions.is_empty());
+        if empty {
+            if empty_since.elapsed() >= EMPTY_DAEMON_IDLE_TIMEOUT {
+                break;
+            }
+        } else {
+            empty_since = Instant::now();
+        }
     }
 
     if let Ok(sessions) = daemon.sessions.read() {
         for runtime in sessions.values() {
-            let _ = runtime.stop();
+            // Daemon shutdown is the ownership boundary: no provider process
+            // may outlive the runtime that created it. A graceful child-only
+            // stop can leave descendants alive, so terminate the whole PTY
+            // process group here.
+            let _ = runtime.force_stop();
         }
     }
     drop(listener);
     if socket_path.exists() {
         fs::remove_file(&socket_path)
             .with_context(|| format!("failed to remove {}", socket_path.display()))?;
+    }
+    if let Some(directory) = socket_path.parent() {
+        let _ = fs::remove_dir(directory);
     }
     Ok(())
 }
@@ -103,6 +136,7 @@ struct Daemon {
     sessions: Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
     attach_leases: Mutex<HashMap<String, String>>,
     shutting_down: AtomicBool,
+    update_notice: RwLock<Option<Value>>,
 }
 
 enum AgentRuntime {
@@ -216,7 +250,12 @@ impl Daemon {
             return self.subscribe_events(&mut stream, &request);
         }
         let response = match self.dispatch(&request.method, &request.params) {
-            Ok(result) => Response::ok(request.id, result),
+            Ok(result) => Response::ok(request.id, result).with_info(
+                self.update_notice
+                    .read()
+                    .ok()
+                    .and_then(|notice| notice.clone()),
+            ),
             Err(error) => {
                 if let Some(failure) = error.downcast_ref::<SessionLaunchFailure>() {
                     Response::session_error(
@@ -236,7 +275,11 @@ impl Daemon {
 
     fn dispatch(&self, method: &str, params: &Value) -> Result<Value> {
         match method {
-            "server.ping" => Ok(json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})),
+            "server.ping" => Ok(json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "socket": paths::socket_path()?,
+            })),
             "server.stop" => {
                 self.shutting_down.store(true, Ordering::SeqCst);
                 Ok(json!({"stopping": true}))
@@ -717,14 +760,14 @@ impl Daemon {
             if let Ok(store) = output_store.lock()
                 && let Err(error) = store.record_output(&output_session_id, data)
             {
-                eprintln!("dlgt failed to persist PTY output: {error:#}");
+                eprintln!("dlgt failed to retain PTY output: {error:#}");
             }
         });
         let exit_store = Arc::clone(&self.store);
         let exit_sessions = Arc::clone(&self.sessions);
         let exit_session_id = session_id.to_owned();
         let on_exit = Arc::new(move |exit_code: u32| {
-            persist_session_exit(&exit_store, &exit_sessions, &exit_session_id, exit_code);
+            record_session_exit(&exit_store, &exit_sessions, &exit_session_id, exit_code);
         });
         SessionRuntime::spawn(
             spec,
@@ -790,14 +833,14 @@ impl Daemon {
             if let Ok(store) = output_store.lock()
                 && let Err(error) = store.record_output(&output_session_id, data)
             {
-                eprintln!("dlgt failed to persist Codex TUI output: {error:#}");
+                eprintln!("dlgt failed to retain Codex TUI output: {error:#}");
             }
         });
         let exit_store = Arc::clone(&self.store);
         let exit_sessions = Arc::clone(&self.sessions);
         let exit_session_id = session_id.clone();
         let on_exit = Arc::new(move |exit_code: u32| {
-            persist_session_exit(&exit_store, &exit_sessions, &exit_session_id, exit_code);
+            record_session_exit(&exit_store, &exit_sessions, &exit_session_id, exit_code);
         });
         let view = SessionRuntime::spawn(
             &spec,
@@ -1442,7 +1485,7 @@ impl Daemon {
     fn lock_store(&self) -> Result<MutexGuard<'_, Store>> {
         self.store
             .lock()
-            .map_err(|_| anyhow!("SQLite store lock poisoned"))
+            .map_err(|_| anyhow!("session store lock poisoned"))
     }
 }
 
@@ -1969,7 +2012,7 @@ fn sanitize_message(message: &str) -> String {
     message.chars().take(4_096).collect()
 }
 
-fn persist_session_exit(
+fn record_session_exit(
     store: &Arc<Mutex<Store>>,
     sessions: &Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
     session_id: &str,
@@ -1986,7 +2029,7 @@ fn persist_session_exit(
                 "stopping" | "stopped" | "restarting"
             )
         });
-        persist_exit_result(&store, session.as_ref(), exit_code, intentional);
+        record_exit_result(&store, session.as_ref(), exit_code, intentional);
         let terminal = if restarting {
             store.finish_session_restart_stop(session_id)
         } else if intentional {
@@ -2009,7 +2052,7 @@ fn persist_session_exit(
             },
             &json!({"exit_code": exit_code}),
         ) {
-            eprintln!("dlgt failed to persist session exit: {error:#}");
+            eprintln!("dlgt failed to record session exit: {error:#}");
         }
     }
     if let Ok(mut sessions) = sessions.write() {
@@ -2017,7 +2060,7 @@ fn persist_session_exit(
     }
 }
 
-fn persist_exit_result(
+fn record_exit_result(
     store: &Store,
     session: Option<&SessionRecord>,
     exit_code: u32,
@@ -2043,7 +2086,7 @@ fn persist_exit_result(
             );
         }
         Ok(false) => {}
-        Err(error) => eprintln!("dlgt failed to persist provider exit result: {error:#}"),
+        Err(error) => eprintln!("dlgt failed to record provider exit result: {error:#}"),
     }
 }
 
@@ -2243,11 +2286,8 @@ mod tests {
     };
     use crate::store::{NewSession, Store};
 
-    fn ready_store(agent: &str) -> (tempfile::TempDir, Store) {
-        let directory =
-            tempfile::tempdir().unwrap_or_else(|error| panic!("failed to create tempdir: {error}"));
-        let store = Store::open(&directory.path().join("state.db"))
-            .unwrap_or_else(|error| panic!("failed to open store: {error}"));
+    fn ready_store(agent: &str) -> Store {
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "ses_1",
@@ -2271,7 +2311,7 @@ mod tests {
                 .set_session_state("ses_1", "idle")
                 .unwrap_or_else(|error| panic!("failed to ready session: {error}"))
         );
-        (directory, store)
+        store
     }
 
     #[test]
@@ -2297,7 +2337,7 @@ mod tests {
 
     #[test]
     fn public_session_exposes_provider_session_id() {
-        let (_directory, store) = ready_store("codex");
+        let store = ready_store("codex");
         store
             .set_session_provider_id("ses_1", "provider_1")
             .unwrap_or_else(|error| panic!("failed to bind provider session: {error}"));
@@ -2312,7 +2352,7 @@ mod tests {
 
     #[test]
     fn public_result_exposes_sequence_but_not_internal_turn_identity() {
-        let (_directory, mut store) = ready_store("codex");
+        let mut store = ready_store("codex");
         let turn = store
             .insert_turn("turn_private", "ses_1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
@@ -2341,7 +2381,7 @@ mod tests {
 
     #[test]
     fn claude_stop_failure_finishes_the_turn_as_failed() {
-        let (_directory, mut store) = ready_store("claude");
+        let mut store = ready_store("claude");
         store
             .insert_turn("turn_1", "ses_1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
@@ -2379,7 +2419,7 @@ mod tests {
 
     #[test]
     fn codex_retry_error_does_not_finish_before_authoritative_completion() {
-        let (_directory, mut store) = ready_store("codex");
+        let mut store = ready_store("codex");
         store
             .set_session_provider_id("ses_1", "thread-1")
             .unwrap_or_else(|error| panic!("failed to bind thread: {error}"));
@@ -2455,7 +2495,7 @@ mod tests {
 
     #[test]
     fn codex_terminal_event_quiesces_without_resurrecting_a_canceled_turn() {
-        let (_directory, mut store) = ready_store("codex");
+        let mut store = ready_store("codex");
         store
             .set_session_provider_id("ses_1", "thread-1")
             .unwrap_or_else(|error| panic!("failed to bind thread: {error}"));
