@@ -14,7 +14,7 @@ use portable_pty::PtySize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::codex::CodexConnection;
+use crate::codex::{CodexConnection, final_agent_message_text};
 use crate::paths;
 use crate::protocol::{Request, Response, SessionRecord, TurnRecord};
 use crate::provider::{
@@ -22,6 +22,9 @@ use crate::provider::{
 };
 use crate::session::SessionRuntime;
 use crate::store::{NewSession, Store};
+
+const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn run() -> Result<()> {
     let socket_path = paths::socket_path()?;
@@ -1450,6 +1453,16 @@ fn write_semantic_input(runtime: &AgentRuntime, input: &[u8]) -> Result<()> {
     if commit != b'\r' {
         bail!("semantic input must end with carriage return");
     }
+    runtime
+        .wait_for_input_ready(CLAUDE_INPUT_READY_TIMEOUT)
+        .context("Claude PTY did not become input-ready")?;
+    // Claude emits SessionStart before its interactive input handler is fully
+    // installed. Keep a provider-specific settle interval after terminal mode
+    // and output become quiet, then recheck in case startup rendered again.
+    std::thread::sleep(CLAUDE_INPUT_SETTLE_INTERVAL);
+    runtime
+        .wait_for_input_ready(CLAUDE_INPUT_READY_TIMEOUT)
+        .context("Claude PTY did not remain input-ready")?;
     runtime.write(paste)?;
     // Interactive CLIs may turn a large bracketed paste into an asynchronous
     // placeholder. Committing in the same write can be consumed before that
@@ -1925,13 +1938,8 @@ fn codex_turn_prompt(params: &Value) -> String {
 
 fn codex_final_message(params: &Value) -> Option<String> {
     params
-        .pointer("/turn/items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
-        .and_then(|item| item.get("text").and_then(Value::as_str))
+        .get("turn")
+        .and_then(final_agent_message_text)
         .map(str::to_owned)
 }
 
