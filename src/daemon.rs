@@ -1455,7 +1455,7 @@ fn write_semantic_input(runtime: &AgentRuntime, input: &[u8]) -> Result<()> {
     // placeholder. Committing in the same write can be consumed before that
     // placeholder is installed, so deliver Enter separately after a short
     // provider-agnostic settle interval.
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_secs(1));
     runtime.write(&[commit])
 }
 
