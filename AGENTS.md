@@ -89,6 +89,12 @@ Run at least three fresh containers for each Harness:
 2. Create a Codex Session with the equivalent `CODEX_E2E_<N>_OK` prompt.
 3. Give every `--wait` an explicit `--timeout 5m`.
 
+`dlgt new` and `session.create` require a non-empty initial prompt. To verify
+post-daemon continuity without creating duplicates, use the returned
+`resume_ref` (`codex:<provider_session_id>` or `claude:<provider_session_id>`)
+with `dlgt send <resume_ref> --resume -- <PROMPT>`; plain `send` never launches
+a replacement and returns `SESSION_NOT_RUNNING` with that hint.
+
 Every run passes only when all of the following are true:
 
 - the command exits zero and returns `ok: true`;
@@ -111,6 +117,14 @@ no running provider process may remain. A minimal Docker PID 1 such as
 `sleep infinity` may leave a dead provider as a `Z` zombie because it does not
 reap adopted children; check the process state and reject non-zombie provider
 processes rather than treating a zombie as live.
+
+Repeat the ownership check by sending `SIGKILL` to the daemon PID. The sibling
+reaper must observe control-pipe EOF and terminate the registered provider
+process groups, including the Codex app-server group.
+
+Also deliver `SIGINT` to the daemon process group. The reaper runs in a
+separate process group and ignores ordinary shutdown signals, so it must still
+enforce provider cleanup after the daemon disappears.
 
 Start the daemon again and run `dlgt list --all`. It must return an empty
 Session list: dlgt runtime state is memory-only and must not recover after

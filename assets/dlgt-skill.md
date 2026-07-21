@@ -34,7 +34,12 @@ both counterpart reviewers unless the user explicitly requests both.
 
 ## Rules
 
-- Create only with `new`; `send` never creates or selects another Session.
+- `new` requires its initial prompt and atomically accepts it; `send` is
+  side-effect-free unless `--resume` is explicit.
+- Resume a provider conversation with `dlgt send codex:<thread-id> --resume --
+  "prompt"` or the equivalent `claude:<session-id>` selector. A successful
+  resume returns a new `ses_*` ID and canonical `resume_ref`; an already-live
+  matching Session is reused instead of duplicated.
 - Restart any stable Session with `restart`. Active work becomes interrupted;
   retain the immutable Session ID because terminal aliases may have been reused.
 - Keep one active execution per Session. `SESSION_BUSY` means retry after the

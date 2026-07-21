@@ -103,7 +103,7 @@ USAGE
   dlgt <COMMAND> [OPTIONS]
 
 DELEGATION
-  new          Create a new Session, optionally with its first prompt
+  new          Create a new Session with its first prompt
   restart      Restart a Session
   send         Send work to an existing idle Session
   wait         Wait for the Session's current or latest execution
@@ -133,11 +133,14 @@ RUNTIME
 ```
 
 Each release uses its own socket at
-`$DLGT_HOME/run/<version>/dlgt.sock`. Normal commands address only the daemon
-for the invoking binary's version. `dlgt list --all-versions` queries every
-currently running version and annotates each Session with `runtime_version` and
-`runtime_socket`. Session state, results, events, and terminal history exist
-only while their owning daemon remains alive.
+`$DLGT_HOME/run/<version>/dlgt.sock`. Most commands address the daemon for the
+invoking binary's version. `send` first scans all live versioned sockets for an
+exact `ses_*` ID or provider-qualified `resume_ref` and routes to its owning
+daemon; multiple matches fail rather than choosing or launching. `dlgt list
+--all-versions` queries every currently running version and annotates each
+Session with `runtime_version` and `runtime_socket`. Session state, results,
+events, and terminal history exist only while their owning daemon remains
+alive.
 
 Successful commands may include an optional non-error notice:
 
@@ -152,7 +155,8 @@ daemons and their live Sessions continue on their versioned sockets.
 
 ## `new`
 
-`new` is the only Session creation command.
+`new` is the only Session creation command and always requires its first
+prompt. Launch and acceptance are one atomic operation.
 
 Its command-specific help is available through either equivalent spelling:
 
@@ -178,7 +182,7 @@ dlgt new
   [--env <KEY=VALUE>]...
   [--unset-env <KEY>]...
   [--wait --timeout <DURATION>]
-  [--stdin | -- <PROMPT>]
+  [--stdin | -- <PROMPT>]   (required)
 ```
 
 Rules:
@@ -202,11 +206,11 @@ Rules:
   accept Harness options.
 - `--startup-timeout` is optional and defaults to 60 seconds, but startup is
   never unbounded.
-- If a prompt is supplied, Session creation and acceptance of the first prompt
-  are one atomic daemon operation.
+- Session creation and acceptance of the first prompt are one atomic daemon
+  operation; omitting it returns `INVALID_ARGUMENT`.
 - `--stdin` reads the exact prompt from standard input and is mutually exclusive
   with a prompt after `--`. It avoids argv disclosure and length limits.
-- Without a prompt, `new` returns an idle Session for attach-first workflows.
+- Use `--stdin` when the required prompt should not appear in argv.
 - `--wait` requires a prompt and an explicit positive `--timeout`.
 - If an exact requested alias is active, `new` fails with `ALIAS_IN_USE` and
   creates no Session or provider process.
@@ -316,11 +320,31 @@ dlgt send <SESSION_ID|@ALIAS>
   [--stdin | -- <PROMPT>]
 ```
 
+Resume a provider conversation after its owning daemon exits with an explicit
+provider-qualified selector:
+
+```text
+dlgt send codex:<provider-thread-id> --resume [launch options] -- <PROMPT>
+dlgt send claude:<provider-session-id> --resume [launch options] -- <PROMPT>
+```
+
+`--resume` accepts `--cwd`, `--model`, `--effort`, Claude
+`--harness-option`, approval/environment flags, and startup timeout. The
+provider prefix selects the Harness. A matching live Session is reused; if
+none exists dlgt reserves the provider conversation, launches a new Session,
+waits for bind/readiness, and atomically accepts the prompt. The success
+contains a new `ses_*` ID, canonical `resume_ref`, and caller correlation ID.
+Plain `send` never launches and returns `SESSION_NOT_RUNNING` with a
+`--resume` hint when its target is not live.
+
 Rules:
 
 - The target Session must already exist.
-- Launch, model, environment, and Profile options are not accepted by `send`.
-- The prompt is exactly one argument after mandatory `--`.
+- Launch, model, and environment options are accepted only with `--resume`;
+  Profile options are not accepted by `send`.
+- The prompt is required. `--` is recommended so prompt text beginning with an
+  option-like token is never parsed as a CLI option; multiple remaining words
+  are joined with spaces.
 - `--stdin` is the mutually exclusive safe path for long or sensitive prompts.
 - If the Session is idle, dlgt accepts the prompt and transitions it to busy.
 - If the Session is busy, canceling, blocked, stopping, stopped, or
@@ -496,6 +520,12 @@ dlgt restart <SESSION_ID> [environment options]
   multi-attach is outside v1.
 - `stop` requests graceful Session termination.
 - `stop --force` terminates the provider process group.
+
+The daemon owns provider PTYs and the Codex app-server in separate process
+groups. A sibling reaper has its own process group, ignores ordinary terminal
+and service shutdown signals, and keeps provider groups registered until
+normal teardown. If the daemon exits without running destructors,
+control-pipe EOF makes the reaper terminate every remaining registered group.
 
 ## Lifecycle events
 
