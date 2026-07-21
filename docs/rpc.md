@@ -45,7 +45,7 @@ terminate the stdio proxy.
 ## Public methods
 
 ```text
-session.create        Create a Session, optionally with an initial prompt
+session.create        Create a Session with its required initial prompt
 session.restart       Replace a Session process and resume provider context
 session.send          Accept work on an existing idle Session
 session.wait          Wait for the bound current or latest execution
@@ -67,9 +67,9 @@ alias. The following parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), optional `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
-| `session.send` | `session`, `prompt` |
+| `session.send` | `session`, `prompt`; with `resume:true`, provider-qualified `codex:<id>`/`claude:<id>` selectors and launch options are accepted |
 | `session.wait` | `session`, positive `timeout_ms` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
@@ -99,8 +99,13 @@ own permission default. Codex Harness options are not currently supported.
 A public Session contains its immutable ID, active alias and title, Harness,
 working directory, model selection, state, timing, and the nullable
 `provider_session_id`. The provider session ID is the Codex thread ID or Claude
-session ID and correlates dlgt activity with provider-native logs and resume
-tools. Provider turn IDs and internal execution row IDs are excluded.
+session ID and correlates dlgt activity with provider-native logs; `resume_ref`
+exposes the canonical `codex:<id>` or `claude:<id>` selector. Provider turn IDs
+and internal execution row IDs are excluded.
+
+CLI `send` scans live versioned daemon sockets before dispatch. Raw JSONL RPC
+is intentionally scoped to the selected socket; callers using RPC directly
+must select the owning versioned socket themselves.
 
 The public state set is:
 

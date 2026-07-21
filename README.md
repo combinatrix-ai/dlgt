@@ -132,6 +132,7 @@ The command returns a Session ID such as `ses_7K3M9Q2X`:
 dlgt wait ses_7K3M9Q2X --timeout 15m
 dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "Review the revision"
 dlgt restart ses_7K3M9Q2X
+dlgt send codex:<provider-thread-id> --resume -- "Continue the review"
 dlgt show ses_7K3M9Q2X
 dlgt scrollback ses_7K3M9Q2X --lines 100
 dlgt attach ses_7K3M9Q2X
@@ -161,7 +162,15 @@ per Profile with `auto_approve = false`.
 Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
 override only the current version's socket. Session state is held in memory by
 the daemon that owns the Harness processes; after that daemon exits, use the
-returned `provider_session_id` for provider-native lookup or resume.
+canonical `codex:<provider_session_id>` or `claude:<provider_session_id>`
+`resume_ref` with `send --resume`. `send` scans live versioned sockets before
+launching or resuming, so a binary update routes a returned `ses_*` ID or
+`resume_ref` back to its owning daemon instead of creating a duplicate.
+
+The daemon owns every provider process group. A sibling reaper runs in a
+separate process group and ignores ordinary shutdown signals; when the daemon
+is killed abruptly, loss of its control pipe terminates any provider groups
+that were still registered.
 
 ## Build and verify
 
