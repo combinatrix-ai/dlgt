@@ -28,6 +28,16 @@ pub struct RpcError {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 impl Response {
@@ -53,6 +63,11 @@ impl Response {
                 message: message.into(),
                 session_id: None,
                 provider_session_id: None,
+                correlation_id: None,
+                hint: None,
+                resume_ref: None,
+                session_state: None,
+                action: None,
             }),
             info: None,
         }
@@ -73,6 +88,11 @@ impl Response {
                 message: message.into(),
                 session_id: Some(session_id.into()),
                 provider_session_id,
+                correlation_id: None,
+                hint: None,
+                resume_ref: None,
+                session_state: None,
+                action: None,
             }),
             info: None,
         }

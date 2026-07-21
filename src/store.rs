@@ -20,6 +20,7 @@ const OUTPUT_CHUNK_LIMIT: usize = 8192;
 #[derive(Default)]
 struct MemoryState {
     sessions: HashMap<String, StoredSession>,
+    provider_reservations: HashMap<String, String>,
     turns: HashMap<String, TurnRecord>,
     events: Vec<EventRecord>,
     inputs: Vec<StoredInput>,
@@ -137,7 +138,7 @@ impl Store {
 
     pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
         let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get_mut(id) else {
+        let Some(session) = state.sessions.get(id) else {
             return Ok(false);
         };
         if matches!(
@@ -146,6 +147,17 @@ impl Store {
         ) {
             return Ok(false);
         }
+        let alias = session.record.alias.clone();
+        if state.sessions.values().any(|candidate| {
+            candidate.record.id != id
+                && candidate.record.alias == alias
+                && !terminal_session(&candidate.record)
+        }) {
+            bail!("active session alias already exists");
+        }
+        let Some(session) = state.sessions.get_mut(id) else {
+            return Ok(false);
+        };
         session.record.state = "restarting".to_owned();
         session.record.updated_at_ms = now_ms();
         Ok(true)
@@ -211,6 +223,40 @@ impl Store {
         Ok(())
     }
 
+    /// Reserve a provider conversation before launching a replacement runtime.
+    /// This closes the check/launch race between concurrent `--resume` calls.
+    pub fn reserve_provider_session(&self, provider_ref: &str, session_id: &str) -> Result<bool> {
+        let mut state = self.state.borrow_mut();
+        let (provider_agent, provider_id) = provider_ref
+            .split_once(':')
+            .map_or((None, provider_ref), |(agent, id)| (Some(agent), id));
+        if state.provider_reservations.contains_key(provider_ref)
+            || state.sessions.values().any(|session| {
+                session.record.provider_session_id.as_deref() == Some(provider_id)
+                    && provider_agent.is_none_or(|agent| session.record.agent == agent)
+                    && !terminal_session(&session.record)
+            })
+        {
+            return Ok(false);
+        }
+        state
+            .provider_reservations
+            .insert(provider_ref.to_owned(), session_id.to_owned());
+        Ok(true)
+    }
+
+    pub fn release_provider_session(&self, provider_ref: &str, session_id: &str) {
+        let mut state = self.state.borrow_mut();
+        if state
+            .provider_reservations
+            .get(provider_ref)
+            .map(String::as_str)
+            == Some(session_id)
+        {
+            state.provider_reservations.remove(provider_ref);
+        }
+    }
+
     pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) -> Result<()> {
         if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
             session.terminal_rows = rows;
@@ -233,6 +279,19 @@ impl Store {
         let state = self.state.borrow();
         if let Some(session) = state.sessions.get(selector) {
             return Ok(Some(session.record.clone()));
+        }
+        if let Some((agent, provider_id)) = selector.split_once(':')
+            && matches!(agent, "codex" | "claude")
+        {
+            return Ok(state
+                .sessions
+                .values()
+                .filter(|session| {
+                    session.record.agent == agent
+                        && session.record.provider_session_id.as_deref() == Some(provider_id)
+                })
+                .max_by_key(|session| session.record.created_at_ms)
+                .map(|session| session.record.clone()));
         }
         Ok(state
             .sessions
@@ -820,6 +879,41 @@ mod tests {
     }
 
     #[test]
+    fn terminal_session_cannot_restart_after_its_alias_is_reused() {
+        let store = Store::new();
+        for id in ["ses_old", "ses_new"] {
+            store
+                .insert_session(&NewSession {
+                    id,
+                    alias: "@worker",
+                    title: "worker",
+                    agent: "claude",
+                    cwd: "/tmp",
+                    model: None,
+                    effort: None,
+                    harness_options: &[],
+                    auto_approve: true,
+                })
+                .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
+            mark_ready(&store, id);
+            if id == "ses_old" {
+                store
+                    .set_session_stopped(id)
+                    .unwrap_or_else(|error| panic!("failed to stop old session: {error}"));
+            }
+        }
+        let error = store
+            .begin_session_restart("ses_old")
+            .err()
+            .unwrap_or_else(|| panic!("alias-conflicting restart unexpectedly succeeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("active session alias already exists")
+        );
+    }
+
+    #[test]
     fn active_session_can_enter_restart_without_releasing_its_alias() {
         let store = Store::new();
         store
@@ -1153,5 +1247,44 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.state, "stopped");
+    }
+
+    #[test]
+    fn provider_qualified_lookup_and_reservation_are_agent_scoped() {
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "ses_codex",
+                alias: "@codex",
+                title: "codex",
+                agent: "codex",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        store
+            .set_session_provider_id("ses_codex", "shared-id")
+            .unwrap_or_else(|error| panic!("failed to bind provider id: {error}"));
+        assert_eq!(
+            store
+                .get_session("codex:shared-id")
+                .unwrap_or_else(|error| panic!("failed to resolve provider ref: {error}"))
+                .map(|session| session.id),
+            Some("ses_codex".to_owned())
+        );
+        assert!(
+            !store
+                .reserve_provider_session("codex:shared-id", "ses_new")
+                .unwrap_or_else(|error| panic!("failed to reserve provider ref: {error}"))
+        );
+        assert!(
+            store
+                .reserve_provider_session("claude:shared-id", "ses_claude")
+                .unwrap_or_else(|error| panic!("failed to reserve scoped provider ref: {error}"))
+        );
+        store.release_provider_session("claude:shared-id", "ses_claude");
     }
 }

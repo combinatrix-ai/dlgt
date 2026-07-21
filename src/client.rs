@@ -27,6 +27,11 @@ pub struct RpcFailure {
     pub message: String,
     pub session_id: Option<String>,
     pub provider_session_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub hint: Option<String>,
+    pub resume_ref: Option<String>,
+    pub session_state: Option<String>,
+    pub action: Option<String>,
 }
 
 impl std::fmt::Display for RpcFailure {
@@ -58,9 +63,24 @@ pub fn call_existing(method: &str, params: Value) -> Result<Value> {
     call_socket(&socket, method, params)
 }
 
-fn call_socket(socket: &Path, method: &str, params: Value) -> Result<Value> {
+pub(crate) fn call_socket(socket: &Path, method: &str, params: Value) -> Result<Value> {
+    call_socket_with_timeout(socket, method, params, None)
+}
+
+fn call_socket_with_timeout(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Option<Duration>,
+) -> Result<Value> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("dlgt server is not running at {}", socket.display()))?;
+    stream
+        .set_read_timeout(timeout)
+        .context("failed to configure daemon socket read timeout")?;
+    stream
+        .set_write_timeout(timeout)
+        .context("failed to configure daemon socket write timeout")?;
     let request = Request {
         id: format!("req_{}", Uuid::new_v4().simple()),
         method: method.to_owned(),
@@ -72,6 +92,78 @@ fn call_socket(socket: &Path, method: &str, params: Value) -> Result<Value> {
         .read_line(&mut line)
         .context("failed to read daemon response")?;
     decode_response(&line)
+}
+
+#[derive(Debug)]
+pub struct LiveSessionRoute {
+    pub socket: std::path::PathBuf,
+    pub session_id: String,
+}
+
+pub fn find_live_session(selector: &str) -> Result<Option<LiveSessionRoute>> {
+    let durable = selector
+        .split_once(':')
+        .filter(|(harness, id)| matches!(*harness, "codex" | "claude") && !id.is_empty());
+    if durable.is_none() && !selector.starts_with("ses_") {
+        return Ok(None);
+    }
+
+    let mut routes = Vec::new();
+    for socket in paths::runtime_sockets()? {
+        let result = match call_socket_with_timeout(
+            &socket,
+            "session.list",
+            json!({"all":false}),
+            Some(Duration::from_secs(2)),
+        ) {
+            Ok(result) => result,
+            Err(error) if socket_is_stale(&error) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect live dlgt runtime at {}",
+                        socket.display()
+                    )
+                });
+            }
+        };
+        let Some(sessions) = result.as_array() else {
+            continue;
+        };
+        for session in sessions {
+            let session_id = session.get("id").and_then(Value::as_str);
+            let is_match = if let Some((harness, provider_id)) = durable {
+                session.get("harness").and_then(Value::as_str) == Some(harness)
+                    && session.get("provider_session_id").and_then(Value::as_str)
+                        == Some(provider_id)
+            } else {
+                session_id == Some(selector)
+            };
+            if is_match && let Some(session_id) = session_id {
+                routes.push(LiveSessionRoute {
+                    socket: socket.clone(),
+                    session_id: session_id.to_owned(),
+                });
+            }
+        }
+    }
+    if routes.len() > 1 {
+        bail!(
+            "selector {selector:?} is live in multiple dlgt runtimes; stop the duplicate before sending work"
+        );
+    }
+    Ok(routes.pop())
+}
+
+fn socket_is_stale(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            )
+        })
+    })
 }
 
 pub fn list_all_versions(include_all: bool) -> Result<Vec<Value>> {
@@ -316,6 +408,11 @@ fn decode_response(line: &str) -> Result<Value> {
             message: error.message,
             session_id: error.session_id,
             provider_session_id: error.provider_session_id,
+            correlation_id: error.correlation_id,
+            hint: error.hint,
+            resume_ref: error.resume_ref,
+            session_state: error.session_state,
+            action: error.action,
         }
         .into());
     }

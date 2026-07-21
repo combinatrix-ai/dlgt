@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::provider::CommandSpec;
+use crate::reaper::Registration;
 
 const RETAINED_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const INPUT_READY_QUIET_WINDOW: Duration = Duration::from_millis(500);
@@ -22,6 +23,7 @@ pub struct SessionRuntime {
     output: Arc<OutputState>,
     alive: Arc<AtomicBool>,
     pid: Option<u32>,
+    reaper_registration: Mutex<Option<Registration>>,
 }
 
 struct OutputState {
@@ -115,7 +117,16 @@ impl SessionRuntime {
             output,
             alive,
             pid,
+            reaper_registration: Mutex::new(None),
         }))
+    }
+
+    pub fn track_with(&self, registration: Registration) -> Result<()> {
+        self.reaper_registration
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reaper registration lock poisoned"))?
+            .replace(registration);
+        Ok(())
     }
 
     pub const fn pid(&self) -> Option<u32> {

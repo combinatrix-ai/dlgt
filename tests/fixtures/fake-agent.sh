@@ -11,4 +11,7 @@ if [ -n "${DLGT_FAKE_EXIT_AFTER:-}" ]; then
 fi
 while IFS= read -r line; do
   printf 'fake:%s\r\n' "$line"
+  case "$line" in
+    *crash*) kill -TERM "$$" ;;
+  esac
 done

@@ -75,3 +75,20 @@ fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::
     assert_ne!(output.stdout, dlgt(&["new", "--help"])?.stdout);
     Ok(())
 }
+
+#[test]
+fn send_rejects_timeout_before_starting_a_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .args(["send", "ses_TEST", "--timeout", "1s", "--", "hello"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)?.contains("--timeout requires --wait"),
+        "unexpected timeout error"
+    );
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
