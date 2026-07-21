@@ -20,13 +20,14 @@ use crate::protocol::{Request, Response, SessionRecord, TurnRecord};
 use crate::provider::{
     Agent, CommandSpec, LaunchOptions, codex_remote_tui_command, command_spec, prepare_workspace,
 };
+use crate::reaper::Reaper;
 use crate::session::SessionRuntime;
 use crate::store::{NewSession, Store};
 use crate::update;
 
 const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
-const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn run() -> Result<()> {
     let socket_path = paths::socket_path()?;
@@ -46,12 +47,14 @@ pub fn run() -> Result<()> {
     }
 
     let store = Store::new();
+    let reaper = Reaper::spawn()?;
     let daemon = Arc::new(Daemon {
         store: Arc::new(Mutex::new(store)),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
         shutting_down: AtomicBool::new(false),
         update_notice: RwLock::new(None),
+        reaper,
     });
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
@@ -137,6 +140,21 @@ struct Daemon {
     attach_leases: Mutex<HashMap<String, String>>,
     shutting_down: AtomicBool,
     update_notice: RwLock<Option<Value>>,
+    reaper: Arc<Reaper>,
+}
+
+struct ProviderReservation {
+    store: Arc<Mutex<Store>>,
+    provider_ref: String,
+    session_id: String,
+}
+
+impl Drop for ProviderReservation {
+    fn drop(&mut self) {
+        if let Ok(store) = self.store.lock() {
+            store.release_provider_session(&self.provider_ref, &self.session_id);
+        }
+    }
 }
 
 enum AgentRuntime {
@@ -270,6 +288,55 @@ impl Daemon {
                 }
             }
         };
+        let mut response = response;
+        if let Some(error) = response.error.as_mut() {
+            if let Some(correlation_id) =
+                request.params.get("correlation_id").and_then(Value::as_str)
+            {
+                error.correlation_id = Some(correlation_id.to_owned());
+            }
+            if error.code == "SESSION_NOT_RUNNING" {
+                error.hint =
+                    Some("retry with --resume and a provider-qualified selector".to_owned());
+            }
+            if error.code == "SESSION_NOT_RUNNING"
+                || matches!(
+                    request.method.as_str(),
+                    "session.send" | "session.wait" | "session.cancel"
+                )
+            {
+                if let Some(selector) = request.params.get("session").and_then(Value::as_str) {
+                    if let Ok(Some(session)) = self
+                        .lock_store()
+                        .and_then(|store| store.get_session(selector))
+                    {
+                        error.session_id = Some(session.id);
+                        error
+                            .provider_session_id
+                            .clone_from(&session.provider_session_id);
+                        error.resume_ref = session
+                            .provider_session_id
+                            .map(|id| format!("{}:{id}", session.agent));
+                        error.session_state = Some(match session.state.as_str() {
+                            "quiescing" => "canceling".to_owned(),
+                            "running" => "starting".to_owned(),
+                            other => other.to_owned(),
+                        });
+                        if error.code == "SESSION_BLOCKED" {
+                            error.action = Some(format!(
+                                "dlgt attach {}",
+                                error.session_id.as_deref().unwrap_or(selector)
+                            ));
+                        }
+                    } else if let Some((agent, provider_id)) = selector.split_once(':')
+                        && matches!(agent, "codex" | "claude")
+                    {
+                        error.resume_ref = Some(selector.to_owned());
+                        error.provider_session_id = Some(provider_id.to_owned());
+                    }
+                }
+            }
+        }
         write_response(&mut stream, &response)
     }
 
@@ -303,13 +370,23 @@ impl Daemon {
             "session.input" => self.input_session(params),
             "session.resize" => self.resize_session(params),
             "session.stop" => self.stop_session(params),
-            "session.send" => self.submit_turn(params),
+            "session.send" => {
+                if params
+                    .get("resume")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    self.resume_session(params)
+                } else {
+                    self.submit_turn(params)
+                }
+            }
             "session.wait" => self.wait_session(params),
             "session.cancel" => self.cancel_session(params),
             "transcript.read_raw" => self.read_transcript(params),
             "event.read" => self.read_events(params),
             "scrollback.read" => self.read_scrollback(params),
-            "model.list" => Self::list_models(params),
+            "model.list" => self.list_models(params),
             "harness.list" => Self::list_harnesses(params),
             "hook.event" => self.handle_hook(params),
             _ => bail!("unknown method {method:?}"),
@@ -326,6 +403,12 @@ impl Daemon {
             .unwrap_or(&generated_alias);
         validate_alias(alias)?;
         let agent = Agent::parse(params_string(params, "harness")?)?;
+        let initial_prompt = params_string(params, "prompt")?;
+        if initial_prompt.is_empty() {
+            bail!("initial prompt must not be empty");
+        }
+        let resume_provider_id = params.get("resume_provider_id").and_then(Value::as_str);
+        let provider_ref = resume_provider_id.map(|id| format!("{}:{id}", agent.as_str()));
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -395,6 +478,27 @@ impl Daemon {
                 Err(error) => return Err(error),
             }
         }
+        let _provider_reservation = if let Some(provider_ref) = provider_ref.as_deref() {
+            let reserved = self
+                .lock_store()?
+                .reserve_provider_session(provider_ref, &id)?;
+            if !reserved {
+                self.lock_store()?.set_session_failed(&id)?;
+                bail!("provider conversation is already reserved: {provider_ref}");
+            }
+            let reservation = ProviderReservation {
+                store: Arc::clone(&self.store),
+                provider_ref: provider_ref.to_owned(),
+                session_id: id.clone(),
+            };
+            if let Some(provider_id) = resume_provider_id {
+                self.lock_store()?
+                    .set_session_provider_id(&id, provider_id)?;
+            }
+            Some(reservation)
+        } else {
+            None
+        };
         self.lock_store()?
             .record_event(Some(&id), None, "session.created", &json!({}))?;
         self.lock_store()?.set_terminal_size(&id, rows, cols)?;
@@ -406,7 +510,7 @@ impl Daemon {
             model,
             effort,
             harness_options: &harness_options,
-            resume_provider_id: None,
+            resume_provider_id,
             environment: &environment,
             auto_approve,
         };
@@ -496,10 +600,10 @@ impl Daemon {
                 ));
             }
         }
-        let session = loop {
+        loop {
             let current = self.resolve_session(&id)?;
             if current.state == "idle" {
-                break current;
+                break;
             }
             if matches!(current.state.as_str(), "stopped" | "failed") {
                 return Err(self.session_launch_failure(
@@ -516,20 +620,37 @@ impl Daemon {
                 ));
             }
             std::thread::sleep(Duration::from_millis(25));
-        };
-        let mut response = json!({"session": public_session(&session)});
-        if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
-            match self.submit_turn(&json!({"session": id, "prompt": prompt})) {
-                Ok(result) => response = result,
-                Err(error) => {
-                    let _ = runtime.force_stop();
-                    self.lock_store()?.set_session_failed(&id)?;
-                    return Err(self.session_launch_failure(
-                        &id,
-                        &error.context("initial prompt acceptance failed"),
-                    ));
-                }
+        }
+        let correlation_id = params
+            .get("correlation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut response = match self.submit_turn(&json!({
+            "session": id,
+            "prompt": initial_prompt,
+            "correlation_id": correlation_id,
+        })) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = runtime.force_stop();
+                self.lock_store()?.set_session_failed(&id)?;
+                return Err(self.session_launch_failure(
+                    &id,
+                    &error.context("initial prompt acceptance failed"),
+                ));
             }
+        };
+        if provider_ref.is_some() {
+            if let Some(provider_id) = self
+                .lock_store()?
+                .get_session(&id)?
+                .and_then(|session| session.provider_session_id)
+            {
+                response["resume_ref"] = json!(format!("{}:{provider_id}", agent.as_str()));
+            }
+        }
+        if !correlation_id.is_empty() {
+            response["correlation_id"] = json!(correlation_id);
         }
         Ok(response)
     }
@@ -546,6 +667,90 @@ impl Daemon {
             message: format!("{error:#}"),
         }
         .into()
+    }
+
+    /// Resume a provider conversation without mutating an existing live
+    /// Session. A provider-qualified selector is the durable lookup form;
+    /// Session IDs and aliases first resolve to a live runtime when present.
+    fn resume_session(&self, params: &Value) -> Result<Value> {
+        let selector = params_string(params, "session")?;
+        let prompt = params_string(params, "prompt")?;
+        if prompt.is_empty() {
+            bail!("prompt must not be empty");
+        }
+        let correlation_id = params
+            .get("correlation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        if let Ok(existing) = self.resolve_session(selector) {
+            let live = self
+                .sessions
+                .read()
+                .map_err(|_| anyhow!("session map lock poisoned"))?
+                .contains_key(&existing.id);
+            if live {
+                if existing.state == "blocked" {
+                    bail!("session blocked on input");
+                }
+                if existing.state != "idle" || existing.active_turn_id.is_some() {
+                    bail!("session already has an active turn");
+                }
+                let mut result = self.submit_turn(params)?;
+                if !correlation_id.is_empty() {
+                    result["correlation_id"] = json!(correlation_id);
+                }
+                if let Some(provider_id) = existing.provider_session_id {
+                    result["resume_ref"] = json!(format!("{}:{provider_id}", existing.agent));
+                }
+                return Ok(result);
+            }
+            let provider_id = existing.provider_session_id.as_deref().context(
+                "SESSION_NOT_RUNNING: Session has no provider conversation; retry with a provider-qualified selector",
+            )?;
+            return self.launch_resumed_session(
+                params,
+                &existing.agent,
+                provider_id,
+                Some(&existing.alias),
+                Some(&existing.title),
+            );
+        }
+
+        let (agent, provider_id) = selector
+            .split_once(':')
+            .filter(|(agent, id)| matches!(*agent, "codex" | "claude") && !id.is_empty())
+            .context(
+                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<provider_session_id> or claude:<provider_session_id> with --resume",
+            )?;
+        self.launch_resumed_session(params, agent, provider_id, None, None)
+    }
+
+    fn launch_resumed_session(
+        &self,
+        params: &Value,
+        agent: &str,
+        provider_id: &str,
+        alias: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<Value> {
+        let mut create = params.clone();
+        let object = create
+            .as_object_mut()
+            .context("resume parameters must be an object")?;
+        object.insert("harness".to_owned(), json!(agent));
+        object.insert("resume_provider_id".to_owned(), json!(provider_id));
+        object.insert(
+            "title".to_owned(),
+            json!(title.unwrap_or("resumed provider conversation")),
+        );
+        if let Some(alias) = alias {
+            object.insert("alias".to_owned(), json!(alias));
+        } else {
+            object.remove("alias");
+        }
+        object.remove("resume");
+        self.create_session(&create)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -769,7 +974,7 @@ impl Daemon {
         let on_exit = Arc::new(move |exit_code: u32| {
             record_session_exit(&exit_store, &exit_sessions, &exit_session_id, exit_code);
         });
-        SessionRuntime::spawn(
+        let runtime = SessionRuntime::spawn(
             spec,
             PtySize {
                 rows,
@@ -779,8 +984,12 @@ impl Daemon {
             },
             on_output,
             on_exit,
-        )
-        .map(|runtime| Arc::new(AgentRuntime::Claude(runtime)))
+        )?;
+        runtime.track_with(
+            self.reaper
+                .watch(runtime.pid().context("Claude runtime had no pid")?)?,
+        )?;
+        Ok(Arc::new(AgentRuntime::Claude(runtime)))
     }
 
     fn spawn_codex_runtime(
@@ -825,6 +1034,7 @@ impl Daemon {
             socket_path.clone(),
             handler,
             Some(options.environment),
+            &self.reaper,
         )?;
         let spec = codex_remote_tui_command(options, &socket_path);
         let output_store = Arc::clone(&self.store);
@@ -852,6 +1062,10 @@ impl Daemon {
             },
             on_output,
             on_exit,
+        )?;
+        view.track_with(
+            self.reaper
+                .watch(view.pid().context("Codex TUI runtime had no pid")?)?,
         )?;
         let provider_thread_id = match thread_receiver.recv_timeout(startup_timeout) {
             Ok(thread_id) => thread_id,
@@ -958,8 +1172,28 @@ impl Daemon {
         Ok(json!({"stopping": true, "force": force, "session_id": session.id}))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn submit_turn(&self, params: &Value) -> Result<Value> {
-        let session = self.resolve_session(params_string(params, "session")?)?;
+        let selector = params_string(params, "session")?;
+        let session = self.resolve_session(selector).map_err(|_| {
+            anyhow!(
+                "SESSION_NOT_RUNNING: no live Session matches {selector}; retry with --resume and a provider-qualified selector"
+            )
+        })?;
+        if matches!(
+            session.state.as_str(),
+            "stopped" | "failed" | "starting" | "stopping"
+        ) || !self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .contains_key(&session.id)
+        {
+            bail!(
+                "SESSION_NOT_RUNNING: Session {} is not running; retry with --resume and a provider-qualified selector",
+                session.id
+            );
+        }
         if self
             .attach_leases
             .lock()
@@ -1046,17 +1280,38 @@ impl Daemon {
             },
             Agent::Claude => {
                 if let Err(error) = write_semantic_input(&runtime, &input) {
-                    let _ = self.lock_store()?.cancel_turn(&turn_id)?;
+                    let store = self.lock_store()?;
+                    let message = sanitize_message(&error.to_string());
+                    let _ = store.finish_turn_if_matching(
+                        &turn_id,
+                        None,
+                        "failed",
+                        None,
+                        Some(&message),
+                    )?;
+                    store.set_session_state(&session.id, "idle")?;
+                    store.record_event(
+                        Some(&session.id),
+                        Some(&turn_id),
+                        "turn.failed",
+                        &json!({"error": message, "accepted": false}),
+                    )?;
                     return Err(error);
                 }
                 self.lock_store()?.set_session_state(&session.id, "busy")?;
             }
         }
         let current = self.resolve_session(&session.id)?;
-        Ok(json!({
+        let mut result = json!({
             "session": public_session(&current),
             "execution_seq": turn.execution_seq,
-        }))
+        });
+        if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
+            && !correlation_id.is_empty()
+        {
+            result["correlation_id"] = json!(correlation_id);
+        }
+        Ok(result)
     }
 
     fn read_session(&self, params: &Value) -> Result<Value> {
@@ -1092,11 +1347,17 @@ impl Daemon {
         loop {
             let turn = self.resolve_turn(&target.id)?;
             if is_terminal_turn_state(&turn.state) {
-                return Ok(json!({
+                let mut response = json!({
                     "session": public_session(&self.resolve_session(&session.id)?),
                     "result": public_result(&turn),
                     "execution_seq": turn.execution_seq,
-                }));
+                });
+                if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
+                    && !correlation_id.is_empty()
+                {
+                    response["correlation_id"] = json!(correlation_id);
+                }
+                return Ok(response);
             }
             if self.resolve_session(&session.id)?.state == "blocked" {
                 bail!("session blocked on input");
@@ -1111,7 +1372,11 @@ impl Daemon {
     fn cancel_session(&self, params: &Value) -> Result<Value> {
         let session = self.resolve_session(params_string(params, "session")?)?;
         let Some(turn_id) = session.active_turn_id else {
-            return Ok(json!({"session_id": session.id, "canceled": false}));
+            return Ok(json!({
+                "session_id": session.id,
+                "canceled": false,
+                "reason": "NO_ACTIVE_WORK",
+            }));
         };
         let timeout_ms = params
             .get("timeout_ms")
@@ -1298,7 +1563,7 @@ impl Daemon {
         }))
     }
 
-    fn list_models(params: &Value) -> Result<Value> {
+    fn list_models(&self, params: &Value) -> Result<Value> {
         match params_string(params, "harness")? {
             "claude" => Ok(json!({
                 "harness": "claude", "source": "claude-code-aliases", "discovery": "partial",
@@ -1312,7 +1577,7 @@ impl Daemon {
                     .join("run")
                     .join(format!("models-{}", Uuid::new_v4().simple()))
                     .join("app-server.sock");
-                let connection = CodexConnection::connect(socket, Arc::new(|_| {}))?;
+                let connection = CodexConnection::connect(socket, Arc::new(|_| {}), &self.reaper)?;
                 let response = connection.list_models(
                     params
                         .get("include_hidden")
@@ -1656,6 +1921,14 @@ fn bind_provider_session(store: &Store, session: &SessionRecord, payload: &Value
     if let Some(expected) = session.provider_session_id.as_deref()
         && expected != provider_session_id
     {
+        // Claude may rotate its session ID when resuming a conversation. The
+        // startup hook is the authoritative bind point; retain the new ID so
+        // subsequent resumes do not wait forever on the old identifier.
+        if session.agent == "claude" && matches!(session.state.as_str(), "starting" | "restarting")
+        {
+            store.set_session_provider_id(&session.id, provider_session_id)?;
+            return Ok(());
+        }
         bail!("hook provider session mismatch: expected {expected}, got {provider_session_id}");
     }
     if session.provider_session_id.is_none() {
@@ -2126,13 +2399,19 @@ fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
-    if message.contains("wait timed out") {
+    if message.contains("SESSION_NOT_RUNNING") {
+        "SESSION_NOT_RUNNING"
+    } else if message.contains("wait timed out") {
         "WAIT_TIMEOUT"
     } else if message.contains("cancel timed out") {
         "CANCEL_TIMEOUT"
     } else if message.contains("blocked on input") {
         "SESSION_BLOCKED"
-    } else if message.contains("already has an active turn") || message.contains("not ready") {
+    } else if message.contains("already has an active turn")
+        || message.contains("not ready")
+        || message.contains("provider conversation is already reserved")
+        || message.contains("provider conversation is already running")
+    {
         "SESSION_BUSY"
     } else if message.contains("has no result") {
         "NO_RESULT"
@@ -2140,9 +2419,7 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "SESSION_ATTACHED"
     } else if message.contains("already attached") {
         "ALREADY_ATTACHED"
-    } else if message.contains("UNIQUE constraint failed: sessions.alias")
-        || message.contains("active_session_alias")
-    {
+    } else if message.contains("active session alias already exists") {
         "ALIAS_IN_USE"
     } else if message.contains("launch")
         || message.contains("failed to spawn")
@@ -2181,6 +2458,10 @@ fn public_session(session: &SessionRecord) -> Value {
         "effort": session.effort,
         "auto_approve": session.auto_approve,
         "provider_session_id": session.provider_session_id,
+        "resume_ref": session
+            .provider_session_id
+            .as_ref()
+            .map(|id| format!("{}:{id}", session.agent)),
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
     })
@@ -2278,11 +2559,14 @@ fn is_terminal_turn_state(state: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use serde_json::json;
 
     use super::{
-        apply_codex_notification, apply_hook_event, generate_alias, generate_session_id,
-        public_result, public_session, validate_alias,
+        ProviderReservation, apply_codex_notification, apply_hook_event, bind_provider_session,
+        classify_error, generate_alias, generate_session_id, public_result, public_session,
+        validate_alias,
     };
     use crate::store::{NewSession, Store};
 
@@ -2318,6 +2602,62 @@ mod tests {
     fn archive_separator_is_reserved_in_aliases() {
         assert!(validate_alias("@worker").is_ok());
         assert!(validate_alias("@worker#old").is_err());
+    }
+
+    #[test]
+    fn stopped_send_error_has_resume_code_and_hint_source() {
+        let error = anyhow::anyhow!(
+            "SESSION_NOT_RUNNING: Session ses_1 is not running; retry with --resume"
+        );
+        assert_eq!(classify_error(&error), "SESSION_NOT_RUNNING");
+    }
+
+    #[test]
+    fn provider_reservation_guard_releases_after_failure_scope() {
+        let store = Arc::new(Mutex::new(Store::new()));
+        assert!(
+            store
+                .lock()
+                .unwrap_or_else(|error| panic!("store lock failed: {error}"))
+                .reserve_provider_session("claude:provider", "ses_failed")
+                .unwrap_or(false)
+        );
+        drop(ProviderReservation {
+            store: Arc::clone(&store),
+            provider_ref: "claude:provider".to_owned(),
+            session_id: "ses_failed".to_owned(),
+        });
+        assert!(
+            store
+                .lock()
+                .unwrap_or_else(|error| panic!("store lock failed: {error}"))
+                .reserve_provider_session("claude:provider", "ses_retry")
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn claude_resume_can_rotate_provider_id_during_startup() {
+        let store = ready_store("claude");
+        store
+            .set_session_provider_id("ses_1", "old-session")
+            .unwrap_or_else(|error| panic!("failed to bind old provider id: {error}"));
+        store
+            .set_session_state("ses_1", "starting")
+            .unwrap_or_else(|error| panic!("failed to mark startup: {error}"));
+        let session = store
+            .get_session("ses_1")
+            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
+            .unwrap_or_else(|| panic!("session missing"));
+        bind_provider_session(&store, &session, &json!({"session_id":"new-session"}))
+            .unwrap_or_else(|error| panic!("failed to rotate Claude provider id: {error}"));
+        assert_eq!(
+            store
+                .get_session("ses_1")
+                .unwrap_or_else(|error| panic!("failed to read rotated session: {error}"))
+                .and_then(|session| session.provider_session_id),
+            Some("new-session".to_owned())
+        );
     }
 
     #[test]

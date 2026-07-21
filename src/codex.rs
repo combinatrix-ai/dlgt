@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,8 +15,9 @@ use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, client};
 
 use crate::provider::{codex_app_server_args, codex_program};
+use crate::reaper::{Reaper, Registration};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -43,19 +45,32 @@ pub struct CodexConnection {
     handler: NotificationHandler,
     terminal_turns: Arc<Mutex<HashSet<String>>>,
     joined: AtomicBool,
+    _reaper_registration: Registration,
 }
 
+struct ChildGuard(Option<Child>);
+
 impl CodexConnection {
-    pub fn connect(socket_path: PathBuf, handler: NotificationHandler) -> Result<Arc<Self>> {
-        Self::connect_with_environment(socket_path, handler, None)
+    pub fn connect(
+        socket_path: PathBuf,
+        handler: NotificationHandler,
+        reaper: &Arc<Reaper>,
+    ) -> Result<Arc<Self>> {
+        Self::connect_with_environment(socket_path, handler, None, reaper)
     }
 
     pub fn connect_with_environment(
         socket_path: PathBuf,
         handler: NotificationHandler,
         environment: Option<&HashMap<String, String>>,
+        reaper: &Arc<Reaper>,
     ) -> Result<Arc<Self>> {
-        let child = spawn_app_server(&socket_path, environment)?;
+        let mut child_guard = ChildGuard(Some(spawn_app_server(&socket_path, environment)?));
+        let child = child_guard
+            .0
+            .as_ref()
+            .context("Codex app-server child was unavailable")?;
+        let reaper_registration = reaper.watch(child.id())?;
         let stream = UnixStream::connect(&socket_path)
             .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
         stream
@@ -74,11 +89,17 @@ impl CodexConnection {
         let connection = Arc::new(Self {
             outbound: sender,
             next_id: AtomicU64::new(1),
-            child: Mutex::new(child),
+            child: Mutex::new(
+                child_guard
+                    .0
+                    .take()
+                    .context("Codex app-server child was unavailable")?,
+            ),
             socket_path,
             handler,
             terminal_turns,
             joined: AtomicBool::new(false),
+            _reaper_registration: reaper_registration,
         });
         connection.request(
             "initialize",
@@ -243,13 +264,32 @@ impl Drop for CodexConnection {
     fn drop(&mut self) {
         let _ = self.outbound.send(Outbound::Close);
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_child_group(&mut child);
         }
         if let Some(parent) = self.socket_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
     }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            kill_child_group(child);
+        }
+    }
+}
+
+fn kill_child_group(child: &mut Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: kill has no memory-safety preconditions. The app-server is
+        // spawned as the leader of this process group.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn io_loop(
@@ -473,6 +513,7 @@ fn spawn_app_server(
     }
     let mut child = command
         .args(codex_app_server_args(&endpoint))
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
