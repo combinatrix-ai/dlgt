@@ -2651,10 +2651,11 @@ fn generate_alias(title: &str) -> String {
         .join("-");
     let slug = if slug.is_empty() { "session" } else { &slug };
     let id = generate_internal_id();
+    let suffix = id.strip_prefix("internal:").unwrap_or(&id);
     format!(
         "@{}-{}",
         slug.chars().take(32).collect::<String>(),
-        &id[6..12]
+        &suffix[..6]
     )
 }
 
@@ -2775,6 +2776,11 @@ mod tests {
         let alias = generate_alias("Run Review");
         assert!(alias.starts_with("@run-review-"));
         assert_eq!(alias.rsplit('-').next().map(str::len), Some(6));
+        assert!(alias.rsplit('-').next().is_some_and(|suffix| {
+            suffix
+                .chars()
+                .all(|character| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(character))
+        }));
     }
 
     #[test]
