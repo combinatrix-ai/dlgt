@@ -69,7 +69,7 @@ fn bracketed_paste_input(prompt: &str) -> Result<Vec<u8>> {
 pub struct LaunchOptions<'a> {
     pub agent: Agent,
     pub session_id: &'a str,
-    pub alias: &'a str,
+    pub title: &'a str,
     pub cwd: &'a Path,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
@@ -77,6 +77,10 @@ pub struct LaunchOptions<'a> {
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
     pub auto_approve: bool,
+}
+
+pub(crate) fn provider_display_name(title: &str) -> String {
+    format!("[dlgt] {title}")
 }
 
 #[derive(Debug, Clone)]
@@ -325,7 +329,7 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     let settings = claude_hook_settings(&hook_command);
     let mut args = vec![
         "--name".to_owned(),
-        options.alias.trim_start_matches('@').to_owned(),
+        provider_display_name(options.title),
         "--settings".to_owned(),
         settings.to_string(),
     ];
@@ -447,7 +451,7 @@ mod tests {
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: Some("claude-4-5-haiku-latest"),
             effort: Some("high"),
@@ -472,12 +476,34 @@ mod tests {
     }
 
     #[test]
+    fn claude_uses_the_dlgt_prefixed_session_title_as_provider_name() {
+        let spec = command_spec(&LaunchOptions {
+            agent: Agent::Claude,
+            session_id: "ses_1",
+            title: "Review API boundaries",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            harness_options: &[],
+            resume_provider_id: None,
+            environment: &std::collections::HashMap::new(),
+            auto_approve: true,
+        })
+        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args == ["--name", "[dlgt] Review API boundaries"])
+        );
+    }
+
+    #[test]
     fn claude_no_auto_approve_omits_implicit_skip_permissions() {
         let environment = std::collections::HashMap::new();
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
@@ -508,7 +534,7 @@ mod tests {
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
@@ -538,7 +564,7 @@ mod tests {
             &LaunchOptions {
                 agent: Agent::Codex,
                 session_id: "ses_1",
-                alias: "@worker",
+                title: "Worker title",
                 cwd: Path::new("/tmp"),
                 model: None,
                 effort: Some("xhigh"),
@@ -580,7 +606,7 @@ mod tests {
             &LaunchOptions {
                 agent: Agent::Codex,
                 session_id: "ses_1",
-                alias: "@worker",
+                title: "Worker title",
                 cwd: Path::new("/tmp"),
                 model: None,
                 effort: None,
@@ -619,7 +645,7 @@ mod tests {
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
@@ -652,7 +678,7 @@ mod tests {
         let claude = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
@@ -673,7 +699,7 @@ mod tests {
             &LaunchOptions {
                 agent: Agent::Codex,
                 session_id: "ses_1",
-                alias: "@worker",
+                title: "Worker title",
                 cwd: Path::new("/tmp"),
                 model: None,
                 effort: None,
@@ -702,7 +728,7 @@ mod tests {
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
@@ -727,7 +753,7 @@ mod tests {
         let result = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "ses_1",
-            alias: "@worker",
+            title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
             effort: None,
