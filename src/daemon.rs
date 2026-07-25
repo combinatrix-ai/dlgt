@@ -19,6 +19,7 @@ use crate::paths;
 use crate::protocol::{Request, Response, SessionRecord, TurnRecord};
 use crate::provider::{
     Agent, CommandSpec, LaunchOptions, codex_remote_tui_command, command_spec, prepare_workspace,
+    provider_display_name,
 };
 use crate::reaper::Reaper;
 use crate::session::SessionRuntime;
@@ -505,7 +506,7 @@ impl Daemon {
         let options = LaunchOptions {
             agent,
             session_id: &id,
-            alias,
+            title,
             cwd: &cwd,
             model,
             effort,
@@ -862,7 +863,7 @@ impl Daemon {
         let options = LaunchOptions {
             agent,
             session_id: &session.id,
-            alias: &session.alias,
+            title: &session.title,
             cwd: &cwd,
             model: session.model.as_deref(),
             effort: session.effort.as_deref(),
@@ -1081,6 +1082,12 @@ impl Daemon {
             bail!(
                 "resumed Codex provider conversation mismatch: expected {expected}, got {provider_thread_id}"
             );
+        }
+        if let Err(error) =
+            control.set_thread_name(&provider_thread_id, &provider_display_name(options.title))
+        {
+            let _ = view.force_stop();
+            return Err(error).context("failed to set Codex provider thread name");
         }
         Ok(Arc::new(AgentRuntime::Codex {
             control,

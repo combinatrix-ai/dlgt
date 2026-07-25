@@ -138,6 +138,11 @@ impl CodexConnection {
             .context("Codex turn/start response had no turn id")
     }
 
+    pub fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
+        self.request("thread/name/set", thread_name_set_params(thread_id, name))?;
+        Ok(())
+    }
+
     pub fn list_models(&self, include_hidden: bool) -> Result<Value> {
         let mut data = Vec::new();
         let mut cursor = Value::Null;
@@ -253,6 +258,10 @@ impl CodexConnection {
             .send(Outbound::Notification { method, params })
             .context("Codex app-server connection closed")
     }
+}
+
+pub(crate) fn thread_name_set_params(thread_id: &str, name: &str) -> Value {
+    json!({"threadId": thread_id, "name": name})
 }
 
 fn is_rollout_not_ready(message: &str) -> bool {
@@ -547,7 +556,7 @@ mod tests {
 
     use super::{
         NotificationHandler, dispatch_notification, is_rollout_not_ready, terminal_turn,
-        transport_closed,
+        thread_name_set_params, transport_closed,
     };
 
     #[test]
@@ -694,5 +703,16 @@ mod tests {
         assert!(is_rollout_not_ready("no rollout found for thread id abc"));
         assert!(is_rollout_not_ready("rollout at /tmp/a.jsonl is empty"));
         assert!(!is_rollout_not_ready("permission denied"));
+    }
+
+    #[test]
+    fn thread_name_set_uses_the_app_server_thread_name_protocol() {
+        assert_eq!(
+            thread_name_set_params("thread-1", "[dlgt] Review API boundaries"),
+            json!({
+                "threadId": "thread-1",
+                "name": "[dlgt] Review API boundaries",
+            })
+        );
     }
 }
