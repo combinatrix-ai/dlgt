@@ -25,6 +25,7 @@ export HOME="$state_dir/home"
 export DLGT_CLAUDE_BIN="$repo_root/tests/fixtures/fake-agent.sh"
 export DLGT_FAKE_ARGS_FILE="$state_dir/fake-args.log"
 mkdir -p "$HOME"
+touch "$DLGT_FAKE_ARGS_FILE"
 old_socket="$state_dir/run/old/dlgt.sock"
 
 "$binary" server --foreground >"$state_dir/server.log" 2>&1 &
@@ -39,18 +40,19 @@ done
   --harness-option permission-mode=auto -- smoke-initial >"$state_dir/new.json" &
 new_pid=$!
 attempt=0
-session_id=
-while [ -z "$session_id" ]; do
-  sessions=$("$binary" list --all)
-  session_id=$(printf '%s\n' "$sessions" | sed -n 's/.*"id":"\(ses_[0-9A-Z]*\)".*/\1/p')
+launch_id=
+while [ -z "$launch_id" ]; do
+  launch_id=$(sed -n "s/.*hook emit '\\(internal:[0-9A-Z]*\\)' 'claude'.*/\\1/p" \
+    "$DLGT_FAKE_ARGS_FILE" | tail -1)
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"}' \
-  | "$binary" hook emit "$session_id" claude
+  | "$binary" hook emit "$launch_id" claude
 wait "$new_pid"
-grep -Eq '"id":"ses_[0-9A-Z]{8}"' "$state_dir/new.json"
+session_id=claude:provider-session
+grep -q '"id":"claude:provider-session"' "$state_dir/new.json"
 grep -q '"alias":"@smoke"' "$state_dir/new.json"
-grep -q '"provider_session_id":"provider-session"' "$state_dir/new.json"
+if grep -q '"provider_session_id"\|"resume_ref"\|"internal:' "$state_dir/new.json"; then exit 1; fi
 grep -q -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE"
 if grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"; then exit 1; fi
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-1","user_prompt":"smoke-initial"}' \
@@ -71,15 +73,16 @@ DLGT_SOCKET="$old_socket" "$binary" new --title cross-version --alias @cross-ver
   --harness claude --cwd "$repo_root" -- cross-version-initial >"$state_dir/cross-version.json" &
 cross_version_new_pid=$!
 attempt=0
-cross_version_id=
-while [ -z "$cross_version_id" ]; do
-  current=$(DLGT_SOCKET="$old_socket" "$binary" show @cross-version 2>/dev/null || true)
-  cross_version_id=$(printf '%s\n' "$current" | sed -n 's/.*"id":"\(ses_[0-9A-Z]*\)".*/\1/p')
+cross_version_launch_id=
+while [ -z "$cross_version_launch_id" ] || [ "$cross_version_launch_id" = "$launch_id" ]; do
+  cross_version_launch_id=$(sed -n "s/.*hook emit '\\(internal:[0-9A-Z]*\\)' 'claude'.*/\\1/p" \
+    "$DLGT_FAKE_ARGS_FILE" | tail -1)
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-cross-version"}' \
-  | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
+  | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_launch_id" claude
 wait "$cross_version_new_pid"
+cross_version_id=claude:provider-cross-version
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","user_prompt":"cross-version-initial"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","last_assistant_message":"cross-version-ready"}' \
@@ -104,7 +107,9 @@ launch_failure_status=$?
 set -e
 test "$launch_failure_status" -eq 1
 printf '%s\n' "$launch_failure_json" | grep -q '"code":"LAUNCH_FAILED"'
-printf '%s\n' "$launch_failure_json" | grep -Eq '"session_id":"ses_[0-9A-Z]{8}"'
+printf '%s\n' "$launch_failure_json" | grep -Eq '"launch_id":"internal:[0-9A-Z]{8}"'
+launch_failure_id=$(printf '%s\n' "$launch_failure_json" \
+  | sed -n 's/.*"launch_id":"\([^"]*\)".*/\1/p')
 
 long_message=$(awk 'BEGIN { for (i = 0; i < 12000; i++) printf "x" }')
 send_json=$("$binary" send "$session_id" -- "$long_message")
@@ -184,15 +189,18 @@ done
   -- reused-initial >"$state_dir/reused.json" &
 new_pid=$!
 attempt=0
-reused_id=
-while [ -z "$reused_id" ] || [ "$reused_id" = "$session_id" ]; do
-  current=$("$binary" show @smoke 2>/dev/null || true)
-  reused_id=$(printf '%s\n' "$current" | sed -n 's/.*"id":"\(ses_[0-9A-Z]*\)".*/\1/p')
+reused_launch_id=
+while [ -z "$reused_launch_id" ] \
+  || [ "$reused_launch_id" = "$cross_version_launch_id" ] \
+  || [ "$reused_launch_id" = "$launch_failure_id" ]; do
+  reused_launch_id=$(sed -n "s/.*hook emit '\\(internal:[0-9A-Z]*\\)' 'claude'.*/\\1/p" \
+    "$DLGT_FAKE_ARGS_FILE" | tail -1)
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session-2"}' \
-  | "$binary" hook emit "$reused_id" claude
+  | "$binary" hook emit "$reused_launch_id" claude
 wait "$new_pid"
+reused_id=claude:provider-session-2
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","user_prompt":"reused-initial"}' \
   | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","last_assistant_message":"reused-ready"}' \

@@ -107,7 +107,6 @@ impl Store {
                     effort: session.effort.map(str::to_owned),
                     harness_options: session.harness_options.to_vec(),
                     auto_approve: session.auto_approve,
-                    provider_session_id: None,
                     active_turn_id: None,
                     pid: None,
                     created_at_ms: now,
@@ -215,10 +214,63 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_session_provider_id(&self, id: &str, provider_id: &str) -> Result<()> {
-        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
-            session.record.provider_session_id = Some(provider_id.to_owned());
-            session.record.updated_at_ms = now_ms();
+    pub fn rekey_session(&self, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return self
+                .state
+                .borrow()
+                .sessions
+                .contains_key(from)
+                .then_some(())
+                .context("session not found");
+        }
+
+        let mut state = self.state.borrow_mut();
+        if state
+            .sessions
+            .get(to)
+            .is_some_and(|session| !terminal_session(&session.record))
+        {
+            bail!("active session id already exists: {to}");
+        }
+        let replaced = state.sessions.remove(to);
+        let mut session = state.sessions.remove(from).context("session not found")?;
+        if let Some(replaced) = replaced {
+            session.record.created_at_ms = session
+                .record
+                .created_at_ms
+                .min(replaced.record.created_at_ms);
+        }
+        session.record.id = to.to_owned();
+        session.record.updated_at_ms = now_ms();
+        state.sessions.insert(to.to_owned(), session);
+
+        for turn in state.turns.values_mut() {
+            if turn.session_id == from {
+                turn.session_id = to.to_owned();
+            }
+        }
+        for event in &mut state.events {
+            if event.session_id.as_deref() == Some(from) {
+                event.session_id = Some(to.to_owned());
+            }
+        }
+        for input in &mut state.inputs {
+            if input.session_id == from {
+                input.session_id = to.to_owned();
+            }
+        }
+
+        let mut merged = state.outputs.remove(to).unwrap_or_default();
+        if let Some(mut launched) = state.outputs.remove(from) {
+            merged.append(&mut launched);
+        }
+        if !merged.is_empty() {
+            merged.make_contiguous().sort_by_key(|chunk| chunk.seq);
+            while merged.len() > OUTPUT_CHUNK_LIMIT {
+                merged.pop_front();
+            }
+            state.outputs.insert(to.to_owned(), merged);
         }
         Ok(())
     }
@@ -227,15 +279,11 @@ impl Store {
     /// This closes the check/launch race between concurrent `--resume` calls.
     pub fn reserve_provider_session(&self, provider_ref: &str, session_id: &str) -> Result<bool> {
         let mut state = self.state.borrow_mut();
-        let (provider_agent, provider_id) = provider_ref
-            .split_once(':')
-            .map_or((None, provider_ref), |(agent, id)| (Some(agent), id));
         if state.provider_reservations.contains_key(provider_ref)
-            || state.sessions.values().any(|session| {
-                session.record.provider_session_id.as_deref() == Some(provider_id)
-                    && provider_agent.is_none_or(|agent| session.record.agent == agent)
-                    && !terminal_session(&session.record)
-            })
+            || state
+                .sessions
+                .get(provider_ref)
+                .is_some_and(|session| !terminal_session(&session.record))
         {
             return Ok(false);
         }
@@ -279,19 +327,6 @@ impl Store {
         let state = self.state.borrow();
         if let Some(session) = state.sessions.get(selector) {
             return Ok(Some(session.record.clone()));
-        }
-        if let Some((agent, provider_id)) = selector.split_once(':')
-            && matches!(agent, "codex" | "claude")
-        {
-            return Ok(state
-                .sessions
-                .values()
-                .filter(|session| {
-                    session.record.agent == agent
-                        && session.record.provider_session_id.as_deref() == Some(provider_id)
-                })
-                .max_by_key(|session| session.record.created_at_ms)
-                .map(|session| session.record.clone()));
         }
         Ok(state
             .sessions
@@ -690,7 +725,7 @@ mod tests {
         let store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "claude:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "claude",
@@ -702,7 +737,7 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         let session = store
-            .get_session("ses_1")
+            .get_session("claude:thread-1")
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert!(!session.auto_approve);
@@ -713,7 +748,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@test",
                 title: "test",
                 agent: "codex",
@@ -724,20 +759,25 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
         let turn = store
-            .insert_turn("turn_1", "ses_1", "hello")
+            .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         assert_eq!(turn.state, "submitted");
         store
-            .record_event(Some("ses_1"), Some("turn_1"), "turn.submitted", &json!({}))
+            .record_event(
+                Some("codex:thread-1"),
+                Some("turn_1"),
+                "turn.submitted",
+                &json!({}),
+            )
             .unwrap_or_else(|error| panic!("failed to record event: {error}"));
         store
-            .record_input("ses_1", Some("turn_1"), "api", b"hello\r")
+            .record_input("codex:thread-1", Some("turn_1"), "api", b"hello\r")
             .unwrap_or_else(|error| panic!("failed to record input: {error}"));
         assert_eq!(
             store
-                .read_inputs("ses_1", 0)
+                .read_inputs("codex:thread-1", 0)
                 .unwrap_or_else(|error| panic!("failed to read inputs: {error}"))[0]
                 .display,
             "hello\\r"
@@ -748,7 +788,7 @@ mod tests {
     fn unscoped_event_reads_include_session_events() {
         let store = Store::new();
         store
-            .record_event(Some("ses_1"), None, "session.started", &json!({}))
+            .record_event(Some("codex:thread-1"), None, "session.started", &json!({}))
             .unwrap_or_else(|error| panic!("failed to record session event: {error}"));
         store
             .record_event(None, None, "runtime.started", &json!({}))
@@ -760,7 +800,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(
             store
-                .read_events(Some("ses_1"), 0)
+                .read_events(Some("codex:thread-1"), 0)
                 .unwrap_or_else(|error| panic!("failed to read session events: {error}"))
                 .len(),
             1
@@ -777,7 +817,7 @@ mod tests {
         let store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_old",
+                id: "codex:old-session",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -788,13 +828,13 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_old");
+        mark_ready(&store, "codex:old-session");
         store
-            .set_session_stopped("ses_old")
+            .set_session_stopped("codex:old-session")
             .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
         store
             .insert_session(&NewSession {
-                id: "ses_new",
+                id: "codex:new-session",
                 alias: "@worker",
                 title: "worker",
                 agent: "claude",
@@ -806,7 +846,7 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to reuse alias: {error}"));
         let archived = store
-            .get_session("ses_old")
+            .get_session("codex:old-session")
             .unwrap_or_else(|error| panic!("failed to read old session: {error}"))
             .unwrap_or_else(|| panic!("old session missing"));
         assert_eq!(archived.alias, "@worker");
@@ -816,7 +856,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to read new session: {error}"))
                 .unwrap_or_else(|| panic!("new session missing"))
                 .id,
-            "ses_new"
+            "codex:new-session"
         );
     }
 
@@ -826,7 +866,7 @@ mod tests {
         let harness_options = vec!["permission-mode=auto".to_owned()];
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "claude:provider-thread",
                 alias: "@worker",
                 title: "worker",
                 agent: "claude",
@@ -837,40 +877,37 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "claude:provider-thread");
         store
-            .set_session_provider_id("ses_1", "provider-thread")
-            .unwrap_or_else(|error| panic!("failed to bind provider: {error}"));
-        store
-            .set_session_stopped("ses_1")
+            .set_session_stopped("claude:provider-thread")
             .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
 
         assert!(
             store
-                .begin_session_restart("ses_1")
+                .begin_session_restart("claude:provider-thread")
                 .unwrap_or_else(|error| panic!("failed to restart session: {error}"))
         );
         let session = store
-            .get_session("ses_1")
+            .get_session("claude:provider-thread")
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.state, "restarting");
-        assert_eq!(session.id, "ses_1");
+        assert_eq!(session.id, "claude:provider-thread");
         assert_eq!(session.alias, "@worker");
         assert_eq!(session.harness_options, harness_options);
-        assert_eq!(
-            session.provider_session_id.as_deref(),
-            Some("provider-thread")
+        assert!(
+            !store
+                .begin_session_restart("claude:provider-thread")
+                .unwrap_or(false)
         );
-        assert!(!store.begin_session_restart("ses_1").unwrap_or(false));
         assert!(
             store
-                .start_restarted_session("ses_1")
+                .start_restarted_session("claude:provider-thread")
                 .unwrap_or_else(|error| panic!("failed to start restarted session: {error}"))
         );
         assert_eq!(
             store
-                .get_session("ses_1")
+                .get_session("claude:provider-thread")
                 .unwrap_or_else(|error| panic!("failed to read restarted session: {error}"))
                 .unwrap_or_else(|| panic!("restarted session missing"))
                 .state,
@@ -881,7 +918,7 @@ mod tests {
     #[test]
     fn terminal_session_cannot_restart_after_its_alias_is_reused() {
         let store = Store::new();
-        for id in ["ses_old", "ses_new"] {
+        for id in ["codex:old-session", "codex:new-session"] {
             store
                 .insert_session(&NewSession {
                     id,
@@ -896,14 +933,14 @@ mod tests {
                 })
                 .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
             mark_ready(&store, id);
-            if id == "ses_old" {
+            if id == "codex:old-session" {
                 store
                     .set_session_stopped(id)
                     .unwrap_or_else(|error| panic!("failed to stop old session: {error}"));
             }
         }
         let error = store
-            .begin_session_restart("ses_old")
+            .begin_session_restart("codex:old-session")
             .err()
             .unwrap_or_else(|| panic!("alias-conflicting restart unexpectedly succeeded"));
         assert!(
@@ -918,7 +955,7 @@ mod tests {
         let store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "claude",
@@ -929,11 +966,11 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
 
         assert!(
             store
-                .begin_session_restart("ses_1")
+                .begin_session_restart("codex:thread-1")
                 .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
         );
         assert_eq!(
@@ -944,10 +981,14 @@ mod tests {
                 .state,
             "restarting"
         );
-        assert!(!store.set_session_state("ses_1", "idle").unwrap_or(true));
+        assert!(
+            !store
+                .set_session_state("codex:thread-1", "idle")
+                .unwrap_or(true)
+        );
         assert_eq!(
             store
-                .get_session("ses_1")
+                .get_session("codex:thread-1")
                 .unwrap_or_else(|error| panic!("failed to reread restarting session: {error}"))
                 .unwrap_or_else(|| panic!("restarting session missing"))
                 .state,
@@ -956,7 +997,7 @@ mod tests {
         assert!(
             store
                 .insert_session(&NewSession {
-                    id: "ses_2",
+                    id: "codex:session-2",
                     alias: "@worker",
                     title: "other",
                     agent: "codex",
@@ -975,7 +1016,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -986,12 +1027,12 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
         store
-            .insert_turn("turn_1", "ses_1", "hello")
+            .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         let interrupted = store
-            .interrupt_active_turn("ses_1", "agent exited")
+            .interrupt_active_turn("codex:thread-1", "agent exited")
             .unwrap_or_else(|error| panic!("failed to interrupt turn: {error}"));
         assert_eq!(interrupted.as_deref(), Some("turn_1"));
         let turn = store
@@ -1007,7 +1048,7 @@ mod tests {
         let store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -1019,18 +1060,18 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store
-            .record_output("ses_1", b"first")
+            .record_output("codex:thread-1", b"first")
             .unwrap_or_else(|error| panic!("failed to write first output: {error}"));
         store
-            .record_output("ses_1", b"second")
+            .record_output("codex:thread-1", b"second")
             .unwrap_or_else(|error| panic!("failed to write second output: {error}"));
         let first = store
-            .read_output_page("ses_1", 0, 5)
+            .read_output_page("codex:thread-1", 0, 5)
             .unwrap_or_else(|error| panic!("failed to read first page: {error}"));
         assert_eq!(first.data, b"first");
         assert!(first.has_more);
         let second = store
-            .read_output_page("ses_1", first.next_after, 5)
+            .read_output_page("codex:thread-1", first.next_after, 5)
             .unwrap_or_else(|error| panic!("failed to read second page: {error}"));
         assert_eq!(second.data, b"second");
         assert!(!second.has_more);
@@ -1041,7 +1082,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -1052,11 +1093,15 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
         store
-            .insert_turn("turn_1", "ses_1", "first")
+            .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert first turn: {error}"));
-        assert!(store.insert_turn("turn_2", "ses_1", "second").is_err());
+        assert!(
+            store
+                .insert_turn("turn_2", "codex:thread-1", "second")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1064,7 +1109,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_claude",
+                id: "claude:session",
                 alias: "@claude",
                 title: "claude",
                 agent: "claude",
@@ -1077,11 +1122,15 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(
             store
-                .set_session_running("ses_claude", Some(42))
+                .set_session_running("claude:session", Some(42))
                 .unwrap_or_else(|error| panic!("failed to start session: {error}"))
         );
 
-        assert!(store.insert_turn("turn_1", "ses_claude", "first").is_err());
+        assert!(
+            store
+                .insert_turn("turn_1", "claude:session", "first")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1089,7 +1138,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -1100,9 +1149,9 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
         store
-            .insert_turn("turn_1", "ses_1", "first")
+            .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         assert!(
             store
@@ -1126,7 +1175,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -1137,9 +1186,9 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
         store
-            .insert_turn("turn_1", "ses_1", "first")
+            .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert first turn: {error}"));
         assert!(
             store
@@ -1152,7 +1201,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to complete first turn: {error}"))
         );
         store
-            .insert_turn("turn_2", "ses_1", "second")
+            .insert_turn("turn_2", "codex:thread-1", "second")
             .unwrap_or_else(|error| panic!("failed to insert second turn: {error}"));
         assert!(
             !store
@@ -1160,7 +1209,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to reject late cancel: {error}"))
         );
         let session = store
-            .get_session("ses_1")
+            .get_session("codex:thread-1")
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.active_turn_id.as_deref(), Some("turn_2"));
@@ -1171,7 +1220,7 @@ mod tests {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -1182,9 +1231,9 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "ses_1");
+        mark_ready(&store, "codex:thread-1");
         store
-            .insert_turn("turn_1", "ses_1", "first")
+            .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         assert!(
             store
@@ -1192,7 +1241,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to start turn: {error}"))
         );
         store
-            .set_session_state("ses_1", "busy")
+            .set_session_state("codex:thread-1", "busy")
             .unwrap_or_else(|error| panic!("failed to mark session busy: {error}"));
         assert!(
             store
@@ -1200,7 +1249,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to cancel turn: {error}"))
         );
         let session = store
-            .get_session("ses_1")
+            .get_session("codex:thread-1")
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.state, "quiescing");
@@ -1211,7 +1260,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to settle canceled turn: {error}"))
         );
         let session = store
-            .get_session("ses_1")
+            .get_session("codex:thread-1")
             .unwrap_or_else(|error| panic!("failed to read settled session: {error}"))
             .unwrap_or_else(|| panic!("settled session missing"));
         assert_eq!(session.state, "idle");
@@ -1223,7 +1272,7 @@ mod tests {
         let store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_1",
+                id: "codex:thread-1",
                 alias: "@worker",
                 title: "worker",
                 agent: "codex",
@@ -1235,15 +1284,15 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store
-            .set_session_stopped("ses_1")
+            .set_session_stopped("codex:thread-1")
             .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
         assert!(
             !store
-                .set_session_state("ses_1", "idle")
+                .set_session_state("codex:thread-1", "idle")
                 .unwrap_or_else(|error| panic!("failed to reject transition: {error}"))
         );
         let session = store
-            .get_session("ses_1")
+            .get_session("codex:thread-1")
             .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.state, "stopped");
@@ -1254,7 +1303,7 @@ mod tests {
         let store = Store::new();
         store
             .insert_session(&NewSession {
-                id: "ses_codex",
+                id: "codex:shared-id",
                 alias: "@codex",
                 title: "codex",
                 agent: "codex",
@@ -1265,26 +1314,128 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        store
-            .set_session_provider_id("ses_codex", "shared-id")
-            .unwrap_or_else(|error| panic!("failed to bind provider id: {error}"));
         assert_eq!(
             store
                 .get_session("codex:shared-id")
                 .unwrap_or_else(|error| panic!("failed to resolve provider ref: {error}"))
                 .map(|session| session.id),
-            Some("ses_codex".to_owned())
+            Some("codex:shared-id".to_owned())
         );
         assert!(
             !store
-                .reserve_provider_session("codex:shared-id", "ses_new")
+                .reserve_provider_session("codex:shared-id", "codex:new-session")
                 .unwrap_or_else(|error| panic!("failed to reserve provider ref: {error}"))
         );
         assert!(
             store
-                .reserve_provider_session("claude:shared-id", "ses_claude")
+                .reserve_provider_session("claude:shared-id", "claude:session")
                 .unwrap_or_else(|error| panic!("failed to reserve scoped provider ref: {error}"))
         );
-        store.release_provider_session("claude:shared-id", "ses_claude");
+        store.release_provider_session("claude:shared-id", "claude:session");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn launch_id_rekeys_every_retained_session_record() {
+        let mut store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "codex:thread-1",
+                alias: "@worker",
+                title: "old generation",
+                agent: "codex",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert old Session: {error}"));
+        mark_ready(&store, "codex:thread-1");
+        store
+            .record_output("codex:thread-1", b"old")
+            .unwrap_or_else(|error| panic!("failed to record old output: {error}"));
+        store
+            .set_session_stopped("codex:thread-1")
+            .unwrap_or_else(|error| panic!("failed to stop old Session: {error}"));
+
+        store
+            .insert_session(&NewSession {
+                id: "internal:ABC12345",
+                alias: "@worker",
+                title: "new generation",
+                agent: "codex",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert launch Session: {error}"));
+        mark_ready(&store, "internal:ABC12345");
+        let turn = store
+            .insert_turn("turn_rekey", "internal:ABC12345", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        store
+            .record_event(
+                Some("internal:ABC12345"),
+                Some(&turn.id),
+                "turn.submitted",
+                &json!({}),
+            )
+            .unwrap_or_else(|error| panic!("failed to record event: {error}"));
+        store
+            .record_input("internal:ABC12345", Some(&turn.id), "api", b"hello")
+            .unwrap_or_else(|error| panic!("failed to record input: {error}"));
+        store
+            .record_output("internal:ABC12345", b"new")
+            .unwrap_or_else(|error| panic!("failed to record new output: {error}"));
+
+        store
+            .rekey_session("internal:ABC12345", "codex:thread-1")
+            .unwrap_or_else(|error| panic!("failed to promote Session: {error}"));
+
+        assert!(
+            store
+                .get_session("internal:ABC12345")
+                .unwrap_or_else(|error| panic!("failed to read launch ID: {error}"))
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .list_sessions()
+                .unwrap_or_else(|error| panic!("failed to list Sessions: {error}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_turn("turn_rekey")
+                .unwrap_or_else(|error| panic!("failed to read turn: {error}"))
+                .unwrap_or_else(|| panic!("turn missing"))
+                .session_id,
+            "codex:thread-1"
+        );
+        assert_eq!(
+            store
+                .read_events(Some("codex:thread-1"), 0)
+                .unwrap_or_else(|error| panic!("failed to read events: {error}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .read_inputs("codex:thread-1", 0)
+                .unwrap_or_else(|error| panic!("failed to read inputs: {error}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .read_output_page("codex:thread-1", 0, 64)
+                .unwrap_or_else(|error| panic!("failed to read output: {error}"))
+                .data,
+            b"oldnew"
+        );
     }
 }
