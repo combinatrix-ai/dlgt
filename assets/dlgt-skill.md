@@ -7,11 +7,10 @@ description: Create, address, observe, and control live Codex and Claude Session
 
 Use `dlgt` when a Codex or Claude subagent should remain alive in an owned PTY
 and be addressable from later commands. The only public runtime object is a
-Session. Retain `session.id`, `session.resume_ref`, and
-`session.provider_session_id` from `new`. Use the immutable `session.id` while
-its daemon is live. Use the provider-qualified `resume_ref` (`codex:<id>` or
-`claude:<id>`) for provider-native lookup or explicit resume after dlgt exits.
-Aliases are human conveniences and may be reused after a Session stops.
+Session. Retain `session.id` from `new`. It is provider-qualified
+(`codex:<thread-id>` or `claude:<session-id>`) and is the one identifier for
+live commands, provider-native correlation, and explicit resume after dlgt
+exits. Aliases are human conveniences and may be reused after a Session stops.
 
 ## Exact delegation routes
 
@@ -63,13 +62,14 @@ dlgt profiles list
 | Situation | Operation |
 | --- | --- |
 | Start new work with no provider conversation | `new` with the required first prompt |
-| Send a follow-up to a live, idle Session | plain `send <ses_*|@alias>` |
-| Replace a Session's provider process but preserve its `ses_*` ID and history | `restart <ses_*>` |
-| Continue after the owning daemon or Session is gone | `send <resume_ref> --resume` |
+| Send a follow-up to a live, idle Session | plain `send <session.id|@alias>` |
+| Replace a Session's provider process and preserve its history | `restart <session.id>` |
+| Continue after the owning daemon or Session is gone | `send <session.id> --resume` |
 
 `restart` interrupts active work. Plain `send` never launches, restarts,
-resumes, or queues a Session. `send --resume` may create a new `ses_*` Session
-and atomically submit the follow-up; retain the new identifiers it returns.
+resumes, or queues a Session. `send --resume` launches the saved provider
+conversation and atomically submits the follow-up. Retain the returned
+`session.id`; Claude may return a new one if it rotates its provider session.
 
 ## Rules
 
@@ -79,8 +79,8 @@ and atomically submit the follow-up; retain the new identifiers it returns.
   side-effect-free; accepted work changes the Session to busy.
 - Resume a provider conversation with `dlgt send codex:<thread-id> --resume --
   "prompt"` or the equivalent `claude:<session-id>` selector. A successful
-  resume returns a new `ses_*` ID and canonical `resume_ref`; an already-live
-  matching Session is reused instead of duplicated.
+  resume returns the canonical `session.id`; an already-live matching Session
+  is reused instead of duplicated.
 - Keep one active execution per Session. `SESSION_BUSY` means retry after the
   current execution terminalizes; dlgt never queues prompts.
 - Always give `new --wait`, `send --wait`, and `wait` an explicit `--timeout`.
@@ -115,8 +115,6 @@ created=$(dlgt new --title "Fable review" --alias @fable-review \
   -- "Review only; do not edit or delegate again. Report findings and trade-offs.")
 
 session_id=$(printf '%s\n' "$created" | jq -er '.session.id')
-resume_ref=$(printf '%s\n' "$created" | jq -er '.session.resume_ref')
-provider_session_id=$(printf '%s\n' "$created" | jq -er '.session.provider_session_id')
 
 dlgt send "$session_id" --wait --timeout 15m -- "Address the findings"
 dlgt show "$session_id"
@@ -124,20 +122,20 @@ dlgt stop "$session_id"
 ```
 
 Use a real JSON parser rather than regex. If `jq` is unavailable, parse the
-same three fields with another structured JSON tool. Do not rely on an Alias
-after a Session stops.
+same field with another structured JSON tool. Do not rely on an Alias after a
+Session stops.
 
 ## Recover from structured errors
 
 | Error | Required action |
 | --- | --- |
-| `SESSION_BUSY` | Do not resend. Run `wait <ses_*> --timeout <duration>`, or explicitly `cancel` the active work. |
+| `SESSION_BUSY` | Do not resend. Run `wait <session.id> --timeout <duration>`, or explicitly `cancel` the active work. |
 | `SESSION_BLOCKED` | Inspect `events` and `scrollback`, `attach`, answer the visible prompt, detach with `Ctrl-b d`, then `wait` again. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. Use `--steal` only for a known stale attach client. |
-| `SESSION_NOT_RUNNING` | Use the error's `resume_ref` or the saved one with `send <resume_ref> --resume -- <prompt>`. |
+| `SESSION_NOT_RUNNING` | Use the saved `session.id` with `send <session.id> --resume -- <prompt>`. |
 | `WAIT_TIMEOUT` | Work continues. Wait again, inspect it, or cancel explicitly. Do not report completion. |
 | `CANCEL_TIMEOUT` | Cancellation continues. Inspect `events` and wait for a terminal result. |
-| `LAUNCH_FAILED` / `PROVIDER_FAILED` | Inspect `events`, `scrollback`, `show`, and only then sensitive `logs --raw`. |
+| `LAUNCH_FAILED` / `PROVIDER_FAILED` | If present, retain `error.launch_id` only for startup diagnostics. Inspect `events`, `scrollback`, `show`, and only then sensitive `logs --raw`. |
 
 Useful observation and control commands:
 

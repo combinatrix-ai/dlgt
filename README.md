@@ -126,17 +126,18 @@ dlgt new \
   -- "Review the implementation and report correctness risks."
 ```
 
-The command returns a Session ID such as `ses_7K3M9Q2X`:
+The command returns one provider-qualified Session ID, such as
+`codex:019f6307-341e-7e81-8a33-7ab61e804345`:
 
 ```bash
-dlgt wait ses_7K3M9Q2X --timeout 15m
-dlgt send ses_7K3M9Q2X --wait --timeout 15m -- "Review the revision"
-dlgt restart ses_7K3M9Q2X
-dlgt send codex:<provider-thread-id> --resume -- "Continue the review"
-dlgt show ses_7K3M9Q2X
-dlgt scrollback ses_7K3M9Q2X --lines 100
-dlgt attach ses_7K3M9Q2X
-dlgt stop ses_7K3M9Q2X
+dlgt wait codex:019f6307-341e-7e81-8a33-7ab61e804345 --timeout 15m
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait --timeout 15m -- "Review the revision"
+dlgt restart codex:019f6307-341e-7e81-8a33-7ab61e804345
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume -- "Continue the review"
+dlgt show codex:019f6307-341e-7e81-8a33-7ab61e804345
+dlgt scrollback codex:019f6307-341e-7e81-8a33-7ab61e804345 --lines 100
+dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345
+dlgt stop codex:019f6307-341e-7e81-8a33-7ab61e804345
 ```
 
 The first client command starts the local daemon automatically.
@@ -161,11 +162,11 @@ per Profile with `auto_approve = false`.
 
 Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
 override only the current version's socket. Session state is held in memory by
-the daemon that owns the Harness processes; after that daemon exits, use the
-canonical `codex:<provider_session_id>` or `claude:<provider_session_id>`
-`resume_ref` with `send --resume`. `send` scans live versioned sockets before
-launching or resuming, so a binary update routes a returned `ses_*` ID or
-`resume_ref` back to its owning daemon instead of creating a duplicate.
+the daemon that owns the Harness processes. The returned Session ID is also
+the provider conversation's durable resume selector: after that daemon exits,
+pass the same `codex:<id>` or `claude:<id>` to `send --resume`. Plain `send`
+scans live versioned sockets first, so a binary update routes that same ID back
+to its owning daemon instead of creating a duplicate.
 
 The daemon owns every provider process group. A sibling reaper runs in a
 separate process group and ignores ordinary shutdown signals; when the daemon

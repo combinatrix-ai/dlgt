@@ -39,14 +39,22 @@ Title     A non-unique human description used to generate an Alias
 
 ## Identifier and naming model
 
-Session IDs are short, immutable, and intended for automation:
+Every successful `new` returns one provider-qualified Session ID:
 
 ```text
-ses_7K3M9Q2X
+codex:019f6307-341e-7e81-8a33-7ab61e804345
+claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629
 ```
 
-The suffix is eight characters of unambiguous Crockford Base32. Generation is
-random, protected by a runtime uniqueness check, and retried on collision.
+The suffix is the provider's own Codex thread ID or Claude session ID. This
+single `session.id` is both the live dlgt address and the durable resume
+address. There is no separate provider Session ID or resume reference.
+
+During startup only, dlgt correlates the not-yet-bound process with an
+`internal:<short-id>`. It atomically rekeys all retained state to the
+provider-qualified ID before accepting the first prompt or returning success.
+The internal launch ID is not a public Session ID; it may appear only as
+`error.launch_id` when startup fails before provider binding.
 
 Aliases are for humans:
 
@@ -71,13 +79,13 @@ All control-plane commands emit one JSON document to stdout.
 Success:
 
 ```json
-{"ok":true,"session":{"id":"ses_7K3M9Q2X","state":"idle"}}
+{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"idle"}}
 ```
 
 Failure:
 
 ```json
-{"ok":false,"error":{"code":"SESSION_BUSY","message":"session already has active work","session_id":"ses_7K3M9Q2X"}}
+{"ok":false,"error":{"code":"SESSION_BUSY","message":"session already has active work","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}}
 ```
 
 Failures also return a non-zero process exit status. stderr is reserved for
@@ -138,8 +146,8 @@ RUNTIME
 Each release uses its own socket at
 `$DLGT_HOME/run/<version>/dlgt.sock`. Most commands address the daemon for the
 invoking binary's version. `send` first scans all live versioned sockets for an
-exact `ses_*` ID or provider-qualified `resume_ref` and routes to its owning
-daemon; multiple matches fail rather than choosing or launching. `dlgt list
+exact provider-qualified Session ID and routes to its owning daemon; multiple
+matches fail rather than choosing or launching. `dlgt list
 --all-versions` queries every currently running version and annotates each
 Session with `runtime_version` and `runtime_socket`. Session state, results,
 events, and terminal history exist only while their owning daemon remains
@@ -254,11 +262,10 @@ dlgt new \
 {
   "ok": true,
   "session": {
-    "id": "ses_7K3M9Q2X",
+    "id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
     "alias": "@run-review-361csx",
     "title": "run review",
     "harness": "codex",
-    "provider_session_id": "019f6307-341e-7e81-8a33-7ab61e804345",
     "state": "busy"
   },
   "execution_seq": 1
@@ -290,10 +297,10 @@ dlgt restart <SESSION_ID>
   [--pretty]
 ```
 
-`restart` replaces a Session's provider process while preserving its dlgt
-Session ID, alias, retained history, execution sequence, and provider
-conversation. Codex resumes the stored thread and Claude resumes the stored
-conversation.
+`restart` replaces a Session's provider process while preserving its alias,
+retained history, execution sequence, and provider conversation. Codex normally
+keeps the same Session ID. If Claude reports a rotated provider session ID,
+dlgt atomically rekeys the Session and returns the new canonical `session.id`.
 
 Rules:
 
@@ -302,9 +309,9 @@ Rules:
   completed as `interrupted` before the replacement process starts.
 - `starting`, `stopping`, and `restarting` Sessions reject a second lifecycle
   operation with `SESSION_UNAVAILABLE`.
-- The Session must have a stored provider conversation ID.
-- A terminal Session should be addressed by immutable Session ID because its
-  alias may already belong to a newer active Session.
+- The Session ID must contain a provider conversation ID.
+- A terminal Session should be addressed by its provider-qualified Session ID
+  because its alias may already belong to a newer active Session.
 - If another active Session now owns the old alias, restart fails with
   `ALIAS_IN_USE`; it never renames either Session implicitly.
 - Restarting an active Session keeps its alias reserved throughout the process
@@ -323,8 +330,8 @@ dlgt send <SESSION_ID|@ALIAS>
   [--stdin | -- <PROMPT>]
 ```
 
-Resume a provider conversation after its owning daemon exits with an explicit
-provider-qualified selector:
+Resume a provider conversation after its owning daemon exits with the same
+Session ID returned by `new`:
 
 ```text
 dlgt send codex:<provider-thread-id> --resume [launch options] -- <PROMPT>
@@ -335,8 +342,9 @@ dlgt send claude:<provider-session-id> --resume [launch options] -- <PROMPT>
 `--harness-option`, approval/environment flags, and startup timeout. The
 provider prefix selects the Harness. A matching live Session is reused; if
 none exists dlgt reserves the provider conversation, launches a new Session,
-waits for bind/readiness, and atomically accepts the prompt. The success
-contains a new `ses_*` ID, canonical `resume_ref`, and caller correlation ID.
+waits for bind/readiness, and atomically accepts the prompt. Success returns
+the same canonical `session.id` and caller correlation ID. If Claude rotates
+its provider session ID while resuming, success returns that new canonical ID.
 Plain `send` never launches and returns `SESSION_NOT_RUNNING` with a
 `--resume` hint when its target is not live.
 
@@ -363,23 +371,23 @@ Rules:
 Asynchronous example:
 
 ```bash
-dlgt send ses_7K3M9Q2X -- "Review the revised design"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revised design"
 ```
 
 ```json
-{"ok":true,"session":{"id":"ses_7K3M9Q2X","state":"busy"},"execution_seq":2}
+{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2}
 ```
 
 Busy rejection:
 
 ```json
-{"ok":false,"error":{"code":"SESSION_BUSY","session_id":"ses_7K3M9Q2X"}}
+{"ok":false,"error":{"code":"SESSION_BUSY","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}}
 ```
 
 Synchronous example:
 
 ```bash
-dlgt send ses_7K3M9Q2X \
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 \
   --wait \
   --timeout 15m \
   -- "Review the revised design"
@@ -388,7 +396,7 @@ dlgt send ses_7K3M9Q2X \
 ```json
 {
   "ok": true,
-  "session": {"id":"ses_7K3M9Q2X","state":"idle"},
+  "session": {"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"idle"},
   "result": {
     "execution_seq": 2,
     "status": "completed",
@@ -453,7 +461,7 @@ A wait timeout returns `WAIT_TIMEOUT` and leaves the Session busy:
   "ok": false,
   "error": {
     "code": "WAIT_TIMEOUT",
-    "session_id": "ses_7K3M9Q2X",
+    "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
     "session_state": "busy"
   }
 }
@@ -491,8 +499,8 @@ not an infinite wait.
   "ok": false,
   "error": {
     "code": "SESSION_BLOCKED",
-    "session_id": "ses_7K3M9Q2X",
-    "action": "dlgt attach ses_7K3M9Q2X"
+    "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
+    "action": "dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345"
   }
 }
 ```
@@ -560,7 +568,7 @@ for older pages.
 ```json
 {
   "ok": true,
-  "session_id": "ses_7K3M9Q2X",
+  "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
   "screen": {"rows":24,"cols":120},
   "lines": ["Review complete.","","Main concerns:","1. Timeout behavior..."],
   "truncated": true,
@@ -724,9 +732,9 @@ INTERNAL               dlgt runtime invariant failure
 Commands may add contextual fields, but must not overload one code with a
 different retry or human-action policy.
 
-`new` launch failures include the failed audit record's `session_id`. If Codex
-or Claude assigned its own session ID before the failure, the error also
-includes `provider_session_id` so provider-native logs can be correlated.
+If `new` fails before provider binding, its error includes the temporary
+`launch_id` for diagnostics and never presents it as a Session ID. A failure
+after binding includes the canonical `session_id`.
 
 ## Design and RPC contracts
 
