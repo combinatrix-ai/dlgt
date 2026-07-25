@@ -32,6 +32,19 @@ and required final response. The leader inspects the actual result or shared
 filesystem diff and remains responsible for final verification. Do not run
 both counterpart reviewers unless the user explicitly requests both.
 
+## Command reference
+
+Use `dlgt help <command>` for syntax matching the installed binary. For the
+complete CLI contract, fetch the latest released reference:
+
+```bash
+curl -fsSL https://combinatrix.ai/dlgt/cli.md
+```
+
+The hosted reference may describe a newer release. When it conflicts with the
+installed binary, follow that binary's help and tell the user an update may be
+available.
+
 ## Rules
 
 - `new` requires its initial prompt and atomically accepts it; `send` is

@@ -2,6 +2,9 @@
 
 Status: implemented public contract for the repository binary.
 
+This reference is also published as raw Markdown at
+https://combinatrix.ai/dlgt/cli.md for agents to fetch with curl.
+
 This document is the normative command reference. See [RPC](rpc.md) for the
 programmatic interface and [Design](design.md) for the product boundary,
 invariants, lifecycle rationale, security model, and acceptance criteria.
