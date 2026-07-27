@@ -68,6 +68,25 @@ correlation, and later resume. Stopping a Session ends its process, not the
 provider conversation: the same `session.id` still resumes. An Alias is a
 convenience only and may be reused by a new Session after this one stops.
 
+## Pass long prompts on stdin
+
+A self-contained delegation prompt is usually multi-line, so prefer `--stdin`
+over a shell-quoted argument. It reads standard input as the exact prompt and
+is mutually exclusive with a prompt after `--`.
+
+```bash
+dlgt new --title "counterpart review" --harness claude --cwd . \
+  --wait --timeout 15m --stdin <<'PROMPT'
+Review the uncommitted changes in this repository.
+Do not edit files and do not delegate again.
+Report findings and trade-offs only.
+PROMPT
+```
+
+Quote the heredoc delimiter as `<<'PROMPT'`. Left unquoted, the shell expands
+`$` and backticks inside the prompt before dlgt ever sees it. `--stdin` also
+keeps the prompt out of argv, so use it for anything sensitive.
+
 ## Choose the harness and model
 
 - To cross the provider boundary, select the other harness: from Codex use
@@ -124,7 +143,6 @@ when a delegation must keep the Harness's own permission prompts.
 
 - Always give `new --wait`, `send --wait`, and `wait` an explicit `--timeout`.
   A timeout does not cancel the work.
-- Use `--stdin` for long or sensitive prompts so they do not appear in argv.
 - Use provider lifecycle state and `wait`, not PTY silence, as completion proof.
 - Use `scrollback` for bounded plain-text observation. Raw PTY bytes require
   the explicit diagnostic command `logs --raw`.

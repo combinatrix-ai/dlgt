@@ -327,20 +327,32 @@ Rules:
 ```text
 dlgt send <SESSION_ID|@ALIAS>
   [--wait --timeout <DURATION>]
-  [--stdin | -- <PROMPT>]
+  [--pretty]
+  [--stdin | -- <PROMPT>]   (required)
 ```
 
 Resume a provider conversation after its owning daemon exits with the same
 Session ID returned by `new`:
 
 ```text
-dlgt send codex:<provider-thread-id> --resume [launch options] -- <PROMPT>
-dlgt send claude:<provider-session-id> --resume [launch options] -- <PROMPT>
+dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
+  [--model <MODEL>]
+  [--effort <LEVEL>]
+  [--cwd <DIR>]
+  [--harness-option <KEY=VALUE>]...
+  [--no-auto-approve]
+  [--startup-timeout <DURATION>]
+  [--clean-env]
+  [--pass-env <KEY>]...
+  [--env <KEY=VALUE>]...
+  [--unset-env <KEY>]...
+  [--wait --timeout <DURATION>]
+  [--pretty]
+  [--stdin | -- <PROMPT>]   (required)
 ```
 
-`--resume` accepts `--cwd`, `--model`, `--effort`, Claude
-`--harness-option`, approval/environment flags, and startup timeout. The
-provider prefix selects the Harness. A matching live Session is reused; if
+The launch options above are accepted only with `--resume`, and `--harness`
+is rejected because the provider prefix selects the Harness. A matching live Session is reused; if
 none exists dlgt reserves the provider conversation, launches a new Session,
 waits for bind/readiness, and atomically accepts the prompt. Success returns
 the same canonical `session.id` and caller correlation ID. If Claude rotates
