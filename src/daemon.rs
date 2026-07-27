@@ -275,8 +275,8 @@ impl AgentRuntime {
                 provider_thread_id,
                 ..
             } => {
-                let turn_id = control.start_turn(provider_thread_id, prompt)?;
                 control.join_thread(provider_thread_id)?;
+                let turn_id = control.start_turn(provider_thread_id, prompt)?;
                 control.watch_turn(provider_thread_id, &turn_id)?;
                 Ok(turn_id)
             }
@@ -1147,21 +1147,17 @@ impl Daemon {
             self.reaper
                 .watch(view.pid().context("Codex TUI runtime had no pid")?)?,
         )?;
-        let provider_thread_id = match thread_receiver.recv_timeout(startup_timeout) {
-            Ok(thread_id) => thread_id,
-            Err(error) => {
-                let _ = view.force_stop();
-                return Err(error).context("Codex remote TUI did not create a thread");
+        let provider_thread_id = if let Some(expected) = options.resume_provider_id {
+            expected.to_owned()
+        } else {
+            match thread_receiver.recv_timeout(startup_timeout) {
+                Ok(thread_id) => thread_id,
+                Err(error) => {
+                    let _ = view.force_stop();
+                    return Err(error).context("Codex remote TUI did not create a thread");
+                }
             }
         };
-        if let Some(expected) = options.resume_provider_id
-            && provider_thread_id != expected
-        {
-            let _ = view.force_stop();
-            bail!(
-                "resumed Codex provider conversation mismatch: expected {expected}, got {provider_thread_id}"
-            );
-        }
         if let Err(error) =
             control.set_thread_name(&provider_thread_id, &provider_display_name(options.title))
         {

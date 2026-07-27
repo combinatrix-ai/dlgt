@@ -203,6 +203,7 @@ impl CodexConnection {
         std::thread::Builder::new()
             .name("dlgt-codex-turn-watch".to_owned())
             .spawn(move || {
+                let mut pending_terminal_status = None;
                 loop {
                     let Some(connection) = connection.upgrade() else {
                         return;
@@ -214,19 +215,23 @@ impl CodexConnection {
                     if let Ok(response) = response
                         && let Some(turn) = terminal_turn(&response, &turn_id)
                     {
-                        dispatch_notification(
-                            &connection.handler,
-                            &connection.terminal_turns,
-                            json!({
-                                "method": "turn/completed",
-                                "params": {
-                                    "threadId": thread_id,
-                                    "turn": turn,
-                                    "source": "thread/read",
-                                },
-                            }),
-                        );
-                        return;
+                        if terminal_reconciliation_ready(&mut pending_terminal_status, &turn) {
+                            dispatch_notification(
+                                &connection.handler,
+                                &connection.terminal_turns,
+                                json!({
+                                    "method": "turn/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turn": turn,
+                                        "source": "thread/read",
+                                    },
+                                }),
+                            );
+                            return;
+                        }
+                    } else {
+                        pending_terminal_status = None;
                     }
                     drop(connection);
                     std::thread::sleep(TURN_RECONCILE_INTERVAL);
@@ -428,6 +433,12 @@ fn dispatch_notification(
     terminal_turns: &Arc<Mutex<HashSet<String>>>,
     message: Value,
 ) {
+    if message.get("method").and_then(Value::as_str) == Some("turn/started")
+        && let Some(turn_id) = message.pointer("/params/turn/id").and_then(Value::as_str)
+        && is_terminal(terminal_turns, turn_id)
+    {
+        return;
+    }
     if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
         let turn = message.pointer("/params/turn");
         if turn
@@ -453,6 +464,12 @@ fn mark_terminal_once(terminal_turns: &Arc<Mutex<HashSet<String>>>, turn_id: &st
     terminal_turns
         .lock()
         .map_or(true, |mut turns| turns.insert(turn_id.to_owned()))
+}
+
+fn is_terminal(terminal_turns: &Arc<Mutex<HashSet<String>>>, turn_id: &str) -> bool {
+    terminal_turns
+        .lock()
+        .is_ok_and(|turns| turns.contains(turn_id))
 }
 
 fn terminal_turn(response: &Value, turn_id: &str) -> Option<Value> {
@@ -481,6 +498,18 @@ fn terminal_turn(response: &Value, turn_id: &str) -> Option<Value> {
             }
         })
         .cloned()
+}
+
+fn terminal_reconciliation_ready(pending_status: &mut Option<String>, turn: &Value) -> bool {
+    let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
+    if status == "completed" {
+        return true;
+    }
+    if pending_status.as_deref() == Some(status) {
+        return true;
+    }
+    *pending_status = Some(status.to_owned());
+    false
 }
 
 pub(crate) fn final_agent_message_text(turn: &Value) -> Option<&str> {
@@ -555,8 +584,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        NotificationHandler, dispatch_notification, is_rollout_not_ready, terminal_turn,
-        thread_name_set_params, transport_closed,
+        NotificationHandler, dispatch_notification, is_rollout_not_ready,
+        terminal_reconciliation_ready, terminal_turn, thread_name_set_params, transport_closed,
     };
 
     #[test]
@@ -611,6 +640,19 @@ mod tests {
     }
 
     #[test]
+    fn thread_read_confirms_failure_states_before_reconciling() {
+        let interrupted = json!({"id": "turn", "status": "interrupted"});
+        let completed = json!({"id": "turn", "status": "completed"});
+        let mut pending = None;
+
+        assert!(!terminal_reconciliation_ready(&mut pending, &interrupted));
+        assert!(terminal_reconciliation_ready(&mut pending, &interrupted));
+
+        pending = None;
+        assert!(terminal_reconciliation_ready(&mut pending, &completed));
+    }
+
+    #[test]
     fn duplicate_terminal_notifications_are_suppressed() {
         let calls = Arc::new(AtomicUsize::new(0));
         let handler_calls = Arc::clone(&calls);
@@ -631,6 +673,37 @@ mod tests {
         });
         dispatch_notification(&handler, &terminal_turns, notification.clone());
         dispatch_notification(&handler, &terminal_turns, notification);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn late_start_after_terminal_notification_is_suppressed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let handler: NotificationHandler = Arc::new(move |_message| {
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+        });
+        let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
+        let completed = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "done"}],
+                },
+            },
+        });
+        let late_started = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread",
+                "turn": {"id": "turn", "status": "inProgress", "items": []},
+            },
+        });
+        dispatch_notification(&handler, &terminal_turns, completed);
+        dispatch_notification(&handler, &terminal_turns, late_started);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
