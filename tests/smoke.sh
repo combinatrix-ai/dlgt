@@ -28,10 +28,13 @@ mkdir -p "$HOME"
 touch "$DLGT_FAKE_ARGS_FILE"
 old_socket="$state_dir/run/old/dlgt.sock"
 
+version=$("$binary" --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+test -n "$version" || exit 1
+
 "$binary" server --foreground >"$state_dir/server.log" 2>&1 &
 server_pid=$!
 attempt=0
-while [ ! -S "$state_dir/run/0.2.0/dlgt.sock" ]; do
+while [ ! -S "$state_dir/run/$version/dlgt.sock" ]; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
 

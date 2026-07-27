@@ -2539,7 +2539,11 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
     } else if message.contains("launch")
         || message.contains("failed to spawn")
         || message.contains("failed to start")
+        || message.contains("failed to establish")
         || message.contains("did not become")
+        || message.contains("did not create a thread")
+        || message.contains("did not report a Session ID")
+        || message.contains("app-server child was unavailable")
     {
         "LAUNCH_FAILED"
     } else if message.contains("not found") {
@@ -2733,6 +2737,23 @@ mod tests {
             "SESSION_NOT_RUNNING: Session codex:thread-1 is not running; retry with --resume"
         );
         assert_eq!(classify_error(&error), "SESSION_NOT_RUNNING");
+    }
+
+    #[test]
+    fn harness_startup_failures_are_launch_failures() {
+        for message in [
+            "Codex remote TUI did not create a thread: timed out waiting on channel",
+            "provider did not report a Session ID",
+            "Codex app-server child was unavailable",
+            "failed to establish Codex app-server WebSocket",
+        ] {
+            let error = anyhow::anyhow!("{message}");
+            assert_eq!(
+                classify_error(&error),
+                "LAUNCH_FAILED",
+                "{message} must not be reported as an internal invariant failure"
+            );
+        }
     }
 
     #[test]
