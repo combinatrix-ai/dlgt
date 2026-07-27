@@ -6,9 +6,20 @@ description: Delegate work to the competing harness - run Claude from Codex, or 
 # dlgt
 
 `dlgt` runs a Codex or Claude subagent in a dlgt-owned PTY that stays alive
-between commands. Use it to cross the provider boundary, or when a worker must
-remain addressable for follow-up prompts. For a subagent on the same harness
-you are already running, prefer that harness's own built-in subagent tooling.
+between commands. Reach for it whenever the work should cross the provider
+boundary.
+
+On the harness you are already running, its own built-in subagent call is the
+cheaper default. Use dlgt there too when the delegation needs something that
+call cannot express:
+
+- a model or `--effort` pinned to that one worker
+- a Session that stays alive and keeps its context across later follow-ups
+- `attach` or `scrollback` to watch the worker's screen or answer a prompt on it
+- a distinct `--cwd`, launch environment, or approval posture
+
+Outside those, prefer the built-in subagent: dlgt costs a daemon, a process,
+and a PTY.
 
 Terms used below:
 
@@ -57,10 +68,12 @@ correlation, and later resume. Stopping a Session ends its process, not the
 provider conversation: the same `session.id` still resumes. An Alias is a
 convenience only and may be reused by a new Session after this one stops.
 
-## Choose the counterpart
+## Choose the harness and model
 
-- Default to the other harness: from Codex delegate with `--harness claude`,
-  from Claude delegate with `--harness codex`.
+- To cross the provider boundary, select the other harness: from Codex use
+  `--harness claude`, from Claude use `--harness codex`. When you are using
+  dlgt for the control it gives rather than to change providers, stay on the
+  harness you are already running.
 - Pass exactly the model the user named. Never silently substitute another
   model; if the named one is unavailable, say so instead.
 - If the user named no model, omit `--model` and let the provider default
