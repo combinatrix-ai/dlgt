@@ -704,8 +704,8 @@ They configure the provider CLI rather than the launch environment.
 
 The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
-5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ALIAS_IN_USE`, and
-`SESSION_UNAVAILABLE` use exit 1. `WAIT_TIMEOUT` and `CANCEL_TIMEOUT` use exit
+5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ALIAS_IN_USE`,
+`SESSION_NOT_RUNNING`, and `SESSION_UNAVAILABLE` use exit 1. `WAIT_TIMEOUT` and `CANCEL_TIMEOUT` use exit
 3. A Session stopped during `wait` produces a retained `interrupted` result and
 exit 2. Idle `cancel` is an idempotent exit-0 no-op.
 
@@ -715,6 +715,7 @@ The stable v1 structured error-code families are:
 INVALID_ARGUMENT       Invocation cannot be retried unchanged
 NOT_FOUND              Session or configuration object does not exist
 NO_RESULT              Session has never accepted work
+SESSION_NOT_RUNNING    No live Session matches; retry with --resume
 ALIAS_IN_USE           Exact Alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
 SESSION_BLOCKED        Human input is required
