@@ -1,13 +1,85 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { withBase } from "vitepress";
 
 const heroImage = withBase("/delegate-to-the-competition.jpg");
-const installCodex = 'codex "Install and verify dlgt. Fetch https://combinatrix.ai/dlgt/installation.md with curl and follow its instructions."';
-const installClaude = 'claude "Install and verify dlgt. Fetch https://combinatrix.ai/dlgt/installation.md with curl and follow its instructions."';
+
+// Both harnesses take the identical instruction, so the picker only swaps the
+// leading binary name. Keep this sentence in sync with the README quick start.
+const installInstruction =
+  '"Install and verify dlgt. Fetch https://combinatrix.ai/dlgt/installation.md with curl and follow its instructions."';
+const installAgent = ref<"codex" | "claude">("codex");
+const installCommand = computed(() => `${installAgent.value} ${installInstruction}`);
+
 const exampleCodex = 'codex -m gpt-5.6-sol "Create a great game. Ask Fable to review it."';
 const exampleClaude = 'claude --model claude-fable-5 "Think of 10 funny jokes. Ask Sol at xhigh effort to review them."';
 const exampleEffort = 'codex -m gpt-5.6-sol "Make the CLI faster. Have Luna do it at xhigh effort."';
+const exampleCommands = [
+  { key: "example-codex", label: "Codex", command: exampleCodex },
+  { key: "example-claude", label: "Claude", command: exampleClaude },
+];
+
+// Copy feedback is per command line, so one button's state never overwrites
+// another's. Clipboard access fails on insecure origins and when the user
+// denies it, and that has to stay visible rather than look like a success.
+type CopyState = "idle" | "copied" | "error";
+const copyStates = ref<Record<string, CopyState>>({});
+const copyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function copyState(key: string): CopyState {
+  return copyStates.value[key] ?? "idle";
+}
+
+// One <svg> per button whose path swaps with the state, so the markup stays as
+// flat as the rest of this page and no icon package is needed.
+const COPY_GLYPH = "M8 8V4h12v12h-4M4 8h12v12H4V8Z";
+const COPIED_GLYPH = "m4 12 5 5L20 6";
+const ERROR_GLYPH = "M12 7v6m0 3.5v.5M12 3 2 20h20L12 3Z";
+
+function copyGlyph(key: string): string {
+  const state = copyState(key);
+  if (state === "copied") return COPIED_GLYPH;
+  if (state === "error") return ERROR_GLYPH;
+  return COPY_GLYPH;
+}
+
+function copyLabel(key: string): string {
+  const state = copyState(key);
+  if (state === "copied") return "Copied";
+  if (state === "error") return "Try again";
+  return "Copy";
+}
+
+async function copyCommand(key: string, command: string) {
+  const priorTimer = copyTimers.get(key);
+  if (priorTimer) clearTimeout(priorTimer);
+
+  try {
+    await navigator.clipboard.writeText(command);
+    copyStates.value[key] = "copied";
+  } catch {
+    copyStates.value[key] = "error";
+  }
+
+  copyTimers.set(
+    key,
+    setTimeout(() => {
+      copyStates.value[key] = "idle";
+      copyTimers.delete(key);
+    }, 2200),
+  );
+}
+
+// Switching agents replaces the command under the button, so a stale "Copied"
+// would claim the clipboard holds something it does not.
+watch(installAgent, () => {
+  copyStates.value.install = "idle";
+});
+
+onBeforeUnmount(() => {
+  copyTimers.forEach(clearTimeout);
+  copyTimers.clear();
+});
 
 // Every pair crosses providers, and each target only shows effort levels its
 // harness actually accepts (sol supports ultra; the others top out at max).
@@ -115,23 +187,41 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
       </header>
       <div class="command-lines">
         <div class="command-line">
-          <strong>Codex</strong>
-          <pre><code>{{ installCodex }}</code></pre>
-        </div>
-        <div class="command-line">
-          <strong>Claude</strong>
-          <pre><code>{{ installClaude }}</code></pre>
+          <label class="agent-picker">
+            <span class="dlgt-sr-only">Coding agent</span>
+            <select v-model="installAgent">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+            </select>
+          </label>
+          <pre><code>{{ installCommand }}</code></pre>
+          <button
+            class="copy-command"
+            :class="`is-${copyState('install')}`"
+            type="button"
+            :aria-label="`${copyLabel('install')} install command`"
+            @click="copyCommand('install', installCommand)"
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path :d="copyGlyph('install')" /></svg>
+            <span aria-live="polite">{{ copyLabel("install") }}</span>
+          </button>
         </div>
       </div>
       <p class="after-install">Then ask either agent normally.</p>
       <div class="command-lines example-lines">
-        <div class="command-line">
-          <strong>Codex</strong>
-          <pre><code>{{ exampleCodex }}</code></pre>
-        </div>
-        <div class="command-line">
-          <strong>Claude</strong>
-          <pre><code>{{ exampleClaude }}</code></pre>
+        <div v-for="example in exampleCommands" :key="example.key" class="command-line">
+          <strong>{{ example.label }}</strong>
+          <pre><code>{{ example.command }}</code></pre>
+          <button
+            class="copy-command"
+            :class="`is-${copyState(example.key)}`"
+            type="button"
+            :aria-label="`${copyLabel(example.key)} ${example.label} example`"
+            @click="copyCommand(example.key, example.command)"
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path :d="copyGlyph(example.key)" /></svg>
+            <span aria-live="polite">{{ copyLabel(example.key) }}</span>
+          </button>
         </div>
       </div>
       <p class="after-install">Bonus: naming an effort is also enough — native subagents can't choose theirs.</p>
@@ -139,6 +229,16 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
         <div class="command-line">
           <strong>Codex</strong>
           <pre><code>{{ exampleEffort }}</code></pre>
+          <button
+            class="copy-command"
+            :class="`is-${copyState('example-effort')}`"
+            type="button"
+            :aria-label="`${copyLabel('example-effort')} effort example`"
+            @click="copyCommand('example-effort', exampleEffort)"
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path :d="copyGlyph('example-effort')" /></svg>
+            <span aria-live="polite">{{ copyLabel("example-effort") }}</span>
+          </button>
         </div>
       </div>
     </section>
