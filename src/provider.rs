@@ -450,7 +450,7 @@ mod tests {
             std::collections::HashMap::from([("DISABLE_AUTOUPDATER".to_owned(), "0".to_owned())]);
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: Some("claude-4-5-haiku-latest"),
@@ -479,7 +479,7 @@ mod tests {
     fn claude_uses_the_dlgt_prefixed_session_title_as_provider_name() {
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Review API boundaries",
             cwd: Path::new("/tmp"),
             model: None,
@@ -502,7 +502,7 @@ mod tests {
         let environment = std::collections::HashMap::new();
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
@@ -533,7 +533,7 @@ mod tests {
         let options = vec!["permission-mode=plan".to_owned()];
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
@@ -563,7 +563,7 @@ mod tests {
         let spec = codex_remote_tui_command(
             &LaunchOptions {
                 agent: Agent::Codex,
-                session_id: "ses_1",
+                session_id: "internal:TESTID1",
                 title: "Worker title",
                 cwd: Path::new("/tmp"),
                 model: None,
@@ -605,7 +605,7 @@ mod tests {
         let spec = codex_remote_tui_command(
             &LaunchOptions {
                 agent: Agent::Codex,
-                session_id: "ses_1",
+                session_id: "internal:TESTID1",
                 title: "Worker title",
                 cwd: Path::new("/tmp"),
                 model: None,
@@ -644,7 +644,7 @@ mod tests {
         let environment = std::collections::HashMap::new();
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
@@ -677,7 +677,7 @@ mod tests {
         let environment = std::collections::HashMap::new();
         let claude = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
@@ -698,7 +698,7 @@ mod tests {
         let codex = codex_remote_tui_command(
             &LaunchOptions {
                 agent: Agent::Codex,
-                session_id: "ses_1",
+                session_id: "internal:TESTID1",
                 title: "Worker title",
                 cwd: Path::new("/tmp"),
                 model: None,
@@ -727,7 +727,7 @@ mod tests {
         ];
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,
@@ -752,7 +752,7 @@ mod tests {
         let options = vec!["settings={}".to_owned()];
         let result = command_spec(&LaunchOptions {
             agent: Agent::Claude,
-            session_id: "ses_1",
+            session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
             model: None,

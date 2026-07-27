@@ -13,7 +13,7 @@ request produces exactly one response line.
 Request:
 
 ```json
-{"id":"req_1","method":"session.wait","params":{"session":"ses_7K3M9Q2X","timeout_ms":900000}}
+{"id":"req_1","method":"session.wait","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","timeout_ms":900000}}
 ```
 
 Success:
@@ -62,14 +62,15 @@ profile.list          List client-side Profile names
 harness.list          Read Harness capabilities
 ```
 
-`session` parameters accept an immutable `ses_XXXXXXXX` ID or the active human
-alias. The following parameter shapes are stable for v1:
+`session` parameters accept a provider-qualified `codex:<thread-id>` or
+`claude:<session-id>` Session ID, or the active human alias. The following
+parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
 | `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
-| `session.send` | `session`, `prompt`; with `resume:true`, provider-qualified `codex:<id>`/`claude:<id>` selectors and launch options are accepted |
+| `session.send` | `session`, `prompt`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
 | `session.wait` | `session`, positive `timeout_ms` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
@@ -96,12 +97,12 @@ own permission default. Codex Harness options are not currently supported.
 
 ## Session and result schemas
 
-A public Session contains its immutable ID, active alias and title, Harness,
-working directory, model selection, state, timing, and the nullable
-`provider_session_id`. The provider session ID is the Codex thread ID or Claude
-session ID and correlates dlgt activity with provider-native logs; `resume_ref`
-exposes the canonical `codex:<id>` or `claude:<id>` selector. Provider turn IDs
-and internal execution row IDs are excluded.
+A public Session contains its provider-qualified ID, active alias and title,
+Harness, working directory, model selection, state, and timing. The suffix of
+`session.id` is the Codex thread ID or Claude session ID, so the same value
+correlates provider-native logs, addresses a live Session, and explicitly
+resumes it after daemon exit. Provider turn IDs, internal launch IDs, and
+internal execution row IDs are excluded.
 
 CLI `send` scans live versioned daemon sockets before dispatch. Raw JSONL RPC
 is intentionally scoped to the selected socket; callers using RPC directly
@@ -148,16 +149,16 @@ and then one normalized NDJSON event per line until interrupted or the
 connection closes.
 
 ```jsonl
-{"schema_version":1,"seq":101,"type":"session.created","session_id":"ses_7K3M9Q2X"}
-{"schema_version":1,"seq":102,"type":"session.ready","session_id":"ses_7K3M9Q2X"}
-{"schema_version":1,"seq":103,"type":"session.busy","session_id":"ses_7K3M9Q2X","execution_seq":1}
-{"schema_version":1,"seq":104,"type":"provider.retrying","session_id":"ses_7K3M9Q2X","execution_seq":1,"attempt":1}
-{"schema_version":1,"seq":105,"type":"session.blocked","session_id":"ses_7K3M9Q2X","execution_seq":1,"reason":"user_input"}
-{"schema_version":1,"seq":106,"type":"session.resumed","session_id":"ses_7K3M9Q2X","execution_seq":1}
-{"schema_version":1,"seq":107,"type":"session.idle","session_id":"ses_7K3M9Q2X","execution_seq":1,"result_status":"completed"}
-{"schema_version":1,"seq":108,"type":"session.stopped","session_id":"ses_7K3M9Q2X"}
-{"schema_version":1,"seq":109,"type":"session.restarting","session_id":"ses_7K3M9Q2X"}
-{"schema_version":1,"seq":110,"type":"session.ready","session_id":"ses_7K3M9Q2X"}
+{"schema_version":1,"seq":101,"type":"session.created","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}
+{"schema_version":1,"seq":102,"type":"session.ready","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}
+{"schema_version":1,"seq":103,"type":"session.busy","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","execution_seq":1}
+{"schema_version":1,"seq":104,"type":"provider.retrying","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","execution_seq":1,"attempt":1}
+{"schema_version":1,"seq":105,"type":"session.blocked","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","execution_seq":1,"reason":"user_input"}
+{"schema_version":1,"seq":106,"type":"session.resumed","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","execution_seq":1}
+{"schema_version":1,"seq":107,"type":"session.idle","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","execution_seq":1,"result_status":"completed"}
+{"schema_version":1,"seq":108,"type":"session.stopped","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}
+{"schema_version":1,"seq":109,"type":"session.restarting","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}
+{"schema_version":1,"seq":110,"type":"session.ready","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}
 ```
 
 The complete v1 event type set is:
@@ -192,7 +193,7 @@ or interactive attach.
 
 ```json
 {
-  "session_id": "ses_7K3M9Q2X",
+  "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
   "screen": {"rows":24,"cols":120},
   "lines": ["Review complete.","","Main concerns:"],
   "truncated": true,
@@ -208,7 +209,7 @@ base64 page and byte cursor:
 
 ```json
 {
-  "session_id":"ses_7K3M9Q2X",
+  "session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345",
   "data_base64":"...",
   "byte_len":4096,
   "next_after":8192,
@@ -243,10 +244,10 @@ INTERNAL               dlgt runtime invariant failure
 ```
 
 Methods may add contextual error fields but must not overload a code with a
-different retry or human-action policy. `session.create` launch failures include
-the created `session_id` and include `provider_session_id` when the Harness
-assigned one before failing. CLI exit-status mapping is defined in
-[CLI](cli.md#exit-statuses).
+different retry or human-action policy. A `session.create` failure before
+provider binding includes an `internal:<short-id>` as `launch_id`, never as
+`session_id`. A failure after binding includes the canonical `session_id`.
+CLI exit-status mapping is defined in [CLI](cli.md#exit-statuses).
 
 ## Security boundary
 

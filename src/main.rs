@@ -33,17 +33,14 @@ fn main() {
             if let Some(session_id) = &failure.session_id {
                 error_object.insert("session_id".to_owned(), json!(session_id));
             }
-            if let Some(provider_session_id) = &failure.provider_session_id {
-                error_object.insert("provider_session_id".to_owned(), json!(provider_session_id));
+            if let Some(launch_id) = &failure.launch_id {
+                error_object.insert("launch_id".to_owned(), json!(launch_id));
             }
             if let Some(correlation_id) = &failure.correlation_id {
                 error_object.insert("correlation_id".to_owned(), json!(correlation_id));
             }
             if let Some(hint) = &failure.hint {
                 error_object.insert("hint".to_owned(), json!(hint));
-            }
-            if let Some(resume_ref) = &failure.resume_ref {
-                error_object.insert("resume_ref".to_owned(), json!(resume_ref));
             }
             if let Some(session_state) = &failure.session_state {
                 error_object.insert("session_state".to_owned(), json!(session_state));

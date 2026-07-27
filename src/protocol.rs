@@ -27,13 +27,11 @@ pub struct RpcError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_session_id: Option<String>,
+    pub launch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,10 +60,9 @@ impl Response {
                 code: code.into(),
                 message: message.into(),
                 session_id: None,
-                provider_session_id: None,
+                launch_id: None,
                 correlation_id: None,
                 hint: None,
-                resume_ref: None,
                 session_state: None,
                 action: None,
             }),
@@ -77,8 +74,8 @@ impl Response {
         id: impl Into<String>,
         code: impl Into<String>,
         message: impl Into<String>,
-        session_id: impl Into<String>,
-        provider_session_id: Option<String>,
+        session_id: Option<String>,
+        launch_id: Option<String>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -86,11 +83,10 @@ impl Response {
             error: Some(RpcError {
                 code: code.into(),
                 message: message.into(),
-                session_id: Some(session_id.into()),
-                provider_session_id,
+                session_id,
+                launch_id,
                 correlation_id: None,
                 hint: None,
-                resume_ref: None,
                 session_state: None,
                 action: None,
             }),
@@ -118,7 +114,6 @@ pub struct SessionRecord {
     pub effort: Option<String>,
     pub harness_options: Vec<String>,
     pub auto_approve: bool,
-    pub provider_session_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub pid: Option<u32>,
     pub created_at_ms: i64,
@@ -194,8 +189,8 @@ mod tests {
             "req_1",
             "LAUNCH_FAILED",
             "launch failed",
-            "ses_1",
-            Some("provider_1".to_owned()),
+            None,
+            Some("internal:ABC12345".to_owned()),
         ))
         .unwrap_or_else(|error| panic!("failed to encode response: {error}"));
         assert_eq!(
@@ -205,8 +200,7 @@ mod tests {
                 "error":{
                     "code":"LAUNCH_FAILED",
                     "message":"launch failed",
-                    "session_id":"ses_1",
-                    "provider_session_id":"provider_1"
+                    "launch_id":"internal:ABC12345"
                 }
             })
         );

@@ -81,7 +81,14 @@ fn send_rejects_timeout_before_starting_a_daemon() -> Result<(), Box<dyn std::er
     let home = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
         .env("DLGT_HOME", home.path())
-        .args(["send", "ses_TEST", "--timeout", "1s", "--", "hello"])
+        .args([
+            "send",
+            "codex:test-session",
+            "--timeout",
+            "1s",
+            "--",
+            "hello",
+        ])
         .output()?;
 
     assert!(!output.status.success());

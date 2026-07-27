@@ -91,16 +91,17 @@ Run at least three fresh containers for each Harness:
 
 `dlgt new` and `session.create` require a non-empty initial prompt. To verify
 post-daemon continuity without creating duplicates, use the returned
-`resume_ref` (`codex:<provider_session_id>` or `claude:<provider_session_id>`)
-with `dlgt send <resume_ref> --resume -- <PROMPT>`; plain `send` never launches
-a replacement and returns `SESSION_NOT_RUNNING` with that hint.
+provider-qualified `session.id` with
+`dlgt send <session.id> --resume -- <PROMPT>`; plain `send` never launches a
+replacement and returns `SESSION_NOT_RUNNING` with that hint.
 
 Every run passes only when all of the following are true:
 
 - the command exits zero and returns `ok: true`;
 - the result has `status: "completed"` and the exact non-empty marker in
   `final_text`;
-- `provider_session_id` is non-empty;
+- `session.id` has the expected `codex:<thread-id>` or
+  `claude:<session-id>` form;
 - `dlgt list --all-versions` reports the expected `runtime_version` and
   `$DLGT_HOME/run/<version>/dlgt.sock`;
 - the Session is stopped, and the container and temporary authentication copy
@@ -159,7 +160,7 @@ curl -fsSL https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh
 ```
 
 Verify the published version, both embedded Skill copies, one real Claude
-delegation, one real Codex delegation, `provider_session_id`, and the versioned
-socket. Confirm that the GitHub Release is neither a draft nor a prerelease and
-contains all six platform archives, six per-archive SHA-256 files, and the
-checksum manifest.
+delegation, one real Codex delegation, provider-qualified `session.id`, and the
+versioned socket. Confirm that the GitHub Release is neither a draft nor a
+prerelease and contains all six platform archives, six per-archive SHA-256
+files, and the checksum manifest.

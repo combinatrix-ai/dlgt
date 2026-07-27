@@ -18,8 +18,8 @@ provider-specific control path, one PTY and rendered screen, and one serialized
 controller. The owning version's daemon keeps Session state, executions,
 lifecycle events, results, bounded raw PTY bytes, and rendered scrollback in
 memory. When that daemon exits, its dlgt Session state disappears; the returned
-provider conversation ID remains the durable lookup and resume key in Codex or
-Claude.
+provider-qualified Session ID remains the durable lookup and resume key in
+Codex or Claude.
 
 Provider turns, steering messages, queued prompts, and delivery attempts are
 internal correlation records. They do not have public selectors and do not
@@ -124,7 +124,7 @@ notifications. Its remote TUI PTY exists for attach and presentation.
 
 | App-server signal | dlgt interpretation |
 | --- | --- |
-| `thread/started` | Bind and validate the Codex thread as `provider_session_id`; establish startup/resume readiness for the expected generation. |
+| `thread/started` | Bind and validate the Codex thread, then publish `codex:<thread-id>` as the Session ID; establish startup/resume readiness for the expected generation. |
 | `turn/started` | Match the bound thread and pending execution, bind `provider_turn_id`, and confirm `busy`. |
 | `turn/completed`, `completed` | Store the final assistant text, terminalize the execution successfully, then dispatch queued work or become `idle`. |
 | `turn/completed`, `failed` | Store the sanitized error, terminalize as failed, then dispatch queued work or become `idle`. |
@@ -150,7 +150,7 @@ modify the user's global hook configuration.
 
 | Claude hook | dlgt interpretation |
 | --- | --- |
-| `SessionStart` | Bind and validate Claude `session_id` as `provider_session_id`; establish startup/resume readiness. |
+| `SessionStart` | Bind and validate Claude `session_id`, then publish `claude:<session-id>` as the Session ID; establish startup/resume readiness. |
 | `UserPromptSubmit` | Match the pending prompt, bind provider turn data when present, and confirm `busy`. |
 | `Notification(permission_prompt)` | Preserve the active execution and enter `blocked`. |
 | `Notification(elicitation_dialog)` | Preserve the active execution and enter `blocked`. |
@@ -324,9 +324,11 @@ interruption cannot reach quiescence, cancel/replace times out and the caller
 may request an explicit process restart.
 
 Restart replaces the provider process/control generation while retaining the
-Session ID, alias, provider conversation ID when possible, execution sequence,
-and queued work. Active work receives a retained interrupted result before the
-replacement generation can dispatch new work.
+alias, provider conversation, execution sequence, and queued work. The
+provider-qualified Session ID remains the same unless Claude rotates its
+provider session ID, in which case dlgt atomically rekeys the retained Session.
+Active work receives a retained interrupted result before the replacement
+generation can dispatch new work.
 
 Attach grants one exclusive writer lease. While attached, semantic send modes
 are rejected with `SESSION_ATTACHED`; the attached human owns provider input.
@@ -479,9 +481,9 @@ failure-policy problems. Consumers follow normalized events instead.
 
 ### Identifiers have distinct roles
 
-Aliases are readable active-session conveniences. Immutable Session IDs remain
-unambiguous after alias reuse. `execution_seq` correlates accepted work and
-results without creating a public Turn identity.
+Aliases are readable active-session conveniences. Provider-qualified Session
+IDs remain unambiguous after alias reuse. `execution_seq` correlates accepted
+work and results without creating a public Turn identity.
 
 ### Idle cancel is idempotent
 

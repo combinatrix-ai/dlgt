@@ -6,6 +6,9 @@ import { defineConfig } from "vitepress";
 const installationSource = fileURLToPath(
   new URL("../installation.md", import.meta.url),
 );
+const cliSource = fileURLToPath(
+  new URL("../cli.md", import.meta.url),
+);
 const siteBase = process.env.CF_PAGES === "1" ? "/" : "/dlgt/";
 
 export default defineConfig({
@@ -16,10 +19,16 @@ export default defineConfig({
   lastUpdated: true,
   sitemap: { hostname: "https://combinatrix.ai/dlgt/" },
   async buildEnd(siteConfig) {
-    await copyFile(
-      installationSource,
-      resolve(siteConfig.outDir, "installation.md"),
-    );
+    await Promise.all([
+      copyFile(
+        installationSource,
+        resolve(siteConfig.outDir, "installation.md"),
+      ),
+      copyFile(
+        cliSource,
+        resolve(siteConfig.outDir, "cli.md"),
+      ),
+    ]);
   },
   head: [
     ["meta", { name: "theme-color", content: "#f04b23" }],

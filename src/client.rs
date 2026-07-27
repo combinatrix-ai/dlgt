@@ -26,10 +26,9 @@ pub struct RpcFailure {
     pub code: String,
     pub message: String,
     pub session_id: Option<String>,
-    pub provider_session_id: Option<String>,
+    pub launch_id: Option<String>,
     pub correlation_id: Option<String>,
     pub hint: Option<String>,
-    pub resume_ref: Option<String>,
     pub session_state: Option<String>,
     pub action: Option<String>,
 }
@@ -101,10 +100,10 @@ pub struct LiveSessionRoute {
 }
 
 pub fn find_live_session(selector: &str) -> Result<Option<LiveSessionRoute>> {
-    let durable = selector
+    let canonical = selector
         .split_once(':')
         .filter(|(harness, id)| matches!(*harness, "codex" | "claude") && !id.is_empty());
-    if durable.is_none() && !selector.starts_with("ses_") {
+    if canonical.is_none() {
         return Ok(None);
     }
 
@@ -132,14 +131,9 @@ pub fn find_live_session(selector: &str) -> Result<Option<LiveSessionRoute>> {
         };
         for session in sessions {
             let session_id = session.get("id").and_then(Value::as_str);
-            let is_match = if let Some((harness, provider_id)) = durable {
-                session.get("harness").and_then(Value::as_str) == Some(harness)
-                    && session.get("provider_session_id").and_then(Value::as_str)
-                        == Some(provider_id)
-            } else {
-                session_id == Some(selector)
-            };
-            if is_match && let Some(session_id) = session_id {
+            if session_id == Some(selector)
+                && let Some(session_id) = session_id
+            {
                 routes.push(LiveSessionRoute {
                     socket: socket.clone(),
                     session_id: session_id.to_owned(),
@@ -328,13 +322,13 @@ pub fn rpc_stdio() -> Result<()> {
             Err(error) => error.downcast_ref::<RpcFailure>().map_or_else(
                 || Response::error(&request.id, "RPC_UNAVAILABLE", error.to_string()),
                 |failure| {
-                    if let Some(session_id) = &failure.session_id {
+                    if failure.session_id.is_some() || failure.launch_id.is_some() {
                         Response::session_error(
                             &request.id,
                             &failure.code,
                             &failure.message,
-                            session_id,
-                            failure.provider_session_id.clone(),
+                            failure.session_id.clone(),
+                            failure.launch_id.clone(),
                         )
                     } else {
                         Response::error(&request.id, &failure.code, &failure.message)
@@ -407,10 +401,9 @@ fn decode_response(line: &str) -> Result<Value> {
             code: error.code,
             message: error.message,
             session_id: error.session_id,
-            provider_session_id: error.provider_session_id,
+            launch_id: error.launch_id,
             correlation_id: error.correlation_id,
             hint: error.hint,
-            resume_ref: error.resume_ref,
             session_state: error.session_state,
             action: error.action,
         }
@@ -563,9 +556,9 @@ mod tests {
     }
 
     #[test]
-    fn rpc_failure_preserves_session_correlation_ids() {
+    fn rpc_failure_preserves_launch_correlation_id() {
         let result = decode_response(
-            r#"{"id":"req_1","error":{"code":"LAUNCH_FAILED","message":"failed","session_id":"ses_1","provider_session_id":"provider_1"}}"#,
+            r#"{"id":"req_1","error":{"code":"LAUNCH_FAILED","message":"failed","launch_id":"internal:ABC12345"}}"#,
         );
         let error = match result {
             Ok(value) => panic!("expected RPC failure, got {value}"),
@@ -574,7 +567,7 @@ mod tests {
         let failure = error
             .downcast_ref::<RpcFailure>()
             .unwrap_or_else(|| panic!("RPC failure missing"));
-        assert_eq!(failure.session_id.as_deref(), Some("ses_1"));
-        assert_eq!(failure.provider_session_id.as_deref(), Some("provider_1"));
+        assert_eq!(failure.launch_id.as_deref(), Some("internal:ABC12345"));
+        assert!(failure.session_id.is_none());
     }
 }
