@@ -13,6 +13,7 @@ mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -165,10 +166,7 @@ fn command_new(args: &[String]) -> Result<()> {
         None
     };
     let timeout_ms = timeout_ms.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
-    let cwd = parsed.one("--cwd").map(str::to_owned).map_or_else(
-        || std::env::current_dir().map(|path| path.to_string_lossy().into_owned()),
-        Ok,
-    )?;
+    let cwd = launch_cwd(&parsed)?;
     let model = parsed.one("--model").or_else(|| {
         profile
             .as_ref()
@@ -258,13 +256,7 @@ fn command_send(args: &[String]) -> Result<()> {
     });
     if parsed.flag("--resume") {
         let object = params.as_object_mut().context("invalid send parameters")?;
-        object.insert(
-            "cwd".to_owned(),
-            json!(parsed.one("--cwd").map(str::to_owned).map_or_else(
-                || std::env::current_dir().map(|path| path.to_string_lossy().into_owned()),
-                Ok,
-            )?),
-        );
+        object.insert("cwd".to_owned(), json!(launch_cwd(&parsed)?));
         object.insert("model".to_owned(), json!(parsed.one("--model")));
         object.insert("effort".to_owned(), json!(parsed.one("--effort")));
         object.insert(
@@ -716,6 +708,23 @@ fn launch_environment(parsed: &Args, profile: Option<&Value>) -> Result<Map<Stri
         .collect())
 }
 
+fn launch_cwd(parsed: &Args) -> Result<String> {
+    let invocation_dir =
+        std::env::current_dir().context("cannot determine the current directory")?;
+    resolve_launch_cwd(parsed.one("--cwd"), &invocation_dir)
+}
+
+fn resolve_launch_cwd(argument: Option<&str>, invocation_dir: &Path) -> Result<String> {
+    let Some(argument) = argument else {
+        return Ok(invocation_dir.to_string_lossy().into_owned());
+    };
+    let resolved = invocation_dir
+        .join(argument)
+        .canonicalize()
+        .with_context(|| format!("--cwd {argument:?} does not exist"))?;
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
 fn launch_harness_options(parsed: &Args, profile: Option<&Value>) -> Result<Vec<String>> {
     let mut options = Vec::new();
     if let Some(value) = profile.and_then(|profile| profile.get("harness_options")) {
@@ -911,4 +920,66 @@ fn print_command_usage(command: &str) -> Result<()> {
     };
     println!("{usage}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_cwd_resolves_against_the_invocation_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = tempfile::tempdir()?;
+        std::fs::create_dir(base.path().join("sub"))?;
+        let expected = base
+            .path()
+            .join("sub")
+            .canonicalize()?
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(resolve_launch_cwd(Some("sub"), base.path())?, expected);
+        assert_eq!(resolve_launch_cwd(Some("./sub"), base.path())?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_cwd_ignores_the_invocation_directory() -> Result<(), Box<dyn std::error::Error>> {
+        let target = tempfile::tempdir()?;
+        let unrelated = tempfile::tempdir()?;
+        let expected = target.path().canonicalize()?.to_string_lossy().into_owned();
+
+        assert_eq!(
+            resolve_launch_cwd(Some(&expected), unrelated.path())?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_cwd_fails_on_the_client() -> Result<(), Box<dyn std::error::Error>> {
+        let base = tempfile::tempdir()?;
+
+        match resolve_launch_cwd(Some("missing"), base.path()) {
+            Ok(resolved) => return Err(format!("expected an error, got {resolved:?}").into()),
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("--cwd \"missing\" does not exist"),
+                    "unexpected error message: {message}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_cwd_uses_the_invocation_directory_verbatim() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(
+            resolve_launch_cwd(None, Path::new("/nonexistent-base"))?,
+            "/nonexistent-base"
+        );
+        Ok(())
+    }
 }
