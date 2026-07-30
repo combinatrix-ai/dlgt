@@ -17,6 +17,7 @@ dbg_macro = "deny"
 
 [dependencies]
 anyhow = "1"
+attestation-verify = { git = "https://github.com/combinatrix-ai/attestation-verify", rev = "70d918cf55c43c290549d02c0c507bab428b4a28" }
 base64 = "0.22"
 libc = "0.2"
 portable-pty = "0.9"

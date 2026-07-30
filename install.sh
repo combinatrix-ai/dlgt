@@ -27,6 +27,8 @@ Options:
   --version VERSION  Install VERSION (for example v0.1.0); default: latest
   --bin-dir DIR      Install into DIR; default: $DLGT_BIN_DIR or ~/.local/bin
   --skill MODE       Register the embedded skill: auto, none, codex, claude, or both
+  --expect-sha256 HEX
+                       Require the downloaded archive's SHA-256 to equal HEX
   --register-skills-from BINARY
                        Register skills from an existing dlgt binary; skip download
   --no-skill         Alias for --skill none
@@ -159,6 +161,23 @@ verify_checksum() {
   [ "$actual" = "$expected" ] || die "checksum verification failed for $(basename "$archive_path")"
 }
 
+validate_expect_sha256() {
+  candidate="$1"
+  case "$candidate" in
+    *[!0-9A-Fa-f]*) die "invalid --expect-sha256 value; expected 64 hex characters" ;;
+  esac
+  [ "${#candidate}" -eq 64 ] || die "invalid --expect-sha256 value; expected 64 hex characters"
+}
+
+verify_expected_sha256() {
+  archive_path="$1"
+  expected="$2"
+  actual="$(sha256 "$archive_path")"
+  expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+  [ "$actual" = "$expected" ] \
+    || die "attested checksum mismatch for $(basename "$archive_path"): expected $expected, got $actual"
+}
+
 install_skill() {
   skill_target="$1"
   skill_directory="$(dirname "$skill_target")"
@@ -228,6 +247,7 @@ main() {
   bin_dir="${DLGT_BIN_DIR:-$HOME/.local/bin}"
   skill_mode="auto"
   register_skills_from=""
+  expect_sha256=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -244,6 +264,12 @@ main() {
       --skill)
         [ "$#" -ge 2 ] || die "--skill requires a value"
         skill_mode="$2"
+        shift 2
+        ;;
+      --expect-sha256)
+        [ "$#" -ge 2 ] || die "--expect-sha256 requires a value"
+        validate_expect_sha256 "$2"
+        expect_sha256="$2"
         shift 2
         ;;
       --register-skills-from)
@@ -300,6 +326,9 @@ main() {
   download "$release_base/$archive_name" "$archive_path"
   download "$release_base/${archive_name}.sha256" "$checksum_path"
   verify_checksum "$archive_path" "$checksum_path"
+  if [ -n "$expect_sha256" ]; then
+    verify_expected_sha256 "$archive_path" "$expect_sha256"
+  fi
 
   extract_directory="$temporary_directory/extract"
   mkdir -p "$extract_directory"

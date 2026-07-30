@@ -63,6 +63,36 @@ if (verify_checksum "$archive" "$checksum") >/dev/null 2>&1; then
   exit 1
 fi
 
+# --expect-sha256: a correct digest passes, a mismatched digest dies with a
+# message distinct from verify_checksum's, and a malformed value is rejected
+# immediately (before any download would happen).
+attested_archive="$checksum_test_directory/attested-dlgt.tar.gz"
+printf 'attested dlgt archive\n' > "$attested_archive"
+attested_digest="$(sha256 "$attested_archive")"
+
+verify_expected_sha256 "$attested_archive" "$attested_digest"
+
+mismatched_digest="$(printf '%s' "$attested_digest" | tr '0123456789abcdef' '9876543210fedcba')"
+if (verify_expected_sha256 "$attested_archive" "$mismatched_digest") >/dev/null 2>&1; then
+  printf 'mismatched --expect-sha256 digest passed verification\n' >&2
+  exit 1
+fi
+mismatch_message="$( (verify_expected_sha256 "$attested_archive" "$mismatched_digest") 2>&1 || true )"
+printf '%s\n' "$mismatch_message" | grep -q 'attested checksum mismatch' || {
+  printf 'mismatch die message missing expected text: %s\n' "$mismatch_message" >&2
+  exit 1
+}
+
+if (validate_expect_sha256 "not-hex-and-wrong-length") >/dev/null 2>&1; then
+  printf 'malformed --expect-sha256 value was accepted\n' >&2
+  exit 1
+fi
+short_digest="$(printf '%s' "$attested_digest" | cut -c1-63)"
+if (validate_expect_sha256 "$short_digest") >/dev/null 2>&1; then
+  printf 'too-short --expect-sha256 value was accepted\n' >&2
+  exit 1
+fi
+
 if detect_target FreeBSD x86_64 auto >/dev/null 2>&1; then
   printf 'unsupported OS was accepted\n' >&2
   exit 1
