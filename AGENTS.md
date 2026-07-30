@@ -163,4 +163,11 @@ Verify the published version, both embedded Skill copies, one real Claude
 delegation, one real Codex delegation, provider-qualified `session.id`, and the
 versioned socket. Confirm that the GitHub Release is neither a draft nor a
 prerelease and contains all six platform archives, six per-archive SHA-256
-files, and the checksum manifest.
+files, the checksum manifest, and seven Sigstore bundle assets (one
+`<asset>.sigstore.json` per archive plus one for the manifest). Verify the
+provenance of at least one downloaded archive and of the checksum manifest:
+
+```sh
+gh attestation verify dlgt-<tag>-<target>.tar.gz --repo combinatrix-ai/dlgt
+gh attestation verify dlgt-<tag>-checksums.txt --repo combinatrix-ai/dlgt
+```
