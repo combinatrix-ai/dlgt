@@ -141,6 +141,10 @@ when a delegation must keep the Harness's own permission prompts.
 
 ## Rules
 
+- `--cwd` accepts absolute and relative paths. The client resolves a relative
+  value against its own working directory before sending and fails fast when
+  the path does not exist. Omitting `--cwd` uses the client's current
+  directory.
 - Always give `new --wait`, `send --wait`, and `wait` an explicit `--timeout`.
   A timeout does not cancel the work.
 - Use provider lifecycle state and `wait`, not PTY silence, as completion proof.
