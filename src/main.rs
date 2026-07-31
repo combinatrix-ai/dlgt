@@ -1,3 +1,4 @@
+mod claude_models;
 mod client;
 mod codex;
 mod daemon;

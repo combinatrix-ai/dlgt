@@ -626,23 +626,27 @@ modalities, and service tiers.
 ```
 
 Claude Code does not currently expose an equivalent documented non-interactive
-picker API. dlgt returns stable Claude Code aliases and reports discovery as
-partial. When API-key authentication provides access to the Anthropic Models
-API, those results may be included separately but must not be presented as the
-Claude Code subscription picker.
+picker API. dlgt always returns the stable Claude Code aliases, then augments
+them with current canonical IDs from the public, daily refreshed
+[`claude-models-list`](https://github.com/combinatrix-ai/claude-models-list)
+snapshot. Date-pinned IDs ending in `-YYYYMMDD` are omitted. The snapshot is
+account-scoped and is not presented as the Claude Code subscription picker. If
+it cannot be fetched or validated, dlgt falls back to the aliases and reports
+discovery as `partial`.
 
 ```json
 {
   "ok": true,
   "harness": "claude",
-  "source": "claude-code-aliases",
-  "discovery": "partial",
+  "source": "https://raw.githubusercontent.com/combinatrix-ai/claude-models-list/main/models.json",
+  "discovery": "snapshot",
   "models": [
-    {"id":"default","recommended":true},
-    {"id":"best"},
-    {"id":"sonnet"},
-    {"id":"opus"},
-    {"id":"haiku"}
+    {"id":"default","kind":"alias","recommended":true},
+    {"id":"best","kind":"alias"},
+    {"id":"sonnet","kind":"alias"},
+    {"id":"opus","kind":"alias"},
+    {"id":"haiku","kind":"alias"},
+    {"id":"claude-fable-5","display_name":"Claude Fable 5"}
   ]
 }
 ```
@@ -650,6 +654,12 @@ Claude Code subscription picker.
 Model and effort are optional at launch. Omission selects the provider's
 recommended default. Profiles should prefer stable provider aliases unless an
 exact version pin is required.
+
+For an exact canonical Claude model ID, dlgt validates `--effort` against the
+snapshot's `capabilities.effort` before starting Claude Code. Floating aliases
+such as `default`, `opus`, and `sonnet` remain provider-validated because their
+target model can change independently of the snapshot. If the snapshot is
+unavailable, launch validation fails open and Claude Code remains authoritative.
 
 Model aliases are resolved by the Harness when `new` launches the Session, not
 on each `send`. dlgt does not silently pin a drifting alias; `show` reports the

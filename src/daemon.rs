@@ -475,6 +475,9 @@ impl Daemon {
         }
         let model = params.get("model").and_then(Value::as_str);
         let effort = params.get("effort").and_then(Value::as_str);
+        if agent == Agent::Claude {
+            crate::claude_models::validate_model_effort(model, effort)?;
+        }
         let harness_options = match params.get("harness_options") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(options)) => options
@@ -1650,13 +1653,7 @@ impl Daemon {
 
     fn list_models(&self, params: &Value) -> Result<Value> {
         match params_string(params, "harness")? {
-            "claude" => Ok(json!({
-                "harness": "claude", "source": "claude-code-aliases", "discovery": "partial",
-                "models": [
-                    {"id":"default","recommended":true}, {"id":"best"},
-                    {"id":"sonnet"}, {"id":"opus"}, {"id":"haiku"}
-                ]
-            })),
+            "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
                 let socket = paths::home_dir()?
                     .join("run")
@@ -1685,7 +1682,7 @@ impl Daemon {
     fn list_harnesses(params: &Value) -> Result<Value> {
         let all = json!([
             {"id":"codex","model_discovery":"complete","effort":true},
-            {"id":"claude","model_discovery":"partial","effort":true}
+            {"id":"claude","model_discovery":"snapshot","effort":true}
         ]);
         if let Some(name) = params.get("harness").and_then(Value::as_str) {
             return all
