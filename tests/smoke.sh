@@ -153,7 +153,7 @@ done
 kill "$follow_pid"
 wait "$follow_pid" 2>/dev/null || true
 grep -q '"schema_version":1' "$state_dir/follow.jsonl"
-"$binary" models --harness claude | grep -q '"discovery":"partial"'
+"$binary" models --harness claude | grep -q '"id":"default"'
 "$binary" harnesses | grep -q '"codex"'
 "$binary" skill | grep -q '^name: dlgt$'
 
