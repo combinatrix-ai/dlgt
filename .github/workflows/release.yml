@@ -5,9 +5,6 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,6 +12,10 @@ jobs:
   build-dlgt:
     name: Build dlgt (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -108,6 +109,19 @@ jobs:
             shasum -a 256 "$archive" > "${archive}.sha256"
           fi
 
+      - name: Attest dlgt build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dlgt-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+      - name: Stage dlgt attestation bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ steps.attest.outputs.bundle-path }}" \
+            "dlgt-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sigstore.json"
+
       - name: Upload dlgt package
         uses: actions/upload-artifact@v4
         with:
@@ -115,12 +129,17 @@ jobs:
           path: |
             dlgt-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
             dlgt-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            dlgt-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sigstore.json
           if-no-files-found: error
 
   publish-dlgt:
     name: Publish dlgt GitHub Release
     runs-on: ubuntu-latest
     needs: build-dlgt
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Download dlgt packages
@@ -135,6 +154,19 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           sha256sum dlgt-"${tag}"-*.tar.gz > "dlgt-${tag}-checksums.txt"
+
+      - name: Attest dlgt checksum manifest
+        id: attest-manifest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dlgt-${{ github.ref_name }}-checksums.txt
+
+      - name: Stage dlgt manifest attestation bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ steps.attest-manifest.outputs.bundle-path }}" \
+            "dlgt-${{ github.ref_name }}-checksums.txt.sigstore.json"
 
       - name: Publish dlgt GitHub Release
         uses: softprops/action-gh-release@v2

@@ -99,3 +99,36 @@ fn send_rejects_timeout_before_starting_a_daemon() -> Result<(), Box<dyn std::er
     assert!(!home.path().join("run").exists());
     Ok(())
 }
+
+#[test]
+fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let workdir = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .current_dir(workdir.path())
+        .args([
+            "new",
+            "--title",
+            "t",
+            "--harness",
+            "claude",
+            "--cwd",
+            "./missing",
+            "--",
+            "hello",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("--cwd"), "unexpected output: {stdout}");
+    assert!(stdout.contains("./missing"), "unexpected output: {stdout}");
+    assert!(
+        stdout.contains("does not exist"),
+        "unexpected output: {stdout}"
+    );
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}

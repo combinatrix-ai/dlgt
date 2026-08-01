@@ -49,6 +49,16 @@ Dockerfiles and intermediate tags must not be committed.
 - Reuse provider authentication only. Copy the required files from
   `.dlgt-e2e-home/` into a fresh `mktemp` home and bind-mount that copy at
   `/root`. Do not let the test modify the canonical authentication home.
+- Claude OAuth refresh tokens rotate on use. The first container that refreshes
+  an expired access token invalidates the refresh token every later run would
+  copy from the canonical home, so a naive copy-per-run matrix passes its first
+  Claude run and then fails the rest with `Login expired · Please run /login`.
+  Carry the credential file forward between Claude runs: seed the first run
+  from the canonical home, then start each later run from the previous run's
+  post-run `.claude/.credentials.json`. Everything else stays per-run fresh and
+  the canonical home is still never written to. Re-seed it deliberately, by
+  copying a post-matrix credential file back, if the stored authentication
+  should stay usable for the next matrix.
 - Set `DLGT_HOME=/tmp/dlgt`. Docker Desktop bind mounts cannot reliably apply
   the Unix-socket permissions used by dlgt.
 - A persisted home may contain an old `/root/.local/bin/dlgt`. Invoke the PR
@@ -163,4 +173,11 @@ Verify the published version, both embedded Skill copies, one real Claude
 delegation, one real Codex delegation, provider-qualified `session.id`, and the
 versioned socket. Confirm that the GitHub Release is neither a draft nor a
 prerelease and contains all six platform archives, six per-archive SHA-256
-files, and the checksum manifest.
+files, the checksum manifest, and seven Sigstore bundle assets (one
+`<asset>.sigstore.json` per archive plus one for the manifest). Verify the
+provenance of at least one downloaded archive and of the checksum manifest:
+
+```sh
+gh attestation verify dlgt-<tag>-<target>.tar.gz --repo combinatrix-ai/dlgt
+gh attestation verify dlgt-<tag>-checksums.txt --repo combinatrix-ai/dlgt
+```
