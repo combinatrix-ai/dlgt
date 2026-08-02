@@ -1,5 +1,7 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use attestation_verify::{
@@ -18,11 +20,12 @@ const DLGT_SOURCE_OWNER_ID: u64 = 139_831_903;
 const DLGT_SOURCE_REPOSITORY_ID: u64 = 1_305_737_421;
 const DLGT_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 const PUBLIC_GOOD_CHECKPOINT_ORIGIN: &str = "rekor.sigstore.dev - 1193050959916656506";
+pub(crate) const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 
-pub fn check_for_update() -> Option<Value> {
-    let latest = resolve_latest_version().ok()?;
+pub fn check_for_update() -> Result<Option<Value>> {
+    let latest = resolve_latest_version()?;
     let current = env!("CARGO_PKG_VERSION");
-    version_is_newer(&latest, current).then(|| {
+    Ok(version_is_newer(&latest, current).then(|| {
         json!({
             "code": "UPDATE_AVAILABLE",
             "message": "A new version of dlgt is available.",
@@ -30,7 +33,44 @@ pub fn check_for_update() -> Option<Value> {
             "latest_version": latest,
             "command": "dlgt update",
         })
-    })
+    }))
+}
+
+pub(crate) fn refresh_notice(notice: &RwLock<Option<Value>>) {
+    apply_check_result(notice, check_for_update());
+}
+
+fn apply_check_result(notice: &RwLock<Option<Value>>, result: Result<Option<Value>>) {
+    let Ok(result) = result else {
+        // A transient network or release-metadata failure must not hide the
+        // last notice that was successfully discovered.
+        return;
+    };
+    if let Ok(mut stored) = notice.write() {
+        *stored = result;
+    }
+}
+
+pub(crate) fn run_periodic_check_loop<ShouldStop, Wait, Check>(
+    interval: Duration,
+    mut should_stop: ShouldStop,
+    mut wait: Wait,
+    mut check: Check,
+) where
+    ShouldStop: FnMut() -> bool,
+    Wait: FnMut(Duration) -> bool,
+    Check: FnMut(),
+{
+    if should_stop() {
+        return;
+    }
+    check();
+    while !should_stop() {
+        if !wait(interval) || should_stop() {
+            break;
+        }
+        check();
+    }
 }
 
 pub fn install_latest() -> Result<Value> {
@@ -353,13 +393,75 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::sync::RwLock;
+
     use attestation_verify::{RefPolicy, TrustStore, Verifier, WorkflowRevisionPolicy};
+    use serde_json::json;
 
     use super::{
-        format_release_target, manifest_digest_for, parse_version,
-        public_good_checkpoint_origin_policy, release_attestation_policy, release_target,
-        version_is_newer,
+        UPDATE_CHECK_INTERVAL, apply_check_result, format_release_target, manifest_digest_for,
+        parse_version, public_good_checkpoint_origin_policy, release_attestation_policy,
+        release_target, run_periodic_check_loop, version_is_newer,
     };
+
+    #[test]
+    fn failed_check_preserves_the_last_update_notice() {
+        let notice = RwLock::new(Some(
+            json!({"code":"UPDATE_AVAILABLE","latest_version":"0.4.0"}),
+        ));
+        apply_check_result(&notice, Err(anyhow::anyhow!("temporary network failure")));
+        assert_eq!(
+            *notice
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(json!({"code":"UPDATE_AVAILABLE","latest_version":"0.4.0"}))
+        );
+    }
+
+    #[test]
+    fn successful_check_replaces_or_clears_the_notice() {
+        let notice = RwLock::new(Some(
+            json!({"code":"UPDATE_AVAILABLE","latest_version":"0.4.0"}),
+        ));
+        apply_check_result(
+            &notice,
+            Ok(Some(json!({
+                "code": "UPDATE_AVAILABLE",
+                "latest_version": "0.5.0"
+            }))),
+        );
+        assert_eq!(
+            *notice
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(json!({"code":"UPDATE_AVAILABLE","latest_version":"0.5.0"}))
+        );
+        apply_check_result(&notice, Ok(None));
+        assert_eq!(
+            *notice
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None
+        );
+    }
+
+    #[test]
+    fn periodic_loop_checks_immediately_and_then_at_the_configured_interval() {
+        let checks = Cell::new(0);
+        let waits = RefCell::new(Vec::new());
+        run_periodic_check_loop(
+            UPDATE_CHECK_INTERVAL,
+            || checks.get() >= 3,
+            |interval| {
+                waits.borrow_mut().push(interval);
+                true
+            },
+            || checks.set(checks.get() + 1),
+        );
+        assert_eq!(checks.get(), 3);
+        assert_eq!(*waits.borrow(), vec![UPDATE_CHECK_INTERVAL; 2]);
+    }
 
     #[test]
     fn compares_release_versions_numerically() {

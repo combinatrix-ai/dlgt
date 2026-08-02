@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,37 @@ const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
+fn wait_for_update_check(shutdown: &Receiver<()>, interval: Duration) -> bool {
+    match shutdown.recv_timeout(interval) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+        Err(RecvTimeoutError::Timeout) => true,
+    }
+}
+
+fn signal_shutdown(shutting_down: &AtomicBool, shutdown: &SyncSender<()>) {
+    shutting_down.store(true, Ordering::SeqCst);
+    let _ = shutdown.try_send(());
+}
+
+fn spawn_update_checker(
+    daemon: &Arc<Daemon>,
+    shutdown: Receiver<()>,
+) -> Result<std::thread::JoinHandle<()>> {
+    let update_notice = Arc::clone(&daemon.update_notice);
+    let update_shutdown = Arc::clone(daemon);
+    std::thread::Builder::new()
+        .name("dlgt-update-check".to_owned())
+        .spawn(move || {
+            update::run_periodic_check_loop(
+                update::UPDATE_CHECK_INTERVAL,
+                || update_shutdown.shutting_down.load(Ordering::SeqCst),
+                |interval| wait_for_update_check(&shutdown, interval),
+                || update::refresh_notice(&update_notice),
+            );
+        })
+        .context("failed to start update check")
+}
+
 pub fn run() -> Result<()> {
     let socket_path = paths::socket_path()?;
     if let Some(parent) = socket_path.parent() {
@@ -49,13 +81,15 @@ pub fn run() -> Result<()> {
 
     let store = Store::new();
     let reaper = Reaper::spawn()?;
+    let (update_shutdown, update_wait) = mpsc::sync_channel(1);
     let daemon = Arc::new(Daemon {
         store: Arc::new(Mutex::new(store)),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
         pending_provider_ids: Arc::new(Mutex::new(HashMap::new())),
         shutting_down: AtomicBool::new(false),
-        update_notice: RwLock::new(None),
+        update_notice: Arc::new(RwLock::new(None)),
+        update_shutdown,
         reaper,
     });
     let listener = UnixListener::bind(&socket_path)
@@ -66,17 +100,7 @@ pub fn run() -> Result<()> {
         .set_nonblocking(true)
         .context("failed to make server socket nonblocking")?;
 
-    let update_daemon = Arc::clone(&daemon);
-    std::thread::Builder::new()
-        .name("dlgt-update-check".to_owned())
-        .spawn(move || {
-            if let Some(notice) = update::check_for_update()
-                && let Ok(mut stored) = update_daemon.update_notice.write()
-            {
-                *stored = Some(notice);
-            }
-        })
-        .context("failed to start update check")?;
+    let update_thread = spawn_update_checker(&daemon, update_wait)?;
 
     let mut empty_since = Instant::now();
     while !daemon.shutting_down.load(Ordering::SeqCst) {
@@ -116,6 +140,8 @@ pub fn run() -> Result<()> {
         }
     }
 
+    daemon.request_shutdown();
+    let _ = update_thread.join();
     if let Ok(sessions) = daemon.sessions.read() {
         for runtime in sessions.values() {
             // Daemon shutdown is the ownership boundary: no provider process
@@ -142,8 +168,15 @@ struct Daemon {
     attach_leases: Mutex<HashMap<String, String>>,
     pending_provider_ids: Arc<Mutex<HashMap<String, Option<String>>>>,
     shutting_down: AtomicBool,
-    update_notice: RwLock<Option<Value>>,
+    update_notice: Arc<RwLock<Option<Value>>>,
+    update_shutdown: SyncSender<()>,
     reaper: Arc<Reaper>,
+}
+
+impl Daemon {
+    fn request_shutdown(&self) {
+        signal_shutdown(&self.shutting_down, &self.update_shutdown);
+    }
 }
 
 struct ProviderReservation {
@@ -407,7 +440,7 @@ impl Daemon {
                 "socket": paths::socket_path()?,
             })),
             "server.stop" => {
-                self.shutting_down.store(true, Ordering::SeqCst);
+                self.request_shutdown();
                 Ok(json!({"stopping": true}))
             }
             "session.create" => self.create_session(params),
@@ -2763,7 +2796,9 @@ fn is_terminal_turn_state(state: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
 
     use serde_json::json;
 
@@ -2771,7 +2806,7 @@ mod tests {
         BusyMetrics, ProviderReservation, apply_codex_notification, apply_hook_event,
         canonical_session_id, clamp_busy_metrics, classify_error, generate_alias,
         generate_internal_id, provider_id_from_session, public_result, public_session,
-        public_session_with_metrics, validate_alias,
+        public_session_with_metrics, signal_shutdown, validate_alias, wait_for_update_check,
     };
     use crate::store::{NewSession, Store};
 
@@ -2802,6 +2837,18 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to ready session: {error}"))
         );
         store
+    }
+
+    #[test]
+    fn queued_shutdown_signal_cannot_be_lost_before_wait() {
+        let shutting_down = AtomicBool::new(false);
+        let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
+        signal_shutdown(&shutting_down, &shutdown_sender);
+        assert!(shutting_down.load(Ordering::SeqCst));
+        assert!(!wait_for_update_check(
+            &shutdown_receiver,
+            Duration::from_secs(1)
+        ));
     }
 
     #[test]
