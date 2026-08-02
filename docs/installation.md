@@ -69,9 +69,10 @@ Run `dlgt update` after approving an update. It checks the latest GitHub
 release, verifies the attested checksum manifest, and passes that authenticated
 archive digest to the installer embedded in the running binary. No installer
 code is downloaded after attestation verification. The embedded installer
-replaces the current executable in its existing directory and refreshes both
-embedded skill copies. Existing Sessions keep running on their original
-versioned daemon; later commands use the newly installed version.
+pins the archive target to the running binary's build target, replaces the
+current executable in its existing directory, and refreshes both embedded skill
+copies. Existing Sessions keep running on their original versioned daemon;
+later commands use the newly installed version.
 
 Machine-readable command responses may include an `info` object with code
 `UPDATE_AVAILABLE`. Agents should show the available version and ask the user
@@ -253,6 +254,14 @@ tag. The workflow rejects a tag whose version does not match Cargo.toml.
 
 The release workflow runs these explicit dlgt builds for version tags and
 publishes the resulting target-named archives and checksums.
+
+Released updater binaries freeze this release-asset contract. Every future
+release must continue publishing `dlgt-<tag>-<target>.tar.gz`, its matching
+`.sha256` asset, and `dlgt-<tag>-checksums.txt` with the matching
+`.sigstore.json` bundle. Each archive must contain exactly one file named
+`dlgt`. Renaming or reshaping these assets breaks updates from already-released
+binaries; those updaters will reject the release rather than fall back to an
+unauthenticated path.
 
 ## If something fails
 

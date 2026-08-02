@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -88,8 +89,9 @@ pub fn install_latest() -> Result<Value> {
         }));
     }
     let tag = format!("v{latest}");
+    let target = release_target();
 
-    let verified = verify_release_attestation(&tag)?;
+    let verified = verify_release_attestation(&tag, &target)?;
     let attestation = json!({
         "verified": true,
         "source_ref": verified.source_ref,
@@ -108,10 +110,8 @@ pub fn install_latest() -> Result<Value> {
     let mut command = Command::new("sh");
     command
         .arg(&installer)
-        .args(["--bin-dir", &bin_dir.to_string_lossy(), "--skill", "both"])
-        .arg("--version")
-        .arg(&tag);
-    command.args(["--expect-sha256", &expected_sha256]);
+        .args(installer_args(&tag, &target, &expected_sha256, bin_dir));
+    command.env_remove("DLGT_INSTALLER_NO_MAIN");
     let result = command.output();
     let _ = std::fs::remove_file(&installer);
     let result = result.context("failed to run dlgt installer")?;
@@ -138,6 +138,11 @@ fn resolve_latest_version() -> Result<String> {
             "--silent",
             "--show-error",
             "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
             "--max-time",
             "3",
             "--output",
@@ -165,20 +170,38 @@ fn resolve_latest_version() -> Result<String> {
     Ok(version.to_owned())
 }
 
+fn installer_args(tag: &str, target: &str, sha256: &str, bin_dir: &Path) -> Vec<OsString> {
+    [
+        OsString::from("--bin-dir"),
+        bin_dir.as_os_str().to_owned(),
+        OsString::from("--skill"),
+        OsString::from("both"),
+        OsString::from("--version"),
+        OsString::from(tag),
+        OsString::from("--target"),
+        OsString::from(target),
+        OsString::from("--expect-sha256"),
+        OsString::from(sha256),
+    ]
+    .into()
+}
+
 fn write_embedded_installer(path: &Path) -> Result<()> {
+    let mut created = false;
     let outcome = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
             .context("failed to create temporary dlgt installer")?;
+        created = true;
         file.write_all(INSTALLER_SCRIPT.as_bytes())
             .context("failed to write embedded dlgt installer")?;
         file.sync_all()
             .context("failed to sync embedded dlgt installer")?;
         Ok(())
     })();
-    if outcome.is_err() {
+    if created && outcome.is_err() {
         let _ = std::fs::remove_file(path);
     }
     outcome
@@ -198,7 +221,7 @@ struct VerifiedRelease {
 /// bundle against the embedded public-good trust root and dlgt's GitHub
 /// identity policy, and extracts this platform's expected release-archive
 /// sha256 from the now-authenticated manifest.
-fn verify_release_attestation(tag: &str) -> Result<VerifiedRelease> {
+fn verify_release_attestation(tag: &str, target: &str) -> Result<VerifiedRelease> {
     let temp_dir =
         std::env::temp_dir().join(format!("dlgt-attestation-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&temp_dir).context("failed to create attestation temp directory")?;
@@ -232,7 +255,7 @@ fn verify_release_attestation(tag: &str) -> Result<VerifiedRelease> {
             .verify_bytes(&manifest_bytes, &bundle)
             .context("checksum manifest attestation did not verify")?;
 
-        let asset_name = format!("dlgt-{tag}-{}.tar.gz", release_target());
+        let asset_name = format!("dlgt-{tag}-{target}.tar.gz");
         let manifest_text =
             String::from_utf8(manifest_bytes).context("checksum manifest was not valid UTF-8")?;
         let sha256 = manifest_digest_for(&manifest_text, &asset_name)
@@ -310,7 +333,13 @@ fn download_release_asset(tag: &str, name: &str, dest: &Path) -> Result<()> {
             "--location",
             "--proto",
             "=https",
+            "--proto-redir",
+            "=https",
             "--tlsv1.2",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
             "--output",
         ])
         .arg(dest)
@@ -391,6 +420,9 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::RwLock;
 
     use attestation_verify::{RefPolicy, TrustStore, Verifier, WorkflowRevisionPolicy};
@@ -399,7 +431,7 @@ mod tests {
 
     use super::{
         INSTALLER_SCRIPT, UPDATE_CHECK_INTERVAL, apply_check_result, format_release_target,
-        manifest_digest_for, parse_version, public_good_checkpoint_origin_policy,
+        installer_args, manifest_digest_for, parse_version, public_good_checkpoint_origin_policy,
         release_attestation_policy, release_target, run_periodic_check_loop, version_is_newer,
         write_embedded_installer,
     };
@@ -472,9 +504,60 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path)?, INSTALLER_SCRIPT);
         assert!(write_embedded_installer(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path)?, INSTALLER_SCRIPT);
         assert!(INSTALLER_SCRIPT.contains("--expect-sha256"));
         assert!(INSTALLER_SCRIPT.contains("verify_expected_sha256"));
         Ok(())
+    }
+
+    #[test]
+    fn embedded_installer_rejects_an_unattested_archive() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let installer = directory.path().join("install.sh");
+        let archive = directory.path().join("dlgt.tar.gz");
+        write_embedded_installer(&installer)?;
+        std::fs::write(&archive, b"not the attested archive")?;
+
+        let output = Command::new("sh")
+            .args(["-c", ". \"$1\"; verify_expected_sha256 \"$2\" \"$3\""])
+            .arg("embedded-installer-test")
+            .arg(&installer)
+            .arg(&archive)
+            .arg("0".repeat(64))
+            .env("DLGT_INSTALLER_NO_MAIN", "1")
+            .output()?;
+
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("attested checksum mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn installer_arguments_bind_tag_target_digest_and_exact_bin_path() {
+        let digest = "a".repeat(64);
+        let args = installer_args(
+            "v0.3.4",
+            "x86_64-unknown-linux-musl",
+            &digest,
+            Path::new("/opt/dlgt bin"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--bin-dir"),
+                OsString::from("/opt/dlgt bin"),
+                OsString::from("--skill"),
+                OsString::from("both"),
+                OsString::from("--version"),
+                OsString::from("v0.3.4"),
+                OsString::from("--target"),
+                OsString::from("x86_64-unknown-linux-musl"),
+                OsString::from("--expect-sha256"),
+                OsString::from(digest),
+            ]
+        );
     }
 
     #[test]

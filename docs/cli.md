@@ -185,10 +185,10 @@ newer release clears the notice.
 `dlgt update` verifies the release's attested checksum manifest, then installs
 the archive through the installer embedded in the running binary. It never
 downloads executable installer code after verification. The embedded installer
-checks the authenticated archive digest, atomically replaces the current
-executable, and refreshes the embedded Codex and Claude Skills. Existing
-older-version daemons and their live Sessions continue on their versioned
-sockets.
+checks the authenticated archive digest, pins the archive target to the running
+binary's build target, atomically replaces the current executable, and
+refreshes the embedded Codex and Claude Skills. Existing older-version daemons
+and their live Sessions continue on their versioned sockets.
 
 ## `new`
 
