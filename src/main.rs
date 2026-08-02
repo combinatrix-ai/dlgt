@@ -205,7 +205,7 @@ fn command_new(args: &[String]) -> Result<()> {
             "auto_approve": auto_approve,
             "prompt": prompt,
             "startup_timeout_ms": parsed.one("--startup-timeout")
-                .map(parse_duration).transpose()?.unwrap_or(Duration::from_secs(60)).as_millis(),
+                .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
             "environment": environment,
             "rows": rows,
             "cols": cols,
@@ -275,7 +275,7 @@ fn command_send(args: &[String]) -> Result<()> {
                     .one("--startup-timeout")
                     .map(parse_duration)
                     .transpose()?
-                    .unwrap_or(Duration::from_secs(60))
+                    .unwrap_or(Duration::from_mins(1))
                     .as_millis()
             ),
         );
@@ -327,7 +327,7 @@ fn command_restart(args: &[String]) -> Result<()> {
         json!({
             "session": session,
             "startup_timeout_ms": parsed.one("--startup-timeout")
-                .map(parse_duration).transpose()?.unwrap_or(Duration::from_secs(60)).as_millis(),
+                .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
             "environment": environment,
             "rows": rows,
             "cols": cols,

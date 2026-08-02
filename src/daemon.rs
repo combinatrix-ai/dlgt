@@ -28,7 +28,7 @@ use crate::update;
 
 const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
-const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 pub fn run() -> Result<()> {
     let socket_path = paths::socket_path()?;
@@ -355,38 +355,37 @@ impl Daemon {
             if error.code == "SESSION_NOT_RUNNING" {
                 error.hint = Some("retry with --resume using the same session_id".to_owned());
             }
-            if error.code == "SESSION_NOT_RUNNING"
+            if (error.code == "SESSION_NOT_RUNNING"
                 || matches!(
                     request.method.as_str(),
                     "session.send" | "session.wait" | "session.cancel"
-                )
+                ))
+                && let Some(selector) = request.params.get("session").and_then(Value::as_str)
             {
-                if let Some(selector) = request.params.get("session").and_then(Value::as_str) {
-                    if let Ok(Some(session)) = self
-                        .lock_store()
-                        .and_then(|store| store.get_session(selector))
-                    {
-                        if session.id.starts_with("internal:") {
-                            error.launch_id = Some(session.id.clone());
-                        } else {
-                            error.session_id = Some(session.id.clone());
-                        }
-                        error.session_state = Some(match session.state.as_str() {
-                            "quiescing" => "canceling".to_owned(),
-                            "running" => "starting".to_owned(),
-                            other => other.to_owned(),
-                        });
-                        if error.code == "SESSION_BLOCKED" && error.session_id.is_some() {
-                            error.action = Some(format!(
-                                "dlgt attach {}",
-                                error.session_id.as_deref().unwrap_or(selector)
-                            ));
-                        }
-                    } else if selector.split_once(':').is_some_and(|(agent, id)| {
-                        matches!(agent, "codex" | "claude") && !id.is_empty()
-                    }) {
-                        error.session_id = Some(selector.to_owned());
+                if let Ok(Some(session)) = self
+                    .lock_store()
+                    .and_then(|store| store.get_session(selector))
+                {
+                    if session.id.starts_with("internal:") {
+                        error.launch_id = Some(session.id.clone());
+                    } else {
+                        error.session_id = Some(session.id.clone());
                     }
+                    error.session_state = Some(match session.state.as_str() {
+                        "quiescing" => "canceling".to_owned(),
+                        "running" => "starting".to_owned(),
+                        other => other.to_owned(),
+                    });
+                    if error.code == "SESSION_BLOCKED" && error.session_id.is_some() {
+                        error.action = Some(format!(
+                            "dlgt attach {}",
+                            error.session_id.as_deref().unwrap_or(selector)
+                        ));
+                    }
+                } else if selector.split_once(':').is_some_and(|(agent, id)| {
+                    matches!(agent, "codex" | "claude") && !id.is_empty()
+                }) {
+                    error.session_id = Some(selector.to_owned());
                 }
             }
         }
@@ -1859,10 +1858,10 @@ impl Daemon {
             .sessions
             .write()
             .map_err(|_| anyhow!("session map lock poisoned"))?;
-        if let Some(runtime) = sessions.remove(from) {
-            if sessions.insert(to.to_owned(), runtime).is_some() {
-                bail!("active runtime already exists for Session {to}");
-            }
+        if let Some(runtime) = sessions.remove(from)
+            && sessions.insert(to.to_owned(), runtime).is_some()
+        {
+            bail!("active runtime already exists for Session {to}");
         }
         let mut leases = self
             .attach_leases
