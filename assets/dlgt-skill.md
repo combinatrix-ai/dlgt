@@ -68,6 +68,37 @@ correlation, and later resume. Stopping a Session ends its process, not the
 provider conversation: the same `session.id` still resumes. An Alias is a
 convenience only and may be reused by a new Session after this one stops.
 
+## Clean up provider history
+
+A dlgt Session is also a real provider conversation and may appear in the
+Codex or Claude history with a title beginning `[dlgt]`. `dlgt stop` releases
+the live Harness process and PTY but deliberately preserves that conversation
+for later `send --resume`.
+
+Treat provider-history cleanup as a separate, explicit user action. Do not
+archive provider history automatically when ordinary delegated work finishes.
+
+- For a Codex Session, remove the `codex:` qualifier from `session.id` and run
+  `codex archive <thread-id>`. Use `codex unarchive <thread-id>` to restore it.
+- For a Claude Session, Claude Code has no equivalent public archive command.
+  Use the runtime's available macOS UI-control tool to operate Claude Desktop:
+  search for the full `[dlgt] <title>`, identify the matching conversation,
+  choose **Archive** from its session menu, then search again and verify that
+  the result is marked archived.
+- A title is not a unique identifier. If search returns multiple plausible
+  Claude conversations, open candidates and compare the project or cwd,
+  initial prompt, and recency. If the target still cannot be identified
+  unambiguously, do not guess; report that cleanup needs user selection.
+- If the Claude result is already marked archived, make no change. If Claude
+  Desktop or suitable UI control is unavailable, report the limitation rather
+  than editing provider storage directly.
+- Never rewrite Claude transcript JSONL fields such as `entrypoint`, and never
+  edit Claude Desktop's private metadata files to imitate its Archive action.
+
+If the user asks only to finish, stop, or clean up the live worker, run
+`dlgt stop`. Archive the provider conversation only when the user explicitly
+asks to clean up its retained history or the visible `[dlgt]` conversation.
+
 ## Pass long prompts on stdin
 
 A self-contained delegation prompt is usually multi-line, so prefer `--stdin`
