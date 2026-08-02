@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::sync::RwLock;
@@ -12,8 +13,11 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 const LATEST_RELEASE_URL: &str = "https://github.com/combinatrix-ai/dlgt/releases/latest";
-const INSTALLER_URL: &str = "https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh";
 const RELEASE_DOWNLOAD_URL: &str = "https://github.com/combinatrix-ai/dlgt/releases/download";
+// Update code remains inside the already-trusted running binary. Fetching a
+// mutable installer after attestation would let that code ignore the verified
+// archive digest and bypass the trust decision made above.
+const INSTALLER_SCRIPT: &str = include_str!("../install.sh");
 
 const DLGT_REPOSITORY: &str = "combinatrix-ai/dlgt";
 const DLGT_SOURCE_OWNER_ID: u64 = 139_831_903;
@@ -100,7 +104,7 @@ pub fn install_latest() -> Result<Value> {
         .context("dlgt executable has no parent directory")?;
     let installer =
         std::env::temp_dir().join(format!("dlgt-installer-{}.sh", Uuid::new_v4().simple()));
-    download_installer(&installer)?;
+    write_embedded_installer(&installer)?;
     let mut command = Command::new("sh");
     command
         .arg(&installer)
@@ -161,30 +165,23 @@ fn resolve_latest_version() -> Result<String> {
     Ok(version.to_owned())
 }
 
-fn download_installer(path: &Path) -> Result<()> {
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https",
-            "--tlsv1.2",
-            "--output",
-        ])
-        .arg(path)
-        .arg(INSTALLER_URL)
-        .output()
-        .context("failed to download the dlgt installer")?;
-    if !output.status.success() {
+fn write_embedded_installer(path: &Path) -> Result<()> {
+    let outcome = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .context("failed to create temporary dlgt installer")?;
+        file.write_all(INSTALLER_SCRIPT.as_bytes())
+            .context("failed to write embedded dlgt installer")?;
+        file.sync_all()
+            .context("failed to sync embedded dlgt installer")?;
+        Ok(())
+    })();
+    if outcome.is_err() {
         let _ = std::fs::remove_file(path);
-        bail!(
-            "installer download failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
     }
-    Ok(())
+    outcome
 }
 
 /// The result of a successful release-attestation verification: the facts
@@ -398,11 +395,13 @@ mod tests {
 
     use attestation_verify::{RefPolicy, TrustStore, Verifier, WorkflowRevisionPolicy};
     use serde_json::json;
+    use tempfile::tempdir;
 
     use super::{
-        UPDATE_CHECK_INTERVAL, apply_check_result, format_release_target, manifest_digest_for,
-        parse_version, public_good_checkpoint_origin_policy, release_attestation_policy,
-        release_target, run_periodic_check_loop, version_is_newer,
+        INSTALLER_SCRIPT, UPDATE_CHECK_INTERVAL, apply_check_result, format_release_target,
+        manifest_digest_for, parse_version, public_good_checkpoint_origin_policy,
+        release_attestation_policy, release_target, run_periodic_check_loop, version_is_newer,
+        write_embedded_installer,
     };
 
     #[test]
@@ -461,6 +460,21 @@ mod tests {
         );
         assert_eq!(checks.get(), 3);
         assert_eq!(*waits.borrow(), vec![UPDATE_CHECK_INTERVAL; 2]);
+    }
+
+    #[test]
+    fn embedded_installer_is_written_once_without_network_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("install.sh");
+
+        write_embedded_installer(&path)?;
+
+        assert_eq!(std::fs::read_to_string(&path)?, INSTALLER_SCRIPT);
+        assert!(write_embedded_installer(&path).is_err());
+        assert!(INSTALLER_SCRIPT.contains("--expect-sha256"));
+        assert!(INSTALLER_SCRIPT.contains("verify_expected_sha256"));
+        Ok(())
     }
 
     #[test]

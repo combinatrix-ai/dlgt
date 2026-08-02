@@ -66,9 +66,12 @@ sh /tmp/install-dlgt.sh --skill both
 ## Update an existing installation
 
 Run `dlgt update` after approving an update. It checks the latest GitHub
-release, replaces the current executable in its existing directory, and
-refreshes both embedded skill copies. Existing Sessions keep running on their
-original versioned daemon; later commands use the newly installed version.
+release, verifies the attested checksum manifest, and passes that authenticated
+archive digest to the installer embedded in the running binary. No installer
+code is downloaded after attestation verification. The embedded installer
+replaces the current executable in its existing directory and refreshes both
+embedded skill copies. Existing Sessions keep running on their original
+versioned daemon; later commands use the newly installed version.
 
 Machine-readable command responses may include an `info` object with code
 `UPDATE_AVAILABLE`. Agents should show the available version and ask the user
