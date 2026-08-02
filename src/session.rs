@@ -197,6 +197,15 @@ impl SessionRuntime {
         self.output.subscribe()
     }
 
+    /// Return the elapsed monotonic time since the most recent PTY output.
+    ///
+    /// This is diagnostic-only state. In particular, callers must not infer a
+    /// lifecycle transition from a quiet PTY: providers can legitimately do
+    /// work without rendering output for an extended period.
+    pub fn last_output_age(&self) -> Result<Option<Duration>> {
+        self.output.last_output_age()
+    }
+
     pub fn stop(&self) -> Result<()> {
         self.killer
             .lock()
@@ -291,6 +300,14 @@ impl OutputState {
         Ok(inner
             .last_output
             .is_some_and(|last_output| last_output.elapsed() >= duration))
+    }
+
+    fn last_output_age(&self) -> Result<Option<Duration>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY output lock poisoned"))?;
+        Ok(inner.last_output.map(|last_output| last_output.elapsed()))
     }
 }
 

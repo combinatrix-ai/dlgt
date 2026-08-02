@@ -104,6 +104,24 @@ correlates provider-native logs, addresses a live Session, and explicitly
 resumes it after daemon exit. Provider turn IDs, internal launch IDs, and
 internal execution row IDs are excluded.
 
+When `state` is exactly `busy`, the Session snapshot also includes two integer
+diagnostics:
+
+```json
+{
+  "state": "busy",
+  "busy_for_ms": 183000,
+  "pty_quiet_for_ms": 72000
+}
+```
+
+`busy_for_ms` is elapsed time since the current turn was reserved (its local
+creation timestamp), so provider startup or binding cannot make it move
+backwards. `pty_quiet_for_ms` is elapsed time since the latest PTY output,
+clamped to the current busy interval; if no output has been observed it equals
+`busy_for_ms`. These values are diagnostic only and never transition a Session
+or permit another send. Both fields are omitted for every non-`busy` state.
+
 CLI `send` scans live versioned daemon sockets before dispatch. Raw JSONL RPC
 is intentionally scoped to the selected socket; callers using RPC directly
 must select the owning versioned socket themselves.
