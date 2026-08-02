@@ -72,7 +72,11 @@ original versioned daemon; later commands use the newly installed version.
 
 Machine-readable command responses may include an `info` object with code
 `UPDATE_AVAILABLE`. Agents should show the available version and ask the user
-before running `dlgt update`; the notice itself never installs anything.
+before running `dlgt update`; the notice itself never installs anything. A
+long-lived versioned daemon performs the first check asynchronously at startup
+and refreshes it every six hours. A transient check failure leaves the last
+successful `UPDATE_AVAILABLE` notice intact; a successful check with no newer
+release clears it.
 
 ## Install a specific version
 
