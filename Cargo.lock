@@ -23,7 +23,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "attestation-verify"
 version = "0.0.1"
-source = "git+https://github.com/combinatrix-ai/attestation-verify?rev=70d918cf55c43c290549d02c0c507bab428b4a28#70d918cf55c43c290549d02c0c507bab428b4a28"
+source = "git+https://github.com/combinatrix-ai/attestation-verify?rev=73d3b53ecbf2d3c71846ae4cab3fa6482be012eb#73d3b53ecbf2d3c71846ae4cab3fa6482be012eb"
 dependencies = [
  "base64 0.23.0",
  "der",

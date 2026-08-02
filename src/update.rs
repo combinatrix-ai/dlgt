@@ -3,8 +3,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use attestation_verify::{
-    Bundle, GithubPolicy, RefPolicy, RepositoryIdentity, SignerPolicy, SourcePolicy, TrustStore,
-    Verifier, WorkflowPath, WorkflowRevisionPolicy,
+    Bundle, CheckpointOriginPolicy, GithubPolicy, RefPolicy, RepositoryIdentity, SignerPolicy,
+    SourcePolicy, TrustStore, Verifier, WorkflowPath, WorkflowRevisionPolicy,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -17,13 +17,7 @@ const DLGT_REPOSITORY: &str = "combinatrix-ai/dlgt";
 const DLGT_SOURCE_OWNER_ID: u64 = 139_831_903;
 const DLGT_SOURCE_REPOSITORY_ID: u64 = 1_305_737_421;
 const DLGT_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
-
-/// Warn-only rollout for release-attestation verification: a verification
-/// failure is recorded as a warning in the update result and the update
-/// proceeds without `--expect-sha256`, rather than blocking. Flip to `true`
-/// in the release after this one, once attestation coverage has been
-/// observed across a full release cycle.
-const ATTESTATION_ENFORCED: bool = false;
+const PUBLIC_GOOD_CHECKPOINT_ORIGIN: &str = "rekor.sigstore.dev - 1193050959916656506";
 
 pub fn check_for_update() -> Option<Value> {
     let latest = resolve_latest_version().ok()?;
@@ -51,25 +45,14 @@ pub fn install_latest() -> Result<Value> {
     }
     let tag = format!("v{latest}");
 
-    let (attestation, expected_sha256) = match verify_release_attestation(&tag) {
-        Ok(verified) => (
-            json!({
-                "verified": true,
-                "source_ref": verified.source_ref,
-                "log_index": verified.log_index,
-                "trust_root": verified.trust_root,
-            }),
-            Some(verified.sha256),
-        ),
-        Err(error) if ATTESTATION_ENFORCED => return Err(error),
-        Err(error) => (
-            json!({
-                "verified": false,
-                "warning": format!("{error:#}"),
-            }),
-            None,
-        ),
-    };
+    let verified = verify_release_attestation(&tag)?;
+    let attestation = json!({
+        "verified": true,
+        "source_ref": verified.source_ref,
+        "log_index": verified.log_index,
+        "trust_root": verified.trust_root,
+    });
+    let expected_sha256 = verified.sha256;
 
     let executable = std::env::current_exe().context("failed to locate dlgt executable")?;
     let bin_dir = executable
@@ -84,9 +67,7 @@ pub fn install_latest() -> Result<Value> {
         .args(["--bin-dir", &bin_dir.to_string_lossy(), "--skill", "both"])
         .arg("--version")
         .arg(&tag);
-    if let Some(sha256) = &expected_sha256 {
-        command.args(["--expect-sha256", sha256]);
-    }
+    command.args(["--expect-sha256", &expected_sha256]);
     let result = command.output();
     let _ = std::fs::remove_file(&installer);
     let result = result.context("failed to run dlgt installer")?;
@@ -199,12 +180,13 @@ fn verify_release_attestation(tag: &str) -> Result<VerifiedRelease> {
         let bundle_bytes =
             std::fs::read(&bundle_path).context("failed to read the downloaded sigstore bundle")?;
 
+        let trust_store = TrustStore::embedded_public_good()
+            .context("failed to load the embedded attestation trust root")?;
+        let checkpoint_origin_policy = public_good_checkpoint_origin_policy(&trust_store)?;
         let verifier = Verifier::builder()
-            .trust_store(
-                TrustStore::embedded_public_good()
-                    .context("failed to load the embedded attestation trust root")?,
-            )
+            .trust_store(trust_store)
             .github_policy(release_attestation_policy(tag)?)
+            .checkpoint_origin_policy(checkpoint_origin_policy)
             .build()
             .context("failed to build the attestation verifier")?;
         let bundle =
@@ -229,6 +211,28 @@ fn verify_release_attestation(tag: &str) -> Result<VerifiedRelease> {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
     outcome
+}
+
+/// Binds the exact signed Rekor checkpoint origin used by GitHub Artifact
+/// Attestations to the public-good Rekor v1 ECDSA log key. The origin is not
+/// inferred from the log URL; both the URL and key algorithm are authoritative
+/// selectors for the trusted-root entry.
+fn public_good_checkpoint_origin_policy(
+    trust_store: &TrustStore,
+) -> Result<CheckpointOriginPolicy> {
+    let log = trust_store
+        .tlogs
+        .iter()
+        .find(|log| {
+            log.base_url == "https://rekor.sigstore.dev"
+                && log.public_key.key_details == "PKIX_ECDSA_P256_SHA_256"
+        })
+        .context("embedded trust root has no public-good Rekor v1 ECDSA log")?;
+    CheckpointOriginPolicy::builder()
+        .allow_origin(log, PUBLIC_GOOD_CHECKPOINT_ORIGIN)
+        .context("failed to bind the public-good Rekor checkpoint origin")?
+        .build()
+        .context("failed to build the public-good checkpoint-origin policy")
 }
 
 /// The GitHub identity policy release attestations must satisfy: the
@@ -349,11 +353,12 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use attestation_verify::{RefPolicy, WorkflowRevisionPolicy};
+    use attestation_verify::{RefPolicy, TrustStore, Verifier, WorkflowRevisionPolicy};
 
     use super::{
-        format_release_target, manifest_digest_for, parse_version, release_attestation_policy,
-        release_target, version_is_newer,
+        format_release_target, manifest_digest_for, parse_version,
+        public_good_checkpoint_origin_policy, release_attestation_policy, release_target,
+        version_is_newer,
     };
 
     #[test]
@@ -507,6 +512,19 @@ mod tests {
             policy.signer.revision,
             WorkflowRevisionPolicy::Ref("refs/tags/v1.2.3".to_owned())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn public_good_checkpoint_origin_policy_is_accepted_by_verifier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let trust_store = TrustStore::embedded_public_good()?;
+        let checkpoint_origin_policy = public_good_checkpoint_origin_policy(&trust_store)?;
+        Verifier::builder()
+            .trust_store(trust_store)
+            .github_policy(release_attestation_policy("v1.2.3")?)
+            .checkpoint_origin_policy(checkpoint_origin_policy)
+            .build()?;
         Ok(())
     }
 }
