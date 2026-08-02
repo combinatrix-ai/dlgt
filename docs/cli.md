@@ -153,6 +153,24 @@ Session with `runtime_version` and `runtime_socket`. Session state, results,
 events, and terminal history exist only while their owning daemon remains
 alive.
 
+Busy Session snapshots include two integer diagnostics when `state` is exactly
+`busy`:
+
+```json
+{
+  "state": "busy",
+  "busy_for_ms": 183000,
+  "pty_quiet_for_ms": 72000
+}
+```
+
+`busy_for_ms` measures from reservation of the current turn. `pty_quiet_for_ms`
+measures PTY silence, clamped to that same busy interval so output from an
+earlier turn cannot inflate it. If no PTY output has occurred, it equals
+`busy_for_ms`. These counters are diagnostic only; PTY silence never changes
+Session state or makes a busy Session accept another prompt. Both fields are
+omitted for every other state.
+
 Successful commands may include an optional non-error notice:
 
 ```json

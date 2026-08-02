@@ -23,7 +23,7 @@ use crate::provider::{
 };
 use crate::reaper::Reaper;
 use crate::session::SessionRuntime;
-use crate::store::{NewSession, Store};
+use crate::store::{NewSession, Store, now_ms};
 use crate::update;
 
 const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -247,6 +247,13 @@ impl AgentRuntime {
         }
     }
 
+    fn last_output_age(&self) -> Result<Option<Duration>> {
+        match self {
+            Self::Claude(runtime) => runtime.last_output_age(),
+            Self::Codex { view, .. } => view.last_output_age(),
+        }
+    }
+
     fn stop(&self) -> Result<()> {
         match self {
             Self::Claude(runtime) => runtime.stop(),
@@ -408,17 +415,14 @@ impl Daemon {
             "session.list" => {
                 let include_all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
                 let sessions = self.lock_store()?.list_sessions()?;
-                Ok(Value::Array(
-                    sessions
-                        .into_iter()
-                        .filter(|session| {
-                            !session.id.starts_with("internal:")
-                                && (include_all
-                                    || !matches!(session.state.as_str(), "stopped" | "failed"))
-                        })
-                        .map(|session| public_session(&session))
-                        .collect(),
-                ))
+                let mut public = Vec::new();
+                for session in sessions.into_iter().filter(|session| {
+                    !session.id.starts_with("internal:")
+                        && (include_all || !matches!(session.state.as_str(), "stopped" | "failed"))
+                }) {
+                    public.push(self.public_session(&session)?);
+                }
+                Ok(Value::Array(public))
             }
             "session.read" => self.read_session(params),
             "session.input" => self.input_session(params),
@@ -1022,7 +1026,7 @@ impl Daemon {
         let canonical_id = canonical_session_id(agent.as_str(), &rebound_provider_id);
         self.promote_session(&session.id, &canonical_id, &runtime_session_id)?;
         let current = self.resolve_session(&canonical_id)?;
-        Ok(json!({"session": public_session(&current)}))
+        Ok(json!({"session": self.public_session(&current)?}))
     }
 
     fn spawn_claude_runtime(
@@ -1171,6 +1175,49 @@ impl Daemon {
             provider_thread_id,
             view,
         }))
+    }
+
+    fn public_session(&self, session: &SessionRecord) -> Result<Value> {
+        let busy_metrics = self.busy_metrics(session)?;
+        Ok(public_session_with_metrics(session, busy_metrics))
+    }
+
+    fn busy_metrics(&self, session: &SessionRecord) -> Result<Option<BusyMetrics>> {
+        if session.state != "busy" {
+            return Ok(None);
+        }
+
+        // A turn is reserved before provider execution starts. Use that
+        // creation timestamp rather than the provider's started_at timestamp
+        // so the reported age cannot jump backwards while a provider binds.
+        let busy_for_ms = session
+            .active_turn_id
+            .as_deref()
+            .map(|turn_id| self.lock_store().and_then(|store| store.get_turn(turn_id)))
+            .transpose()?
+            .flatten()
+            .map_or(0, |turn| {
+                u64::try_from(now_ms().saturating_sub(turn.created_at_ms)).unwrap_or(0)
+            });
+
+        // PTY output is a presentation/fallback signal only. If this runtime
+        // has not emitted output yet (or has already exited), consider the
+        // entire current busy interval quiet. The pure helper below clamps a
+        // prior output's age to busy_for_ms, preventing pre-turn idle time from
+        // leaking into this interval.
+        let runtime = self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .get(&session.id)
+            .cloned();
+        let last_output_age_ms = runtime
+            .map(|runtime| runtime.last_output_age())
+            .transpose()?
+            .flatten()
+            .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+
+        Ok(Some(clamp_busy_metrics(busy_for_ms, last_output_age_ms)))
     }
 
     fn input_session(&self, params: &Value) -> Result<Value> {
@@ -1387,7 +1434,7 @@ impl Daemon {
         }
         let current = self.resolve_session(&session.id)?;
         let mut result = json!({
-            "session": public_session(&current),
+            "session": self.public_session(&current)?,
             "execution_seq": turn.execution_seq,
         });
         if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
@@ -1405,7 +1452,7 @@ impl Daemon {
         }
         let latest = self.lock_store()?.latest_turn(&session.id)?;
         Ok(json!({
-            "session": public_session(&session),
+            "session": self.public_session(&session)?,
             "result": latest.as_ref().filter(|turn| is_terminal_turn_state(&turn.state)).map(public_result),
             "execution_seq": latest.as_ref().map(|turn| turn.execution_seq),
         }))
@@ -1435,7 +1482,7 @@ impl Daemon {
             let turn = self.resolve_turn(&target.id)?;
             if is_terminal_turn_state(&turn.state) {
                 let mut response = json!({
-                    "session": public_session(&self.resolve_session(&session.id)?),
+                    "session": self.public_session(&self.resolve_session(&session.id)?)?,
                     "result": public_result(&turn),
                     "execution_seq": turn.execution_seq,
                 });
@@ -1476,7 +1523,7 @@ impl Daemon {
             if current.state == "idle" || current.active_turn_id.is_none() {
                 let result = self.lock_store()?.latest_turn(&session.id)?;
                 return Ok(json!({
-                    "session": public_session(&current),
+                    "session": self.public_session(&current)?,
                     "canceled": true,
                     "result": result.as_ref().map(public_result),
                 }));
@@ -2557,8 +2604,32 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusyMetrics {
+    busy_for_ms: u64,
+    pty_quiet_for_ms: u64,
+}
+
+fn clamp_busy_metrics(busy_for_ms: u64, last_output_age_ms: Option<u64>) -> BusyMetrics {
+    BusyMetrics {
+        busy_for_ms,
+        // No output observed means no evidence of activity during this busy
+        // interval, so report the whole interval as quiet. If output predates
+        // the turn, min() removes that prior-idle time from the public value.
+        pty_quiet_for_ms: last_output_age_ms.map_or(busy_for_ms, |age| age.min(busy_for_ms)),
+    }
+}
+
+#[cfg(test)]
 fn public_session(session: &SessionRecord) -> Value {
-    json!({
+    public_session_with_metrics(session, None)
+}
+
+fn public_session_with_metrics(
+    session: &SessionRecord,
+    busy_metrics: Option<BusyMetrics>,
+) -> Value {
+    let mut value = json!({
         "id": session.id,
         "alias": session.alias,
         "title": session.title,
@@ -2574,7 +2645,18 @@ fn public_session(session: &SessionRecord) -> Value {
         "auto_approve": session.auto_approve,
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
-    })
+    });
+    if let Some(metrics) = busy_metrics
+        && session.state == "busy"
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("busy_for_ms".to_owned(), json!(metrics.busy_for_ms));
+        object.insert(
+            "pty_quiet_for_ms".to_owned(),
+            json!(metrics.pty_quiet_for_ms),
+        );
+    }
+    value
 }
 
 #[derive(Debug)]
@@ -2686,9 +2768,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ProviderReservation, apply_codex_notification, apply_hook_event, canonical_session_id,
-        classify_error, generate_alias, generate_internal_id, provider_id_from_session,
-        public_result, public_session, validate_alias,
+        BusyMetrics, ProviderReservation, apply_codex_notification, apply_hook_event,
+        canonical_session_id, clamp_busy_metrics, classify_error, generate_alias,
+        generate_internal_id, provider_id_from_session, public_result, public_session,
+        public_session_with_metrics, validate_alias,
     };
     use crate::store::{NewSession, Store};
 
@@ -2808,6 +2891,65 @@ mod tests {
         assert!(value.get("provider_session_id").is_none());
         assert!(value.get("resume_ref").is_none());
         assert_eq!(provider_id_from_session(&session), Some("thread-1"));
+    }
+
+    #[test]
+    fn busy_public_session_exposes_bounded_diagnostic_ages() {
+        let mut store = ready_store("codex");
+        store
+            .insert_turn("turn_busy", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        store
+            .set_session_state("codex:thread-1", "busy")
+            .unwrap_or_else(|error| panic!("failed to mark session busy: {error}"));
+        let session = store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
+            .unwrap_or_else(|| panic!("session missing"));
+
+        let value = public_session_with_metrics(
+            &session,
+            Some(BusyMetrics {
+                busy_for_ms: 1_234,
+                pty_quiet_for_ms: 987,
+            }),
+        );
+        assert_eq!(value["state"], "busy");
+        assert_eq!(value["busy_for_ms"], 1_234);
+        assert_eq!(value["pty_quiet_for_ms"], 987);
+
+        let idle = ready_store("codex")
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|error| panic!("failed to read idle session: {error}"))
+            .unwrap_or_else(|| panic!("idle session missing"));
+        let idle_value = public_session(&idle);
+        assert!(idle_value.get("busy_for_ms").is_none());
+        assert!(idle_value.get("pty_quiet_for_ms").is_none());
+    }
+
+    #[test]
+    fn pty_quiet_age_is_clamped_to_current_busy_interval() {
+        assert_eq!(
+            clamp_busy_metrics(500, Some(1_200)),
+            BusyMetrics {
+                busy_for_ms: 500,
+                pty_quiet_for_ms: 500,
+            }
+        );
+        assert_eq!(
+            clamp_busy_metrics(500, Some(250)),
+            BusyMetrics {
+                busy_for_ms: 500,
+                pty_quiet_for_ms: 250,
+            }
+        );
+        assert_eq!(
+            clamp_busy_metrics(500, None),
+            BusyMetrics {
+                busy_for_ms: 500,
+                pty_quiet_for_ms: 500,
+            }
+        );
     }
 
     #[test]
