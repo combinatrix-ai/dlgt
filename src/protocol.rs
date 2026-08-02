@@ -1,6 +1,101 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Starting,
+    Running,
+    Idle,
+    Busy,
+    Quiescing,
+    Stopping,
+    Stopped,
+    Failed,
+    Restarting,
+    Blocked,
+}
+
+impl SessionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+            Self::Quiescing => "quiescing",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Restarting => "restarting",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
+
+    pub const fn public_name(self) -> &'static str {
+        match self {
+            Self::Running => "starting",
+            Self::Quiescing => "canceling",
+            _ => self.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnState {
+    Submitted,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+impl TurnState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Submitted | Self::Running)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Interrupted
+        )
+    }
+
+    pub const fn is_provider_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Interrupted)
+    }
+}
+
+impl std::fmt::Display for TurnState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Request {
     pub id: String,
@@ -109,7 +204,7 @@ pub struct SessionRecord {
     pub title: String,
     pub agent: String,
     pub cwd: String,
-    pub state: String,
+    pub state: SessionState,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub harness_options: Vec<String>,
@@ -126,7 +221,7 @@ pub struct TurnRecord {
     pub session_id: String,
     pub execution_seq: i64,
     pub prompt: String,
-    pub state: String,
+    pub state: TurnState,
     pub provider_turn_id: Option<String>,
     pub final_message: Option<String>,
     pub error: Option<String>,
@@ -142,26 +237,14 @@ pub struct EventRecord {
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
     pub kind: String,
-    pub payload: Value,
-    pub created_at_ms: i64,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct InputRecord {
-    pub seq: i64,
-    pub session_id: String,
-    pub turn_id: Option<String>,
-    pub source: String,
-    pub data_base64: String,
-    pub display: String,
-    pub byte_len: usize,
-    pub created_at_ms: i64,
+    /// The only event payload retained: retry attempts are exposed by the
+    /// public event stream for provider retry notifications.
+    pub retry_attempt: Option<u64>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, Response};
+    use super::{Request, Response, SessionState, TurnState};
     use serde_json::json;
 
     #[test]
@@ -211,5 +294,21 @@ mod tests {
         let request: Request = serde_json::from_value(json!({"id":"1","method":"server.ping"}))
             .unwrap_or_else(|error| panic!("failed to decode request: {error}"));
         assert_eq!(request.params, json!(null));
+    }
+
+    #[test]
+    fn lifecycle_states_keep_wire_names_and_public_session_aliases() {
+        assert_eq!(
+            serde_json::to_value(SessionState::Restarting)
+                .unwrap_or_else(|error| panic!("failed to serialize session state: {error}")),
+            "restarting"
+        );
+        assert_eq!(
+            serde_json::to_value(TurnState::Interrupted)
+                .unwrap_or_else(|error| panic!("failed to serialize turn state: {error}")),
+            "interrupted"
+        );
+        assert_eq!(SessionState::Running.public_name(), "starting");
+        assert_eq!(SessionState::Quiescing.public_name(), "canceling");
     }
 }
