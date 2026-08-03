@@ -325,15 +325,19 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-sess
   | "$binary" hook emit "$reused_id" claude
 printf '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","last_assistant_message":"%s"}\n' "$long_message" \
   | "$binary" hook emit "$reused_id" claude
-chunk_json=$("$binary" fetch "$reused_id" --cursor "$gap_cursor" --no-screen --max-bytes 4096)
+chunk_json=$("$binary" fetch "$reused_id" --cursor "$gap_cursor" --no-screen --max-bytes 2048)
 printf '%s\n' "$chunk_json" | grep -q '"final_text_complete":false'
 printf '%s\n' "$chunk_json" | grep -q '"final_text_offset":0'
 printf '%s\n' "$chunk_json" | grep -q '"has_more":true'
 printf '%s\n' "$chunk_json" | grep -q '"reason":"page_full"'
+# The budget spent everything on the result body, so the event watermark must
+# not have advanced past the events this page did not carry.
+printf '%s\n' "$chunk_json" | grep -q '"events":\[\]'
 chunk_cursor=$(printf '%s\n' "$chunk_json" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 rest_json=$("$binary" fetch "$reused_id" --cursor "$chunk_cursor" --no-screen)
 printf '%s\n' "$rest_json" | grep -q '"final_text_complete":true'
 if printf '%s\n' "$rest_json" | grep -q '"final_text_offset":0'; then exit 1; fi
+printf '%s\n' "$rest_json" | grep -q '"type":"session.idle"'
 
 # fetch --all reports every Session of one daemon without a screen projection.
 all_json=$("$binary" fetch --all)
@@ -380,6 +384,70 @@ printf '%s\n' "$crash_json" | grep -q '"status":"failed"' || {
   printf 'unexpected provider crash result: %s\n' "$crash_json" >&2
   exit 1
 }
+
+# A rotated provider Session ID keeps the pre-rekey address and its cursor
+# usable, and resuming the conversation keeps the retained screen history.
+"$binary" new --title rekey --alias @rekey --harness claude --cwd "$repo_root" \
+  -- rekey-initial >"$state_dir/rekey.json" &
+new_pid=$!
+attempt=0
+rekey_launch_id=
+while [ -z "$rekey_launch_id" ] || [ "$rekey_launch_id" = "$reused_launch_id" ]; do
+  rekey_launch_id=$(sed -n "s/.*hook emit '\\(internal:[0-9A-Z]*\\)' 'claude'.*/\\1/p" \
+    "$DLGT_FAKE_ARGS_FILE" | tail -1)
+  attempt=$((attempt + 1)); test "$attempt" -lt 200 || exit 1; sleep 0.02
+done
+printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-rekey-1"}' \
+  | "$binary" hook emit "$rekey_launch_id" claude
+wait "$new_pid"
+rekey_id=claude:provider-rekey-1
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-rekey-1","turn_id":"rekey-turn-1","user_prompt":"rekey-initial"}' \
+  | "$binary" hook emit "$rekey_id" claude
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-rekey-1","turn_id":"rekey-turn-1","last_assistant_message":"rekey-ready"}' \
+  | "$binary" hook emit "$rekey_id" claude
+rekey_cursor=$("$binary" fetch "$rekey_id" --until result --wait 4s \
+  | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+test -n "$rekey_cursor"
+
+"$binary" restart "$rekey_id" >"$state_dir/rekey-restart.json" &
+restart_pid=$!
+attempt=0
+while ! "$binary" show "$rekey_id" | grep -q '"state":"starting"\|"state":"running"'; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 200 || exit 1; sleep 0.02
+done
+printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-rekey-2"}' \
+  | "$binary" hook emit "$rekey_id" claude
+wait "$restart_pid"
+rotated_id=claude:provider-rekey-2
+grep -q "\"id\":\"$rotated_id\"" "$state_dir/rekey-restart.json"
+# The pre-rekey address and a cursor taken before the rotation both still
+# resolve to the same logical Session.
+"$binary" fetch "$rekey_id" --cursor "$rekey_cursor" | grep -q "\"id\":\"$rotated_id\""
+"$binary" scrollback "$rotated_id" --lines 200 | grep -q 'fake:rekey-initial'
+
+"$binary" stop "$rotated_id" --force >/dev/null
+attempt=0
+while "$binary" show @rekey >/dev/null 2>&1; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 200 || exit 1; sleep 0.02
+done
+"$binary" send "$rotated_id" --resume -- resumed-prompt >"$state_dir/rekey-resume.json" &
+resume_pid=$!
+attempt=0
+resume_launch_id=
+while [ -z "$resume_launch_id" ] || [ "$resume_launch_id" = "$rekey_launch_id" ]; do
+  resume_launch_id=$(sed -n "s/.*hook emit '\\(internal:[0-9A-Z]*\\)' 'claude'.*/\\1/p" \
+    "$DLGT_FAKE_ARGS_FILE" | tail -1)
+  attempt=$((attempt + 1)); test "$attempt" -lt 200 || exit 1; sleep 0.02
+done
+printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-rekey-2"}' \
+  | "$binary" hook emit "$resume_launch_id" claude
+wait "$resume_pid"
+grep -q "\"id\":\"$rotated_id\"" "$state_dir/rekey-resume.json"
+# Resuming the same provider conversation continues one logical Session, so
+# the screen history recorded before the resume is still readable.
+"$binary" scrollback "$rotated_id" --lines 400 | grep -q 'fake:rekey-initial'
+"$binary" fetch "$rekey_id" --cursor "$rekey_cursor" | grep -q "\"id\":\"$rotated_id\""
+"$binary" stop "$rotated_id" --force >/dev/null
 
 "$binary" server stop >/dev/null
 wait "$server_pid"

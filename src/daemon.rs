@@ -1665,10 +1665,12 @@ impl Daemon {
             }
             cursor::SCOPE_ALL.to_owned()
         } else {
+            // Resolve through the UID index so a pre-rekey public ID, which a
+            // UID-bound cursor implies is still valid, keeps addressing the
+            // same logical Session.
             let selector = selector.unwrap_or_default();
-            let session = self.resolve_session(selector)?;
             self.lock_store()?
-                .session_uid(&session.id)
+                .session_uid(selector)
                 .with_context(|| format!("session not found: {selector}"))?
         };
         let cursor = params
@@ -1697,28 +1699,33 @@ impl Daemon {
         let session = store
             .session_for_uid(&uid)
             .context("session not found: cursor no longer addresses a live Session")?;
-        let baseline = options.cursor.is_none();
-        let position = options
-            .cursor
-            .as_ref()
-            .map(|cursor| cursor.session(&uid))
-            .unwrap_or_default();
+        let baseline = options.baseline();
+        let mut position = options.position(&uid);
+        let mut scope_gaps = Vec::new();
         let mut gaps = Vec::new();
 
-        let (events, events_more, event_seq) = if baseline {
+        let (events, events_more, event_watermark) = if baseline {
             (Vec::new(), false, store.latest_event_seq())
         } else {
-            let after = options.cursor.as_ref().map_or(0, |cursor| cursor.e);
+            let after = options.event_position();
             if after < store.evicted_event_seq() {
-                gaps.push(retention_gap("events"));
+                scope_gaps.push(retention_gap("events"));
             }
-            normalized_page(&store, Some(&session.id), after, FETCH_EVENT_PAGE)
+            normalized_page(&store, Some(&uid), after, FETCH_EVENT_PAGE)
         };
 
         let (results, results_more) = if baseline {
             let latest = store
                 .latest_turn(&session.id)
                 .filter(|turn| turn.state.is_terminal());
+            // A baseline delivers only the latest retained result. Anchor the
+            // watermark immediately below it so a chunked body resumes on the
+            // same result instead of restarting from the oldest retained one.
+            if let Some(turn) = latest.as_ref() {
+                position.x = turn.execution_seq - 1;
+                position.px = None;
+                position.po = 0;
+            }
             (latest.into_iter().collect::<Vec<_>>(), false)
         } else {
             if position.x < store.evicted_result_seq(&uid) {
@@ -1770,119 +1777,124 @@ impl Daemon {
         Ok(Cut {
             baseline,
             state: Some(session.state),
+            bound_seq: *bound,
             bound_terminal,
-            event_seq,
+            event_watermark,
             events_more,
-            sessions: vec![SessionDelta {
+            dropped_event_seq: None,
+            scope_gaps,
+            buckets: vec![Bucket::new(BucketInput {
                 uid,
                 session: public,
-                events,
+                gaps,
+                events: events.into_iter().map(|(_, event)| event).collect(),
                 results,
                 results_more,
                 stable,
                 live,
                 epoch_reset,
-                gaps,
-                position,
-            }],
+                screen: options.stable_limit > 0,
+                incoming: position,
+            })],
             sessions_more: false,
+            baseline_next: None,
         })
     }
 
     #[allow(clippy::too_many_lines)]
     fn fetch_all_cut(&self, options: &FetchOptions) -> Result<Cut> {
         let store = self.lock_store()?;
-        let baseline = options.cursor.is_none();
-        let after = options.cursor.as_ref().map_or(0, |cursor| cursor.e);
-        let mut gaps = Vec::new();
+        let baseline = options.baseline();
+        let after = options.event_position();
+        let mut scope_gaps = Vec::new();
         if !baseline && after < store.evicted_event_seq() {
-            gaps.push(retention_gap("events"));
+            scope_gaps.push(retention_gap("events"));
         }
-        let (events, mut events_more, mut event_seq) = if baseline {
-            (Vec::new(), false, store.latest_event_seq())
+        let (events, events_more, event_watermark) = if baseline {
+            // Freeze the watermark at the first baseline page so events
+            // produced while the baseline is still paging are delivered as a
+            // delta once enumeration completes.
+            let watermark = if options.cursor.is_some() {
+                after
+            } else {
+                store.latest_event_seq()
+            };
+            (Vec::new(), false, watermark)
         } else {
             normalized_page(&store, None, after, FETCH_EVENT_PAGE)
         };
 
-        // Bucket the global event page, truncating it rather than advancing
-        // the shared watermark past a Session that did not fit this page.
-        let mut order = Vec::new();
-        let mut buckets: HashMap<String, Vec<Value>> = HashMap::new();
-        let mut delivered_events = Vec::new();
-        for event in events {
-            let Some(id) = event.get("session_id").and_then(Value::as_str) else {
+        // Bucket the global event page. A Session that does not fit this page
+        // records the sequence it refused so the shared watermark cannot move
+        // past it.
+        let mut order: Vec<String> = Vec::new();
+        let mut by_uid: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut dropped_event_seq: Option<i64> = None;
+        for (uid, event) in events {
+            let Some(uid) = uid else { continue };
+            if !by_uid.contains_key(&uid) && order.len() >= FETCH_SESSION_PAGE {
+                let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+                dropped_event_seq =
+                    Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
                 continue;
-            };
-            let Some(uid) = store.session_uid(id) else {
-                continue;
-            };
-            if !buckets.contains_key(&uid) {
-                if order.len() >= FETCH_SESSION_PAGE {
-                    events_more = true;
-                    event_seq = delivered_events
-                        .last()
-                        .and_then(|value: &Value| value.get("seq"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(after);
-                    break;
-                }
+            }
+            if !by_uid.contains_key(&uid) {
                 order.push(uid.clone());
             }
-            buckets.entry(uid).or_default().push(event.clone());
-            delivered_events.push(event);
+            by_uid.entry(uid).or_default().push(event);
         }
 
-        let mut deltas = Vec::new();
-        let mut sessions_more = false;
-        for uid in store.session_uids() {
+        let mut candidates = store.session_uids();
+        if baseline && let Some(resume) = options.resume_after() {
+            let start = candidates
+                .iter()
+                .position(|uid| uid == resume)
+                .map_or(0, |index| index + 1);
+            candidates.drain(..start);
+        }
+
+        let mut buckets = Vec::new();
+        let mut included_last = None;
+        let mut remaining = false;
+        for uid in candidates {
             let Some(session) = store.session_for_uid(&uid) else {
                 continue;
             };
             if session.id.starts_with("internal:") {
                 continue;
             }
-            let position = options
-                .cursor
-                .as_ref()
-                .map(|cursor| cursor.session(&uid))
-                .unwrap_or_default();
+            let mut position = options.position(&uid);
+            let events = by_uid.remove(&uid).unwrap_or_default();
+            let mut gaps = Vec::new();
             let (results, results_more) = if baseline {
-                (Vec::new(), false)
+                let latest = store
+                    .latest_turn(&session.id)
+                    .filter(|turn| turn.state.is_terminal());
+                if let Some(turn) = latest.as_ref() {
+                    position.x = turn.execution_seq - 1;
+                    position.px = None;
+                    position.po = 0;
+                }
+                (latest.into_iter().collect::<Vec<_>>(), false)
             } else {
+                if position.x < store.evicted_result_seq(&uid) {
+                    gaps.push(retention_gap("results"));
+                }
                 store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
             };
-            let events = buckets.remove(&uid).unwrap_or_default();
-            let changed = !events.is_empty() || !results.is_empty();
-            if !baseline && !changed {
+            if !baseline && events.is_empty() && results.is_empty() {
                 continue;
             }
-            if deltas.len() >= FETCH_SESSION_PAGE {
-                sessions_more = true;
+            if buckets.len() >= FETCH_SESSION_PAGE {
+                remaining = true;
                 break;
             }
-            let mut session_gaps = Vec::new();
-            if !baseline && position.x < store.evicted_result_seq(&uid) {
-                session_gaps.push(retention_gap("results"));
-            }
-            let baseline_result = baseline
-                .then(|| {
-                    store
-                        .latest_turn(&session.id)
-                        .filter(|turn| turn.state.is_terminal())
-                })
-                .flatten();
-            let result_seq = baseline_result
-                .as_ref()
-                .map_or(position.x, |turn| turn.execution_seq);
-            deltas.push(SessionDelta {
+            buckets.push(Bucket::new(BucketInput {
                 uid: uid.clone(),
                 session: self.public_session_locked(&store, &session)?,
+                gaps,
                 events,
-                results: if baseline {
-                    baseline_result.into_iter().collect()
-                } else {
-                    results
-                },
+                results,
                 results_more,
                 stable: crate::screen::StablePage {
                     next_after: store.stable_head(&uid),
@@ -1893,27 +1905,29 @@ impl Daemon {
                     ..crate::store::LiveScreen::default()
                 },
                 epoch_reset: false,
-                gaps: session_gaps,
-                position: crate::cursor::SessionCursor {
-                    x: result_seq,
-                    ..position
-                },
-            });
+                screen: false,
+                incoming: position,
+            }));
+            included_last = Some(uid);
         }
         drop(store);
-        if !gaps.is_empty()
-            && let Some(first) = deltas.first_mut()
-        {
-            first.gaps.extend(gaps);
-        }
+
         Ok(Cut {
             baseline,
             state: None,
+            bound_seq: None,
             bound_terminal: false,
-            event_seq,
+            event_watermark,
             events_more,
-            sessions: deltas,
-            sessions_more,
+            dropped_event_seq,
+            scope_gaps,
+            buckets,
+            sessions_more: remaining && !baseline,
+            baseline_next: if remaining && baseline {
+                included_last
+            } else {
+                None
+            },
         })
     }
 
@@ -1940,16 +1954,20 @@ impl Daemon {
 
     fn read_events(&self, params: &Value) -> Result<Value> {
         let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        let session_id = if let Some(selector) = params.get("session").and_then(Value::as_str) {
-            Some(self.resolve_session(selector)?.id)
+        let store = self.lock_store()?;
+        let uid = if let Some(selector) = params.get("session").and_then(Value::as_str) {
+            Some(
+                store
+                    .session_uid(selector)
+                    .with_context(|| format!("session not found: {selector}"))?,
+            )
         } else {
             None
         };
-        let store = self.lock_store()?;
         let normalized = store
-            .read_events(session_id.as_deref(), after)
+            .read_events(uid.as_deref(), after)
             .iter()
-            .filter_map(|event| normalize_event(&store, event))
+            .filter_map(normalize_event)
             .collect::<Vec<_>>();
         Ok(Value::Array(normalized))
     }
@@ -3149,6 +3167,32 @@ struct FetchOptions {
     instance_id: String,
 }
 
+impl FetchOptions {
+    /// A cursorless request, or an `--all` baseline that is still enumerating
+    /// Sessions. Baseline mode persists until enumeration completes so a
+    /// caller cannot lose the Sessions it has not been shown yet.
+    fn baseline(&self) -> bool {
+        self.cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.bl.is_some())
+    }
+
+    fn resume_after(&self) -> Option<&str> {
+        self.cursor.as_ref().and_then(|cursor| cursor.bl.as_deref())
+    }
+
+    fn position(&self, uid: &str) -> cursor::SessionCursor {
+        self.cursor
+            .as_ref()
+            .map(|cursor| cursor.session(uid))
+            .unwrap_or_default()
+    }
+
+    fn event_position(&self) -> i64 {
+        self.cursor.as_ref().map_or(0, |cursor| cursor.e)
+    }
+}
+
 /// An immutable observation cut taken under the store lock. Serialization
 /// happens after the lock is released, so output arriving during serialization
 /// belongs to the next cursor.
@@ -3156,24 +3200,316 @@ struct FetchOptions {
 struct Cut {
     baseline: bool,
     state: Option<SessionState>,
+    /// Execution bound by `--until result`, and whether it has terminalized.
+    bound_seq: Option<i64>,
     bound_terminal: bool,
-    event_seq: i64,
+    /// Event watermark to publish when every candidate event is delivered.
+    event_watermark: i64,
     events_more: bool,
-    sessions: Vec<SessionDelta>,
+    /// Lowest event sequence this cut already refused to bucket.
+    dropped_event_seq: Option<i64>,
+    /// Scope-wide gaps. Per-Session gaps live on the bucket.
+    scope_gaps: Vec<Value>,
+    buckets: Vec<Bucket>,
     sessions_more: bool,
+    /// `--all` baseline enumeration position for the next page.
+    baseline_next: Option<String>,
 }
 
-struct SessionDelta {
+/// One Session's renderable payload. Every variable-length field keeps its
+/// full candidate list plus an inclusion count, so the shrink loop can shed
+/// content in reverse priority order and still know what it left behind.
+#[allow(clippy::struct_excessive_bools)]
+struct Bucket {
     uid: String,
     session: Value,
+    gaps: Vec<Value>,
+    events: Vec<Value>,
+    events_len: usize,
+    results: Vec<ResultChunk>,
+    results_len: usize,
+    results_more: bool,
+    stable: Vec<String>,
+    stable_len: usize,
+    /// Byte length the last included stable row is truncated to.
+    stable_truncate: Option<usize>,
+    /// Row ID immediately before `stable[0]`.
+    stable_start: u64,
+    stable_more: bool,
+    live: Vec<String>,
+    live_included: bool,
+    live_truncated: bool,
+    epoch: u64,
+    epoch_reset: bool,
+    reset_reason: Option<&'static str>,
+    screen: bool,
+    incoming: cursor::SessionCursor,
+}
+
+/// A retained result plus how much of its `final_text` this response carries.
+struct ResultChunk {
+    exec: i64,
+    base: Value,
+    text: String,
+    offset: u64,
+    take: usize,
+}
+
+impl ResultChunk {
+    fn new(turn: &TurnRecord, offset: u64) -> Self {
+        let mut base = public_result(turn);
+        base["final_text"] = json!("");
+        let text = turn.final_message.clone().unwrap_or_default();
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(text.len());
+        let start = char_floor(&text, start);
+        let text = text[start..].to_owned();
+        let take = text.len();
+        Self {
+            exec: turn.execution_seq,
+            base,
+            text,
+            offset: u64::try_from(start).unwrap_or(0),
+            take,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.take == self.text.len()
+    }
+
+    /// Take the largest UTF-8 prefix whose encoded record fits `budget`.
+    /// Chunking beats dropping: the result body is what the caller asked for.
+    fn fit(&mut self, budget: usize) {
+        self.take = self.text.len();
+        while self.take > 0 && json_cost(&self.value()) > budget {
+            let next = self.take * 3 / 4;
+            let next = if next == self.take {
+                self.take - 1
+            } else {
+                next
+            };
+            self.take = char_floor(&self.text, next);
+        }
+    }
+
+    fn value(&self) -> Value {
+        let mut value = self.base.clone();
+        value["final_text"] = json!(&self.text[..self.take]);
+        value["final_text_offset"] = json!(self.offset);
+        value["final_text_complete"] = json!(self.complete());
+        value
+    }
+}
+
+/// Largest index at or below `index` that is a UTF-8 character boundary.
+fn char_floor(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+struct BucketInput {
+    uid: String,
+    session: Value,
+    gaps: Vec<Value>,
     events: Vec<Value>,
     results: Vec<TurnRecord>,
     results_more: bool,
     stable: crate::screen::StablePage,
     live: crate::store::LiveScreen,
     epoch_reset: bool,
-    gaps: Vec<Value>,
-    position: cursor::SessionCursor,
+    screen: bool,
+    incoming: cursor::SessionCursor,
+}
+
+impl Bucket {
+    fn new(input: BucketInput) -> Self {
+        let stable_start = input
+            .stable
+            .next_after
+            .saturating_sub(u64::try_from(input.stable.lines.len()).unwrap_or(0));
+        let mut incoming = input.incoming;
+        let results = input
+            .results
+            .iter()
+            .map(|turn| {
+                let offset = if incoming.px == Some(turn.execution_seq) {
+                    incoming.po
+                } else {
+                    0
+                };
+                ResultChunk::new(turn, offset)
+            })
+            .collect::<Vec<_>>();
+        // A partial-delivery marker that no longer names the next retained
+        // result is stale; dropping it keeps the continuation unambiguous.
+        if incoming
+            .px
+            .is_some_and(|exec| results.first().is_none_or(|chunk| chunk.exec != exec))
+        {
+            incoming.px = None;
+            incoming.po = 0;
+        }
+        let events_len = input.events.len();
+        let results_len = results.len();
+        let stable_len = input.stable.lines.len();
+        Self {
+            uid: input.uid,
+            session: input.session,
+            gaps: input.gaps,
+            events: input.events,
+            events_len,
+            results,
+            results_len,
+            results_more: input.results_more,
+            stable: input.stable.lines,
+            stable_len,
+            stable_truncate: None,
+            stable_start,
+            stable_more: input.stable.has_more,
+            live: input.live.rows,
+            live_included: input.screen,
+            live_truncated: input.live.truncated,
+            epoch: input.live.epoch,
+            epoch_reset: input.epoch_reset,
+            reset_reason: input.live.reset_reason,
+            screen: input.screen,
+            incoming,
+        }
+    }
+
+    fn value(&self) -> Value {
+        let mut stable = self.stable[..self.stable_len]
+            .iter()
+            .map(|line| Value::String(line.clone()))
+            .collect::<Vec<_>>();
+        if let Some(limit) = self.stable_truncate
+            && let Some(Value::String(last)) = stable.last_mut()
+        {
+            last.truncate(char_floor(last, limit));
+        }
+        let mut bucket = json!({
+            "session": self.session,
+            "gaps": self.gaps,
+            "results": self.results[..self.results_len]
+                .iter()
+                .map(ResultChunk::value)
+                .collect::<Vec<_>>(),
+            "events": self.events[..self.events_len],
+        });
+        if self.screen {
+            bucket["screen"] = json!({
+                "epoch": self.epoch,
+                "reset": self.epoch_reset,
+                "reset_reason": self.epoch_reset.then_some(self.reset_reason).flatten(),
+                "stable": stable,
+                "live": if self.live_included { self.live.clone() } else { Vec::new() },
+                "live_truncated": self.live_truncated,
+            });
+        }
+        bucket
+    }
+
+    /// Outgoing watermarks for exactly the content this bucket still carries.
+    fn position(&self) -> cursor::SessionCursor {
+        let mut position = self.incoming;
+        for chunk in &self.results[..self.results_len] {
+            if chunk.complete() {
+                position.x = chunk.exec;
+                position.px = None;
+                position.po = 0;
+            } else {
+                position.px = Some(chunk.exec);
+                position.po = chunk.offset + u64::try_from(chunk.take).unwrap_or(0);
+            }
+        }
+        position.r = self.stable_start + u64::try_from(self.stable_len).unwrap_or(0);
+        position.ep = self.epoch;
+        position
+    }
+
+    fn delivered(&self) -> bool {
+        self.events_len > 0 || self.results_len > 0 || self.stable_len > 0
+    }
+
+    /// Content this response does not carry and a later one must.
+    fn pending(&self) -> bool {
+        self.results_more
+            || self.stable_more
+            || self.events_len < self.events.len()
+            || self.results_len < self.results.len()
+            || self.stable_len < self.stable.len()
+            || self.results[..self.results_len]
+                .iter()
+                .any(|chunk| !chunk.complete())
+    }
+
+    /// Drop the lowest-priority remaining content: screen text, then events,
+    /// then result bodies. State and gaps are never shed.
+    fn shed(&mut self) -> bool {
+        if self.live_included && !self.live.is_empty() {
+            self.live_included = false;
+            return true;
+        }
+        if self.stable_len > 0 {
+            self.stable_len -= 1;
+            self.stable_truncate = None;
+            return true;
+        }
+        if self.events_len > 0 {
+            self.events_len -= 1;
+            return true;
+        }
+        if self.results_len > 0 {
+            let index = self.results_len - 1;
+            let chunk = &mut self.results[index];
+            if chunk.take > 0 {
+                chunk.take = char_floor(&chunk.text, chunk.take * 3 / 4);
+                if chunk.take > 0 {
+                    return true;
+                }
+            }
+            self.results_len -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Re-admit exactly one unit of content so a `has_more` response always
+    /// advances a watermark. Result bodies come first because they are the
+    /// answer the caller asked for; a single oversized screen row is truncated
+    /// mid-line rather than blocking the cursor forever.
+    fn force_progress(&mut self, budget: usize) -> bool {
+        if !self.results.is_empty() {
+            self.results_len = 1;
+            let chunk = &mut self.results[0];
+            if chunk.take == 0 {
+                chunk.take = char_floor(&chunk.text, budget.max(1));
+                if chunk.take == 0 {
+                    chunk.take = chunk
+                        .text
+                        .char_indices()
+                        .nth(1)
+                        .map_or(chunk.text.len(), |(index, _)| index);
+                }
+            }
+            return true;
+        }
+        if !self.events.is_empty() {
+            self.events_len = 1;
+            return true;
+        }
+        if !self.stable.is_empty() {
+            self.stable_len = 1;
+            self.stable_truncate = Some(budget);
+            return true;
+        }
+        false
+    }
 }
 
 struct Rendered {
@@ -3183,177 +3519,214 @@ struct Rendered {
     settled: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
+struct Assembled {
+    value: Value,
+    has_more: bool,
+    progress: bool,
+    delivered: bool,
+    result_ready: bool,
+    gapped: bool,
+}
+
 impl Cut {
+    /// Serialize the cut, shedding content until the encoded document fits the
+    /// caller's byte budget. The measured document is authoritative: estimates
+    /// cannot bound JSON escaping or the cursor's own length.
     fn render(mut self, options: &FetchOptions) -> Result<Rendered> {
-        let mut next = cursor::Cursor::new(&options.instance_id, &options.scope);
-        next.e = self.event_seq;
-        if let Some(previous) = options.cursor.as_ref() {
-            next.p.clone_from(&previous.p);
+        self.pre_trim(options);
+        let mut assembled = self.assemble(options)?;
+        while serialized_len(&assembled.value)? > options.max_bytes {
+            if !self.shed() {
+                break;
+            }
+            assembled = self.assemble(options)?;
         }
-        let mut has_more = self.events_more || self.sessions_more;
-        let mut gapped = false;
-        // Envelope, cursor, and reason are reserved before any payload so a
-        // squeezed response can still carry state and gaps.
-        let mut budget = options.max_bytes.saturating_sub(
-            FETCH_ENVELOPE_RESERVE + FETCH_SESSION_CURSOR_RESERVE * self.sessions.len().max(1),
-        );
-        let mut buckets = Vec::new();
-        for delta in &mut self.sessions {
-            let (value, position, more, gap) = delta.render(options, &mut budget);
-            has_more = has_more || more;
-            gapped = gapped || gap;
-            next.set_session(&delta.uid, position);
-            buckets.push(value);
+        if assembled.has_more && !assembled.progress {
+            // Every has_more response must advance at least one watermark or
+            // the caller loops forever on an unchanged cursor.
+            let floor = serialized_len(&assembled.value)?;
+            let budget = options.max_bytes.saturating_sub(floor);
+            if self.force_progress(budget) {
+                assembled = self.assemble(options)?;
+            }
         }
-        let delivered = buckets.iter().any(|bucket| {
-            bucket
-                .get("events")
-                .and_then(Value::as_array)
-                .is_some_and(|events| !events.is_empty())
-                || bucket
-                    .get("results")
-                    .and_then(Value::as_array)
-                    .is_some_and(|results| !results.is_empty())
-                || bucket
-                    .pointer("/screen/stable")
-                    .and_then(Value::as_array)
-                    .is_some_and(|stable| !stable.is_empty())
-        });
         let blocked = self.state == Some(SessionState::Blocked);
-        let reason = if gapped {
+        let reason = if assembled.gapped {
             "gap"
         } else if blocked {
             "blocked"
-        } else if options.until_result && self.bound_terminal {
+        } else if options.until_result && assembled.result_ready {
             "result"
-        } else if has_more {
+        } else if assembled.has_more {
             "page_full"
         } else if self.baseline {
             "snapshot"
-        } else if delivered {
+        } else if assembled.delivered {
             "change"
         } else {
             "timeout"
         };
-        let settled = gapped
+        let settled = assembled.gapped
             || blocked
-            || has_more
+            || assembled.has_more
             || if options.until_result {
-                self.bound_terminal
+                assembled.result_ready
             } else {
-                self.baseline || delivered
+                self.baseline || assembled.delivered
             };
-        Ok(Rendered {
-            value: json!({
-                "schema_version": 1,
-                "runtime": {
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "instance_id": options.instance_id,
-                },
-                "reason": reason,
-                "has_more": has_more,
-                "cursor": next.encode()?,
-                "sessions": buckets,
-            }),
-            settled,
+        let mut value = assembled.value;
+        value["reason"] = json!(reason);
+        Ok(Rendered { value, settled })
+    }
+
+    /// Cheap greedy fit before the exact loop, so the measured loop normally
+    /// converges in a couple of iterations instead of hundreds.
+    fn pre_trim(&mut self, options: &FetchOptions) {
+        let reserve = FETCH_ENVELOPE_RESERVE
+            + FETCH_SESSION_CURSOR_RESERVE * self.buckets.len().max(1)
+            + self
+                .buckets
+                .iter()
+                .map(|bucket| {
+                    json_cost(&bucket.session) + json_cost(&Value::Array(bucket.gaps.clone()))
+                })
+                .sum::<usize>();
+        let mut budget = options.max_bytes.saturating_sub(reserve);
+        for bucket in &mut self.buckets {
+            let mut kept = 0;
+            for chunk in &mut bucket.results {
+                let cost = json_cost(&chunk.value());
+                if cost <= budget {
+                    budget -= cost;
+                    kept += 1;
+                    continue;
+                }
+                chunk.fit(budget);
+                if chunk.take > 0 {
+                    kept += 1;
+                    budget = 0;
+                }
+                break;
+            }
+            bucket.results_len = kept;
+            let mut kept = 0;
+            for event in &bucket.events {
+                let cost = json_cost(event);
+                if cost > budget {
+                    break;
+                }
+                budget -= cost;
+                kept += 1;
+            }
+            bucket.events_len = kept;
+            let mut kept = 0;
+            for line in &bucket.stable {
+                let cost = json_cost(&Value::String(line.clone()));
+                if cost > budget {
+                    break;
+                }
+                budget -= cost;
+                kept += 1;
+            }
+            bucket.stable_len = kept;
+            let live_cost = bucket
+                .live
+                .iter()
+                .map(|line| json_cost(&Value::String(line.clone())))
+                .sum::<usize>();
+            bucket.live_included = bucket.screen && live_cost <= budget;
+            if bucket.live_included {
+                budget -= live_cost;
+            }
+        }
+    }
+
+    fn shed(&mut self) -> bool {
+        for bucket in self.buckets.iter_mut().rev() {
+            if bucket.shed() {
+                return true;
+            }
+        }
+        // Only the mandatory floor is left; drop whole trailing buckets.
+        if self.buckets.len() > 1 {
+            self.buckets.pop();
+            self.sessions_more = true;
+            return true;
+        }
+        false
+    }
+
+    fn force_progress(&mut self, budget: usize) -> bool {
+        self.buckets
+            .first_mut()
+            .is_some_and(|bucket| bucket.force_progress(budget))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assemble(&self, options: &FetchOptions) -> Result<Assembled> {
+        let mut next = cursor::Cursor::new(&options.instance_id, &options.scope);
+        if let Some(previous) = options.cursor.as_ref() {
+            next.p.clone_from(&previous.p);
+        }
+        // The event watermark may only advance over events this document
+        // actually carries.
+        let mut first_dropped = self.dropped_event_seq;
+        for bucket in &self.buckets {
+            for event in bucket.events.iter().skip(bucket.events_len) {
+                let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+                first_dropped = Some(first_dropped.map_or(seq, |current| current.min(seq)));
+            }
+        }
+        next.e = first_dropped.map_or(self.event_watermark, |seq| seq - 1);
+        next.bl.clone_from(&self.baseline_next);
+
+        let mut buckets = Vec::with_capacity(self.buckets.len());
+        let mut has_more = self.events_more || self.sessions_more || self.baseline_next.is_some();
+        let mut delivered = false;
+        let mut progress = self.baseline;
+        let mut gapped = !self.scope_gaps.is_empty();
+        for bucket in &self.buckets {
+            let position = bucket.position();
+            has_more = has_more || bucket.pending();
+            delivered = delivered || bucket.delivered();
+            gapped = gapped || !bucket.gaps.is_empty();
+            progress = progress || position != bucket.incoming;
+            next.set_session(&bucket.uid, position);
+            buckets.push(bucket.value());
+        }
+        progress = progress || next.e > options.event_position();
+        let result_ready = self.bound_terminal
+            && self.bound_seq.is_some_and(|seq| {
+                self.buckets
+                    .first()
+                    .is_some_and(|bucket| seq <= bucket.position().x)
+            });
+        let value = json!({
+            "schema_version": 1,
+            "runtime": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "instance_id": options.instance_id,
+            },
+            "reason": "timeout",
+            "has_more": has_more,
+            "gaps": self.scope_gaps,
+            "cursor": next.encode()?,
+            "sessions": buckets,
+        });
+        Ok(Assembled {
+            value,
+            has_more,
+            progress,
+            delivered,
+            result_ready,
+            gapped,
         })
     }
 }
 
-impl SessionDelta {
-    /// Fill one Session bucket in priority order: state, gaps, terminal
-    /// results, events, then screen text.
-    fn render(
-        &mut self,
-        options: &FetchOptions,
-        budget: &mut usize,
-    ) -> (Value, cursor::SessionCursor, bool, bool) {
-        let mut position = self.position;
-        let mut has_more = self.results_more;
-        let gapped = !self.gaps.is_empty();
-        let mut bucket = json!({
-            "session": self.session,
-            "gaps": self.gaps,
-        });
-        *budget = budget.saturating_sub(json_cost(&bucket));
-
-        let mut results = Vec::new();
-        for turn in &self.results {
-            let resume = if position.px == Some(turn.execution_seq) {
-                position.po
-            } else {
-                0
-            };
-            let (value, complete, delivered) = fetch_result(turn, resume, *budget);
-            if !complete && delivered == 0 {
-                has_more = true;
-                break;
-            }
-            *budget = budget.saturating_sub(json_cost(&value));
-            results.push(value);
-            if complete {
-                position.x = turn.execution_seq;
-                position.px = None;
-                position.po = 0;
-            } else {
-                position.px = Some(turn.execution_seq);
-                position.po = resume + delivered;
-                has_more = true;
-                break;
-            }
-        }
-        bucket["results"] = Value::Array(results);
-
-        let mut events = Vec::new();
-        for event in &self.events {
-            let cost = json_cost(event);
-            if cost > *budget {
-                has_more = true;
-                break;
-            }
-            *budget -= cost;
-            events.push(event.clone());
-        }
-        bucket["events"] = Value::Array(events);
-
-        if options.stable_limit > 0 {
-            let mut stable = Vec::new();
-            let mut row = self.stable.next_after.saturating_sub(self.delivered_rows());
-            for line in &self.stable.lines {
-                let cost = line.len() + 4;
-                if cost > *budget {
-                    has_more = true;
-                    break;
-                }
-                *budget -= cost;
-                row += 1;
-                stable.push(Value::String(line.clone()));
-            }
-            has_more = has_more || self.stable.has_more;
-            position.r = row;
-            let live = if *budget > 0 {
-                self.live.rows.clone()
-            } else {
-                Vec::new()
-            };
-            bucket["screen"] = json!({
-                "epoch": self.live.epoch,
-                "reset": self.epoch_reset,
-                "reset_reason": self.epoch_reset.then_some(self.live.reset_reason),
-                "stable": stable,
-                "live": live,
-                "live_truncated": self.live.truncated,
-            });
-        } else {
-            position.r = self.stable.next_after;
-        }
-        position.ep = self.live.epoch;
-        (bucket, position, has_more, gapped)
-    }
-
-    fn delivered_rows(&self) -> u64 {
-        u64::try_from(self.stable.lines.len()).unwrap_or(0)
-    }
+fn serialized_len(value: &Value) -> Result<usize> {
+    Ok(serde_json::to_string(value)?.len())
 }
 
 fn json_cost(value: &Value) -> usize {
@@ -3365,74 +3738,46 @@ fn retention_gap(component: &str) -> Value {
 }
 
 /// One bounded page of normalized lifecycle events plus its watermark.
-fn normalized_page(
-    store: &Store,
-    session_id: Option<&str>,
-    after: i64,
-    limit: usize,
-) -> (Vec<Value>, bool, i64) {
+type EventPage = (Vec<(Option<String>, Value)>, bool, i64);
+
+fn normalized_page(store: &Store, uid: Option<&str>, after: i64, limit: usize) -> EventPage {
     let mut page = Vec::new();
     let mut watermark = after;
     let mut has_more = false;
-    for event in store.read_events(session_id, after) {
+    for event in store.read_events(uid, after) {
         if page.len() >= limit {
             has_more = true;
             break;
         }
         watermark = event.seq;
-        if let Some(value) = normalize_event(store, &event) {
-            page.push(value);
+        if let Some(value) = normalize_event(&event) {
+            page.push((event.session_uid.clone(), value));
         }
     }
     (page, has_more, watermark)
 }
 
-/// A retained result, with `final_text` chunked at a UTF-8 boundary when the
-/// remaining response budget cannot carry all of it.
-fn fetch_result(turn: &TurnRecord, offset: u64, budget: usize) -> (Value, bool, u64) {
-    let mut value = public_result(turn);
-    value["final_text"] = json!("");
-    value["final_text_offset"] = json!(offset);
-    value["final_text_complete"] = json!(true);
-    let overhead = json_cost(&value);
-    let text = turn.final_message.clone().unwrap_or_default();
-    let start = usize::try_from(offset).unwrap_or(0).min(text.len());
-    let remaining = &text[start..];
-    let mut end = remaining.len().min(budget.saturating_sub(overhead));
-    loop {
-        while end > 0 && !remaining.is_char_boundary(end) {
-            end -= 1;
-        }
-        value["final_text"] = json!(&remaining[..end]);
-        // JSON escaping can inflate the encoded length past the raw byte
-        // budget, so the measured cost is authoritative.
-        if end == 0 || json_cost(&value) <= budget {
-            break;
-        }
-        end = end * 3 / 4;
-    }
-    let complete = end == remaining.len();
-    value["final_text_complete"] = json!(complete);
-    (value, complete, u64::try_from(end).unwrap_or(0))
-}
-
-fn normalize_event(store: &Store, event: &crate::protocol::EventRecord) -> Option<Value> {
+/// Normalize one retained event. Every field comes from the record itself, so
+/// replaying an old cursor yields byte-identical events even after the turn it
+/// described has been evicted.
+fn normalize_event(event: &crate::protocol::EventRecord) -> Option<Value> {
     let event_type = normalize_event_type(&event.kind)?;
-    let turn = event.turn_id.as_deref().and_then(|id| store.get_turn(id));
     let mut value = json!({
         "schema_version": 1,
         "seq": event.seq,
         "type": event_type,
         "session_id": event.session_id,
     });
-    if let Some(turn) = turn.as_ref() {
-        value["execution_seq"] = json!(turn.execution_seq);
+    if let Some(execution_seq) = event.execution_seq {
+        value["execution_seq"] = json!(execution_seq);
     }
     if event_type == "provider.retrying" {
         value["attempt"] = json!(event.retry_attempt.unwrap_or(1));
     }
     if event_type == "session.idle" {
-        value["result_status"] = turn.as_ref().map_or(Value::Null, |turn| json!(turn.state));
+        value["result_status"] = event
+            .result_status
+            .map_or(Value::Null, |status| json!(status));
     }
     if event_type == "session.blocked" {
         value["reason"] = json!("user_input");
@@ -3466,13 +3811,15 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        BusyMetrics, ProviderReservation, TranscriptRecovery, apply_codex_notification,
-        apply_hook_event, canonical_session_id, clamp_busy_metrics, classify_error, generate_alias,
-        generate_internal_id, provider_id_from_session, public_result, public_session,
-        public_session_with_metrics, signal_shutdown, validate_alias, wait_for_update_check,
+        Bucket, BucketInput, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_HARD_MAX_BYTES,
+        FETCH_MIN_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation,
+        TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
+        clamp_busy_metrics, classify_error, generate_alias, generate_internal_id,
+        provider_id_from_session, public_result, public_session, public_session_with_metrics,
+        retention_gap, signal_shutdown, validate_alias, wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -3813,6 +4160,284 @@ mod tests {
         assert_eq!(public_result(&turn)["final_text_source"], "hook");
     }
 
+    fn fetch_options(max_bytes: usize, cursor: Option<crate::cursor::Cursor>) -> FetchOptions {
+        FetchOptions {
+            scope: "su_test".to_owned(),
+            cursor,
+            wait: Duration::from_millis(0),
+            until_result: false,
+            stable_limit: FETCH_STABLE_PAGE,
+            max_bytes,
+            instance_id: "boot".to_owned(),
+        }
+    }
+
+    fn test_turn(execution_seq: i64, text: &str) -> crate::protocol::TurnRecord {
+        crate::protocol::TurnRecord {
+            id: format!("turn_{execution_seq}"),
+            session_id: "claude:x".to_owned(),
+            execution_seq,
+            prompt: "p".to_owned(),
+            state: TurnState::Completed,
+            provider_turn_id: None,
+            final_message: Some(text.to_owned()),
+            final_text_recovered: false,
+            transcript_path: None,
+            transcript_offset: None,
+            error: None,
+            created_at_ms: 0,
+            started_at_ms: Some(0),
+            completed_at_ms: Some(1),
+            usage: None,
+        }
+    }
+
+    fn test_cut(
+        events: Vec<Value>,
+        results: Vec<crate::protocol::TurnRecord>,
+        stable: Vec<String>,
+        incoming: crate::cursor::SessionCursor,
+    ) -> Cut {
+        let event_watermark = events
+            .last()
+            .and_then(|event| event.get("seq"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let stable_len = u64::try_from(stable.len()).unwrap_or(0);
+        Cut {
+            baseline: false,
+            state: Some(SessionState::Idle),
+            bound_seq: None,
+            bound_terminal: false,
+            event_watermark,
+            events_more: false,
+            dropped_event_seq: None,
+            scope_gaps: Vec::new(),
+            buckets: vec![Bucket::new(BucketInput {
+                uid: "su_test".to_owned(),
+                session: json!({"id": "claude:x", "state": "idle"}),
+                gaps: Vec::new(),
+                events,
+                results,
+                results_more: false,
+                stable: crate::screen::StablePage {
+                    next_after: incoming.r + stable_len,
+                    lines: stable,
+                    has_more: false,
+                    gap: false,
+                },
+                live: crate::store::LiveScreen::default(),
+                epoch_reset: false,
+                screen: true,
+                incoming,
+            })],
+            sessions_more: false,
+            baseline_next: None,
+        }
+    }
+
+    fn lifecycle_events(count: i64) -> Vec<Value> {
+        (1..=count)
+            .map(|seq| {
+                json!({
+                    "schema_version": 1,
+                    "seq": seq,
+                    "type": "session.busy",
+                    "session_id": "claude:x",
+                    "execution_seq": seq,
+                })
+            })
+            .collect()
+    }
+
+    fn decode(value: &Value) -> crate::cursor::Cursor {
+        crate::cursor::Cursor::decode(
+            value["cursor"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no cursor")),
+            "boot",
+        )
+        .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"))
+    }
+
+    #[test]
+    fn the_event_watermark_never_passes_an_event_the_response_dropped() {
+        let cut = test_cut(
+            lifecycle_events(8),
+            Vec::new(),
+            Vec::new(),
+            crate::cursor::SessionCursor::default(),
+        );
+        let rendered = cut
+            .render(&fetch_options(700, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        let delivered = rendered.value["sessions"][0]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no events"))
+            .len();
+        assert!(delivered < 8, "budget did not drop any event");
+        assert_eq!(rendered.value["has_more"], true);
+        let cursor = decode(&rendered.value);
+        assert_eq!(
+            cursor.e,
+            i64::try_from(delivered).unwrap_or(0),
+            "watermark skipped an undelivered event"
+        );
+
+        // The next call from that cursor still owes the dropped events.
+        let remaining = lifecycle_events(8)
+            .into_iter()
+            .filter(|event| event["seq"].as_i64().unwrap_or(0) > cursor.e)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 8 - delivered);
+    }
+
+    #[test]
+    fn a_chunked_baseline_result_resumes_on_the_same_execution() {
+        let text = "x".repeat(4_000);
+        // A baseline anchors just below the latest retained result.
+        let incoming = crate::cursor::SessionCursor {
+            x: 6,
+            ..crate::cursor::SessionCursor::default()
+        };
+        let mut cut = test_cut(Vec::new(), vec![test_turn(7, &text)], Vec::new(), incoming);
+        cut.baseline = true;
+        let first = cut
+            .render(&fetch_options(1_500, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        let result = &first.value["sessions"][0]["results"][0];
+        assert_eq!(result["final_text_complete"], false);
+        assert_eq!(result["final_text_offset"], 0);
+        let cursor = decode(&first.value);
+        let position = cursor.session("su_test");
+        assert_eq!(position.px, Some(7));
+        assert_eq!(position.x, 6, "an incomplete result must not advance x");
+        assert!(position.po > 0);
+
+        // The continuation only ever sees execution 7 again, and completes it.
+        let second = test_cut(Vec::new(), vec![test_turn(7, &text)], Vec::new(), position)
+            .render(&fetch_options(FETCH_HARD_MAX_BYTES, Some(cursor)))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        let result = &second.value["sessions"][0]["results"][0];
+        assert_eq!(result["final_text_complete"], true);
+        assert_eq!(result["final_text_offset"], json!(position.po));
+        let position = decode(&second.value).session("su_test");
+        assert_eq!(position.x, 7);
+        assert_eq!(position.px, None);
+        assert_eq!(position.po, 0);
+    }
+
+    #[test]
+    fn until_result_reports_a_result_only_once_it_is_fully_delivered() {
+        let text = "y".repeat(4_000);
+        let mut cut = test_cut(
+            Vec::new(),
+            vec![test_turn(7, &text)],
+            Vec::new(),
+            crate::cursor::SessionCursor::default(),
+        );
+        cut.bound_seq = Some(7);
+        cut.bound_terminal = true;
+        let mut options = fetch_options(1_500, None);
+        options.until_result = true;
+        let partial = cut
+            .render(&options)
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert_eq!(partial.value["reason"], "page_full");
+        assert!(partial.settled, "a page-full response must return at once");
+
+        let mut cut = test_cut(
+            Vec::new(),
+            vec![test_turn(7, &text)],
+            Vec::new(),
+            crate::cursor::SessionCursor::default(),
+        );
+        cut.bound_seq = Some(7);
+        cut.bound_terminal = true;
+        let mut options = fetch_options(FETCH_HARD_MAX_BYTES, None);
+        options.until_result = true;
+        let complete = cut
+            .render(&options)
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert_eq!(complete.value["reason"], "result");
+    }
+
+    #[test]
+    fn an_oversized_screen_row_still_advances_the_cursor() {
+        let row = "z".repeat(100_000);
+        let cut = test_cut(
+            Vec::new(),
+            Vec::new(),
+            vec![row, "next".to_owned()],
+            crate::cursor::SessionCursor::default(),
+        );
+        let rendered = cut
+            .render(&fetch_options(FETCH_MIN_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        assert_eq!(rendered.value["has_more"], true);
+        let position = decode(&rendered.value).session("su_test");
+        assert!(position.r >= 1, "an oversized row blocked the cursor");
+        let stable = rendered.value["sessions"][0]["screen"]["stable"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no stable array"));
+        assert_eq!(stable.len(), 1);
+        assert!(
+            stable[0].as_str().unwrap_or_default().len() < 100_000,
+            "the oversized row was not truncated"
+        );
+    }
+
+    #[test]
+    fn a_scope_gap_survives_a_response_with_no_session_buckets() {
+        let mut cut = test_cut(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            crate::cursor::SessionCursor::default(),
+        );
+        cut.buckets.clear();
+        cut.state = None;
+        cut.scope_gaps.push(retention_gap("events"));
+
+        let rendered = cut
+            .render(&fetch_options(FETCH_DEFAULT_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert_eq!(rendered.value["reason"], "gap");
+        assert_eq!(rendered.value["gaps"][0]["component"], "events");
+        assert!(rendered.settled);
+    }
+
+    #[test]
+    fn an_unfinished_all_baseline_keeps_paging_from_its_enumeration_position() {
+        let mut cut = test_cut(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            crate::cursor::SessionCursor::default(),
+        );
+        cut.baseline = true;
+        cut.baseline_next = Some("su_last".to_owned());
+        let rendered = cut
+            .render(&fetch_options(FETCH_DEFAULT_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        assert_eq!(rendered.value["has_more"], true);
+        let cursor = decode(&rendered.value);
+        assert_eq!(cursor.bl.as_deref(), Some("su_last"));
+        let resumed = FetchOptions {
+            cursor: Some(cursor),
+            ..fetch_options(FETCH_DEFAULT_MAX_BYTES, None)
+        };
+        assert!(
+            resumed.baseline(),
+            "baseline mode must persist while paging"
+        );
+        assert_eq!(resumed.resume_after(), Some("su_last"));
+    }
+
     #[test]
     fn codex_retry_error_does_not_finish_before_authoritative_completion() {
         let mut store = ready_store("codex");
@@ -3873,7 +4498,10 @@ mod tests {
         let error = turn.error.unwrap_or_else(|| panic!("turn error missing"));
         assert!(error.contains("badRequest"));
         assert!(!error.contains("secret"));
-        let events = store.read_events(Some("codex:thread-1"), 0);
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let events = store.read_events(Some(&uid), 0);
         assert!(
             events
                 .iter()
@@ -3923,9 +4551,12 @@ mod tests {
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.state, SessionState::Idle);
         assert!(session.active_turn_id.is_none());
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
         assert!(
             store
-                .read_events(Some("codex:thread-1"), 0)
+                .read_events(Some(&uid), 0)
                 .iter()
                 .any(|event| event.kind == "provider.quiesced")
         );

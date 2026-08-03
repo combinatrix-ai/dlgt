@@ -28,6 +28,11 @@ pub struct Cursor {
     /// Global lifecycle event watermark.
     #[serde(default)]
     pub e: i64,
+    /// Baseline enumeration position for `all` scope: the Session UID after
+    /// which the next baseline page resumes. Present only while a baseline is
+    /// still paging, so a caller cannot lose the Sessions it has not seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bl: Option<String>,
     /// Per-Session watermarks keyed by Session UID.
     #[serde(default)]
     pub p: BTreeMap<String, SessionCursor>,
@@ -64,6 +69,7 @@ impl Cursor {
             b: instance_id.to_owned(),
             s: scope.to_owned(),
             e: 0,
+            bl: None,
             p: BTreeMap::new(),
         }
     }

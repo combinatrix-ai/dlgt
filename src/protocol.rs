@@ -238,15 +238,23 @@ pub struct TurnRecord {
     pub usage: Option<Value>,
 }
 
+/// A lifecycle event. Every field a reader can observe is materialized when
+/// the event is recorded: replay must never depend on an evictable turn or on
+/// a public Session ID that a later rekey rewrote.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EventRecord {
     pub seq: i64,
+    /// Immutable internal Session identity, used for scoping reads.
+    pub session_uid: Option<String>,
+    /// Public Session ID as published when the event happened.
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
     pub kind: String,
     /// The only event payload retained: retry attempts are exposed by the
     /// public event stream for provider retry notifications.
     pub retry_attempt: Option<u64>,
+    pub execution_seq: Option<i64>,
+    pub result_status: Option<TurnState>,
 }
 
 #[cfg(test)]

@@ -254,6 +254,16 @@ impl Store {
         {
             bail!("active session id already exists: {to}");
         }
+        // An internal launch ID is never published, so retargeting the events
+        // recorded under it is not a replay change. A provider-qualified ID
+        // that a caller may already hold is never rewritten.
+        if from.starts_with("internal:") {
+            for event in &mut state.events {
+                if event.session_id.as_deref() == Some(from) {
+                    event.session_id = Some(to.to_owned());
+                }
+            }
+        }
         let replaced = state.sessions.remove(to);
         let mut session = state.sessions.remove(from).context("session not found")?;
         if let Some(replaced) = replaced {
@@ -261,11 +271,25 @@ impl Store {
                 .record
                 .created_at_ms
                 .min(replaced.record.created_at_ms);
-            state.screens.remove(&replaced.uid);
-            state.evicted_result_seq.remove(&replaced.uid);
+            // Resuming a retained provider conversation continues one logical
+            // Session. Adopt its immutable identity so cursors, screen
+            // history, and retention floors survive the replacement process,
+            // and retire the launch identity that was only ever a placeholder.
+            let launch_uid = std::mem::replace(&mut session.uid, replaced.uid.clone());
+            state.screens.remove(&launch_uid);
+            state.evicted_result_seq.remove(&launch_uid);
             state
                 .uid_index
-                .retain(|_, uid| uid.as_str() != replaced.uid.as_str());
+                .retain(|_, uid| uid.as_str() != launch_uid.as_str());
+            for event in &mut state.events {
+                if event.session_uid.as_deref() == Some(launch_uid.as_str()) {
+                    event.session_uid = Some(session.uid.clone());
+                }
+            }
+            // A replacement PTY is still a new terminal generation.
+            if let Some(screen) = state.screens.get_mut(&session.uid) {
+                screen.restart();
+            }
         }
         to.clone_into(&mut session.record.id);
         session.record.updated_at_ms = now_ms();
@@ -278,11 +302,6 @@ impl Store {
         for turn in state.turns.values_mut() {
             if turn.session_id == from {
                 to.clone_into(&mut turn.session_id);
-            }
-        }
-        for event in &mut state.events {
-            if event.session_id.as_deref() == Some(from) {
-                event.session_id = Some(to.to_owned());
             }
         }
         let mut merged = state.outputs.remove(to).unwrap_or_default();
@@ -642,12 +661,27 @@ impl Store {
         let mut state = self.state.borrow_mut();
         state.next_event_seq += 1;
         let seq = state.next_event_seq;
+        let scope = session_id.and_then(|id| {
+            state
+                .sessions
+                .get(id)
+                .map(|session| session.uid.clone())
+                .or_else(|| state.uid_index.get(id).cloned())
+        });
+        let turn = turn_id.and_then(|id| state.turns.get(id));
+        let execution_seq = turn.map(|turn| turn.execution_seq);
+        let result_status = turn
+            .map(|turn| turn.state)
+            .filter(|state| state.is_terminal());
         state.events.push_back(EventRecord {
             seq,
+            session_uid: scope,
             session_id: session_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             kind: kind.to_owned(),
             retry_attempt,
+            execution_seq,
+            result_status,
         });
         while state.events.len() > EVENT_RETENTION {
             if let Some(evicted) = state.events.pop_front() {
@@ -711,14 +745,16 @@ impl Store {
         }
     }
 
-    pub fn read_events(&self, session_id: Option<&str>, after: i64) -> Vec<EventRecord> {
+    /// Events after `after`, optionally scoped to one immutable Session UID.
+    /// Scoping by UID keeps pre-rekey events readable through the Session's
+    /// current address without rewriting what was already published.
+    pub fn read_events(&self, uid: Option<&str>, after: i64) -> Vec<EventRecord> {
         self.state
             .borrow()
             .events
             .iter()
             .filter(|event| {
-                event.seq > after
-                    && session_id.is_none_or(|id| event.session_id.as_deref() == Some(id))
+                event.seq > after && uid.is_none_or(|uid| event.session_uid.as_deref() == Some(uid))
             })
             .cloned()
             .collect()
@@ -771,6 +807,12 @@ impl Store {
             .collect::<Vec<_>>();
         uids.sort_by_key(|(created, uid)| (std::cmp::Reverse(*created), uid.clone()));
         uids.into_iter().map(|(_, uid)| uid).collect()
+    }
+
+    /// Drop one retained result, as result retention eventually does.
+    #[cfg(test)]
+    pub fn evict_turn_for_test(&self, id: &str) {
+        self.state.borrow_mut().turns.remove(id);
     }
 
     /// Highest execution sequence with a retained terminal result.
@@ -983,6 +1025,26 @@ mod tests {
     use super::{NewSession, Store};
     use crate::protocol::{SessionState, TurnState};
 
+    fn ready_store() -> Store {
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "codex:thread-1",
+                alias: "@worker",
+                title: "worker",
+                agent: "codex",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        assert!(store.set_session_running("codex:thread-1", Some(42)));
+        assert!(store.set_session_state("codex:thread-1", SessionState::Idle));
+        store
+    }
+
     fn mark_ready(store: &Store, session_id: &str) {
         assert!(store.set_session_running(session_id, Some(42)));
         assert!(store.set_session_state(session_id, SessionState::Idle));
@@ -1083,13 +1145,55 @@ mod tests {
 
     #[test]
     fn unscoped_event_reads_include_session_events() {
-        let store = Store::new();
+        let store = ready_store();
         store.record_event(Some("codex:thread-1"), None, "session.started");
         store.record_event(None, None, "runtime.started");
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
 
         let events = store.read_events(None, 0);
         assert_eq!(events.len(), 2);
-        assert_eq!(store.read_events(Some("codex:thread-1"), 0).len(), 1);
+        assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
+    }
+
+    #[test]
+    fn retained_events_survive_result_eviction_and_rekey_unchanged() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+        assert!(
+            store
+                .complete_turn_if_matching("turn_1", Some("provider-turn"), Some("done"), false)
+                .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
+        );
+        store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.completed");
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let before = store.read_events(Some(&uid), 0);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].execution_seq, Some(1));
+        assert_eq!(before[0].result_status, Some(TurnState::Completed));
+
+        // The turn the event described is gone, and the public ID rotated.
+        store.evict_turn_for_test("turn_1");
+        store
+            .rekey_session("codex:thread-1", "codex:thread-2")
+            .unwrap_or_else(|error| panic!("failed to rekey: {error}"));
+
+        let after = store.read_events(Some(&uid), 0);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].execution_seq, Some(1));
+        assert_eq!(after[0].result_status, Some(TurnState::Completed));
+        assert_eq!(after[0].session_id.as_deref(), Some("codex:thread-1"));
+        assert_eq!(
+            store.session_uid("codex:thread-1").as_deref(),
+            Some(uid.as_str()),
+            "the pre-rekey ID must keep addressing the same logical Session"
+        );
     }
 
     #[test]
@@ -1613,7 +1717,10 @@ mod tests {
                 .session_id,
             "codex:thread-1"
         );
-        assert_eq!(store.read_events(Some("codex:thread-1"), 0).len(), 1);
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
         assert_eq!(
             store.read_output_page("codex:thread-1", 0, 64).data,
             b"oldnew"
