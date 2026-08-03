@@ -15,7 +15,7 @@ call cannot express:
 
 - a model or `--effort` pinned to that one worker
 - a Session that stays alive and keeps its context across later follow-ups
-- `attach` or `scrollback` to watch the worker's screen or answer a prompt on it
+- `attach` or `fetch` to watch the worker's screen or answer a prompt on it
 - a distinct `--cwd`, launch environment, or approval posture
 
 Outside those, prefer the built-in subagent: dlgt costs a daemon, a process,
@@ -33,31 +33,49 @@ Profile   A reusable client-side launch specification.
 
 ## Delegate and read the answer
 
+`new` and `send` only accept work; they return immediately. `fetch` is the one
+command that reads state, results, events, and screen. Compound them in a
+single shell call so the acceptance and the read happen in one tool result:
+
 ```bash
-created=$(dlgt new \
+dlgt new \
   --title "counterpart review" \
   --harness claude \
   --cwd . \
-  --wait --timeout 15m \
-  -- "Review the uncommitted changes in this repository. Do not edit files and do not delegate again. Report findings and trade-offs only.")
-
-printf '%s\n' "$created" | jq -er '.result.status'
-printf '%s\n' "$created" | jq -er '.result.final_text'
+  --alias @review \
+  --request-id review-1 \
+  -- "Review the uncommitted changes in this repository. Do not edit files and do not delegate again. Report findings and trade-offs only." \
+  && dlgt fetch @review --until result --wait 60s
 ```
 
-The counterpart's answer is `result.final_text`. Check `result.status` first:
-it is `completed`, `failed`, `canceled`, or `interrupted`, and only `completed`
-means the text is a finished answer. A failed or timed-out command also exits
-non-zero. Parse with a real JSON tool, never a regex.
+The counterpart's answer is `sessions[0].results[0].final_text`. Check
+`status` first: it is `completed`, `failed`, `canceled`, or `interrupted`, and
+only `completed` means the text is a finished answer. Parse with a real JSON
+tool, never a regex:
+
+```bash
+answered=$(dlgt fetch @review --until result --wait 60s)
+printf '%s\n' "$answered" | jq -er '.sessions[0].results[0].status'
+printf '%s\n' "$answered" | jq -er '.sessions[0].results[0].final_text'
+session_id=$(printf '%s\n' "$answered" | jq -er '.sessions[0].session.id')
+cursor=$(printf '%s\n' "$answered" | jq -er '.cursor')
+```
+
+Every `fetch` exits 0 and says why it returned in `reason`: `result`,
+`change`, `snapshot`, `blocked`, `page_full`, `gap`, or `timeout`. `timeout`
+with empty `results` means the work is still running, never that it finished.
+A non-zero exit means the request itself was wrong.
+
+Keep the returned `cursor` and pass it to the next `fetch --cursor`. It makes
+each read a forward delta instead of a re-download of the same tail. `new` and
+`send` also return a `cursor` positioned just before the work they accepted.
 
 Follow up on the same Session, then release it:
 
 ```bash
-session_id=$(printf '%s\n' "$created" | jq -er '.session.id')
-
-dlgt send "$session_id" --wait --timeout 15m \
-  -- "Rank those findings by severity and name the one to fix first." \
-  | jq -er '.result.final_text'
+dlgt send "$session_id" -- "Rank those findings by severity and name the one to fix first." \
+  && dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 60s \
+  | jq -er '.sessions[0].results[0].final_text'
 
 dlgt stop "$session_id"
 ```
@@ -67,6 +85,45 @@ Retain `session.id`. It is provider-qualified (`codex:<thread-id>` or
 correlation, and later resume. Stopping a Session ends its process, not the
 provider conversation: the same `session.id` still resumes. An Alias is a
 convenience only and may be reused by a new Session after this one stops.
+
+## Watch a long task
+
+A long delegation outlives one foreground command, so run the long `fetch` the
+way your own harness supports and never fuse it with acceptance:
+
+- Running as Claude: accept the work first, then run
+  `dlgt fetch <session.id> --until result --wait 30m` through the background
+  mechanism your harness offers. The acceptance receipt is already in hand, so
+  a lost or backgrounded read costs nothing.
+- Running as Codex: run the same long `fetch` inside one exec cell and then
+  issue a single long cell wait. Output produced before the cell yields is
+  retained and delivered at that wait.
+- Either way, one long poll replaces a loop of short polls. Use `--wait 30m`
+  rather than fifteen `--wait 2m` calls.
+
+While waiting is impossible, poll forward instead of re-reading:
+
+```bash
+dlgt fetch "$session_id" --cursor "$cursor" --wait 60s
+```
+
+`--until any` (the default) wakes on any new event, result, or completed
+screen line. A spinner repainting the live screen never wakes it on its own.
+
+## Recover a lost response
+
+If a tool result was killed, truncated, or never arrived, do not re-issue the
+work. Recover instead:
+
+| Lost | Recovery |
+| --- | --- |
+| The `new` or `send` response | Re-run the identical command with the same `--request-id`. It replays the original receipt with `"replayed": true` and never creates a second Session or execution. |
+| A `fetch` response or its cursor | Run `dlgt fetch <session.id\|@alias>` with no `--cursor`. That returns a bounded baseline: current state, the latest retained result, a screen tail, and a fresh cursor. |
+| The Session ID itself | `dlgt list` finds it, but prefer a stable `--alias` on `new` so you never need to search. |
+
+Never re-issue a bare `dlgt new` because you are unsure whether the first one
+landed. That is how duplicate workers get created. Give every `new` and `send`
+a `--request-id` when the caller cannot observe the outcome reliably.
 
 ## Clean up provider history
 
@@ -106,12 +163,13 @@ over a shell-quoted argument. It reads standard input as the exact prompt and
 is mutually exclusive with a prompt after `--`.
 
 ```bash
-dlgt new --title "counterpart review" --harness claude --cwd . \
-  --wait --timeout 15m --stdin <<'PROMPT'
+dlgt new --title "counterpart review" --harness claude --cwd . --alias @review \
+  --stdin <<'PROMPT'
 Review the uncommitted changes in this repository.
 Do not edit files and do not delegate again.
 Report findings and trade-offs only.
 PROMPT
+dlgt fetch @review --until result --wait 60s
 ```
 
 Quote the heredoc delimiter as `<<'PROMPT'`. Left unquoted, the shell expands
@@ -158,7 +216,8 @@ when a delegation must keep the Harness's own permission prompts.
 | Continue after the owning daemon or Session is gone | `send <session.id> --resume -- "<prompt>"` |
 
 - `new` requires its first prompt and atomically starts the Harness and accepts
-  that prompt.
+  that prompt. It returns as soon as the prompt is accepted; it never waits for
+  the answer.
 - Plain `send` never launches, restarts, resumes, or queues. It submits work
   only to a live, idle Session; rejection is side-effect-free, and accepted
   work moves the Session to busy.
@@ -176,15 +235,23 @@ when a delegation must keep the Harness's own permission prompts.
   value against its own working directory before sending and fails fast when
   the path does not exist. Omitting `--cwd` uses the client's current
   directory.
-- Always give `new --wait`, `send --wait`, and `wait` an explicit `--timeout`.
-  A timeout does not cancel the work.
-- Use provider lifecycle state and `wait`, not PTY silence, as completion proof.
-- Use `scrollback` for bounded plain-text observation. Raw PTY bytes require
-  the explicit diagnostic command `logs --raw`.
+- `fetch --wait` needs an explicit duration and accepts up to 24h. A timeout
+  never cancels the work; it only ends that observation.
+- Use provider lifecycle state and the retained result, not PTY silence, as
+  completion proof. `reason: "timeout"` is not completion.
+- Never pass `--pretty`. It only costs tokens; the compact document is the
+  contract.
+- Never run `dlgt server stop` as cleanup. Session state, results, events, and
+  screen history live in that daemon's memory and are gone the moment it
+  exits, which breaks every cursor and every live Session on the machine.
+  `dlgt stop <session.id>` releases one worker; the daemon exits on its own
+  once it has been idle and empty.
+- Use `fetch` for observation. `scrollback` is the human debugging view, and
+  raw PTY bytes require the explicit diagnostic command `logs --raw`.
 - If a Session stays `starting` or `busy` without the expected lifecycle event,
-  inspect `events` and `scrollback`, then `attach` when the screen shows a
-  first-run, authentication, trust, theme, or permission-mode prompt. Complete
-  the prompt, detach, and retry the delegated work in a fresh Session.
+  read `fetch <session.id>` and look at `screen.live`, then `attach` when the
+  screen shows a first-run, authentication, trust, theme, or permission-mode
+  prompt. Complete the prompt, detach, and retry the delegated work.
 - `attach` is exclusive. Detach with `Ctrl-b d`; use `--steal` only when taking
   control from a known stale attach client.
 - Treat results, rendered scrollback, and raw output as potentially sensitive.
@@ -197,31 +264,41 @@ when a delegation must keep the Harness's own permission prompts.
 
 | Error | Required action |
 | --- | --- |
-| `SESSION_BUSY` | Do not resend. Run `wait <session.id> --timeout <duration>`, or explicitly `cancel` the active work. |
-| `SESSION_BLOCKED` | Inspect `events` and `scrollback`, `attach`, answer the visible prompt, detach with `Ctrl-b d`, then `wait` again. |
+| `SESSION_BUSY` | Do not resend. Run `fetch <session.id> --until result --wait <duration>`, or explicitly `cancel` the active work. |
+| `SESSION_BLOCKED` | `fetch` reports this as `reason: "blocked"` with the live screen. Read the question, `attach`, answer it, detach with `Ctrl-b d`, then `fetch` again. |
 | `SESSION_NOT_RUNNING` | Use the saved `session.id` with `send <session.id> --resume -- <prompt>`. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. Use `--steal` only for a known stale attach client. |
-| `WAIT_TIMEOUT` | Work continues. Wait again, inspect it, or cancel explicitly. Do not report completion. |
-| `CANCEL_TIMEOUT` | Cancellation continues. Inspect `events` and wait for a terminal result. |
+| `ATTACH_REQUIRES_TTY` | You have no terminal. Use `fetch <session.id>` and read `screen.live` instead. |
+| `CURSOR_EXPIRED` / `CURSOR_VERSION_UNSUPPORTED` / `CURSOR_SCOPE_MISMATCH` / `CURSOR_INVALID` | Drop the cursor and run one cursorless `fetch <session.id>` to rebase. |
+| `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address the existing Session by ID. |
-| `LAUNCH_FAILED` / `PROVIDER_FAILED` | Inspect `events`, `scrollback`, and `show`, and only then the sensitive `logs --raw`. If present, retain `error.launch_id` for startup diagnostics only. |
+| `LAUNCH_FAILED` / `PROVIDER_FAILED` | Read `fetch` and `show`, and only then the sensitive `logs --raw`. If present, retain `error.launch_id` for startup diagnostics only. |
 
 ## Observation and control
 
 ```bash
-dlgt wait "$session_id" --timeout 15m
+dlgt fetch "$session_id" --until result --wait 30m
+dlgt fetch "$session_id" --cursor "$cursor"
+dlgt fetch "$session_id" --no-screen
+dlgt fetch --all
 dlgt cancel "$session_id"
 dlgt restart "$session_id"
-dlgt events "$session_id"
-dlgt scrollback "$session_id" --lines 100
 dlgt attach "$session_id"
 dlgt show "$session_id"
 dlgt list --all-versions
 ```
 
+`fetch --all` reports every Session of one daemon in a single call, with
+lifecycle events and results but no screens. Use it to check several workers at
+once.
+
 Control-plane commands return compact JSON with `ok:true` or a structured
 `ok:false` error. `events --follow` is NDJSON; `attach` and `logs --raw` are raw
 streams. `rpc --stdio` exposes only the public Session-based v1 methods.
+
+A `fetch` response is bounded to about 32 KiB. `has_more: true` means more is
+already waiting: call again with the returned cursor and it returns
+immediately.
 
 ## Command reference
 

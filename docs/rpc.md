@@ -13,13 +13,13 @@ request produces exactly one response line.
 Request:
 
 ```json
-{"id":"req_1","method":"session.wait","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","timeout_ms":900000}}
+{"id":"req_1","method":"session.fetch","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","until":"result","wait_ms":900000}}
 ```
 
 Success:
 
 ```json
-{"id":"req_1","result":{"execution_seq":1,"result":{"status":"completed","final_text":"done"}}}
+{"id":"req_1","result":{"schema_version":1,"reason":"result","cursor":"f1.eyJ2IjoxLCJi...","sessions":[]}}
 ```
 
 A successful non-streaming response may also carry an informational notice
@@ -35,7 +35,7 @@ must obtain user confirmation before acting on `UPDATE_AVAILABLE`.
 Failure:
 
 ```json
-{"id":"req_1","error":{"code":"WAIT_TIMEOUT","message":"wait timed out; execution continues"}}
+{"id":"req_1","error":{"code":"CURSOR_EXPIRED","message":"cursor belongs to a previous daemon instance"}}
 ```
 
 Raw RPC responses do not use the CLI's `ok:true` or `ok:false` wrapper. Blank
@@ -48,7 +48,7 @@ terminate the stdio proxy.
 session.create        Create a Session with its required initial prompt
 session.restart       Replace a Session process and resume provider context
 session.send          Accept work on an existing idle Session
-session.wait          Wait for the bound current or latest execution
+session.fetch         Read everything new since a cursor, optionally long-polling
 session.cancel        Interrupt active work, bounded by timeout_ms
 session.list          List active or all Sessions
 session.read          Read live Session state and latest retained result
@@ -68,10 +68,10 @@ parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, optional `request_id`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
-| `session.send` | `session`, `prompt`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
-| `session.wait` | `session`, positive `timeout_ms` |
+| `session.send` | `session`, `prompt`, optional `request_id`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
+| `session.fetch` | exactly one of `session` or `all:true`; optional `cursor`, `wait_ms` (max 86,400,000), `until` (`any` or `result`), `screen` (boolean or stable-line count), `max_bytes` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
 | `session.read` | `session` |
@@ -87,6 +87,13 @@ parameter shapes are stable for v1:
 Profiles are expanded by the client. `profile.list` is implemented by the
 stdio proxy rather than delegated to the daemon, so the daemon does not reread
 mutable client configuration.
+
+`request_id` is an optional caller-chosen idempotency key. The daemon retains
+the last 1,024 acceptance receipts for its lifetime. Repeating an ID with a
+byte-identical payload returns the original receipt with `replayed: true`;
+repeating it with a different payload fails with `INVALID_ARGUMENT`. The
+environment snapshot, terminal size, and correlation ID are excluded from the
+payload identity because they legitimately differ between retries.
 
 `harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
 The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
@@ -144,6 +151,7 @@ A retained result has this shape:
   "execution_seq": 2,
   "status": "completed",
   "final_text": "Review result...",
+  "final_text_source": "hook",
   "error": null,
   "started_at_ms": 1784024104395,
   "completed_at_ms": 1784024252019,
@@ -156,9 +164,81 @@ A retained result has this shape:
 empty. Other terminal states may include partial text and provide a structured
 error. Usage is nullable because provider support differs.
 
-`session.wait` binds to the active execution and sequence at request time. If
-the Session is idle, it returns the latest retained result; if no execution has
-ever been accepted, it fails with `NO_RESULT`. A timeout does not cancel work.
+`final_text_source` is `hook` when the Harness lifecycle event reported the
+text, `transcript` when the Harness reported nothing and dlgt recovered the
+text from that Session's own provider transcript within this execution's
+boundary, and `missing` when no text was recovered. A failed recovery never
+changes the execution status.
+
+`session.create` and `session.send` return `{session, execution_seq, cursor}`.
+The `cursor` is captured under the runtime lock immediately before the
+acceptance is recorded, so the first `session.fetch` from it cannot miss output
+produced between acceptance and the caller's next request.
+
+## Composite reads
+
+`session.fetch` returns one document per request. There is no streaming
+variant and no partial output.
+
+```json
+{
+  "schema_version": 1,
+  "runtime": {"version":"0.3.4","instance_id":"1f2c…"},
+  "reason": "result",
+  "has_more": false,
+  "cursor": "f1.eyJ2IjoxLCJi...",
+  "sessions": [
+    {
+      "session": {"id":"claude:8bc7859c","state":"idle"},
+      "events": [
+        {"schema_version":1,"seq":104,"type":"session.idle","session_id":"claude:8bc7859c","execution_seq":7,"result_status":"completed"}
+      ],
+      "results": [
+        {"execution_seq":7,"status":"completed","final_text":"Review result...","final_text_source":"hook","final_text_offset":0,"final_text_complete":true,"error":null,"started_at_ms":1784024104395,"completed_at_ms":1784024252019,"usage":null}
+      ],
+      "screen": {"epoch":3,"reset":false,"reset_reason":null,"stable":["Checking tests..."],"live":["Writing final review..."],"live_truncated":false},
+      "gaps": []
+    }
+  ]
+}
+```
+
+`reason` is `snapshot`, `change`, `result`, `blocked`, `page_full`, `gap`, or
+`timeout`. Every one of them is a successful response; `results[].status`
+remains the authority on whether an execution succeeded.
+
+Rules:
+
+- Without `cursor`, the response is a bounded baseline: current state, the
+  latest retained result, a stable tail, the live screen, and a fresh cursor.
+- `until:"result"` binds to the execution active, or latest, at the first
+  evaluation. A later execution never extends the bind, and blocked input, a
+  page-full response, a gap, or the deadline returns early.
+- Replaying a cursor replays the same immutable events, results, and stable
+  rows. The Session snapshot and live screen are current snapshots and may be
+  newer on replay. Nothing is advanced or consumed server-side.
+- A live-screen repaint alone never completes a wait.
+- `all:true` covers only the addressed daemon, returns changed Sessions after a
+  baseline call, pages at 32 Sessions, and rejects both screen aggregation and
+  `until:"result"`.
+
+Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
+64 events, 4 results, 128 stable lines (512 on request), and 40 live rows per
+response. `has_more: true` means data already exists beyond the returned
+cursor, and the next request returns immediately even with `wait_ms`. The
+cursor advances only over delivered content, and a long `final_text` is chunked
+at a UTF-8 boundary and continued with `final_text_offset` and
+`final_text_complete`.
+
+Cursors are opaque, prefixed `f1.`, and carry the codec version, the daemon
+boot identity, the addressed scope, and per-Session watermarks. They bind to an
+internal Session identity, so a Claude provider-ID rotation keeps them valid.
+
+Retention is bounded to 10,000 stable rows per Session, 50,000 lifecycle events
+per daemon, and 128 results or 16 MiB of result bodies per Session. A cursor
+that predates an eviction returns `reason:"gap"`, a `gaps` array of
+`{"component":"screen"|"events"|"results","reason":"retention_overrun"}`, a
+bounded baseline, and a fresh cursor. dlgt never silently resets a cursor.
 
 ## Lifecycle events
 
@@ -202,8 +282,8 @@ when applicable `session_id` and `execution_seq`. Type-specific fields include
 
 The stream contains lifecycle and actionable state, not token or terminal text
 deltas. `event.subscribe` is the extension point for notification adapters;
-generated output is observed through `scrollback.read`, `transcript.read_raw`,
-or interactive attach.
+`session.fetch` is the read path for agents, and raw output is observed through
+`scrollback.read`, `transcript.read_raw`, or interactive attach.
 
 ## Output readers
 
@@ -219,8 +299,11 @@ or interactive attach.
 }
 ```
 
-The default is the latest 100 rows. Reads are clamped to 1 through 10,000 rows,
-and `before` is an opaque cursor for older pages.
+The default is the latest 100 rows. Reads are clamped to 1 through 10,000
+rows, and `before` is an opaque cursor for older pages. Rows come from the
+persistent per-Session stable-row store that also backs `session.fetch`, so a
+read no longer re-renders the retained raw ring. `before` cursors are opaque
+and are not comparable across daemon instances.
 
 `transcript.read_raw` is an explicit diagnostic method. It returns a bounded
 base64 page and byte cursor:
@@ -253,7 +336,10 @@ SESSION_BLOCKED        Human input is required
 SESSION_ATTACHED       Exclusive attach lease prevents semantic send
 SESSION_UNAVAILABLE    Session state cannot accept the operation
 ALREADY_ATTACHED       Another client owns the attach lease
-WAIT_TIMEOUT           Wait expired; execution continues
+CURSOR_VERSION_UNSUPPORTED  Cursor codec is not understood
+CURSOR_EXPIRED         Cursor belongs to a previous daemon instance
+CURSOR_SCOPE_MISMATCH  Cursor addresses a different Session or scope
+CURSOR_INVALID         Cursor payload is not decodable
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 PROVIDER_FAILED        Provider terminalized work as failed
@@ -273,8 +359,9 @@ CLI exit-status mapping is defined in [CLI](cli.md#exit-statuses).
 terminal input, resize, and private execution operations are unavailable even
 if a caller names them directly.
 
-Provider turn IDs and internal execution row IDs never appear in public
-responses or normalized events. Launch environment values travel in RPC memory
+Provider turn IDs, internal Session UIDs, and internal execution row IDs never
+appear in public responses or normalized events; cursors carry the internal
+Session identity only in opaque form. Launch environment values travel in RPC memory
 but are not directly serialized into Session metadata, errors, Profiles, or
 events. Results and terminal output remain untrusted and potentially sensitive
 because a provider can echo its environment.

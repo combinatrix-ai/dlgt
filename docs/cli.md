@@ -117,7 +117,7 @@ DELEGATION
   new          Create a new Session with its first prompt
   restart      Restart a Session
   send         Send work to an existing idle Session
-  wait         Wait for the Session's current or latest execution
+  fetch        Read new state, results, events, and screen from a cursor
   cancel       Interrupt the Session's active execution
 
 SESSIONS
@@ -193,7 +193,8 @@ and their live Sessions continue on their versioned sockets.
 ## `new`
 
 `new` is the only Session creation command and always requires its first
-prompt. Launch and acceptance are one atomic operation.
+prompt. Launch and acceptance are one atomic operation, and the command always
+returns as soon as the prompt is accepted. Observation is a separate `fetch`.
 
 Its command-specific help is available through either equivalent spelling:
 
@@ -218,7 +219,7 @@ dlgt new
   [--pass-env <KEY>]...
   [--env <KEY=VALUE>]...
   [--unset-env <KEY>]...
-  [--wait --timeout <DURATION>]
+  [--request-id <ID>]
   [--stdin | -- <PROMPT>]   (required)
 ```
 
@@ -248,7 +249,13 @@ Rules:
 - `--stdin` reads the exact prompt from standard input and is mutually exclusive
   with a prompt after `--`. It avoids argv disclosure and length limits.
 - Use `--stdin` when the required prompt should not appear in argv.
-- `--wait` requires a prompt and an explicit positive `--timeout`.
+- `--request-id` is an optional idempotency key. Retrying the same ID with a
+  byte-identical payload returns the original acceptance receipt with
+  `"replayed": true` instead of creating a second Session, even if the Session
+  has since moved on. The same ID with a different payload is
+  `INVALID_ARGUMENT`. The daemon retains the last 1,024 receipts for its
+  lifetime. Use it whenever a caller cannot tell whether an earlier `new`
+  reached the daemon; never re-issue a bare `new` on that ambiguity.
 - If an exact requested alias is active, `new` fails with `ALIAS_IN_USE` and
   creates no Session or provider process.
 - If startup succeeds but prompt acceptance fails, dlgt terminates the Harness,
@@ -294,22 +301,20 @@ dlgt new \
     "harness": "codex",
     "state": "busy"
   },
-  "execution_seq": 1
+  "execution_seq": 1,
+  "cursor": "f1.eyJ2IjoxLCJi..."
 }
 ```
 
-Synchronous first execution:
+`cursor` is an observation cursor positioned immediately before this
+acceptance. It is captured under the runtime lock before the prompt is
+recorded, so passing it to `fetch --cursor` cannot miss output a fast provider
+emitted in between. Follow the acceptance with:
 
 ```bash
-dlgt new \
-  --title "run review" \
-  --profile fable-review \
-  --wait \
-  --timeout 15m \
-  -- "Review the current design"
+dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 \
+  --cursor "f1.eyJ2IjoxLCJi..." --until result --wait 15m
 ```
-
-The response contains the final result instead of exposing an execution ID.
 
 ## `restart`
 
@@ -352,7 +357,7 @@ Rules:
 
 ```text
 dlgt send <SESSION_ID|@ALIAS>
-  [--wait --timeout <DURATION>]
+  [--request-id <ID>]
   [--pretty]
   [--stdin | -- <PROMPT>]   (required)
 ```
@@ -372,7 +377,7 @@ dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
   [--pass-env <KEY>]...
   [--env <KEY=VALUE>]...
   [--unset-env <KEY>]...
-  [--wait --timeout <DURATION>]
+  [--request-id <ID>]
   [--pretty]
   [--stdin | -- <PROMPT>]   (required)
 ```
@@ -401,10 +406,12 @@ Rules:
   canceling return `SESSION_BUSY`; blocked returns `SESSION_BLOCKED`; attached
   returns `SESSION_ATTACHED`; other non-idle states return
   `SESSION_UNAVAILABLE`.
-- `--wait` requires an explicit positive `--timeout`.
-- There is no `--create`, `--enqueue`, `--after`, or `--fail-if-busy`; creation
-  and queueing are not `send` responsibilities, and busy rejection is always
-  the default.
+- `--request-id` behaves exactly as it does for `new`: the same ID and payload
+  replay the original receipt with `"replayed": true`, and the same ID with a
+  different payload is `INVALID_ARGUMENT`.
+- There is no `--wait`, `--create`, `--enqueue`, `--after`, or `--fail-if-busy`.
+  Creation, queueing, and waiting are not `send` responsibilities, and busy
+  rejection is always the default.
 
 Asynchronous example:
 
@@ -413,7 +420,7 @@ dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revised desi
 ```
 
 ```json
-{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2}
+{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2,"cursor":"f1.eyJ2IjoxLCJi..."}
 ```
 
 Busy rejection:
@@ -422,29 +429,11 @@ Busy rejection:
 {"ok":false,"error":{"code":"SESSION_BUSY","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}}
 ```
 
-Synchronous example:
+Read the answer with one `fetch`:
 
 ```bash
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 \
-  --wait \
-  --timeout 15m \
-  -- "Review the revised design"
-```
-
-```json
-{
-  "ok": true,
-  "session": {"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"idle"},
-  "result": {
-    "execution_seq": 2,
-    "status": "completed",
-    "final_text": "Review result...",
-    "error": null,
-    "started_at_ms": 1784024104395,
-    "completed_at_ms": 1784024252019,
-    "usage": null
-  }
-}
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revised design" \
+  && dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
 ```
 
 ## Retained result
@@ -461,6 +450,7 @@ The retained result shape is:
   "execution_seq": 2,
   "status": "completed",
   "final_text": "Review result...",
+  "final_text_source": "hook",
   "error": null,
   "started_at_ms": 1784024104395,
   "completed_at_ms": 1784024252019,
@@ -474,39 +464,176 @@ string for `completed`, although it may be empty. Failed terminal states may
 provide partial final text and must provide a structured error. Usage is
 nullable because availability differs by Harness.
 
-## `wait`
+`final_text_source` is a diagnostic:
 
 ```text
-dlgt wait <SESSION_ID|@ALIAS> --timeout <DURATION>
+hook         the Harness lifecycle event reported the text
+transcript   the Harness reported nothing and dlgt recovered the text from
+             the Session's own provider transcript, bounded to this execution
+missing      no text was recovered; the execution status is still authoritative
 ```
 
-The timeout is required and positive.
+A failed recovery never turns a completed execution into a failure.
 
-`wait` binds to the Session's active execution and `execution_seq` at request
-time. If the Session is already idle and has a latest retained result, it returns
-that result. If the Session has never accepted work, it returns `NO_RESULT`.
+## `fetch`
 
-Because a Session has one controller and no queue, the public contract does not
-need an addressable execution or Turn identifier. The non-addressable sequence
-number lets callers correlate acceptance and result without expanding the
-object model. Internally, dlgt may retain provider IDs to reject stale
-lifecycle events and retain bounded history correctly while the daemon lives.
+```text
+dlgt fetch (<SESSION_ID|@ALIAS> | --all)
+  [--cursor <CURSOR>]
+  [--wait <DURATION>]
+  [--until any|result]
+  [--screen[=<MAX_STABLE_LINES>] | --no-screen]
+  [--max-bytes <BYTES>]
+  [--pretty]
+```
 
-A wait timeout returns `WAIT_TIMEOUT` and leaves the Session busy:
+`fetch` is the one observation command. It returns, in a single JSON document,
+the current Session snapshot, every terminal result and lifecycle event after
+the cursor, the forward screen delta, and a new cursor.
+
+Every observation succeeds. A long poll that expires with nothing new is
+`{"ok":true,"reason":"timeout"}` with empty deltas and the same cursor
+position, not an error. `reason` is one of:
+
+```text
+snapshot    bounded baseline; no cursor was supplied
+change      new events, results, or stable rows were delivered
+result      the bound execution has a retained terminal result
+blocked     the Session needs a human answer; the live screen is included
+page_full   more data already exists beyond the returned cursor
+gap         retention evicted part of the cursor window
+timeout     nothing new in the cursor window
+```
+
+Rules:
+
+- Without `--cursor`, `fetch` returns a bounded baseline: current state, the
+  latest retained result, the last 128 stable screen lines, the live screen,
+  and a fresh cursor. This is the documented recovery path after a lost
+  cursor or a lost response.
+- `--wait` requires an explicit duration and accepts up to 24h. Omitted, the
+  command returns immediately.
+- `--until result` binds to the execution that is active, or latest, at the
+  first evaluation and completes when that execution has a retained terminal
+  result. A later execution never extends the bind. Blocked input, a page-full
+  response, a retention gap, and the deadline all return early.
+- A live-screen repaint alone never completes a `--wait`. Spinner redraws are
+  included opportunistically when something else wakes the poll or the deadline
+  fires.
+- Replaying the same cursor replays the same immutable events, results, and
+  stable rows. Nothing is consumed or advanced server-side; the Session
+  snapshot and live screen are always current.
+- `--all` covers every Session of the addressed daemon. It returns one bucket
+  per Session, includes only Sessions with changes after a baseline call, and
+  pages at 32 Sessions with `has_more`. Screen aggregation and `--until result`
+  are rejected with `INVALID_ARGUMENT`.
+
+Response:
 
 ```json
 {
-  "ok": false,
-  "error": {
-    "code": "WAIT_TIMEOUT",
-    "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
-    "session_state": "busy"
-  }
+  "ok": true,
+  "schema_version": 1,
+  "runtime": {"version":"0.3.4","instance_id":"1f2c…"},
+  "reason": "result",
+  "has_more": false,
+  "cursor": "f1.eyJ2IjoxLCJi...",
+  "sessions": [
+    {
+      "session": {"id":"claude:8bc7859c","state":"idle"},
+      "events": [
+        {"schema_version":1,"seq":104,"type":"session.idle","session_id":"claude:8bc7859c","execution_seq":7,"result_status":"completed"}
+      ],
+      "results": [
+        {
+          "execution_seq": 7,
+          "status": "completed",
+          "final_text": "Review result...",
+          "final_text_source": "hook",
+          "final_text_offset": 0,
+          "final_text_complete": true,
+          "error": null,
+          "started_at_ms": 1784024104395,
+          "completed_at_ms": 1784024252019,
+          "usage": null
+        }
+      ],
+      "screen": {
+        "epoch": 3,
+        "reset": false,
+        "reset_reason": null,
+        "stable": ["Checking tests...", "Found one race."],
+        "live": ["Writing final review..."],
+        "live_truncated": false
+      },
+      "gaps": []
+    }
+  ]
 }
 ```
 
-If the Session transitions to blocked, `wait` returns immediately with
-`SESSION_BLOCKED` and exit 4. It does not wait for the timeout deadline.
+### Bounds and pagination
+
+Response size is part of the contract:
+
+| Dimension | Default | Limit |
+| --- | ---: | ---: |
+| Serialized response | 32 KiB | 256 KiB |
+| Long poll | none | 24h |
+| Lifecycle events per page | 64 | 64 |
+| Results per page | 4 | 4 |
+| Stable screen lines per page | 128 | 512 |
+| Live rows | current screen, cropped to 40 | 40 |
+| Changed Sessions in `--all` | 32 | 32 |
+
+`has_more: true` means requested data already exists beyond the returned
+cursor; that response uses `reason: "page_full"` and the next call returns
+immediately even with `--wait` or `--until result`. The cursor advances only
+over content actually delivered. When `--max-bytes` squeezes a response, dlgt
+keeps state, then gaps, then terminal results, then events, then blocked
+information, and drops screen text first. A long `final_text` is chunked at a
+UTF-8 boundary and continued through `final_text_offset` and
+`final_text_complete`, with the offset carried in the cursor.
+
+### Cursors
+
+A cursor is opaque. It begins with `f1.` and encodes the codec version, the
+daemon boot identity, the addressed scope, and the per-Session watermarks. It
+binds to an internal Session identity, so a Claude provider-ID rotation does
+not invalidate it.
+
+```text
+CURSOR_VERSION_UNSUPPORTED   the prefix or payload version is not understood
+CURSOR_EXPIRED               the cursor belongs to a previous daemon instance
+CURSOR_SCOPE_MISMATCH        the cursor addresses a different Session or --all
+CURSOR_INVALID               the payload is not a decodable cursor
+```
+
+All four are non-zero exits, and the recovery for every one of them is a single
+cursorless `fetch`.
+
+### Retention gaps
+
+Retention is bounded per daemon: 10,000 stable screen rows per Session, 50,000
+lifecycle events, and 128 results or 16 MiB of result bodies per Session. When
+a cursor predates an eviction, `fetch` exits 0 with `reason: "gap"`, a
+structured `gaps` entry, a bounded baseline, and a fresh cursor. It never
+silently resets.
+
+```json
+{"gaps":[{"component":"screen","reason":"retention_overrun"}]}
+```
+
+`component` is `screen`, `events`, or `results`.
+
+### Waiting from an agent harness
+
+- Claude callers: run the long `fetch` through the harness's background
+  mechanism. The acceptance receipt is already in hand from `new` or `send`,
+  so a lost foreground response costs nothing.
+- Codex callers: run the long `fetch` inside one exec cell and use a single
+  long cell wait. Pre-yield output is retained and delivered at the next wait.
+- After any lost response, run a cursorless `fetch` to rebase.
 
 ## `cancel`
 
@@ -521,8 +648,8 @@ returns the Session to idle only after provider quiescence is proven.
 
 Cancellation is bounded and defaults to 30 seconds. On timeout, dlgt returns
 `CANCEL_TIMEOUT`, leaves the Session in `canceling`, and continues observing
-provider quiescence in the background. `events` and `wait` reveal the eventual
-terminal state.
+provider quiescence in the background. `fetch` reveals the eventual terminal
+state.
 
 Canceling an idle Session is idempotent: it returns exit 0 with
 `{"canceled":false,"reason":"NO_ACTIVE_WORK"}`.
@@ -543,9 +670,11 @@ not an infinite wait.
 }
 ```
 
-After a human attaches, answers, and detaches, the same `wait` command may be
-issued again. Provider-specific detection may initially be conservative, but
-dlgt must never infer completion from a quiet screen.
+`fetch` reports the same state as `reason: "blocked"` with the live screen
+attached, so the caller can see the question before attaching. After a human
+attaches, answers, and detaches, the same `fetch` may be issued again.
+Provider-specific detection may initially be conservative, but dlgt must never
+infer completion from a quiet screen.
 
 ## Session commands
 
@@ -564,9 +693,11 @@ dlgt restart <SESSION_ID> [environment options]
 - `show` returns identity, Harness, model selection, state, current timing,
   latest retained result, and relevant failure data.
 - `attach` takes an exclusive input lease, replays the retained terminal view,
-  and follows the live PTY. A second attach returns `ALREADY_ATTACHED` unless
-  `--steal` explicitly transfers the lease. Detach with `Ctrl-b d`. Mirrored
-  multi-attach is outside v1.
+  and follows the live PTY. It requires an interactive terminal on stdin and
+  stdout and otherwise returns `ATTACH_REQUIRES_TTY` pointing at `fetch`. A
+  second attach returns `ALREADY_ATTACHED` unless `--steal` explicitly
+  transfers the lease. Detach with `Ctrl-b d`. Mirrored multi-attach is
+  outside v1.
 - `stop` requests graceful Session termination.
 - `stop --force` terminates the provider process group.
 
@@ -599,9 +730,12 @@ dlgt scrollback <SESSION_ID|@ALIAS>
 ```
 
 The default is the latest 100 rendered lines. v1 retains at most 10,000
-rendered rows per Session. The response includes the
-terminal dimensions, plain-text lines, truncation state, and an opaque cursor
-for older pages.
+rendered rows per Session. Rows are served from the same persistent stable-row
+store that backs `fetch`, so a read no longer re-renders retained raw bytes.
+The response includes the terminal dimensions, plain-text lines, truncation
+state, and an opaque cursor for older pages. `scrollback` is the human
+debugging view; agents should use `fetch`, which returns the forward delta
+instead of an overlapping tail.
 
 ```json
 {
@@ -633,9 +767,14 @@ raw-retention rationale.
 ## Model discovery
 
 ```text
+dlgt models [--include-hidden]
 dlgt models --harness codex [--include-hidden]
 dlgt models --harness claude
 ```
+
+Without `--harness`, `dlgt models` queries every Harness and returns
+`{"harnesses":[...]}`. A Harness that cannot be reached reports
+`"discovery":"unavailable"` with its error rather than failing the command.
 
 Codex discovery uses app-server `model/list` and returns account-aware model
 IDs, display names, descriptions, defaults, supported reasoning efforts, input
@@ -695,10 +834,13 @@ provider-resolved model when the Harness makes it available.
 ## Profiles and launch environment
 
 ```text
+dlgt profiles
 dlgt profiles list
 dlgt profiles show <NAME>
 dlgt harnesses [<HARNESS>]
 ```
+
+Bare `dlgt profiles` is the same request as `dlgt profiles list`.
 
 Profiles are client-side launch specifications. The client expands them before
 RPC so the daemon does not need to reread mutable configuration.
@@ -743,20 +885,24 @@ They configure the provider CLI rather than the launch environment.
 ## Exit statuses
 
 ```text
-0  command succeeded, or a waited execution completed
-1  usage, configuration, identity, launch, or RPC error
-2  waited execution failed, canceled, or was interrupted
-3  bounded wait timeout; the underlying execution or cancellation continues
+0  command succeeded, including every fetch observation
+1  usage, configuration, identity, launch, cursor, or RPC error
+2  a command reported a provider-terminalized failure
+3  bounded cancellation timeout; the cancellation continues
 4  Session is blocked on input
 5  Session is busy and rejected a send
 ```
 
 The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
-5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ALIAS_IN_USE`,
-`SESSION_NOT_RUNNING`, and `SESSION_UNAVAILABLE` use exit 1. `WAIT_TIMEOUT` and `CANCEL_TIMEOUT` use exit
-3. A Session stopped during `wait` produces a retained `interrupted` result and
-exit 2. Idle `cancel` is an idempotent exit-0 no-op.
+5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ATTACH_REQUIRES_TTY`,
+`ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, and every
+`CURSOR_*` code use exit 1. `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
+idempotent exit-0 no-op.
+
+`fetch` never uses a non-zero exit to describe an execution. A failed,
+canceled, or interrupted execution is reported inside `results[].status`, and a
+blocked Session is reported as `reason: "blocked"`.
 
 The stable v1 structured error-code families are:
 
@@ -771,7 +917,11 @@ SESSION_BLOCKED        Human input is required
 SESSION_ATTACHED       Exclusive attach lease prevents semantic send
 SESSION_UNAVAILABLE    Session state cannot accept the requested operation
 ALREADY_ATTACHED       Another client owns the attach lease
-WAIT_TIMEOUT           Wait expired; execution continues
+ATTACH_REQUIRES_TTY    attach needs an interactive terminal; use fetch
+CURSOR_VERSION_UNSUPPORTED  Cursor codec is not understood
+CURSOR_EXPIRED         Cursor belongs to a previous daemon instance
+CURSOR_SCOPE_MISMATCH  Cursor addresses a different Session or scope
+CURSOR_INVALID         Cursor payload is not decodable
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 PROVIDER_FAILED        Provider terminalized work as failed

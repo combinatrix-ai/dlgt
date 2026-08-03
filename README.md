@@ -100,7 +100,7 @@ framework. It is the bridge between two competing harnesses.
 
 ## Direct CLI use
 
-After installing `dlgt`, create a Claude Session and wait for its review:
+After installing `dlgt`, create a Claude Session and read its review:
 
 ```bash
 dlgt new \
@@ -109,10 +109,14 @@ dlgt new \
   --model claude-fable-5 \
   --effort high \
   --cwd . \
-  --wait \
-  --timeout 15m \
-  -- "Review this repository. Return findings and trade-offs only."
+  --alias @review \
+  -- "Review this repository. Return findings and trade-offs only." \
+  && dlgt fetch @review --until result --wait 15m
 ```
+
+`new` returns as soon as the prompt is accepted, and `fetch` is the one
+observation command: it returns current state, new results, lifecycle events,
+and the forward screen delta from an opaque cursor.
 
 Create a Codex Session:
 
@@ -130,8 +134,9 @@ The command returns one provider-qualified Session ID, such as
 `codex:019f6307-341e-7e81-8a33-7ab61e804345`:
 
 ```bash
-dlgt wait codex:019f6307-341e-7e81-8a33-7ab61e804345 --timeout 15m
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait --timeout 15m -- "Review the revision"
+dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revision"
+dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --cursor "$cursor"
 dlgt restart codex:019f6307-341e-7e81-8a33-7ab61e804345
 dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume -- "Continue the review"
 dlgt show codex:019f6307-341e-7e81-8a33-7ab61e804345
