@@ -1769,7 +1769,8 @@ impl Daemon {
             bound_seq: *bound,
             bound_terminal,
             full_event_watermark: event_watermark,
-            events_complete: !events_more,
+            events_more,
+            dropped_event_seq: None,
             scope_gaps,
             sources: vec![BucketSource {
                 uid: uid.clone(),
@@ -1819,7 +1820,7 @@ impl Daemon {
         };
 
         let mut by_uid: HashMap<String, Vec<Value>> = HashMap::new();
-        let mut events_complete = !events_more;
+        let mut dropped_event_seq: Option<i64> = None;
         for (uid, event) in events {
             let Some(uid) = uid else { continue };
             by_uid.entry(uid).or_default().push(event);
@@ -1872,8 +1873,10 @@ impl Daemon {
             validate_continuation(&position, &results, &[])?;
             if sources.len() >= FETCH_SESSION_PAGE {
                 more_candidates = true;
-                if !events.is_empty() {
-                    events_complete = false;
+                for event in &events {
+                    let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+                    dropped_event_seq =
+                        Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
                 }
                 continue;
             }
@@ -1899,8 +1902,10 @@ impl Daemon {
         }
         // Events for Sessions this page never reached must not be counted as
         // delivered by the shared watermark.
-        if !by_uid.is_empty() {
-            events_complete = false;
+        for event in by_uid.values().flatten() {
+            let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+            dropped_event_seq =
+                Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
         }
         drop(store);
 
@@ -1910,7 +1915,8 @@ impl Daemon {
             bound_seq: None,
             bound_terminal: false,
             full_event_watermark: event_watermark,
-            events_complete,
+            events_more,
+            dropped_event_seq,
             scope_gaps,
             sources,
             more_candidates,
@@ -3282,10 +3288,14 @@ struct Cut {
     /// Execution bound by `--until result`, and whether it has terminalized.
     bound_seq: Option<i64>,
     bound_terminal: bool,
-    /// Event watermark that may be published only when every candidate event
-    /// is committed and nothing hid one.
+    /// Watermark the event scan reached. Publishable only when every
+    /// candidate event is committed and the cut hid none.
     full_event_watermark: i64,
-    events_complete: bool,
+    /// The scan stopped at its page limit; more events already exist.
+    events_more: bool,
+    /// Lowest event sequence this cut refused to include at all, because the
+    /// Session it belongs to did not fit the page.
+    dropped_event_seq: Option<i64>,
     /// Scope-wide gaps. Per-Session gaps live on the bucket.
     scope_gaps: Vec<Value>,
     sources: Vec<BucketSource>,
@@ -3614,21 +3624,11 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Sessions whose every candidate unit was committed.
-    fn events_fully_committed(&self) -> bool {
-        self.buckets.len() == self.cut.sources.len()
-            && self
-                .buckets
-                .iter()
-                .zip(&self.cut.sources)
-                .all(|(committed, source)| committed.events.len() == source.events.len())
-    }
-
     fn pending(&self) -> bool {
         if self.buckets.len() < self.cut.sources.len() || self.cut.more_candidates {
             return true;
         }
-        if !self.cut.events_complete {
+        if self.cut.events_more || self.cut.dropped_event_seq.is_some() {
             return true;
         }
         self.buckets
@@ -3682,16 +3682,25 @@ impl<'a> Builder<'a> {
         }
         next.p
             .retain(|_, position| *position != cursor::SessionCursor::default());
-        let committed_event = self
-            .buckets
-            .iter()
-            .flat_map(|bucket| bucket.events.iter())
-            .filter_map(|event| event.get("seq").and_then(Value::as_i64))
-            .max();
-        next.e = if self.events_fully_committed() && self.cut.events_complete {
-            self.cut.full_event_watermark
-        } else {
-            committed_event.unwrap_or_else(|| self.options.event_position())
+        // The watermark may only pass events this document carries. Anything
+        // left behind -- by the byte budget or by the Session page -- clamps it
+        // to just before the earliest one, even if later events did ship.
+        let mut undelivered = self.cut.dropped_event_seq;
+        for (committed, source) in self.buckets.iter().zip(&self.cut.sources) {
+            for event in source.events.iter().skip(committed.events.len()) {
+                let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+                undelivered = Some(undelivered.map_or(seq, |current: i64| current.min(seq)));
+            }
+        }
+        for source in self.cut.sources.iter().skip(self.buckets.len()) {
+            for event in &source.events {
+                let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+                undelivered = Some(undelivered.map_or(seq, |current: i64| current.min(seq)));
+            }
+        }
+        next.e = match undelivered {
+            Some(seq) => seq - 1,
+            None => self.cut.full_event_watermark,
         };
         if self.cut.baseline {
             next.bl = (self.buckets.len() < self.cut.sources.len() || self.cut.more_candidates)
@@ -4467,7 +4476,8 @@ mod tests {
             bound_seq: None,
             bound_terminal: false,
             full_event_watermark,
-            events_complete: true,
+            events_more: false,
+            dropped_event_seq: None,
             scope_gaps: Vec::new(),
             sources,
             more_candidates: false,
@@ -4546,6 +4556,32 @@ mod tests {
             decode(&rendered.value).e,
             2,
             "watermark passed the dropped bucket's events"
+        );
+    }
+
+    #[test]
+    fn a_session_dropped_by_the_page_cap_holds_back_the_event_watermark() {
+        // The committed bucket carries a later event than the one the cut
+        // refused, so a "highest delivered" watermark would strand seq 5.
+        let mut cut = test_cut(vec![
+            SourceSpec {
+                events: lifecycle_events(50..=50),
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ]);
+        cut.dropped_event_seq = Some(5);
+
+        let rendered = cut
+            .render(&fetch_options(FETCH_DEFAULT_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        assert_eq!(event_seqs(&rendered.value), vec![50]);
+        assert_eq!(rendered.value["has_more"], true);
+        assert_eq!(
+            decode(&rendered.value).e,
+            4,
+            "watermark passed an event the cut refused"
         );
     }
 
@@ -4710,7 +4746,7 @@ mod tests {
                 .build(),
             ]);
             cut.sources[0].stable_more = rows.len() > delivered_rows + FETCH_STABLE_PAGE;
-            cut.events_complete = !events_more;
+            cut.events_more = events_more;
             cut.full_event_watermark = events
                 .iter()
                 .filter_map(|event| event["seq"].as_i64())
