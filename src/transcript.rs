@@ -9,6 +9,7 @@
 //! accepted, so a previous turn's answer can never be returned.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -26,7 +27,7 @@ pub fn boundary(path: &str) -> Option<u64> {
 pub fn recover(path: &str, provider_session_id: &str, boundary: u64) -> Option<String> {
     let root = projects_root()?;
     let resolved = resolve(path, &root, provider_session_id)?;
-    let mut file = std::fs::File::open(&resolved).ok()?;
+    let mut file = open_checked(&resolved)?;
     let length = file.metadata().ok()?.len();
     if length <= boundary {
         return None;
@@ -36,6 +37,30 @@ pub fn recover(path: &str, provider_session_id: &str, boundary: u64) -> Option<S
     let mut tail = Vec::new();
     file.take(TAIL_LIMIT).read_to_end(&mut tail).ok()?;
     final_text(&tail, start > boundary)
+}
+
+/// Open the exact file the confinement check validated.
+///
+/// Canonicalization happens before the open, so the final component is
+/// reopened with `O_NOFOLLOW` and the opened descriptor is compared against
+/// the checked target by device and inode. A regular file is required.
+/// Swapping an intermediate directory between the two steps is not covered;
+/// that would need `openat2(RESOLVE_BENEATH)`, which is not portable here.
+fn open_checked(resolved: &Path) -> Option<std::fs::File> {
+    let expected = std::fs::symlink_metadata(resolved).ok()?;
+    if !expected.is_file() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(resolved)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return None;
+    }
+    Some(file)
 }
 
 fn projects_root() -> Option<PathBuf> {
@@ -171,6 +196,20 @@ mod tests {
             recover(&path_text, "session-1", accepted).as_deref(),
             Some("this turn")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_transcript_is_never_opened() -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let target = home.path().join("secret.jsonl");
+        std::fs::write(&target, "{}\n")?;
+        let link = home.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        assert!(super::open_checked(&link).is_none());
+        assert!(super::open_checked(&target).is_some());
+        assert!(super::open_checked(home.path()).is_none());
         Ok(())
     }
 

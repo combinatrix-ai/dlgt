@@ -103,7 +103,7 @@ pub fn run() -> Result<()> {
     let (update_shutdown, update_wait) = mpsc::sync_channel(1);
     let daemon = Arc::new(Daemon {
         instance_id: Uuid::new_v4().simple().to_string(),
-        receipts: Mutex::new(VecDeque::new()),
+        receipts: ReceiptLedger::default(),
         store: Arc::new(Mutex::new(store)),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
@@ -187,10 +187,10 @@ struct Daemon {
     /// Daemon boot identity. Runtime state is memory-only, so no cursor may
     /// survive a restart.
     instance_id: String,
-    /// Bounded request-id to acceptance-receipt map. A caller that never saw
-    /// its acceptance response replays the original receipt instead of
+    /// Bounded request-id to acceptance-receipt ledger. A caller that never
+    /// saw its acceptance response replays the original receipt instead of
     /// creating a duplicate Session or execution.
-    receipts: Mutex<VecDeque<Receipt>>,
+    receipts: ReceiptLedger,
     store: Arc<Mutex<Store>>,
     sessions: Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
     attach_leases: Mutex<HashMap<String, String>>,
@@ -1559,38 +1559,8 @@ impl Daemon {
         let Some(request_id) = params.get("request_id").and_then(Value::as_str) else {
             return run(params);
         };
-        let digest = request_digest(params);
-        let receipts = self
-            .receipts
-            .lock()
-            .map_err(|_| anyhow!("request receipt lock poisoned"))?;
-        if let Some(receipt) = receipts.iter().find(|receipt| receipt.id == request_id) {
-            if receipt.digest != digest {
-                bail!(
-                    "invalid request_id reuse: {request_id:?} already accepted a different payload"
-                );
-            }
-            let mut replay = receipt.value.clone();
-            replay["replayed"] = json!(true);
-            return Ok(replay);
-        }
-        drop(receipts);
-        let result = run(params)?;
-        let mut receipts = self
-            .receipts
-            .lock()
-            .map_err(|_| anyhow!("request receipt lock poisoned"))?;
-        if !receipts.iter().any(|receipt| receipt.id == request_id) {
-            receipts.push_back(Receipt {
-                id: request_id.to_owned(),
-                digest,
-                value: result.clone(),
-            });
-            while receipts.len() > REQUEST_RECEIPT_LIMIT {
-                receipts.pop_front();
-            }
-        }
-        Ok(result)
+        self.receipts
+            .accept_once(request_id, request_digest(params), || run(params))
     }
 
     /// One composite forward-delta read: current state, newly terminalized
@@ -1733,6 +1703,7 @@ impl Daemon {
             }
             store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
         };
+        validate_continuation(&position, &results)?;
 
         let stable = if options.stable_limit == 0 {
             crate::screen::StablePage {
@@ -1882,6 +1853,7 @@ impl Daemon {
                 }
                 store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
             };
+            validate_continuation(&position, &results)?;
             if !baseline && events.is_empty() && results.is_empty() {
                 continue;
             }
@@ -2127,12 +2099,7 @@ impl Daemon {
             let Some(uid) = store.session_uid(&session.id) else {
                 return Ok(None);
             };
-            let Some(path) = turn.transcript_path.clone().or_else(|| {
-                payload
-                    .get("transcript_path")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }) else {
+            let Some((path, boundary)) = transcript_window(&turn) else {
                 return Ok(None);
             };
             TranscriptRecovery {
@@ -2140,7 +2107,7 @@ impl Daemon {
                 // process-generation guard.
                 generation: store.screen_epoch(&uid),
                 provider_turn_id: turn.provider_turn_id.clone(),
-                boundary: turn.transcript_offset.unwrap_or(0),
+                boundary,
                 turn_id,
                 uid,
                 path,
@@ -2339,6 +2306,13 @@ fn write_semantic_input(runtime: &AgentRuntime, input: &[u8]) -> Result<()> {
 struct HookOutcome {
     kind: &'static str,
     turn_id: Option<String>,
+}
+
+/// The transcript fallback is eligible only when the execution recorded both
+/// a transcript path and the byte boundary where it began. Substituting a zero
+/// boundary would let a previous turn's answer be returned as this one's.
+fn transcript_window(turn: &TurnRecord) -> Option<(String, u64)> {
+    Some((turn.transcript_path.clone()?, turn.transcript_offset?))
 }
 
 /// A transcript fallback captured outside the store lock, together with the
@@ -3119,6 +3093,96 @@ struct Receipt {
     value: Value,
 }
 
+#[derive(Default)]
+struct ReceiptState {
+    completed: VecDeque<Receipt>,
+    /// Acceptances currently running, so a concurrent duplicate waits for the
+    /// winner instead of launching a second Session.
+    inflight: HashMap<String, u128>,
+}
+
+#[derive(Default)]
+struct ReceiptLedger {
+    state: Mutex<ReceiptState>,
+    settled: std::sync::Condvar,
+}
+
+impl ReceiptLedger {
+    /// Run `run` at most once for `(request_id, digest)`.
+    ///
+    /// A retry with the same payload replays the original receipt. A
+    /// concurrent duplicate blocks until the winner settles and then replays
+    /// its receipt, so two racing calls can never create two Sessions. The
+    /// same ID with a different payload is rejected against both a stored and
+    /// an in-flight acceptance.
+    fn accept_once(
+        &self,
+        request_id: &str,
+        digest: u128,
+        run: impl FnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("request receipt lock poisoned"))?;
+        loop {
+            if let Some(receipt) = state
+                .completed
+                .iter()
+                .find(|receipt| receipt.id == request_id)
+            {
+                if receipt.digest != digest {
+                    bail!(
+                        "invalid request_id reuse: {request_id:?} already accepted a different payload"
+                    );
+                }
+                let mut replay = receipt.value.clone();
+                replay["replayed"] = json!(true);
+                return Ok(replay);
+            }
+            match state.inflight.get(request_id) {
+                Some(&reserved) if reserved != digest => {
+                    bail!(
+                        "invalid request_id reuse: {request_id:?} is already accepting a different payload"
+                    );
+                }
+                Some(_) => {
+                    state = self
+                        .settled
+                        .wait(state)
+                        .map_err(|_| anyhow!("request receipt lock poisoned"))?;
+                }
+                None => {
+                    state.inflight.insert(request_id.to_owned(), digest);
+                    break;
+                }
+            }
+        }
+        drop(state);
+
+        let result = run();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("request receipt lock poisoned"))?;
+        state.inflight.remove(request_id);
+        if let Ok(value) = result.as_ref() {
+            state.completed.push_back(Receipt {
+                id: request_id.to_owned(),
+                digest,
+                value: value.clone(),
+            });
+            while state.completed.len() > REQUEST_RECEIPT_LIMIT {
+                state.completed.pop_front();
+            }
+        }
+        drop(state);
+        // A failed acceptance leaves no receipt, so a waiter retries it.
+        self.settled.notify_all();
+        result
+    }
+}
+
 /// Identity of an acceptance payload: the prompt and every launch option that
 /// changes what the Session does, excluding per-invocation noise such as the
 /// environment snapshot, terminal size, and correlation ID.
@@ -3725,6 +3789,29 @@ impl Cut {
     }
 }
 
+/// A continuation offset is caller-supplied. Reject one that does not name a
+/// UTF-8 boundary inside the result it claims to continue, rather than
+/// indexing a body with it.
+fn validate_continuation(position: &cursor::SessionCursor, results: &[TurnRecord]) -> Result<()> {
+    let Some(execution_seq) = position.px else {
+        return Ok(());
+    };
+    let Some(turn) = results
+        .first()
+        .filter(|turn| turn.execution_seq == execution_seq)
+    else {
+        return Ok(());
+    };
+    let text = turn.final_message.as_deref().unwrap_or_default();
+    let offset = usize::try_from(position.po).unwrap_or(usize::MAX);
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        bail!(
+            "CURSOR_INVALID: continuation offset is not a character boundary in the retained result"
+        );
+    }
+    Ok(())
+}
+
 fn serialized_len(value: &Value) -> Result<usize> {
     Ok(serde_json::to_string(value)?.len())
 }
@@ -3815,11 +3902,12 @@ mod tests {
 
     use super::{
         Bucket, BucketInput, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_HARD_MAX_BYTES,
-        FETCH_MIN_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation,
+        FETCH_MIN_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
         TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
         clamp_busy_metrics, classify_error, generate_alias, generate_internal_id,
         provider_id_from_session, public_result, public_session, public_session_with_metrics,
-        retention_gap, signal_shutdown, validate_alias, wait_for_update_check,
+        retention_gap, signal_shutdown, transcript_window, validate_alias, validate_continuation,
+        wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -4436,6 +4524,117 @@ mod tests {
             "baseline mode must persist while paging"
         );
         assert_eq!(resumed.resume_after(), Some("su_last"));
+    }
+
+    #[test]
+    fn concurrent_acceptances_with_one_request_id_run_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let ledger = Arc::new(ReceiptLedger::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let ledger = Arc::clone(&ledger);
+                let runs = Arc::clone(&runs);
+                let started = Arc::clone(&started);
+                std::thread::spawn(move || {
+                    started.wait();
+                    ledger.accept_once("retry-1", 42, || {
+                        // Hold the acceptance open long enough that every
+                        // other thread must observe the reservation.
+                        std::thread::sleep(Duration::from_millis(50));
+                        let seq = runs.fetch_add(1, Ordering::SeqCst) + 1;
+                        Ok(json!({"session": {"id": "claude:x"}, "execution_seq": seq}))
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut replayed = 0;
+        for handle in handles {
+            let value = handle
+                .join()
+                .unwrap_or_else(|_| panic!("acceptance thread panicked"))
+                .unwrap_or_else(|error| panic!("acceptance failed: {error}"));
+            assert_eq!(value["execution_seq"], 1, "a duplicate acceptance ran");
+            if value["replayed"] == json!(true) {
+                replayed += 1;
+            }
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the acceptance ran twice");
+        assert_eq!(replayed, 3, "duplicates must be marked as replays");
+
+        let mismatch = ledger
+            .accept_once("retry-1", 43, || Ok(json!({})))
+            .err()
+            .unwrap_or_else(|| panic!("a different payload was accepted"));
+        assert!(mismatch.to_string().contains("invalid request_id reuse"));
+        assert_eq!(classify_error(&mismatch), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn a_failed_acceptance_leaves_no_receipt_and_can_be_retried() {
+        let ledger = ReceiptLedger::default();
+        assert!(
+            ledger
+                .accept_once("retry-2", 7, || Err(anyhow::anyhow!("launch failed")))
+                .is_err()
+        );
+        let value = ledger
+            .accept_once("retry-2", 7, || Ok(json!({"ok": true})))
+            .unwrap_or_else(|error| panic!("retry after failure failed: {error}"));
+        assert!(value.get("replayed").is_none());
+    }
+
+    #[test]
+    fn the_transcript_fallback_needs_a_recorded_boundary() {
+        let mut turn = test_turn(1, "");
+        assert!(transcript_window(&turn).is_none());
+        turn.transcript_path = Some("/x.jsonl".to_owned());
+        assert!(
+            transcript_window(&turn).is_none(),
+            "a path without a boundary must not enable the fallback"
+        );
+        turn.transcript_offset = Some(12);
+        assert_eq!(transcript_window(&turn), Some(("/x.jsonl".to_owned(), 12)));
+    }
+
+    #[test]
+    fn a_continuation_offset_off_a_character_boundary_is_rejected() {
+        let turn = test_turn(7, "héllo");
+        let inside = crate::cursor::SessionCursor {
+            px: Some(7),
+            po: 2,
+            ..crate::cursor::SessionCursor::default()
+        };
+        let error = validate_continuation(&inside, std::slice::from_ref(&turn))
+            .err()
+            .unwrap_or_else(|| panic!("a split character was accepted"));
+        assert_eq!(classify_error(&error), "CURSOR_INVALID");
+
+        let past_end = crate::cursor::SessionCursor {
+            px: Some(7),
+            po: 9_999,
+            ..crate::cursor::SessionCursor::default()
+        };
+        assert!(validate_continuation(&past_end, std::slice::from_ref(&turn)).is_err());
+
+        let valid = crate::cursor::SessionCursor {
+            px: Some(7),
+            po: 1,
+            ..crate::cursor::SessionCursor::default()
+        };
+        assert!(validate_continuation(&valid, std::slice::from_ref(&turn)).is_ok());
+        // A marker that no longer names the next retained result is stale, not
+        // hostile: it is dropped rather than rejected.
+        let stale = crate::cursor::SessionCursor {
+            px: Some(99),
+            po: 5,
+            ..crate::cursor::SessionCursor::default()
+        };
+        assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
     }
 
     #[test]

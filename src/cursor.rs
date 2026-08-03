@@ -16,6 +16,11 @@ pub const CURSOR_PREFIX: &str = "f1.";
 pub const CURSOR_CODEC_VERSION: u32 = 1;
 /// Scope covering every Session owned by one daemon.
 pub const SCOPE_ALL: &str = "all";
+/// Longest cursor token accepted. A cursor is daemon-issued; anything larger
+/// is a hostile or corrupted token, not a token this daemon wrote.
+const MAX_TOKEN_LEN: usize = 8 * 1024;
+/// Most per-Session watermarks a cursor may carry.
+const MAX_SESSIONS: usize = 256;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Cursor {
@@ -95,6 +100,9 @@ impl Cursor {
     /// Every failure is a structured, non-zero error whose recovery is one
     /// cursorless baseline fetch.
     pub fn decode(text: &str, instance_id: &str) -> Result<Self> {
+        if text.len() > MAX_TOKEN_LEN {
+            bail!("CURSOR_INVALID: cursor token is larger than this daemon ever issues");
+        }
         let Some(payload) = text.strip_prefix(CURSOR_PREFIX) else {
             bail!(
                 "CURSOR_VERSION_UNSUPPORTED: cursor prefix is not {CURSOR_PREFIX:?}; fetch without --cursor to recover"
@@ -106,11 +114,16 @@ impl Cursor {
         let Ok(cursor) = serde_json::from_slice::<Self>(&bytes) else {
             bail!("CURSOR_INVALID: cursor payload is not a valid cursor document");
         };
-        if cursor.v > CURSOR_CODEC_VERSION {
+        // Exactly one codec is understood. Accepting anything else would mean
+        // guessing the meaning of watermarks this build never wrote.
+        if cursor.v != CURSOR_CODEC_VERSION {
             bail!(
-                "CURSOR_VERSION_UNSUPPORTED: cursor codec version {} is newer than {CURSOR_CODEC_VERSION}",
+                "CURSOR_VERSION_UNSUPPORTED: cursor codec version {} is not {CURSOR_CODEC_VERSION}",
                 cursor.v
             );
+        }
+        if cursor.p.len() > MAX_SESSIONS {
+            bail!("CURSOR_INVALID: cursor carries more Sessions than this daemon ever issues");
         }
         if cursor.b != instance_id {
             bail!(
@@ -177,16 +190,66 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_payload_version_is_not_reinterpreted() {
-        let mut cursor = sample();
-        cursor.v = 99;
-        let encoded = cursor
+    fn only_the_exact_codec_version_is_accepted() {
+        for version in [0, 2, 99] {
+            let mut cursor = sample();
+            cursor.v = version;
+            let encoded = cursor
+                .encode()
+                .unwrap_or_else(|error| panic!("failed to encode cursor: {error}"));
+            let error = Cursor::decode(&encoded, "boot-1")
+                .err()
+                .unwrap_or_else(|| panic!("version {version} unexpectedly decoded"));
+            assert!(
+                error.to_string().contains("CURSOR_VERSION_UNSUPPORTED"),
+                "version {version} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_cursors_are_rejected_without_panicking() {
+        let oversized = format!("{CURSOR_PREFIX}{}", "A".repeat(super::MAX_TOKEN_LEN));
+        let mut crowded = Cursor::new("boot-1", "su_abc");
+        for index in 0..=super::MAX_SESSIONS {
+            crowded.set_session(&format!("su_{index}"), SessionCursor::default());
+        }
+        let crowded = crowded
             .encode()
             .unwrap_or_else(|error| panic!("failed to encode cursor: {error}"));
-        let error = Cursor::decode(&encoded, "boot-1")
-            .err()
-            .unwrap_or_else(|| panic!("future cursor unexpectedly decoded"));
-        assert!(error.to_string().contains("CURSOR_VERSION_UNSUPPORTED"));
+        let cases = [
+            String::new(),
+            "f1.".to_owned(),
+            "f1.!!!!".to_owned(),
+            format!(
+                "{CURSOR_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json")
+            ),
+            format!(
+                "{CURSOR_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"v":1}"#)
+            ),
+            format!(
+                "{CURSOR_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    br#"{"v":1,"b":"boot-1","s":"su_abc","e":-9223372036854775808,"p":{"su_abc":{"r":18446744073709551615,"x":-1,"px":9223372036854775807,"po":18446744073709551615}}}"#
+                )
+            ),
+            oversized,
+            crowded,
+            "\u{feff}f1.AAAA".to_owned(),
+        ];
+        for case in cases {
+            // Only the last case is well formed enough to decode; none may
+            // panic, and every rejection is a structured cursor error.
+            if let Err(error) = Cursor::decode(&case, "boot-1") {
+                let message = error.to_string();
+                assert!(
+                    message.starts_with("CURSOR_"),
+                    "unstructured cursor failure: {message}"
+                );
+            }
+        }
     }
 
     #[test]
