@@ -258,16 +258,20 @@ least one watermark. A `max_bytes` too small for the envelope plus one chunk
 fails with `INVALID_ARGUMENT` naming the smallest workable value instead of
 emitting an oversized document.
 
-`screen.stable` contains complete rows only. A split row is carried as
-`screen.stable_fragment`:
+`screen.stable` contains complete rows only. A split row is carried in one of
+two ordered slots, each shaped
+`{"row_id":8412,"offset":4096,"text":"...","complete":false}`:
 
-```json
-{"row_id":8412,"offset":4096,"text":"...","complete":false}
-```
+- `screen.fragment_before` continues the row the previous response split. It
+  precedes `stable[0]` and is the only slot where `complete` can be true.
+- `screen.fragment_after` is the row this response split. It follows the last
+  entry of `stable` and is never complete.
 
-Reassemble by concatenating each `row_id`'s fragment `text` in `offset` order
-until `complete` is true. A row never appears in both `stable` and
-`stable_fragment`, and at most one row is fragmented per response.
+The screen delta reads in that order: `fragment_before`, `stable`,
+`fragment_after`. Clients must retain every piece and concatenate the pieces
+for a `row_id` in `offset` order until `complete` is true; a completing piece
+carries only its own tail, so discarding earlier pieces loses data. A row never
+appears in both `stable` and a fragment slot.
 
 Lifecycle events are committed as a strictly ascending prefix across every
 Session in the response, so a Session that did not fit the page can never park

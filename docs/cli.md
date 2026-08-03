@@ -609,23 +609,32 @@ mid-line. Both continuations are carried in the cursor, so every `has_more`
 response advances at least one watermark.
 
 `screen.stable` always contains complete rows and nothing else. A row that had
-to be split is carried separately:
+to be split is carried in one of two explicitly ordered slots:
 
 ```json
 {
   "screen": {
+    "fragment_before": {"row_id": 8412, "offset": 4096, "text": "...", "complete": true},
     "stable": ["Found one race."],
-    "stable_fragment": {"row_id": 8412, "offset": 4096, "text": "...", "complete": false}
+    "fragment_after": {"row_id": 8414, "offset": 0, "text": "...", "complete": false}
   }
 }
 ```
 
-To reassemble: concatenate every `stable_fragment.text` seen for a given
-`row_id` in `offset` order until one arrives with `complete: true`. That is the
-whole row. A row never appears in both `stable` and `stable_fragment`, and at
-most one row is fragmented per response; whole rows resume once the fragment
-completes. Callers that only want finished rows can ignore `stable_fragment`
-until `complete` is true.
+- `fragment_before` continues the row the *previous* response split. It
+  logically precedes `stable[0]` and is the only place `complete: true`
+  appears.
+- `fragment_after` is the row *this* response had to split. It logically
+  follows the last entry of `stable` and is never complete.
+
+The screen delta of one response is therefore, in order: `fragment_before`,
+then every row of `stable`, then `fragment_after`.
+
+Callers **must** retain every fragment piece: concatenate the pieces for a
+given `row_id` in `offset` order until one arrives with `complete: true`, which
+yields the whole row. Discarding pieces until a complete one arrives loses
+data, because the completing piece carries only its own tail. A row never
+appears in both `stable` and a fragment slot.
 
 Lifecycle events are delivered as a strictly ascending prefix: the response
 never skips an event to deliver a later one, so the event watermark is always

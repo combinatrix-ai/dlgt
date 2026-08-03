@@ -3354,8 +3354,12 @@ struct Committed {
     events: Vec<Value>,
     /// Complete rows only. A row split by the byte budget is never here.
     stable: Vec<String>,
-    /// The one row this response carries a piece of, if any.
-    fragment: Option<StableFragment>,
+    /// Continuation of the row a previous response split. Logically precedes
+    /// `stable[0]`, and is the only place `complete: true` can appear.
+    fragment_before: Option<StableFragment>,
+    /// The row this response had to split. Logically follows the last stable
+    /// row, and is never complete.
+    fragment_after: Option<StableFragment>,
     live: Vec<String>,
     live_truncated: bool,
     screen: bool,
@@ -3367,8 +3371,8 @@ struct Committed {
 }
 
 /// One piece of a screen row too wide for the response that carries it.
-/// Continuations keep arriving as fragments, offset advancing, until
-/// `complete` is true; only then do whole rows resume.
+/// Continuations keep arriving, offset advancing, until `complete` is true;
+/// only then do whole rows resume.
 struct StableFragment {
     row_id: u64,
     offset: u64,
@@ -3393,13 +3397,18 @@ impl Committed {
                 "live": self.live,
                 "live_truncated": self.live_truncated,
             });
-            if let Some(fragment) = self.fragment.as_ref() {
-                screen["stable_fragment"] = json!({
-                    "row_id": fragment.row_id,
-                    "offset": fragment.offset,
-                    "text": fragment.text,
-                    "complete": fragment.complete,
-                });
+            for (key, fragment) in [
+                ("fragment_before", self.fragment_before.as_ref()),
+                ("fragment_after", self.fragment_after.as_ref()),
+            ] {
+                if let Some(fragment) = fragment {
+                    screen[key] = json!({
+                        "row_id": fragment.row_id,
+                        "offset": fragment.offset,
+                        "text": fragment.text,
+                        "complete": fragment.complete,
+                    });
+                }
             }
             bucket["screen"] = screen;
         }
@@ -3420,8 +3429,8 @@ enum Unit {
     Stable {
         bucket: usize,
         previous: cursor::SessionCursor,
-        /// The unit filled the fragment slot rather than appending a row.
-        fragment: bool,
+        /// Which slot the unit filled, if it was not a whole row.
+        slot: Option<FragmentSlot>,
     },
     Live {
         bucket: usize,
@@ -3453,8 +3462,15 @@ struct Builder<'a> {
     skeleton: usize,
 }
 
-/// Encoded cost of the fragment frame around a chunked screen row.
+/// Encoded cost of the frame around a chunked screen row.
 const FRAGMENT_FRAME_COST: usize = 96;
+
+/// Where a chunked row sits relative to the whole rows in the same response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragmentSlot {
+    Before,
+    After,
+}
 /// Bytes reserved for each Session's watermarks inside the encoded cursor.
 const CURSOR_ENTRY_RESERVE: usize = 160;
 const CURSOR_BASE_RESERVE: usize = 256;
@@ -3506,7 +3522,8 @@ impl<'a> Builder<'a> {
                 results: Vec::new(),
                 events: Vec::new(),
                 stable: Vec::new(),
-                fragment: None,
+                fragment_before: None,
+                fragment_after: None,
                 live: Vec::new(),
                 live_truncated: source.live_truncated,
                 screen: source.screen,
@@ -3620,28 +3637,40 @@ impl<'a> Builder<'a> {
                     return;
                 };
                 let complete = take == remainder.len();
-                // A row is a fragment if a previous response already carried
-                // part of it, or if this response cannot carry the rest.
-                let fragment = start > 0 || !complete;
-                if fragment && self.buckets[index].fragment.is_some() {
-                    // One fragment slot per response: stop rather than frame a
-                    // second split row this response cannot express.
-                    return;
-                }
+                // A row already partly delivered continues in the leading
+                // slot; a row this response has to split fills the trailing
+                // one. A whole row is never framed.
+                let slot = if start > 0 {
+                    Some(FragmentSlot::Before)
+                } else if complete {
+                    None
+                } else {
+                    Some(FragmentSlot::After)
+                };
                 let previous = self.buckets[index].position;
                 let id = source.stable_start + u64::try_from(row).unwrap_or(0) + 1;
                 let text = remainder[..take].to_owned();
                 self.used += json_cost(&Value::String(text.clone()));
-                if fragment {
-                    self.used += FRAGMENT_FRAME_COST;
-                    self.buckets[index].fragment = Some(StableFragment {
-                        row_id: id,
-                        offset: u64::try_from(start).unwrap_or(0),
-                        text,
-                        complete,
-                    });
-                } else {
-                    self.buckets[index].stable.push(text);
+                match slot {
+                    Some(FragmentSlot::Before) => {
+                        self.used += FRAGMENT_FRAME_COST;
+                        self.buckets[index].fragment_before = Some(StableFragment {
+                            row_id: id,
+                            offset: u64::try_from(start).unwrap_or(0),
+                            text,
+                            complete,
+                        });
+                    }
+                    Some(FragmentSlot::After) => {
+                        self.used += FRAGMENT_FRAME_COST;
+                        self.buckets[index].fragment_after = Some(StableFragment {
+                            row_id: id,
+                            offset: 0,
+                            text,
+                            complete: false,
+                        });
+                    }
+                    None => self.buckets[index].stable.push(text),
                 }
                 let position = &mut self.buckets[index].position;
                 if complete {
@@ -3654,7 +3683,7 @@ impl<'a> Builder<'a> {
                 self.units.push(Unit::Stable {
                     bucket: index,
                     previous,
-                    fragment,
+                    slot,
                 });
                 if !complete {
                     return;
@@ -3692,12 +3721,14 @@ impl<'a> Builder<'a> {
             Some(Unit::Stable {
                 bucket,
                 previous,
-                fragment,
+                slot,
             }) => {
-                if fragment {
-                    self.buckets[bucket].fragment = None;
-                } else {
-                    self.buckets[bucket].stable.pop();
+                match slot {
+                    Some(FragmentSlot::Before) => self.buckets[bucket].fragment_before = None,
+                    Some(FragmentSlot::After) => self.buckets[bucket].fragment_after = None,
+                    None => {
+                        self.buckets[bucket].stable.pop();
+                    }
                 }
                 self.buckets[bucket].position = previous;
                 true
@@ -3735,7 +3766,9 @@ impl<'a> Builder<'a> {
                     || committed.events.len() < source.events.len()
                     || committed.results.len() < source.results.len()
                     || (source.screen
-                        && committed.stable.len() + usize::from(committed.fragment.is_some())
+                        && committed.stable.len()
+                            + usize::from(committed.fragment_before.is_some())
+                            + usize::from(committed.fragment_after.is_some())
                             < source.stable.len())
                     || committed.position.px.is_some()
                     || committed.position.ro > 0
@@ -3747,7 +3780,8 @@ impl<'a> Builder<'a> {
             !bucket.events.is_empty()
                 || !bucket.results.is_empty()
                 || !bucket.stable.is_empty()
-                || bucket.fragment.is_some()
+                || bucket.fragment_before.is_some()
+                || bucket.fragment_after.is_some()
         })
     }
 
@@ -4613,6 +4647,13 @@ mod tests {
         .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"))
     }
 
+    fn fragment_text<'a>(screen: &'a Value, slot: &str) -> &'a str {
+        screen
+            .get(slot)
+            .and_then(|piece| piece["text"].as_str())
+            .unwrap_or_default()
+    }
+
     fn event_seqs(value: &Value) -> Vec<i64> {
         value["sessions"]
             .as_array()
@@ -4960,18 +5001,10 @@ mod tests {
             {
                 body.push_str(chunk["final_text"].as_str().unwrap_or_default());
             }
+            // Reassembled purely from the schema's declared order:
+            // fragment_before, then whole rows, then fragment_after.
             let view = &rendered.value["sessions"][0]["screen"];
-            let fragment = view.get("stable_fragment");
-            let continuation = fragment
-                .and_then(|piece| piece["offset"].as_u64())
-                .is_some_and(|offset| offset > 0);
-            if continuation {
-                screen.push_str(
-                    fragment
-                        .and_then(|piece| piece["text"].as_str())
-                        .unwrap_or(""),
-                );
-            }
+            screen.push_str(fragment_text(view, "fragment_before"));
             for line in view["stable"].as_array().into_iter().flatten() {
                 let line = line.as_str().unwrap_or_default();
                 assert!(
@@ -4980,13 +5013,7 @@ mod tests {
                 );
                 screen.push_str(line);
             }
-            if fragment.is_some() && !continuation {
-                screen.push_str(
-                    fragment
-                        .and_then(|piece| piece["text"].as_str())
-                        .unwrap_or(""),
-                );
-            }
+            screen.push_str(fragment_text(view, "fragment_after"));
             cursor = Some(decode(&rendered.value));
             if rendered.value["has_more"] != json!(true) {
                 return (seen_events, body, screen);
@@ -5004,13 +5031,14 @@ mod tests {
     }
 
     #[test]
-    fn a_split_row_is_framed_as_a_fragment_and_never_as_a_stable_row() {
+    fn a_split_row_is_framed_by_slot_and_never_as_a_stable_row() {
         let row = "z".repeat(100_000);
         let rows = [row.clone(), "tail".to_owned()];
         let mut cursor: Option<crate::cursor::Cursor> = None;
         let mut rebuilt = String::new();
         let mut expected_offset = 0_u64;
         let mut mid_fragment: Option<(crate::cursor::Cursor, String)> = None;
+        let mut completions = 0;
         for _ in 0..200 {
             let options = fetch_options(4 * 1024, cursor.clone());
             let position = options.position("su_test");
@@ -5036,12 +5064,22 @@ mod tests {
                     "a partial row appeared in screen.stable"
                 );
             }
-            if let Some(fragment) = view.get("stable_fragment") {
+            if let Some(after) = view.get("fragment_after") {
+                assert_eq!(
+                    after["complete"],
+                    json!(false),
+                    "fragment_after is never complete"
+                );
+            }
+            for slot in ["fragment_before", "fragment_after"] {
+                let Some(fragment) = view.get(slot) else {
+                    continue;
+                };
                 assert_eq!(fragment["row_id"], 1, "the split row is row 1");
                 assert_eq!(
                     fragment["offset"],
                     json!(expected_offset),
-                    "fragment offsets must advance without gaps"
+                    "{slot} offsets must advance without gaps"
                 );
                 let text = fragment["text"].as_str().unwrap_or_default();
                 if mid_fragment.is_none() && expected_offset > 0 {
@@ -5053,6 +5091,8 @@ mod tests {
                 rebuilt.push_str(text);
                 expected_offset += u64::try_from(text.len()).unwrap_or(0);
                 if fragment["complete"] == json!(true) {
+                    completions += 1;
+                    assert_eq!(slot, "fragment_before", "only a continuation completes");
                     assert_eq!(rebuilt, row, "the fragments must rebuild the row");
                 }
             }
@@ -5062,6 +5102,7 @@ mod tests {
             }
         }
         assert_eq!(rebuilt, row);
+        assert_eq!(completions, 1, "the row must complete exactly once");
 
         // Replaying a mid-fragment cursor returns the identical suffix.
         let (replay_cursor, expected_text) =
@@ -5082,7 +5123,7 @@ mod tests {
         .render(&options)
         .unwrap_or_else(|error| panic!("failed to replay: {error}"));
         assert_eq!(
-            replay.value["sessions"][0]["screen"]["stable_fragment"]["text"],
+            replay.value["sessions"][0]["screen"]["fragment_before"]["text"],
             json!(expected_text)
         );
     }
