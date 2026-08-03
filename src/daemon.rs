@@ -751,6 +751,14 @@ impl Daemon {
             ));
         }
         id = canonical_id;
+        // The launch recorded its lifecycle against an internal ID that is
+        // never published. Now that the Session has a public identity, record
+        // the canonical timeline a caller can actually observe.
+        {
+            let store = self.lock_store()?;
+            store.record_event(Some(&id), None, "session.created");
+            store.record_event(Some(&id), None, "session.ready");
+        }
         let correlation_id = params
             .get("correlation_id")
             .and_then(Value::as_str)
@@ -1462,10 +1470,15 @@ impl Daemon {
         if session.id.starts_with("internal:") {
             bail!("SESSION_UNAVAILABLE: Session has not published its provider ID");
         }
-        let latest = self.lock_store()?.latest_turn(&session.id);
+        let store = self.lock_store()?;
+        let latest = store.latest_turn(&session.id);
+        // A running execution must not hide the answer to the previous one.
+        let result = store.latest_terminal_turn(&session.id);
+        let public = self.public_session_locked(&store, &session)?;
+        drop(store);
         Ok(json!({
-            "session": self.public_session(&session)?,
-            "result": latest.as_ref().filter(|turn| turn.state.is_terminal()).map(public_result),
+            "session": public,
+            "result": result.as_ref().map(public_result),
             "execution_seq": latest.as_ref().map(|turn| turn.execution_seq),
         }))
     }
@@ -1686,9 +1699,7 @@ impl Daemon {
         };
 
         let (results, results_more) = if baseline {
-            let latest = store
-                .latest_turn(&session.id)
-                .filter(|turn| turn.state.is_terminal());
+            let latest = store.latest_terminal_turn(&session.id);
             // A baseline delivers only the latest retained result. Anchor the
             // watermark immediately below it so a chunked body resumes on the
             // same result instead of restarting from the oldest retained one.
@@ -1839,9 +1850,7 @@ impl Daemon {
             let events = by_uid.remove(&uid).unwrap_or_default();
             let mut gaps = Vec::new();
             let (results, results_more) = if baseline {
-                let latest = store
-                    .latest_turn(&session.id)
-                    .filter(|turn| turn.state.is_terminal());
+                let latest = store.latest_terminal_turn(&session.id);
                 if let Some(turn) = latest.as_ref() {
                     position.x = turn.execution_seq - 1;
                     position.px = None;
@@ -3850,6 +3859,16 @@ fn normalized_page(store: &Store, uid: Option<&str>, after: i64, limit: usize) -
 /// described has been evicted.
 fn normalize_event(event: &crate::protocol::EventRecord) -> Option<Value> {
     let event_type = normalize_event_type(&event.kind)?;
+    // Pre-bind events belong to a launch that had no public identity. They are
+    // plumbing, and publishing them would expose an internal launch ID that
+    // the contract says is never a Session ID.
+    if event
+        .session_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("internal:"))
+    {
+        return None;
+    }
     let mut value = json!({
         "schema_version": 1,
         "seq": event.seq,

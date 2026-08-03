@@ -158,6 +158,12 @@ long_message=$(awk 'BEGIN { for (i = 0; i < 12000; i++) printf "x" }')
 send_json=$("$binary" send "$session_id" -- "$long_message")
 printf '%s\n' "$send_json" | grep -q '"execution_seq":2'
 
+# A running execution must not hide the answer to the previous one.
+busy_baseline=$("$binary" fetch "$session_id" --no-screen)
+printf '%s\n' "$busy_baseline" | grep -q '"state":"busy"'
+printf '%s\n' "$busy_baseline" | grep -q '"final_text":"initial-done"'
+"$binary" show "$session_id" | grep -q '"final_text":"initial-done"'
+
 set +e
 busy_json=$("$binary" send "$session_id" -- second)
 busy_status=$?
@@ -184,6 +190,11 @@ printf '%s\n' "$plain_logs" | grep -q '"code":"INVALID_ARGUMENT"'
 "$binary" logs "$session_id" --raw --json | grep -q '"data_base64"'
 "$binary" scrollback "$session_id" --lines 10 | grep -q '"lines"'
 "$binary" events "$session_id" | grep -q '"schema_version":1'
+# The public timeline is materialized against the provider-qualified ID; the
+# pre-bind launch events are plumbing and are never published.
+"$binary" events "$session_id" | grep -q '"type":"session.created"'
+if "$binary" events "$session_id" | grep -q 'internal:'; then exit 1; fi
+if "$binary" events | grep -q 'internal:'; then exit 1; fi
 "$binary" events "$session_id" --follow >"$state_dir/follow.jsonl" &
 follow_pid=$!
 attempt=0

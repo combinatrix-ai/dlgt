@@ -254,16 +254,9 @@ impl Store {
         {
             bail!("active session id already exists: {to}");
         }
-        // An internal launch ID is never published, so retargeting the events
-        // recorded under it is not a replay change. A provider-qualified ID
-        // that a caller may already hold is never rewritten.
-        if from.starts_with("internal:") {
-            for event in &mut state.events {
-                if event.session_id.as_deref() == Some(from) {
-                    event.session_id = Some(to.to_owned());
-                }
-            }
-        }
+        // Retained events are append-only. Pre-bind events recorded against an
+        // internal launch ID stay exactly as they were written and are never
+        // published; the canonical timeline is materialized at bind time.
         let replaced = state.sessions.remove(to);
         let mut session = state.sessions.remove(from).context("session not found")?;
         if let Some(replaced) = replaced {
@@ -281,11 +274,6 @@ impl Store {
             state
                 .uid_index
                 .retain(|_, uid| uid.as_str() != launch_uid.as_str());
-            for event in &mut state.events {
-                if event.session_uid.as_deref() == Some(launch_uid.as_str()) {
-                    event.session_uid = Some(session.uid.clone());
-                }
-            }
             // A replacement PTY is still a new terminal generation.
             if let Some(screen) = state.screens.get_mut(&session.uid) {
                 screen.restart();
@@ -455,6 +443,18 @@ impl Store {
             .turns
             .values()
             .find(|turn| turn.session_id == session_id && turn.execution_seq == execution_seq)
+            .cloned()
+    }
+
+    /// Newest retained *terminal* result. An execution that is still running
+    /// must not hide the answer the caller has not read yet.
+    pub fn latest_terminal_turn(&self, session_id: &str) -> Option<TurnRecord> {
+        self.state
+            .borrow()
+            .turns
+            .values()
+            .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+            .max_by_key(|turn| turn.execution_seq)
             .cloned()
     }
 
@@ -1158,6 +1158,73 @@ mod tests {
     }
 
     #[test]
+    fn a_running_execution_never_hides_the_previous_result() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "first")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("p1")));
+        assert!(
+            store
+                .complete_turn_if_matching("turn_1", Some("p1"), Some("first-answer"), false)
+                .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
+        );
+        store
+            .insert_turn("turn_2", "codex:thread-1", "second")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_2", Some("p2")));
+
+        assert_eq!(
+            store
+                .latest_turn("codex:thread-1")
+                .map(|turn| turn.execution_seq),
+            Some(2)
+        );
+        let retained = store
+            .latest_terminal_turn("codex:thread-1")
+            .unwrap_or_else(|| panic!("the previous result was hidden by the active turn"));
+        assert_eq!(retained.execution_seq, 1);
+        assert_eq!(retained.final_message.as_deref(), Some("first-answer"));
+    }
+
+    #[test]
+    fn retained_events_are_never_rewritten_by_a_rekey() {
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "internal:LAUNCH01",
+                alias: "@worker",
+                title: "worker",
+                agent: "claude",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        store.record_event(Some("internal:LAUNCH01"), None, "session.created");
+        let launch_uid = store
+            .session_uid("internal:LAUNCH01")
+            .unwrap_or_else(|| panic!("launch uid missing"));
+        let before = store.read_events(None, 0);
+
+        store
+            .rekey_session("internal:LAUNCH01", "claude:provider-1")
+            .unwrap_or_else(|error| panic!("failed to promote: {error}"));
+        store.record_event(Some("claude:provider-1"), None, "session.created");
+
+        let after = store.read_events(None, 0);
+        assert_eq!(
+            after[0].session_id, before[0].session_id,
+            "a retained event was rewritten"
+        );
+        assert_eq!(after[0].session_uid.as_deref(), Some(launch_uid.as_str()));
+        assert_eq!(after[1].session_id.as_deref(), Some("claude:provider-1"));
+        assert_eq!(after.len(), 2);
+    }
+
+    #[test]
     fn retained_events_survive_result_eviction_and_rekey_unchanged() {
         let mut store = ready_store();
         store
@@ -1720,6 +1787,10 @@ mod tests {
         let uid = store
             .session_uid("codex:thread-1")
             .unwrap_or_else(|| panic!("session uid missing"));
+        // The launch event keeps the identity it was written with; the
+        // canonical timeline is recorded after binding.
+        assert!(store.read_events(Some(&uid), 0).is_empty());
+        store.record_event(Some("codex:thread-1"), None, "session.created");
         assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
         assert_eq!(
             store.read_output_page("codex:thread-1", 0, 64).data,
