@@ -503,11 +503,34 @@ fn command_models(args: &[String]) -> Result<()> {
         &["--harness"],
     )?;
     parsed.no_positionals()?;
-    let result = client::call(
-        "model.list",
-        json!({"harness":parsed.required("--harness")?,"include_hidden":parsed.flag("--include-hidden")}),
-    )?;
-    print_success(result, parsed.flag("--pretty"))
+    let include_hidden = parsed.flag("--include-hidden");
+    if let Some(harness) = parsed.one("--harness") {
+        let result = client::call(
+            "model.list",
+            json!({"harness":harness,"include_hidden":include_hidden}),
+        )?;
+        return print_success(result, parsed.flag("--pretty"));
+    }
+    // Bare `dlgt models` is a discovery request, not an assertion that every
+    // Harness is reachable: one unavailable provider must not hide the other.
+    let harnesses = ["codex", "claude"]
+        .into_iter()
+        .map(|harness| {
+            client::call(
+                "model.list",
+                json!({"harness":harness,"include_hidden":include_hidden}),
+            )
+            .unwrap_or_else(|error| {
+                json!({
+                    "harness": harness,
+                    "discovery": "unavailable",
+                    "models": [],
+                    "error": format!("{error:#}"),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    print_success(json!({"harnesses":harnesses}), parsed.flag("--pretty"))
 }
 
 fn command_profiles(args: &[String]) -> Result<()> {
@@ -952,7 +975,7 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt logs - read raw retained PTY bytes for diagnosis\n\nUSAGE\n  dlgt logs <SESSION_ID|@ALIAS> --raw [--json]\n\nOPTIONS\n  --raw        Required capability flag; write raw bytes to stdout\n  --json       Return the bytes as base64 JSON\n  -h, --help   Print this help"
         }
         "models" => {
-            "dlgt models - discover models supported by a Harness\n\nUSAGE\n  dlgt models --harness <codex|claude> [OPTIONS]\n\nOPTIONS\n  --harness <codex|claude>   Harness to query (required)\n  --include-hidden           Include hidden models\n  --pretty                   Pretty-print JSON output\n  -h, --help                 Print this help"
+            "dlgt models - discover models supported by a Harness\n\nUSAGE\n  dlgt models [OPTIONS]\n  dlgt models --harness <codex|claude> [OPTIONS]\n\nOPTIONS\n  --harness <codex|claude>   Query one Harness; omitted queries both\n  --include-hidden           Include hidden models\n  --pretty                   Pretty-print JSON output\n  -h, --help                 Print this help\n\nWithout --harness the response lists every Harness, and one that cannot be\nreached reports discovery: \"unavailable\" instead of failing the command."
         }
         "profiles" => {
             "dlgt profiles - list or inspect launch Profiles\n\nUSAGE\n  dlgt profiles list [--pretty]\n  dlgt profiles show <NAME> [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
