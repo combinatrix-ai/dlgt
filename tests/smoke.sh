@@ -314,12 +314,26 @@ done
 gap_json=$("$binary" fetch "$reused_id" --cursor "$flood_cursor")
 printf '%s\n' "$gap_json" | grep -q '"component":"screen","reason":"retention_overrun"'
 printf '%s\n' "$gap_json" | grep -q '"stable":\["flood-'
+gap_cursor=$(printf '%s\n' "$gap_json" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+"$binary" fetch "$reused_id" --cursor "$flood_cursor" --screen=5 | grep -q '"stable":\["flood-'
+if "$binary" fetch "$reused_id" --cursor "$flood_cursor" --no-screen \
+  | grep -q '"screen"'; then exit 1; fi
+"$binary" scrollback "$reused_id" --lines 5 | grep -q '"truncated":true'
+
+# A long final_text is chunked at a UTF-8 boundary and continued by cursor.
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","user_prompt":"flood-the-screen"}' \
   | "$binary" hook emit "$reused_id" claude
-printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","last_assistant_message":"flood-done"}' \
+printf '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","last_assistant_message":"%s"}\n' "$long_message" \
   | "$binary" hook emit "$reused_id" claude
-"$binary" fetch "$reused_id" --until result --wait 4s | grep -q '"final_text":"flood-done"'
-"$binary" scrollback "$reused_id" --lines 5 | grep -q '"truncated":true'
+chunk_json=$("$binary" fetch "$reused_id" --cursor "$gap_cursor" --no-screen --max-bytes 4096)
+printf '%s\n' "$chunk_json" | grep -q '"final_text_complete":false'
+printf '%s\n' "$chunk_json" | grep -q '"final_text_offset":0'
+printf '%s\n' "$chunk_json" | grep -q '"has_more":true'
+printf '%s\n' "$chunk_json" | grep -q '"reason":"page_full"'
+chunk_cursor=$(printf '%s\n' "$chunk_json" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+rest_json=$("$binary" fetch "$reused_id" --cursor "$chunk_cursor" --no-screen)
+printf '%s\n' "$rest_json" | grep -q '"final_text_complete":true'
+if printf '%s\n' "$rest_json" | grep -q '"final_text_offset":0'; then exit 1; fi
 
 # fetch --all reports every Session of one daemon without a screen projection.
 all_json=$("$binary" fetch --all)
