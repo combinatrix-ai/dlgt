@@ -605,8 +605,31 @@ first.
 Progress comes from chunking, never from oversizing. A long `final_text` is
 chunked at a UTF-8 boundary and continued through `final_text_offset` and
 `final_text_complete`; a screen row wider than the remaining budget is chunked
-mid-line and continued on the next call. Both continuations are carried in the
-cursor, so every `has_more` response advances at least one watermark.
+mid-line. Both continuations are carried in the cursor, so every `has_more`
+response advances at least one watermark.
+
+`screen.stable` always contains complete rows and nothing else. A row that had
+to be split is carried separately:
+
+```json
+{
+  "screen": {
+    "stable": ["Found one race."],
+    "stable_fragment": {"row_id": 8412, "offset": 4096, "text": "...", "complete": false}
+  }
+}
+```
+
+To reassemble: concatenate every `stable_fragment.text` seen for a given
+`row_id` in `offset` order until one arrives with `complete: true`. That is the
+whole row. A row never appears in both `stable` and `stable_fragment`, and at
+most one row is fragmented per response; whole rows resume once the fragment
+completes. Callers that only want finished rows can ignore `stable_fragment`
+until `complete` is true.
+
+Lifecycle events are delivered as a strictly ascending prefix: the response
+never skips an event to deliver a later one, so the event watermark is always
+a position with nothing outstanding behind it.
 
 If `--max-bytes` is too small to carry the response envelope plus one chunk of
 progress, `fetch` fails with `INVALID_ARGUMENT` and names the smallest budget

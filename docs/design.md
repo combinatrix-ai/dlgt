@@ -397,14 +397,18 @@ cannot leave a watermark past data the caller never received.
 - Rebasing the VT emulator serializes only the visible grid. Scroll margins
   (`DECSTBM`), origin mode, the saved cursor, and pending wrap are lost across
   a main-screen rebase because the emulator exposes none of them. Already
-  promoted rows are unaffected, and full-screen applications re-issue these
-  modes on their next repaint.
+  promoted rows are unaffected, but applications do not re-issue margins on
+  every repaint, so a lost region can also change how the live grid scrolls
+  afterwards until the application happens to set it again.
 - The Claude transcript fallback canonicalizes a path, then opens it with
   `O_NOFOLLOW` and verifies the descriptor by device and inode. Swapping an
   *intermediate* directory between those two steps is not detected; closing it
-  needs an `openat2(RESOLVE_BENEATH)`-style walk. The transcript is written by
-  a same-user provider that can already modify the target directly, so this
-  race grants no privilege it does not already have.
+  needs an `openat2(RESOLVE_BENEATH)`-style walk. The acceptance boundary is
+  also taken by a separate, unconfined metadata lookup at hook time with no
+  binding to the file identity later opened, so a replaced file could pair a
+  stale offset with new content. The transcript is written by a same-user
+  provider that can already modify the target directly, so neither race grants
+  a privilege it does not already have.
 
 ## Launch environment and security
 

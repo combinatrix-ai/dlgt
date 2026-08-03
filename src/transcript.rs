@@ -19,6 +19,11 @@ pub const TAIL_LIMIT: u64 = 2 * 1024 * 1024;
 
 /// Byte offset recorded when an execution is accepted. Only assistant
 /// messages written after it belong to that execution.
+///
+/// Accepted residual, recorded in docs/design.md: this lookup is unconfined
+/// and binds to a path rather than to a file identity, so a replaced file
+/// could pair a stale offset with new content. The provider that writes the
+/// transcript runs as the same user and can already modify it directly.
 pub fn boundary(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.len())
 }

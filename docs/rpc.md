@@ -253,10 +253,25 @@ derived from what that document actually carries, so it can never advance past
 omitted content. Progress under a tight budget comes from chunking: a long
 `final_text` is chunked at a UTF-8 boundary and continued with
 `final_text_offset` and `final_text_complete`, and a screen row wider than the
-remaining budget is chunked mid-line and continued through the cursor. Every
-`has_more` response advances at least one watermark. A `max_bytes` too small
-for the envelope plus one chunk fails with `INVALID_ARGUMENT` naming the
-smallest workable value instead of emitting an oversized document.
+remaining budget is chunked mid-line. Every `has_more` response advances at
+least one watermark. A `max_bytes` too small for the envelope plus one chunk
+fails with `INVALID_ARGUMENT` naming the smallest workable value instead of
+emitting an oversized document.
+
+`screen.stable` contains complete rows only. A split row is carried as
+`screen.stable_fragment`:
+
+```json
+{"row_id":8412,"offset":4096,"text":"...","complete":false}
+```
+
+Reassemble by concatenating each `row_id`'s fragment `text` in `offset` order
+until `complete` is true. A row never appears in both `stable` and
+`stable_fragment`, and at most one row is fragmented per response.
+
+Lifecycle events are committed as a strictly ascending prefix across every
+Session in the response, so a Session that did not fit the page can never park
+an earlier event behind a later one that keeps redelivering.
 
 Cursors are opaque, prefixed `f1.`, and carry the codec version, the daemon
 boot identity, the addressed scope, and per-Session watermarks. They bind to an
