@@ -387,6 +387,25 @@ a canceled result all exit zero and are described by the response `reason` and
 result status. Non-zero exits remain for malformed requests, unknown Sessions,
 unusable cursors, and transport failure.
 
+A response is assembled one unit at a time. Each watermark is recorded only
+when the unit it describes is committed and survives the final measurement,
+and the cursor is encoded last from the committed set, so a squeezed response
+cannot leave a watermark past data the caller never received.
+
+### Known limitations
+
+- Rebasing the VT emulator serializes only the visible grid. Scroll margins
+  (`DECSTBM`), origin mode, the saved cursor, and pending wrap are lost across
+  a main-screen rebase because the emulator exposes none of them. Already
+  promoted rows are unaffected, and full-screen applications re-issue these
+  modes on their next repaint.
+- The Claude transcript fallback canonicalizes a path, then opens it with
+  `O_NOFOLLOW` and verifies the descriptor by device and inode. Swapping an
+  *intermediate* directory between those two steps is not detected; closing it
+  needs an `openat2(RESOLVE_BENEATH)`-style walk. The transcript is written by
+  a same-user provider that can already modify the target directly, so this
+  race grants no privilege it does not already have.
+
 ## Launch environment and security
 
 Profiles are expanded by the client before RPC:

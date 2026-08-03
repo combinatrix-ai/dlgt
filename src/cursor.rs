@@ -17,9 +17,11 @@ pub const CURSOR_CODEC_VERSION: u32 = 1;
 /// Scope covering every Session owned by one daemon.
 pub const SCOPE_ALL: &str = "all";
 /// Longest cursor token accepted. A cursor is daemon-issued; anything larger
-/// is a hostile or corrupted token, not a token this daemon wrote.
-const MAX_TOKEN_LEN: usize = 8 * 1024;
-/// Most per-Session watermarks a cursor may carry.
+/// is a hostile or corrupted token, not a token this daemon wrote. The bound
+/// is wide enough to represent a full `MAX_SESSIONS` cursor.
+const MAX_TOKEN_LEN: usize = 64 * 1024;
+/// Most per-Session watermarks a cursor may carry. A daemon with more
+/// Sessions than this holding retained state must be read per Session.
 const MAX_SESSIONS: usize = 256;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -45,9 +47,13 @@ pub struct Cursor {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SessionCursor {
-    /// Stable absolute row watermark.
+    /// Stable absolute row watermark: the last row delivered in full.
     #[serde(default)]
     pub r: u64,
+    /// Bytes of row `r + 1` a previous response already delivered. Non-zero
+    /// only while one oversized row is being chunked across responses.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ro: u64,
     /// Screen epoch observed when the cursor was issued.
     #[serde(default)]
     pub ep: u64,
@@ -87,12 +93,27 @@ impl Cursor {
         self.p.insert(uid.to_owned(), session);
     }
 
+    /// Encode a cursor, enforcing the same bounds the decoder enforces. A
+    /// daemon must never issue a token it would refuse to accept back.
     pub fn encode(&self) -> Result<String> {
+        if self.p.len() > MAX_SESSIONS {
+            bail!(
+                "invalid scope: {} Sessions carry retained state, more than the {MAX_SESSIONS} a cursor can address; fetch Sessions individually instead of --all",
+                self.p.len()
+            );
+        }
         let payload = serde_json::to_vec(self)?;
-        Ok(format!(
+        let token = format!(
             "{CURSOR_PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-        ))
+        );
+        if token.len() > MAX_TOKEN_LEN {
+            bail!(
+                "invalid scope: the cursor would be {} bytes, over the {MAX_TOKEN_LEN} byte limit; fetch Sessions individually instead of --all",
+                token.len()
+            );
+        }
+        Ok(token)
     }
 
     /// Decode a caller-supplied cursor and validate it against this daemon.
@@ -157,6 +178,7 @@ mod tests {
             "su_abc",
             SessionCursor {
                 r: 512,
+                ro: 0,
                 ep: 3,
                 x: 7,
                 px: Some(8),
@@ -208,15 +230,77 @@ mod tests {
     }
 
     #[test]
+    fn every_issued_cursor_round_trips_through_decode() {
+        for count in [0, 1, 32, super::MAX_SESSIONS] {
+            let mut cursor = Cursor::new("boot-1", SCOPE_ALL);
+            cursor.e = 4_096;
+            for index in 0..count {
+                cursor.set_session(
+                    &format!("su_{}", "0".repeat(24) + &index.to_string()),
+                    SessionCursor {
+                        r: 9_999,
+                        ro: 12,
+                        ep: 7,
+                        x: 128,
+                        px: Some(129),
+                        po: 4_096,
+                    },
+                );
+            }
+            let encoded = cursor
+                .encode()
+                .unwrap_or_else(|error| panic!("{count} Sessions failed to encode: {error}"));
+            assert!(encoded.len() <= super::MAX_TOKEN_LEN);
+            assert_eq!(
+                Cursor::decode(&encoded, "boot-1")
+                    .unwrap_or_else(|error| panic!("{count} Sessions failed to decode: {error}")),
+                cursor
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_wider_than_the_codec_allows_is_rejected_when_issued() {
+        let mut cursor = Cursor::new("boot-1", SCOPE_ALL);
+        for index in 0..300 {
+            cursor.set_session(
+                &format!("su_{index}"),
+                SessionCursor {
+                    x: 1,
+                    ..SessionCursor::default()
+                },
+            );
+        }
+        let error = cursor
+            .encode()
+            .err()
+            .unwrap_or_else(|| panic!("an unusable cursor was issued"));
+        assert!(
+            error.to_string().contains("invalid scope"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn hostile_cursors_are_rejected_without_panicking() {
         let oversized = format!("{CURSOR_PREFIX}{}", "A".repeat(super::MAX_TOKEN_LEN));
-        let mut crowded = Cursor::new("boot-1", "su_abc");
+        let mut oversized_scope = Cursor::new("boot-1", "su_abc");
         for index in 0..=super::MAX_SESSIONS {
-            crowded.set_session(&format!("su_{index}"), SessionCursor::default());
+            oversized_scope.set_session(
+                &format!("su_{index}"),
+                SessionCursor {
+                    x: 1,
+                    ..SessionCursor::default()
+                },
+            );
         }
-        let crowded = crowded
-            .encode()
-            .unwrap_or_else(|error| panic!("failed to encode cursor: {error}"));
+        // Built by hand: the encoder refuses to issue this, but a caller can
+        // still hand it to the decoder.
+        let crowded = format!(
+            "{CURSOR_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&oversized_scope).unwrap_or_default())
+        );
         let cases = [
             String::new(),
             "f1.".to_owned(),

@@ -334,9 +334,9 @@ impl ScreenStore {
     /// into stable history. Deferring is safe and bounded: the alternate grid
     /// has no scrollback, so `consumed` cannot grow while it is active.
     ///
-    /// Known residual on the main screen: scroll margins (DECSTBM), origin
-    /// mode, the saved cursor, and pending wrap are not carried by
-    /// `state_formatted` and are lost across a rebase. vt100 exposes none of
+    /// Accepted residual on the main screen, recorded in docs/design.md:
+    /// scroll margins (DECSTBM), origin mode, the saved cursor, and pending
+    /// wrap are not carried by `state_formatted` and are lost across a rebase. vt100 exposes none of
     /// them, so they cannot be preserved without forking the emulator. Full
     /// screen applications re-issue them on their next repaint, and a lost
     /// margin only affects live-grid rendering, never already-promoted rows.

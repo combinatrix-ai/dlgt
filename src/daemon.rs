@@ -33,7 +33,6 @@ const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// pays for every byte, so pagination is not optional implementation tuning.
 const FETCH_DEFAULT_MAX_BYTES: usize = 32 * 1024;
 const FETCH_HARD_MAX_BYTES: usize = 256 * 1024;
-const FETCH_MIN_MAX_BYTES: usize = 2 * 1024;
 const FETCH_EVENT_PAGE: usize = 64;
 const FETCH_RESULT_PAGE: usize = 4;
 const FETCH_STABLE_PAGE: usize = 128;
@@ -43,10 +42,8 @@ const FETCH_SESSION_PAGE: usize = 32;
 /// A long poll is bounded only to catch typos and leaked waiters.
 const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const FETCH_ENVELOPE_RESERVE: usize = 1024;
 /// Acceptance receipts retained per daemon, evicted first-in-first-out.
 const REQUEST_RECEIPT_LIMIT: usize = 1024;
-const FETCH_SESSION_CURSOR_RESERVE: usize = 128;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -1555,6 +1552,7 @@ impl Daemon {
             &uid,
             cursor::SessionCursor {
                 r: store.stable_head(&uid),
+                ro: 0,
                 ep: store.screen_epoch(&uid),
                 x: store.latest_result_seq(&uid),
                 px: None,
@@ -1624,7 +1622,10 @@ impl Daemon {
                 .unwrap_or(FETCH_DEFAULT_MAX_BYTES as u64),
         )
         .unwrap_or(FETCH_DEFAULT_MAX_BYTES)
-        .clamp(FETCH_MIN_MAX_BYTES, FETCH_HARD_MAX_BYTES);
+        .min(FETCH_HARD_MAX_BYTES);
+        if max_bytes == 0 {
+            bail!("invalid max_bytes; the response budget must be positive");
+        }
         let screen = params.get("screen").unwrap_or(&Value::Null);
         let stable_limit = match screen {
             Value::Bool(false) => 0,
@@ -1715,7 +1716,6 @@ impl Daemon {
             }
             store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
         };
-        validate_continuation(&position, &results)?;
 
         let stable = if options.stable_limit == 0 {
             crate::screen::StablePage {
@@ -1723,13 +1723,16 @@ impl Daemon {
                 ..crate::screen::StablePage::default()
             }
         } else if baseline {
+            position.ro = 0;
             store.stable_tail(&uid, options.stable_limit)
         } else {
             store.stable_page(&uid, position.r, options.stable_limit)
         };
         if stable.gap {
             gaps.push(retention_gap("screen"));
+            position.ro = 0;
         }
+        validate_continuation(&position, &results, &stable.lines)?;
         let live = if options.stable_limit == 0 {
             crate::store::LiveScreen {
                 epoch: store.screen_epoch(&uid),
@@ -1757,30 +1760,38 @@ impl Daemon {
         let public = self.public_session_locked(&store, &session)?;
         drop(store);
 
+        let stable_start = stable
+            .next_after
+            .saturating_sub(u64::try_from(stable.lines.len()).unwrap_or(0));
         Ok(Cut {
             baseline,
             state: Some(session.state),
             bound_seq: *bound,
             bound_terminal,
-            event_watermark,
-            events_more,
-            dropped_event_seq: None,
+            full_event_watermark: event_watermark,
+            events_complete: !events_more,
             scope_gaps,
-            buckets: vec![Bucket::new(BucketInput {
-                uid,
+            sources: vec![BucketSource {
+                uid: uid.clone(),
                 session: public,
                 gaps,
                 events: events.into_iter().map(|(_, event)| event).collect(),
                 results,
                 results_more,
-                stable,
-                live,
+                stable_offset: usize::try_from(position.ro).unwrap_or(0),
+                stable: stable.lines,
+                stable_start,
+                stable_more: stable.has_more,
+                live: live.rows,
+                live_truncated: live.truncated,
+                epoch: live.epoch,
                 epoch_reset,
+                reset_reason: live.reset_reason,
                 screen: options.stable_limit > 0,
                 incoming: position,
-            })],
-            sessions_more: false,
-            baseline_next: None,
+            }],
+            more_candidates: false,
+            live_uids: vec![uid],
         })
     }
 
@@ -1807,27 +1818,23 @@ impl Daemon {
             normalized_page(&store, None, after, FETCH_EVENT_PAGE)
         };
 
-        // Bucket the global event page. A Session that does not fit this page
-        // records the sequence it refused so the shared watermark cannot move
-        // past it.
-        let mut order: Vec<String> = Vec::new();
         let mut by_uid: HashMap<String, Vec<Value>> = HashMap::new();
-        let mut dropped_event_seq: Option<i64> = None;
+        let mut events_complete = !events_more;
         for (uid, event) in events {
             let Some(uid) = uid else { continue };
-            if !by_uid.contains_key(&uid) && order.len() >= FETCH_SESSION_PAGE {
-                let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
-                dropped_event_seq =
-                    Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
-                continue;
-            }
-            if !by_uid.contains_key(&uid) {
-                order.push(uid.clone());
-            }
             by_uid.entry(uid).or_default().push(event);
         }
 
-        let mut candidates = store.session_uids();
+        let live_uids = store
+            .session_uids()
+            .into_iter()
+            .filter(|uid| {
+                store
+                    .session_for_uid(uid)
+                    .is_some_and(|session| !session.id.starts_with("internal:"))
+            })
+            .collect::<Vec<_>>();
+        let mut candidates = live_uids.clone();
         if baseline && let Some(resume) = options.resume_after() {
             let start = candidates
                 .iter()
@@ -1836,16 +1843,12 @@ impl Daemon {
             candidates.drain(..start);
         }
 
-        let mut buckets = Vec::new();
-        let mut included_last = None;
-        let mut remaining = false;
+        let mut sources = Vec::new();
+        let mut more_candidates = false;
         for uid in candidates {
             let Some(session) = store.session_for_uid(&uid) else {
                 continue;
             };
-            if session.id.starts_with("internal:") {
-                continue;
-            }
             let mut position = options.position(&uid);
             let events = by_uid.remove(&uid).unwrap_or_default();
             let mut gaps = Vec::new();
@@ -1863,34 +1866,41 @@ impl Daemon {
                 }
                 store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
             };
-            validate_continuation(&position, &results)?;
             if !baseline && events.is_empty() && results.is_empty() {
                 continue;
             }
-            if buckets.len() >= FETCH_SESSION_PAGE {
-                remaining = true;
-                break;
+            validate_continuation(&position, &results, &[])?;
+            if sources.len() >= FETCH_SESSION_PAGE {
+                more_candidates = true;
+                if !events.is_empty() {
+                    events_complete = false;
+                }
+                continue;
             }
-            buckets.push(Bucket::new(BucketInput {
+            sources.push(BucketSource {
                 uid: uid.clone(),
                 session: self.public_session_locked(&store, &session)?,
                 gaps,
                 events,
                 results,
                 results_more,
-                stable: crate::screen::StablePage {
-                    next_after: store.stable_head(&uid),
-                    ..crate::screen::StablePage::default()
-                },
-                live: crate::store::LiveScreen {
-                    epoch: store.screen_epoch(&uid),
-                    ..crate::store::LiveScreen::default()
-                },
+                stable: Vec::new(),
+                stable_start: store.stable_head(&uid),
+                stable_offset: 0,
+                stable_more: false,
+                live: Vec::new(),
+                live_truncated: false,
+                epoch: store.screen_epoch(&uid),
                 epoch_reset: false,
+                reset_reason: None,
                 screen: false,
                 incoming: position,
-            }));
-            included_last = Some(uid);
+            });
+        }
+        // Events for Sessions this page never reached must not be counted as
+        // delivered by the shared watermark.
+        if !by_uid.is_empty() {
+            events_complete = false;
         }
         drop(store);
 
@@ -1899,17 +1909,12 @@ impl Daemon {
             state: None,
             bound_seq: None,
             bound_terminal: false,
-            event_watermark,
-            events_more,
-            dropped_event_seq,
+            full_event_watermark: event_watermark,
+            events_complete,
             scope_gaps,
-            buckets,
-            sessions_more: remaining && !baseline,
-            baseline_next: if remaining && baseline {
-                included_last
-            } else {
-                None
-            },
+            sources,
+            more_candidates,
+            live_uids,
         })
     }
 
@@ -3277,41 +3282,36 @@ struct Cut {
     /// Execution bound by `--until result`, and whether it has terminalized.
     bound_seq: Option<i64>,
     bound_terminal: bool,
-    /// Event watermark to publish when every candidate event is delivered.
-    event_watermark: i64,
-    events_more: bool,
-    /// Lowest event sequence this cut already refused to bucket.
-    dropped_event_seq: Option<i64>,
+    /// Event watermark that may be published only when every candidate event
+    /// is committed and nothing hid one.
+    full_event_watermark: i64,
+    events_complete: bool,
     /// Scope-wide gaps. Per-Session gaps live on the bucket.
     scope_gaps: Vec<Value>,
-    buckets: Vec<Bucket>,
-    sessions_more: bool,
-    /// `--all` baseline enumeration position for the next page.
-    baseline_next: Option<String>,
+    sources: Vec<BucketSource>,
+    /// Sessions this cut did not include at all.
+    more_candidates: bool,
+    /// Every live Session UID, used to prune an `--all` cursor.
+    live_uids: Vec<String>,
 }
 
-/// One Session's renderable payload. Every variable-length field keeps its
-/// full candidate list plus an inclusion count, so the shrink loop can shed
-/// content in reverse priority order and still know what it left behind.
+/// Everything one Session could contribute. The builder decides what actually
+/// ships; nothing here is a promise.
 #[allow(clippy::struct_excessive_bools)]
-struct Bucket {
+struct BucketSource {
     uid: String,
     session: Value,
     gaps: Vec<Value>,
     events: Vec<Value>,
-    events_len: usize,
-    results: Vec<ResultChunk>,
-    results_len: usize,
+    results: Vec<TurnRecord>,
     results_more: bool,
     stable: Vec<String>,
-    stable_len: usize,
-    /// Byte length the last included stable row is truncated to.
-    stable_truncate: Option<usize>,
     /// Row ID immediately before `stable[0]`.
     stable_start: u64,
+    /// Bytes of `stable[0]` a previous response already delivered.
+    stable_offset: usize,
     stable_more: bool,
     live: Vec<String>,
-    live_included: bool,
     live_truncated: bool,
     epoch: u64,
     epoch_reset: bool,
@@ -3320,60 +3320,498 @@ struct Bucket {
     incoming: cursor::SessionCursor,
 }
 
-/// A retained result plus how much of its `final_text` this response carries.
-struct ResultChunk {
-    exec: i64,
-    base: Value,
-    text: String,
-    offset: u64,
-    take: usize,
+/// One Session bucket as committed so far.
+#[allow(clippy::struct_excessive_bools)]
+struct Committed {
+    uid: String,
+    session: Value,
+    gaps: Vec<Value>,
+    results: Vec<Value>,
+    events: Vec<Value>,
+    stable: Vec<String>,
+    live: Vec<String>,
+    live_truncated: bool,
+    screen: bool,
+    epoch: u64,
+    epoch_reset: bool,
+    reset_reason: Option<&'static str>,
+    /// Watermarks for exactly the units committed above.
+    position: cursor::SessionCursor,
 }
 
-impl ResultChunk {
-    fn new(turn: &TurnRecord, offset: u64) -> Self {
-        let mut base = public_result(turn);
-        base["final_text"] = json!("");
-        let text = turn.final_message.clone().unwrap_or_default();
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(text.len());
-        let start = char_floor(&text, start);
-        let text = text[start..].to_owned();
-        let take = text.len();
-        Self {
-            exec: turn.execution_seq,
-            base,
-            text,
-            offset: u64::try_from(start).unwrap_or(0),
-            take,
-        }
-    }
-
-    fn complete(&self) -> bool {
-        self.take == self.text.len()
-    }
-
-    /// Take the largest UTF-8 prefix whose encoded record fits `budget`.
-    /// Chunking beats dropping: the result body is what the caller asked for.
-    fn fit(&mut self, budget: usize) {
-        self.take = self.text.len();
-        while self.take > 0 && json_cost(&self.value()) > budget {
-            let next = self.take * 3 / 4;
-            let next = if next == self.take {
-                self.take - 1
-            } else {
-                next
-            };
-            self.take = char_floor(&self.text, next);
-        }
-    }
-
+impl Committed {
     fn value(&self) -> Value {
-        let mut value = self.base.clone();
-        value["final_text"] = json!(&self.text[..self.take]);
-        value["final_text_offset"] = json!(self.offset);
-        value["final_text_complete"] = json!(self.complete());
-        value
+        let mut bucket = json!({
+            "session": self.session,
+            "gaps": self.gaps,
+            "results": self.results,
+            "events": self.events,
+        });
+        if self.screen {
+            bucket["screen"] = json!({
+                "epoch": self.epoch,
+                "reset": self.epoch_reset,
+                "reset_reason": self.epoch_reset.then_some(self.reset_reason).flatten(),
+                "stable": self.stable,
+                "live": self.live,
+                "live_truncated": self.live_truncated,
+            });
+        }
+        bucket
+    }
+}
+
+/// A committed unit, recorded so a rollback can undo exactly what it did.
+enum Unit {
+    Bucket,
+    Result {
+        bucket: usize,
+        previous: cursor::SessionCursor,
+    },
+    Event {
+        bucket: usize,
+    },
+    Stable {
+        bucket: usize,
+        previous: cursor::SessionCursor,
+    },
+    Live {
+        bucket: usize,
+    },
+}
+
+struct Rendered {
+    value: Value,
+    /// The long poll is finished: either something wake-worthy happened or the
+    /// requested binding is satisfied.
+    settled: bool,
+}
+
+/// Assembles a response one unit at a time.
+///
+/// A watermark is recorded only when the unit it describes is committed, and
+/// the cursor is encoded last from the committed set, so shedding cannot leave
+/// a watermark past data the caller never received. Byte accounting is exact
+/// per unit; the finished document is measured once and units are rolled back
+/// until it fits, which can only shrink the cursor further.
+struct Builder<'a> {
+    cut: &'a Cut,
+    options: &'a FetchOptions,
+    buckets: Vec<Committed>,
+    units: Vec<Unit>,
+    /// Exact serialized cost of the committed payload.
+    used: usize,
+    /// Serialized cost of the fixed document skeleton, cursor excluded.
+    skeleton: usize,
+}
+
+/// Bytes reserved for each Session's watermarks inside the encoded cursor.
+const CURSOR_ENTRY_RESERVE: usize = 160;
+const CURSOR_BASE_RESERVE: usize = 256;
+
+impl<'a> Builder<'a> {
+    fn new(cut: &'a Cut, options: &'a FetchOptions) -> Result<Self> {
+        let skeleton = json!({
+            "schema_version": 1,
+            "runtime": {"version": env!("CARGO_PKG_VERSION"), "instance_id": options.instance_id},
+            "reason": "page_full",
+            "has_more": true,
+            "gaps": cut.scope_gaps,
+            "cursor": "",
+            "sessions": [],
+        });
+        Ok(Self {
+            cut,
+            options,
+            buckets: Vec::new(),
+            units: Vec::new(),
+            used: 0,
+            skeleton: serialized_len(&skeleton)?,
+        })
+    }
+
+    /// Fixed cost of the document as currently committed, including room for
+    /// the cursor entries it will carry plus the one being considered.
+    fn envelope(&self) -> usize {
+        self.skeleton + CURSOR_BASE_RESERVE + CURSOR_ENTRY_RESERVE * (self.buckets.len() + 1)
+    }
+
+    fn remaining(&self) -> usize {
+        self.options
+            .max_bytes
+            .saturating_sub(self.envelope() + self.used)
+    }
+
+    /// Commit the mandatory part of each Session bucket: identity and gaps.
+    fn commit_buckets(&mut self) {
+        for source in &self.cut.sources {
+            let mut committed = Committed {
+                uid: source.uid.clone(),
+                session: source.session.clone(),
+                gaps: source.gaps.clone(),
+                results: Vec::new(),
+                events: Vec::new(),
+                stable: Vec::new(),
+                live: Vec::new(),
+                live_truncated: source.live_truncated,
+                screen: source.screen,
+                epoch: source.epoch,
+                epoch_reset: source.epoch_reset,
+                reset_reason: source.reset_reason,
+                position: source.incoming,
+            };
+            // The screen projection publishes the current epoch even when no
+            // row ships, and a screenless bucket carries the head row forward.
+            committed.position.ep = source.epoch;
+            if !source.screen {
+                committed.position.r = source.stable_start;
+                committed.position.ro = 0;
+            }
+            let cost = json_cost(&committed.value());
+            if cost > self.remaining() {
+                return;
+            }
+            self.used += cost;
+            self.buckets.push(committed);
+            self.units.push(Unit::Bucket);
+        }
+    }
+
+    fn commit_results(&mut self) {
+        for index in 0..self.buckets.len() {
+            let source = &self.cut.sources[index];
+            for turn in &source.results {
+                let offset = if self.buckets[index].position.px == Some(turn.execution_seq) {
+                    self.buckets[index].position.po
+                } else {
+                    0
+                };
+                let Some((value, take, complete)) = fit_result(turn, offset, self.remaining())
+                else {
+                    return;
+                };
+                let previous = self.buckets[index].position;
+                self.used += json_cost(&value);
+                self.buckets[index].results.push(value);
+                let position = &mut self.buckets[index].position;
+                if complete {
+                    position.x = turn.execution_seq;
+                    position.px = None;
+                    position.po = 0;
+                } else {
+                    position.px = Some(turn.execution_seq);
+                    position.po = offset + u64::try_from(take).unwrap_or(0);
+                }
+                self.units.push(Unit::Result {
+                    bucket: index,
+                    previous,
+                });
+                if !complete {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn commit_events(&mut self) {
+        for index in 0..self.buckets.len() {
+            for event in &self.cut.sources[index].events {
+                let cost = json_cost(event);
+                if cost > self.remaining() {
+                    return;
+                }
+                self.used += cost;
+                self.buckets[index].events.push(event.clone());
+                self.units.push(Unit::Event { bucket: index });
+            }
+        }
+    }
+
+    fn commit_screen(&mut self) {
+        for index in 0..self.buckets.len() {
+            let source = &self.cut.sources[index];
+            if !source.screen {
+                continue;
+            }
+            for (row, line) in source.stable.iter().enumerate() {
+                let start = if row == 0 { source.stable_offset } else { 0 };
+                let start = char_floor(line, start.min(line.len()));
+                let remainder = &line[start..];
+                let Some(take) = fit_text(remainder, self.remaining()) else {
+                    return;
+                };
+                let previous = self.buckets[index].position;
+                let id = source.stable_start + u64::try_from(row).unwrap_or(0) + 1;
+                self.used += json_cost(&Value::String(remainder[..take].to_owned()));
+                self.buckets[index]
+                    .stable
+                    .push(remainder[..take].to_owned());
+                let position = &mut self.buckets[index].position;
+                let complete = take == remainder.len();
+                if complete {
+                    position.r = id;
+                    position.ro = 0;
+                } else {
+                    position.r = id - 1;
+                    position.ro = u64::try_from(start + take).unwrap_or(0);
+                }
+                self.units.push(Unit::Stable {
+                    bucket: index,
+                    previous,
+                });
+                if !complete {
+                    return;
+                }
+            }
+        }
+        for index in 0..self.buckets.len() {
+            let source = &self.cut.sources[index];
+            if !source.screen || source.live.is_empty() {
+                continue;
+            }
+            let cost = json_cost(&Value::Array(
+                source
+                    .live
+                    .iter()
+                    .map(|line| Value::String(line.clone()))
+                    .collect(),
+            ));
+            if cost > self.remaining() {
+                continue;
+            }
+            self.used += cost;
+            self.buckets[index].live.clone_from(&source.live);
+            self.units.push(Unit::Live { bucket: index });
+        }
+    }
+
+    /// Undo the most recent commit, including the watermark it recorded.
+    fn rollback(&mut self) -> bool {
+        match self.units.pop() {
+            Some(Unit::Live { bucket }) => {
+                self.buckets[bucket].live.clear();
+                true
+            }
+            Some(Unit::Stable { bucket, previous }) => {
+                self.buckets[bucket].stable.pop();
+                self.buckets[bucket].position = previous;
+                true
+            }
+            Some(Unit::Event { bucket }) => {
+                self.buckets[bucket].events.pop();
+                true
+            }
+            Some(Unit::Result { bucket, previous }) => {
+                self.buckets[bucket].results.pop();
+                self.buckets[bucket].position = previous;
+                true
+            }
+            Some(Unit::Bucket) => {
+                self.buckets.pop();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sessions whose every candidate unit was committed.
+    fn events_fully_committed(&self) -> bool {
+        self.buckets.len() == self.cut.sources.len()
+            && self
+                .buckets
+                .iter()
+                .zip(&self.cut.sources)
+                .all(|(committed, source)| committed.events.len() == source.events.len())
+    }
+
+    fn pending(&self) -> bool {
+        if self.buckets.len() < self.cut.sources.len() || self.cut.more_candidates {
+            return true;
+        }
+        if !self.cut.events_complete {
+            return true;
+        }
+        self.buckets
+            .iter()
+            .zip(&self.cut.sources)
+            .any(|(committed, source)| {
+                source.results_more
+                    || source.stable_more
+                    || committed.events.len() < source.events.len()
+                    || committed.results.len() < source.results.len()
+                    || (source.screen && committed.stable.len() < source.stable.len())
+                    || committed.position.px.is_some()
+                    || committed.position.ro > 0
+            })
+    }
+
+    fn delivered(&self) -> bool {
+        self.buckets.iter().any(|bucket| {
+            !bucket.events.is_empty() || !bucket.results.is_empty() || !bucket.stable.is_empty()
+        })
+    }
+
+    /// Whether this response moves the caller forward at all. A baseline
+    /// advances by enumerating Sessions even when none of them has content.
+    fn progress(&self) -> bool {
+        if self.cut.baseline {
+            return !self.buckets.is_empty();
+        }
+        self.delivered()
+    }
+
+    /// Encode the cursor from the committed set only.
+    fn cursor(&self) -> Result<String> {
+        let mut next = cursor::Cursor::new(&self.options.instance_id, &self.options.scope);
+        if let Some(previous) = self.options.cursor.as_ref() {
+            // Carry only watermarks that still mean something: a Session that
+            // no longer exists, or one whose entry is the default, adds bytes
+            // without adding information.
+            next.p = previous
+                .p
+                .iter()
+                .filter(|(uid, position)| {
+                    **position != cursor::SessionCursor::default()
+                        && self.cut.live_uids.iter().any(|live| live == *uid)
+                })
+                .map(|(uid, position)| (uid.clone(), *position))
+                .collect();
+        }
+        for bucket in &self.buckets {
+            next.set_session(&bucket.uid, bucket.position);
+        }
+        next.p
+            .retain(|_, position| *position != cursor::SessionCursor::default());
+        let committed_event = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.events.iter())
+            .filter_map(|event| event.get("seq").and_then(Value::as_i64))
+            .max();
+        next.e = if self.events_fully_committed() && self.cut.events_complete {
+            self.cut.full_event_watermark
+        } else {
+            committed_event.unwrap_or_else(|| self.options.event_position())
+        };
+        if self.cut.baseline {
+            next.bl = (self.buckets.len() < self.cut.sources.len() || self.cut.more_candidates)
+                .then(|| self.buckets.last().map(|bucket| bucket.uid.clone()))
+                .flatten();
+        }
+        next.encode()
+    }
+
+    fn document(&self) -> Result<Value> {
+        Ok(json!({
+            "schema_version": 1,
+            "runtime": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "instance_id": self.options.instance_id,
+            },
+            "reason": "timeout",
+            "has_more": self.pending(),
+            "gaps": self.cut.scope_gaps,
+            "cursor": self.cursor()?,
+            "sessions": self
+                .buckets
+                .iter()
+                .map(Committed::value)
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Smallest response that could carry one unit of progress, used to tell a
+    /// caller what `--max-bytes` would actually work.
+    fn minimum_viable(&self) -> usize {
+        let skeleton = self
+            .cut
+            .sources
+            .first()
+            .map(|source| {
+                json_cost(&json!({
+                    "session": source.session,
+                    "gaps": source.gaps,
+                    "results": [],
+                    "events": [],
+                }))
+            })
+            .unwrap_or_default();
+        let unit = self.cut.sources.first().map_or(8, |source| {
+            source
+                .results
+                .first()
+                .map(minimum_result_cost)
+                .or_else(|| source.events.first().map(json_cost))
+                .unwrap_or(8)
+        });
+        self.envelope() + skeleton + unit
+    }
+
+    fn finish(mut self) -> Result<Rendered> {
+        let mut value = self.document()?;
+        while serialized_len(&value)? > self.options.max_bytes {
+            if !self.rollback() {
+                break;
+            }
+            value = self.document()?;
+        }
+        let length = serialized_len(&value)?;
+        if length > self.options.max_bytes || (self.pending() && !self.progress()) {
+            // Progress must come from chunking, never from oversizing. If not
+            // even one chunk fits, the request itself is unsatisfiable.
+            bail!(
+                "invalid max_bytes {}: too small to carry one unit of progress; retry with --max-bytes {} or more",
+                self.options.max_bytes,
+                self.minimum_viable().max(length)
+            );
+        }
+        let has_more = self.pending();
+        let gapped = !self.cut.scope_gaps.is_empty()
+            || self.buckets.iter().any(|bucket| !bucket.gaps.is_empty());
+        let blocked = self.cut.state == Some(SessionState::Blocked);
+        let result_ready = self.cut.bound_terminal
+            && self.cut.bound_seq.is_some_and(|seq| {
+                self.buckets
+                    .first()
+                    .is_some_and(|bucket| seq <= bucket.position.x)
+            });
+        let delivered = self.delivered();
+        let reason = if gapped {
+            "gap"
+        } else if blocked {
+            "blocked"
+        } else if self.options.until_result && result_ready {
+            "result"
+        } else if has_more {
+            "page_full"
+        } else if self.cut.baseline {
+            "snapshot"
+        } else if delivered {
+            "change"
+        } else {
+            "timeout"
+        };
+        let settled = gapped
+            || blocked
+            || has_more
+            || if self.options.until_result {
+                result_ready
+            } else {
+                self.cut.baseline || delivered
+            };
+        value["reason"] = json!(reason);
+        Ok(Rendered { value, settled })
+    }
+}
+
+impl Cut {
+    fn render(self, options: &FetchOptions) -> Result<Rendered> {
+        let mut builder = Builder::new(&self, options)?;
+        builder.commit_buckets();
+        builder.commit_results();
+        builder.commit_events();
+        builder.commit_screen();
+        builder.finish()
     }
 }
 
@@ -3386,440 +3824,62 @@ fn char_floor(text: &str, index: usize) -> usize {
     index
 }
 
-struct BucketInput {
-    uid: String,
-    session: Value,
-    gaps: Vec<Value>,
-    events: Vec<Value>,
-    results: Vec<TurnRecord>,
-    results_more: bool,
-    stable: crate::screen::StablePage,
-    live: crate::store::LiveScreen,
-    epoch_reset: bool,
-    screen: bool,
-    incoming: cursor::SessionCursor,
-}
-
-impl Bucket {
-    fn new(input: BucketInput) -> Self {
-        let stable_start = input
-            .stable
-            .next_after
-            .saturating_sub(u64::try_from(input.stable.lines.len()).unwrap_or(0));
-        let mut incoming = input.incoming;
-        let results = input
-            .results
-            .iter()
-            .map(|turn| {
-                let offset = if incoming.px == Some(turn.execution_seq) {
-                    incoming.po
-                } else {
-                    0
-                };
-                ResultChunk::new(turn, offset)
-            })
-            .collect::<Vec<_>>();
-        // A partial-delivery marker that no longer names the next retained
-        // result is stale; dropping it keeps the continuation unambiguous.
-        if incoming
-            .px
-            .is_some_and(|exec| results.first().is_none_or(|chunk| chunk.exec != exec))
-        {
-            incoming.px = None;
-            incoming.po = 0;
+/// Largest UTF-8 prefix of `text` whose encoded JSON string fits `budget`.
+/// `None` when not even one character fits.
+fn fit_text(text: &str, budget: usize) -> Option<usize> {
+    let mut take = text.len();
+    loop {
+        if json_cost(&Value::String(text[..take].to_owned())) <= budget {
+            return Some(take);
         }
-        let events_len = input.events.len();
-        let results_len = results.len();
-        let stable_len = input.stable.lines.len();
-        Self {
-            uid: input.uid,
-            session: input.session,
-            gaps: input.gaps,
-            events: input.events,
-            events_len,
-            results,
-            results_len,
-            results_more: input.results_more,
-            stable: input.stable.lines,
-            stable_len,
-            stable_truncate: None,
-            stable_start,
-            stable_more: input.stable.has_more,
-            live: input.live.rows,
-            live_included: input.screen,
-            live_truncated: input.live.truncated,
-            epoch: input.live.epoch,
-            epoch_reset: input.epoch_reset,
-            reset_reason: input.live.reset_reason,
-            screen: input.screen,
-            incoming,
+        if take == 0 {
+            return None;
         }
-    }
-
-    fn value(&self) -> Value {
-        let mut stable = self.stable[..self.stable_len]
-            .iter()
-            .map(|line| Value::String(line.clone()))
-            .collect::<Vec<_>>();
-        if let Some(limit) = self.stable_truncate
-            && let Some(Value::String(last)) = stable.last_mut()
-        {
-            last.truncate(char_floor(last, limit));
-        }
-        let mut bucket = json!({
-            "session": self.session,
-            "gaps": self.gaps,
-            "results": self.results[..self.results_len]
-                .iter()
-                .map(ResultChunk::value)
-                .collect::<Vec<_>>(),
-            "events": self.events[..self.events_len],
-        });
-        if self.screen {
-            bucket["screen"] = json!({
-                "epoch": self.epoch,
-                "reset": self.epoch_reset,
-                "reset_reason": self.epoch_reset.then_some(self.reset_reason).flatten(),
-                "stable": stable,
-                "live": if self.live_included { self.live.clone() } else { Vec::new() },
-                "live_truncated": self.live_truncated,
-            });
-        }
-        bucket
-    }
-
-    /// Outgoing watermarks for exactly the content this bucket still carries.
-    fn position(&self) -> cursor::SessionCursor {
-        let mut position = self.incoming;
-        for chunk in &self.results[..self.results_len] {
-            if chunk.complete() {
-                position.x = chunk.exec;
-                position.px = None;
-                position.po = 0;
-            } else {
-                position.px = Some(chunk.exec);
-                position.po = chunk.offset + u64::try_from(chunk.take).unwrap_or(0);
-            }
-        }
-        position.r = self.stable_start + u64::try_from(self.stable_len).unwrap_or(0);
-        position.ep = self.epoch;
-        position
-    }
-
-    fn delivered(&self) -> bool {
-        self.events_len > 0 || self.results_len > 0 || self.stable_len > 0
-    }
-
-    /// Content this response does not carry and a later one must.
-    fn pending(&self) -> bool {
-        self.results_more
-            || self.stable_more
-            || self.events_len < self.events.len()
-            || self.results_len < self.results.len()
-            || self.stable_len < self.stable.len()
-            || self.results[..self.results_len]
-                .iter()
-                .any(|chunk| !chunk.complete())
-    }
-
-    /// Drop the lowest-priority remaining content: screen text, then events,
-    /// then result bodies. State and gaps are never shed.
-    fn shed(&mut self) -> bool {
-        if self.live_included && !self.live.is_empty() {
-            self.live_included = false;
-            return true;
-        }
-        if self.stable_len > 0 {
-            self.stable_len -= 1;
-            self.stable_truncate = None;
-            return true;
-        }
-        if self.events_len > 0 {
-            self.events_len -= 1;
-            return true;
-        }
-        if self.results_len > 0 {
-            let index = self.results_len - 1;
-            let chunk = &mut self.results[index];
-            if chunk.take > 0 {
-                chunk.take = char_floor(&chunk.text, chunk.take * 3 / 4);
-                if chunk.take > 0 {
-                    return true;
-                }
-            }
-            self.results_len -= 1;
-            return true;
-        }
-        false
-    }
-
-    /// Re-admit exactly one unit of content so a `has_more` response always
-    /// advances a watermark. Result bodies come first because they are the
-    /// answer the caller asked for; a single oversized screen row is truncated
-    /// mid-line rather than blocking the cursor forever.
-    fn force_progress(&mut self, budget: usize) -> bool {
-        if !self.results.is_empty() {
-            self.results_len = 1;
-            let chunk = &mut self.results[0];
-            if chunk.take == 0 {
-                chunk.take = char_floor(&chunk.text, budget.max(1));
-                if chunk.take == 0 {
-                    chunk.take = chunk
-                        .text
-                        .char_indices()
-                        .nth(1)
-                        .map_or(chunk.text.len(), |(index, _)| index);
-                }
-            }
-            return true;
-        }
-        if !self.events.is_empty() {
-            self.events_len = 1;
-            return true;
-        }
-        if !self.stable.is_empty() {
-            self.stable_len = 1;
-            self.stable_truncate = Some(budget);
-            return true;
-        }
-        false
-    }
-}
-
-struct Rendered {
-    value: Value,
-    /// The long poll is finished: either something wake-worthy happened or the
-    /// requested binding is satisfied.
-    settled: bool,
-}
-
-#[allow(clippy::struct_excessive_bools)]
-struct Assembled {
-    value: Value,
-    has_more: bool,
-    progress: bool,
-    delivered: bool,
-    result_ready: bool,
-    gapped: bool,
-}
-
-impl Cut {
-    /// Serialize the cut, shedding content until the encoded document fits the
-    /// caller's byte budget. The measured document is authoritative: estimates
-    /// cannot bound JSON escaping or the cursor's own length.
-    fn render(mut self, options: &FetchOptions) -> Result<Rendered> {
-        self.pre_trim(options);
-        let mut assembled = self.assemble(options)?;
-        while serialized_len(&assembled.value)? > options.max_bytes {
-            if !self.shed() {
-                break;
-            }
-            assembled = self.assemble(options)?;
-        }
-        if assembled.has_more && !assembled.progress {
-            // Every has_more response must advance at least one watermark or
-            // the caller loops forever on an unchanged cursor.
-            let floor = serialized_len(&assembled.value)?;
-            let budget = options.max_bytes.saturating_sub(floor);
-            if self.force_progress(budget) {
-                assembled = self.assemble(options)?;
-            }
-        }
-        let blocked = self.state == Some(SessionState::Blocked);
-        let reason = if assembled.gapped {
-            "gap"
-        } else if blocked {
-            "blocked"
-        } else if options.until_result && assembled.result_ready {
-            "result"
-        } else if assembled.has_more {
-            "page_full"
-        } else if self.baseline {
-            "snapshot"
-        } else if assembled.delivered {
-            "change"
+        let next = char_floor(text, take * 3 / 4);
+        take = if next == take {
+            char_floor(text, take - 1)
         } else {
-            "timeout"
+            next
         };
-        let settled = assembled.gapped
-            || blocked
-            || assembled.has_more
-            || if options.until_result {
-                assembled.result_ready
-            } else {
-                self.baseline || assembled.delivered
-            };
-        let mut value = assembled.value;
-        value["reason"] = json!(reason);
-        Ok(Rendered { value, settled })
-    }
-
-    /// Cheap greedy fit before the exact loop, so the measured loop normally
-    /// converges in a couple of iterations instead of hundreds.
-    fn pre_trim(&mut self, options: &FetchOptions) {
-        let reserve = FETCH_ENVELOPE_RESERVE
-            + FETCH_SESSION_CURSOR_RESERVE * self.buckets.len().max(1)
-            + self
-                .buckets
-                .iter()
-                .map(|bucket| {
-                    json_cost(&bucket.session) + json_cost(&Value::Array(bucket.gaps.clone()))
-                })
-                .sum::<usize>();
-        let mut budget = options.max_bytes.saturating_sub(reserve);
-        for bucket in &mut self.buckets {
-            let mut kept = 0;
-            for chunk in &mut bucket.results {
-                let cost = json_cost(&chunk.value());
-                if cost <= budget {
-                    budget -= cost;
-                    kept += 1;
-                    continue;
-                }
-                chunk.fit(budget);
-                if chunk.take > 0 {
-                    kept += 1;
-                    budget = 0;
-                }
-                break;
-            }
-            bucket.results_len = kept;
-            let mut kept = 0;
-            for event in &bucket.events {
-                let cost = json_cost(event);
-                if cost > budget {
-                    break;
-                }
-                budget -= cost;
-                kept += 1;
-            }
-            bucket.events_len = kept;
-            let mut kept = 0;
-            for line in &bucket.stable {
-                let cost = json_cost(&Value::String(line.clone()));
-                if cost > budget {
-                    break;
-                }
-                budget -= cost;
-                kept += 1;
-            }
-            bucket.stable_len = kept;
-            let live_cost = bucket
-                .live
-                .iter()
-                .map(|line| json_cost(&Value::String(line.clone())))
-                .sum::<usize>();
-            bucket.live_included = bucket.screen && live_cost <= budget;
-            if bucket.live_included {
-                budget -= live_cost;
-            }
-        }
-    }
-
-    fn shed(&mut self) -> bool {
-        for bucket in self.buckets.iter_mut().rev() {
-            if bucket.shed() {
-                return true;
-            }
-        }
-        // Only the mandatory floor is left; drop whole trailing buckets.
-        if self.buckets.len() > 1 {
-            self.buckets.pop();
-            self.sessions_more = true;
-            return true;
-        }
-        false
-    }
-
-    fn force_progress(&mut self, budget: usize) -> bool {
-        self.buckets
-            .first_mut()
-            .is_some_and(|bucket| bucket.force_progress(budget))
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn assemble(&self, options: &FetchOptions) -> Result<Assembled> {
-        let mut next = cursor::Cursor::new(&options.instance_id, &options.scope);
-        if let Some(previous) = options.cursor.as_ref() {
-            next.p.clone_from(&previous.p);
-        }
-        // The event watermark may only advance over events this document
-        // actually carries.
-        let mut first_dropped = self.dropped_event_seq;
-        for bucket in &self.buckets {
-            for event in bucket.events.iter().skip(bucket.events_len) {
-                let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
-                first_dropped = Some(first_dropped.map_or(seq, |current| current.min(seq)));
-            }
-        }
-        next.e = first_dropped.map_or(self.event_watermark, |seq| seq - 1);
-        next.bl.clone_from(&self.baseline_next);
-
-        let mut buckets = Vec::with_capacity(self.buckets.len());
-        let mut has_more = self.events_more || self.sessions_more || self.baseline_next.is_some();
-        let mut delivered = false;
-        let mut progress = self.baseline;
-        let mut gapped = !self.scope_gaps.is_empty();
-        for bucket in &self.buckets {
-            let position = bucket.position();
-            has_more = has_more || bucket.pending();
-            delivered = delivered || bucket.delivered();
-            gapped = gapped || !bucket.gaps.is_empty();
-            progress = progress || position != bucket.incoming;
-            next.set_session(&bucket.uid, position);
-            buckets.push(bucket.value());
-        }
-        progress = progress || next.e > options.event_position();
-        let result_ready = self.bound_terminal
-            && self.bound_seq.is_some_and(|seq| {
-                self.buckets
-                    .first()
-                    .is_some_and(|bucket| seq <= bucket.position().x)
-            });
-        let value = json!({
-            "schema_version": 1,
-            "runtime": {
-                "version": env!("CARGO_PKG_VERSION"),
-                "instance_id": options.instance_id,
-            },
-            "reason": "timeout",
-            "has_more": has_more,
-            "gaps": self.scope_gaps,
-            "cursor": next.encode()?,
-            "sessions": buckets,
-        });
-        Ok(Assembled {
-            value,
-            has_more,
-            progress,
-            delivered,
-            result_ready,
-            gapped,
-        })
     }
 }
 
-/// A continuation offset is caller-supplied. Reject one that does not name a
-/// UTF-8 boundary inside the result it claims to continue, rather than
-/// indexing a body with it.
-fn validate_continuation(position: &cursor::SessionCursor, results: &[TurnRecord]) -> Result<()> {
-    let Some(execution_seq) = position.px else {
-        return Ok(());
-    };
-    let Some(turn) = results
-        .first()
-        .filter(|turn| turn.execution_seq == execution_seq)
-    else {
-        return Ok(());
-    };
-    let text = turn.final_message.as_deref().unwrap_or_default();
-    let offset = usize::try_from(position.po).unwrap_or(usize::MAX);
-    if offset > text.len() || !text.is_char_boundary(offset) {
-        bail!(
-            "CURSOR_INVALID: continuation offset is not a character boundary in the retained result"
-        );
+/// Encode a result, chunking `final_text` at a UTF-8 boundary to fit `budget`.
+/// `None` when the record cannot carry even an empty body.
+fn fit_result(turn: &TurnRecord, offset: u64, budget: usize) -> Option<(Value, usize, bool)> {
+    let mut value = public_result(turn);
+    let text = turn.final_message.clone().unwrap_or_default();
+    let start = char_floor(&text, usize::try_from(offset).unwrap_or(usize::MAX));
+    let remainder = &text[start..];
+    value["final_text_offset"] = json!(offset);
+    let mut take = remainder.len();
+    loop {
+        value["final_text"] = json!(&remainder[..take]);
+        value["final_text_complete"] = json!(take == remainder.len());
+        if json_cost(&value) <= budget {
+            return Some((value, take, take == remainder.len()));
+        }
+        if take == 0 {
+            return None;
+        }
+        let next = char_floor(remainder, take * 3 / 4);
+        take = if next == take {
+            char_floor(remainder, take - 1)
+        } else {
+            next
+        };
     }
-    Ok(())
+}
+
+/// Cost of a result record carrying one character of body.
+fn minimum_result_cost(turn: &TurnRecord) -> usize {
+    let mut value = public_result(turn);
+    let text = turn.final_message.clone().unwrap_or_default();
+    let head = text.chars().next().map(String::from).unwrap_or_default();
+    value["final_text"] = json!(head);
+    value["final_text_offset"] = json!(0);
+    value["final_text_complete"] = json!(false);
+    json_cost(&value)
 }
 
 fn serialized_len(value: &Value) -> Result<usize> {
@@ -3834,7 +3894,41 @@ fn retention_gap(component: &str) -> Value {
     json!({"component": component, "reason": "retention_overrun"})
 }
 
-/// One bounded page of normalized lifecycle events plus its watermark.
+/// A continuation offset is caller-supplied. Reject one that does not name a
+/// UTF-8 boundary inside the unit it claims to continue, rather than indexing
+/// with it.
+fn validate_continuation(
+    position: &cursor::SessionCursor,
+    results: &[TurnRecord],
+    stable: &[String],
+) -> Result<()> {
+    if let Some(execution_seq) = position.px
+        && let Some(turn) = results
+            .first()
+            .filter(|turn| turn.execution_seq == execution_seq)
+    {
+        let text = turn.final_message.as_deref().unwrap_or_default();
+        let offset = usize::try_from(position.po).unwrap_or(usize::MAX);
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            bail!(
+                "CURSOR_INVALID: continuation offset is not a character boundary in the retained result"
+            );
+        }
+    }
+    if position.ro > 0 {
+        let Some(row) = stable.first() else {
+            return Ok(());
+        };
+        let offset = usize::try_from(position.ro).unwrap_or(usize::MAX);
+        if offset > row.len() || !row.is_char_boundary(offset) {
+            bail!(
+                "CURSOR_INVALID: continuation offset is not a character boundary in the retained screen row"
+            );
+        }
+    }
+    Ok(())
+}
+
 type EventPage = (Vec<(Option<String>, Value)>, bool, i64);
 
 fn normalized_page(store: &Store, uid: Option<&str>, after: i64, limit: usize) -> EventPage {
@@ -3854,9 +3948,6 @@ fn normalized_page(store: &Store, uid: Option<&str>, after: i64, limit: usize) -
     (page, has_more, watermark)
 }
 
-/// Normalize one retained event. Every field comes from the record itself, so
-/// replaying an old cursor yields byte-identical events even after the turn it
-/// described has been evicted.
 fn normalize_event(event: &crate::protocol::EventRecord) -> Option<Value> {
     let event_type = normalize_event_type(&event.kind)?;
     // Pre-bind events belong to a launch that had no public identity. They are
@@ -3921,8 +4012,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Bucket, BucketInput, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_HARD_MAX_BYTES,
-        FETCH_MIN_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
+        BucketSource, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
+        FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
         TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
         clamp_busy_metrics, classify_error, generate_alias, generate_internal_id,
         provider_id_from_session, public_result, public_session, public_session_with_metrics,
@@ -4300,52 +4391,8 @@ mod tests {
         }
     }
 
-    fn test_cut(
-        events: Vec<Value>,
-        results: Vec<crate::protocol::TurnRecord>,
-        stable: Vec<String>,
-        incoming: crate::cursor::SessionCursor,
-    ) -> Cut {
-        let event_watermark = events
-            .last()
-            .and_then(|event| event.get("seq"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let stable_len = u64::try_from(stable.len()).unwrap_or(0);
-        Cut {
-            baseline: false,
-            state: Some(SessionState::Idle),
-            bound_seq: None,
-            bound_terminal: false,
-            event_watermark,
-            events_more: false,
-            dropped_event_seq: None,
-            scope_gaps: Vec::new(),
-            buckets: vec![Bucket::new(BucketInput {
-                uid: "su_test".to_owned(),
-                session: json!({"id": "claude:x", "state": "idle"}),
-                gaps: Vec::new(),
-                events,
-                results,
-                results_more: false,
-                stable: crate::screen::StablePage {
-                    next_after: incoming.r + stable_len,
-                    lines: stable,
-                    has_more: false,
-                    gap: false,
-                },
-                live: crate::store::LiveScreen::default(),
-                epoch_reset: false,
-                screen: true,
-                incoming,
-            })],
-            sessions_more: false,
-            baseline_next: None,
-        }
-    }
-
-    fn lifecycle_events(count: i64) -> Vec<Value> {
-        (1..=count)
+    fn lifecycle_events(range: std::ops::RangeInclusive<i64>) -> Vec<Value> {
+        range
             .map(|seq| {
                 json!({
                     "schema_version": 1,
@@ -4358,6 +4405,76 @@ mod tests {
             .collect()
     }
 
+    struct SourceSpec {
+        uid: String,
+        session: Value,
+        events: Vec<Value>,
+        results: Vec<crate::protocol::TurnRecord>,
+        stable: Vec<String>,
+        stable_start: u64,
+        incoming: crate::cursor::SessionCursor,
+        screen: bool,
+    }
+
+    impl SourceSpec {
+        fn new(uid: &str) -> Self {
+            Self {
+                uid: uid.to_owned(),
+                session: json!({"id": "claude:x", "state": "idle"}),
+                events: Vec::new(),
+                results: Vec::new(),
+                stable: Vec::new(),
+                stable_start: 0,
+                incoming: crate::cursor::SessionCursor::default(),
+                screen: false,
+            }
+        }
+
+        fn build(self) -> BucketSource {
+            BucketSource {
+                uid: self.uid,
+                session: self.session,
+                gaps: Vec::new(),
+                events: self.events,
+                results: self.results,
+                results_more: false,
+                stable_offset: usize::try_from(self.incoming.ro).unwrap_or(0),
+                stable: self.stable,
+                stable_start: self.stable_start,
+                stable_more: false,
+                live: Vec::new(),
+                live_truncated: false,
+                epoch: 1,
+                epoch_reset: false,
+                reset_reason: None,
+                screen: self.screen,
+                incoming: self.incoming,
+            }
+        }
+    }
+
+    fn test_cut(sources: Vec<BucketSource>) -> Cut {
+        let full_event_watermark = sources
+            .iter()
+            .flat_map(|source| source.events.iter())
+            .filter_map(|event| event.get("seq").and_then(Value::as_i64))
+            .max()
+            .unwrap_or(0);
+        let live_uids = sources.iter().map(|source| source.uid.clone()).collect();
+        Cut {
+            baseline: false,
+            state: Some(SessionState::Idle),
+            bound_seq: None,
+            bound_terminal: false,
+            full_event_watermark,
+            events_complete: true,
+            scope_gaps: Vec::new(),
+            sources,
+            more_candidates: false,
+            live_uids,
+        }
+    }
+
     fn decode(value: &Value) -> crate::cursor::Cursor {
         crate::cursor::Cursor::decode(
             value["cursor"]
@@ -4368,48 +4485,85 @@ mod tests {
         .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"))
     }
 
+    fn event_seqs(value: &Value) -> Vec<i64> {
+        value["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|bucket| bucket["events"].as_array().into_iter().flatten())
+            .filter_map(|event| event.get("seq").and_then(Value::as_i64))
+            .collect()
+    }
+
     #[test]
     fn the_event_watermark_never_passes_an_event_the_response_dropped() {
-        let cut = test_cut(
-            lifecycle_events(8),
-            Vec::new(),
-            Vec::new(),
-            crate::cursor::SessionCursor::default(),
-        );
+        let cut = test_cut(vec![
+            SourceSpec {
+                events: lifecycle_events(1..=8),
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ]);
         let rendered = cut
-            .render(&fetch_options(700, None))
+            .render(&fetch_options(900, None))
             .unwrap_or_else(|error| panic!("failed to render: {error}"));
 
-        let delivered = rendered.value["sessions"][0]["events"]
-            .as_array()
-            .unwrap_or_else(|| panic!("no events"))
-            .len();
-        assert!(delivered < 8, "budget did not drop any event");
+        let delivered = event_seqs(&rendered.value);
+        assert!(delivered.len() < 8, "budget did not drop any event");
         assert_eq!(rendered.value["has_more"], true);
-        let cursor = decode(&rendered.value);
         assert_eq!(
-            cursor.e,
-            i64::try_from(delivered).unwrap_or(0),
-            "watermark skipped an undelivered event"
+            decode(&rendered.value).e,
+            delivered.last().copied().unwrap_or(0),
+            "watermark passed an undelivered event"
         );
+    }
 
-        // The next call from that cursor still owes the dropped events.
-        let remaining = lifecycle_events(8)
-            .into_iter()
-            .filter(|event| event["seq"].as_i64().unwrap_or(0) > cursor.e)
-            .collect::<Vec<_>>();
-        assert_eq!(remaining.len(), 8 - delivered);
+    #[test]
+    fn shedding_a_bucket_never_advances_the_event_watermark_past_it() {
+        let first = SourceSpec {
+            events: lifecycle_events(1..=2),
+            ..SourceSpec::new("su_first")
+        }
+        .build();
+        let mut second = SourceSpec {
+            events: lifecycle_events(3..=4),
+            ..SourceSpec::new("su_second")
+        };
+        // The second bucket cannot fit any plausible budget on its own.
+        second.session = json!({"id": "claude:y", "title": "t".repeat(8_000)});
+        let cut = test_cut(vec![first, second.build()]);
+        let rendered = cut
+            .render(&fetch_options(4_096, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        let buckets = rendered.value["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no sessions"))
+            .len();
+        assert_eq!(buckets, 1, "budget did not drop the second bucket");
+        assert_eq!(rendered.value["has_more"], true);
+        assert_eq!(
+            decode(&rendered.value).e,
+            2,
+            "watermark passed the dropped bucket's events"
+        );
     }
 
     #[test]
     fn a_chunked_baseline_result_resumes_on_the_same_execution() {
         let text = "x".repeat(4_000);
-        // A baseline anchors just below the latest retained result.
         let incoming = crate::cursor::SessionCursor {
             x: 6,
             ..crate::cursor::SessionCursor::default()
         };
-        let mut cut = test_cut(Vec::new(), vec![test_turn(7, &text)], Vec::new(), incoming);
+        let mut cut = test_cut(vec![
+            SourceSpec {
+                results: vec![test_turn(7, &text)],
+                incoming,
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ]);
         cut.baseline = true;
         let first = cut
             .render(&fetch_options(1_500, None))
@@ -4424,28 +4578,35 @@ mod tests {
         assert_eq!(position.x, 6, "an incomplete result must not advance x");
         assert!(position.po > 0);
 
-        // The continuation only ever sees execution 7 again, and completes it.
-        let second = test_cut(Vec::new(), vec![test_turn(7, &text)], Vec::new(), position)
-            .render(&fetch_options(FETCH_HARD_MAX_BYTES, Some(cursor)))
-            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        let second = test_cut(vec![
+            SourceSpec {
+                results: vec![test_turn(7, &text)],
+                incoming: position,
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ])
+        .render(&fetch_options(FETCH_HARD_MAX_BYTES, Some(cursor)))
+        .unwrap_or_else(|error| panic!("failed to render: {error}"));
         let result = &second.value["sessions"][0]["results"][0];
         assert_eq!(result["final_text_complete"], true);
         assert_eq!(result["final_text_offset"], json!(position.po));
         let position = decode(&second.value).session("su_test");
         assert_eq!(position.x, 7);
         assert_eq!(position.px, None);
-        assert_eq!(position.po, 0);
     }
 
     #[test]
     fn until_result_reports_a_result_only_once_it_is_fully_delivered() {
         let text = "y".repeat(4_000);
-        let mut cut = test_cut(
-            Vec::new(),
-            vec![test_turn(7, &text)],
-            Vec::new(),
-            crate::cursor::SessionCursor::default(),
-        );
+        let source = || {
+            SourceSpec {
+                results: vec![test_turn(7, &text)],
+                ..SourceSpec::new("su_test")
+            }
+            .build()
+        };
+        let mut cut = test_cut(vec![source()]);
         cut.bound_seq = Some(7);
         cut.bound_terminal = true;
         let mut options = fetch_options(1_500, None);
@@ -4456,57 +4617,22 @@ mod tests {
         assert_eq!(partial.value["reason"], "page_full");
         assert!(partial.settled, "a page-full response must return at once");
 
-        let mut cut = test_cut(
-            Vec::new(),
-            vec![test_turn(7, &text)],
-            Vec::new(),
-            crate::cursor::SessionCursor::default(),
-        );
+        let mut cut = test_cut(vec![source()]);
         cut.bound_seq = Some(7);
         cut.bound_terminal = true;
         let mut options = fetch_options(FETCH_HARD_MAX_BYTES, None);
         options.until_result = true;
-        let complete = cut
-            .render(&options)
-            .unwrap_or_else(|error| panic!("failed to render: {error}"));
-        assert_eq!(complete.value["reason"], "result");
-    }
-
-    #[test]
-    fn an_oversized_screen_row_still_advances_the_cursor() {
-        let row = "z".repeat(100_000);
-        let cut = test_cut(
-            Vec::new(),
-            Vec::new(),
-            vec![row, "next".to_owned()],
-            crate::cursor::SessionCursor::default(),
-        );
-        let rendered = cut
-            .render(&fetch_options(FETCH_MIN_MAX_BYTES, None))
-            .unwrap_or_else(|error| panic!("failed to render: {error}"));
-
-        assert_eq!(rendered.value["has_more"], true);
-        let position = decode(&rendered.value).session("su_test");
-        assert!(position.r >= 1, "an oversized row blocked the cursor");
-        let stable = rendered.value["sessions"][0]["screen"]["stable"]
-            .as_array()
-            .unwrap_or_else(|| panic!("no stable array"));
-        assert_eq!(stable.len(), 1);
-        assert!(
-            stable[0].as_str().unwrap_or_default().len() < 100_000,
-            "the oversized row was not truncated"
+        assert_eq!(
+            cut.render(&options)
+                .unwrap_or_else(|error| panic!("failed to render: {error}"))
+                .value["reason"],
+            "result"
         );
     }
 
     #[test]
     fn a_scope_gap_survives_a_response_with_no_session_buckets() {
-        let mut cut = test_cut(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            crate::cursor::SessionCursor::default(),
-        );
-        cut.buckets.clear();
+        let mut cut = test_cut(Vec::new());
         cut.state = None;
         cut.scope_gaps.push(retention_gap("events"));
 
@@ -4519,31 +4645,202 @@ mod tests {
     }
 
     #[test]
-    fn an_unfinished_all_baseline_keeps_paging_from_its_enumeration_position() {
-        let mut cut = test_cut(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            crate::cursor::SessionCursor::default(),
-        );
-        cut.baseline = true;
-        cut.baseline_next = Some("su_last".to_owned());
-        let rendered = cut
-            .render(&fetch_options(FETCH_DEFAULT_MAX_BYTES, None))
-            .unwrap_or_else(|error| panic!("failed to render: {error}"));
-
-        assert_eq!(rendered.value["has_more"], true);
-        let cursor = decode(&rendered.value);
-        assert_eq!(cursor.bl.as_deref(), Some("su_last"));
-        let resumed = FetchOptions {
-            cursor: Some(cursor),
-            ..fetch_options(FETCH_DEFAULT_MAX_BYTES, None)
-        };
+    fn a_budget_too_small_for_any_progress_is_rejected() {
+        let cut = test_cut(vec![
+            SourceSpec {
+                results: vec![test_turn(1, "answer")],
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ]);
+        let error = cut
+            .render(&fetch_options(64, None))
+            .err()
+            .unwrap_or_else(|| panic!("an unsatisfiable budget was accepted"));
+        assert_eq!(classify_error(&error), "INVALID_ARGUMENT");
         assert!(
-            resumed.baseline(),
-            "baseline mode must persist while paging"
+            error.to_string().contains("retry with --max-bytes"),
+            "the error must name a workable budget: {error}"
         );
-        assert_eq!(resumed.resume_after(), Some("su_last"));
+    }
+
+    /// Drive one synthetic history to quiescence and return what was
+    /// delivered, asserting the byte bound on every response.
+    fn drain_history(
+        events: &[Value],
+        result: &crate::protocol::TurnRecord,
+        rows: &[String],
+        max_bytes: usize,
+    ) -> (Vec<i64>, String, String) {
+        let mut cursor: Option<crate::cursor::Cursor> = None;
+        let mut seen_events = Vec::new();
+        let mut body = String::new();
+        let mut screen = String::new();
+        for _ in 0..10_000 {
+            let options = fetch_options(max_bytes, cursor.clone());
+            let position = options.position("su_test");
+            let after = options.event_position();
+            let pending_events = events
+                .iter()
+                .filter(|event| event["seq"].as_i64().unwrap_or(0) > after)
+                .cloned()
+                .collect::<Vec<_>>();
+            let events_more = pending_events.len() > FETCH_EVENT_PAGE;
+            let delivered_rows = usize::try_from(position.r).unwrap_or(0);
+            let pending_rows = rows
+                .iter()
+                .skip(delivered_rows)
+                .take(FETCH_STABLE_PAGE)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut cut = test_cut(vec![
+                SourceSpec {
+                    events: pending_events.into_iter().take(FETCH_EVENT_PAGE).collect(),
+                    results: if position.x >= result.execution_seq {
+                        Vec::new()
+                    } else {
+                        vec![result.clone()]
+                    },
+                    stable_start: position.r,
+                    stable: pending_rows,
+                    incoming: position,
+                    screen: true,
+                    ..SourceSpec::new("su_test")
+                }
+                .build(),
+            ]);
+            cut.sources[0].stable_more = rows.len() > delivered_rows + FETCH_STABLE_PAGE;
+            cut.events_complete = !events_more;
+            cut.full_event_watermark = events
+                .iter()
+                .filter_map(|event| event["seq"].as_i64())
+                .filter(|seq| *seq > after)
+                .take(FETCH_EVENT_PAGE)
+                .last()
+                .unwrap_or(after);
+            let rendered = cut
+                .render(&options)
+                .unwrap_or_else(|error| panic!("failed to render at {max_bytes}: {error}"));
+            let encoded = serde_json::to_string(&rendered.value)
+                .unwrap_or_else(|error| panic!("failed to serialize: {error}"));
+            assert!(
+                encoded.len() <= max_bytes,
+                "response of {} bytes exceeded the {max_bytes} byte budget",
+                encoded.len()
+            );
+            seen_events.extend(event_seqs(&rendered.value));
+            for chunk in rendered.value["sessions"][0]["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                body.push_str(chunk["final_text"].as_str().unwrap_or_default());
+            }
+            for line in rendered.value["sessions"][0]["screen"]["stable"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                screen.push_str(line.as_str().unwrap_or_default());
+            }
+            cursor = Some(decode(&rendered.value));
+            if rendered.value["has_more"] != json!(true) {
+                return (seen_events, body, screen);
+            }
+        }
+        panic!("history never reached quiescence at {max_bytes} bytes");
+    }
+
+    #[test]
+    fn an_oversized_screen_row_pages_through_within_the_byte_bound() {
+        let rows = vec!["z".repeat(100_000), "tail".to_owned()];
+        let result = test_turn(1, "");
+        let (_, _, screen) = drain_history(&[], &result, &rows, 4 * 1024);
+        assert_eq!(screen, rows.concat());
+    }
+
+    #[test]
+    fn every_delivered_window_covers_the_full_history_exactly() {
+        let events = lifecycle_events(1..=40);
+        let result = test_turn(1, &"body ".repeat(3_000));
+        let rows = (0..300)
+            .map(|index| format!("row-{index} {}", "w".repeat(index % 97)))
+            .collect::<Vec<_>>();
+        // A deterministic spread of tight budgets.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..12 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let max_bytes = 1_400 + usize::try_from(seed >> 33).unwrap_or(0) % 6_000;
+            let (delivered, body, screen) = drain_history(&events, &result, &rows, max_bytes);
+
+            assert!(
+                delivered.windows(2).all(|pair| pair[0] < pair[1]),
+                "events were duplicated or reordered at {max_bytes}: {delivered:?}"
+            );
+            assert_eq!(
+                delivered,
+                (1..=40).collect::<Vec<_>>(),
+                "event loss at {max_bytes}"
+            );
+            assert_eq!(
+                body,
+                result.final_message.clone().unwrap_or_default(),
+                "result body loss at {max_bytes}"
+            );
+            assert_eq!(screen, rows.concat(), "screen row loss at {max_bytes}");
+        }
+    }
+
+    #[test]
+    fn a_baseline_pages_through_every_session_under_a_tight_budget() {
+        let all = (0..9)
+            .map(|index| format!("su_{index}"))
+            .collect::<Vec<_>>();
+        let mut cursor: Option<crate::cursor::Cursor> = None;
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            let options = FetchOptions {
+                scope: crate::cursor::SCOPE_ALL.to_owned(),
+                ..fetch_options(1_100, cursor.clone())
+            };
+            let mut remaining = all.clone();
+            if let Some(resume) = options.resume_after() {
+                let start = remaining
+                    .iter()
+                    .position(|uid| uid == resume)
+                    .map_or(0, |index| index + 1);
+                remaining.drain(..start);
+            }
+            let sources = remaining
+                .iter()
+                .map(|uid| SourceSpec::new(uid).build())
+                .collect::<Vec<_>>();
+            let mut cut = test_cut(sources);
+            cut.baseline = true;
+            cut.live_uids.clone_from(&all);
+            let rendered = cut
+                .render(&options)
+                .unwrap_or_else(|error| panic!("failed to render: {error}"));
+            for bucket in rendered.value["sessions"].as_array().into_iter().flatten() {
+                seen.push(bucket["session"]["id"].clone());
+            }
+            let next = decode(&rendered.value);
+            let paging = next.bl.is_some();
+            cursor = Some(next);
+            if !paging {
+                assert_eq!(
+                    seen.len(),
+                    all.len(),
+                    "baseline finished without showing every Session"
+                );
+                assert_eq!(rendered.value["has_more"], json!(false));
+                return;
+            }
+            assert_eq!(rendered.value["has_more"], json!(true));
+        }
+        panic!("baseline enumeration never completed");
     }
 
     #[test]
@@ -4629,7 +4926,7 @@ mod tests {
             po: 2,
             ..crate::cursor::SessionCursor::default()
         };
-        let error = validate_continuation(&inside, std::slice::from_ref(&turn))
+        let error = validate_continuation(&inside, std::slice::from_ref(&turn), &[])
             .err()
             .unwrap_or_else(|| panic!("a split character was accepted"));
         assert_eq!(classify_error(&error), "CURSOR_INVALID");
@@ -4639,14 +4936,14 @@ mod tests {
             po: 9_999,
             ..crate::cursor::SessionCursor::default()
         };
-        assert!(validate_continuation(&past_end, std::slice::from_ref(&turn)).is_err());
+        assert!(validate_continuation(&past_end, std::slice::from_ref(&turn), &[]).is_err());
 
         let valid = crate::cursor::SessionCursor {
             px: Some(7),
             po: 1,
             ..crate::cursor::SessionCursor::default()
         };
-        assert!(validate_continuation(&valid, std::slice::from_ref(&turn)).is_ok());
+        assert!(validate_continuation(&valid, std::slice::from_ref(&turn), &[]).is_ok());
         // A marker that no longer names the next retained result is stale, not
         // hostile: it is dropped rather than rejected.
         let stale = crate::cursor::SessionCursor {
@@ -4654,7 +4951,7 @@ mod tests {
             po: 5,
             ..crate::cursor::SessionCursor::default()
         };
-        assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
+        assert!(validate_continuation(&stale, std::slice::from_ref(&turn), &[]).is_ok());
     }
 
     #[test]

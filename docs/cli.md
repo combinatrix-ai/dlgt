@@ -593,12 +593,30 @@ Response size is part of the contract:
 
 `has_more: true` means requested data already exists beyond the returned
 cursor; that response uses `reason: "page_full"` and the next call returns
-immediately even with `--wait` or `--until result`. The cursor advances only
-over content actually delivered. When `--max-bytes` squeezes a response, dlgt
-keeps state, then gaps, then terminal results, then events, then blocked
-information, and drops screen text first. A long `final_text` is chunked at a
-UTF-8 boundary and continued through `final_text_offset` and
-`final_text_complete`, with the offset carried in the cursor.
+immediately even with `--wait` or `--until result`.
+
+`--max-bytes` is a hard bound: the serialized document is measured, and no
+response ever exceeds it. The cursor is derived from what the document
+actually carries, so it can never advance past content that was left out.
+When the budget squeezes a response, dlgt keeps state, then gaps, then
+terminal results, then events, then blocked information, and drops screen text
+first.
+
+Progress comes from chunking, never from oversizing. A long `final_text` is
+chunked at a UTF-8 boundary and continued through `final_text_offset` and
+`final_text_complete`; a screen row wider than the remaining budget is chunked
+mid-line and continued on the next call. Both continuations are carried in the
+cursor, so every `has_more` response advances at least one watermark.
+
+If `--max-bytes` is too small to carry the response envelope plus one chunk of
+progress, `fetch` fails with `INVALID_ARGUMENT` and names the smallest budget
+that would work rather than emitting an oversized document. The practical
+floor is roughly 1 KiB for a single Session; the default of 32 KiB is far
+above it.
+
+A `--all` cursor carries watermarks for at most 256 Sessions. A daemon holding
+retained state for more than that rejects `--all` with `INVALID_ARGUMENT` and
+must be read one Session at a time.
 
 ### Cursors
 

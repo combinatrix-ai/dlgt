@@ -45,7 +45,10 @@ pub fn recover(path: &str, provider_session_id: &str, boundary: u64) -> Option<S
 /// reopened with `O_NOFOLLOW` and the opened descriptor is compared against
 /// the checked target by device and inode. A regular file is required.
 /// Swapping an intermediate directory between the two steps is not covered;
-/// that would need `openat2(RESOLVE_BENEATH)`, which is not portable here.
+/// closing it needs an `openat2(RESOLVE_BENEATH)`-style walk, which is not
+/// portable here. Accepted residual: the transcript is written by a same-user
+/// provider that can already modify the target directly, so the race grants no
+/// privilege it does not already have. Recorded in docs/design.md.
 fn open_checked(resolved: &Path) -> Option<std::fs::File> {
     let expected = std::fs::symlink_metadata(resolved).ok()?;
     if !expected.is_file() {
