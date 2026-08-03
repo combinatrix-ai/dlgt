@@ -494,10 +494,12 @@ that has never accepted work remains `NO_RESULT`.
 
 Codex discovery uses app-server `model/list`. Claude keeps the stable Claude
 Code aliases and augments them from the public, daily refreshed
-`claude-models-list` snapshot. Date-pinned `-YYYYMMDD` IDs are omitted so the
-default result remains a concise list of aliases and current canonical IDs.
-Exact canonical IDs also use the snapshot's effort capabilities for pre-launch
-model/effort validation. Floating aliases remain provider-validated.
+`claude-models-list` snapshot. Date-pinned `-YYYYMMDD` IDs are normalized to
+their undated alias, which Claude Code accepts and which keeps the default
+result a concise list of aliases and current canonical IDs. Exact canonical IDs
+also use the snapshot's effort capabilities for pre-launch model/effort
+validation, and a date-pinned ID validates against its alias. Floating aliases
+remain provider-validated.
 
 ## Provider references
 
