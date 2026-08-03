@@ -1796,146 +1796,13 @@ impl Daemon {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn fetch_all_cut(&self, options: &FetchOptions) -> Result<Cut> {
         let store = self.lock_store()?;
-        let baseline = options.baseline();
-        let after = options.event_position();
-        let mut scope_gaps = Vec::new();
-        if !baseline && after < store.evicted_event_seq() {
-            scope_gaps.push(retention_gap("events"));
-        }
-        let (events, events_more, event_watermark) = if baseline {
-            // Freeze the watermark at the first baseline page so events
-            // produced while the baseline is still paging are delivered as a
-            // delta once enumeration completes.
-            let watermark = if options.cursor.is_some() {
-                after
-            } else {
-                store.latest_event_seq()
-            };
-            (Vec::new(), false, watermark)
-        } else {
-            normalized_page(&store, None, after, FETCH_EVENT_PAGE)
-        };
-
-        let mut by_uid: HashMap<String, Vec<Value>> = HashMap::new();
-        let mut dropped_event_seq: Option<i64> = None;
-        for (uid, event) in events {
-            let Some(uid) = uid else { continue };
-            by_uid.entry(uid).or_default().push(event);
-        }
-
-        let live_uids = store
-            .session_uids()
-            .into_iter()
-            .filter(|uid| {
-                store
-                    .session_for_uid(uid)
-                    .is_some_and(|session| !session.id.starts_with("internal:"))
-            })
-            .collect::<Vec<_>>();
-        let mut candidates = live_uids.clone();
-        if baseline && let Some(resume) = options.resume_after() {
-            let start = candidates
-                .iter()
-                .position(|uid| uid == resume)
-                .map_or(0, |index| index + 1);
-            candidates.drain(..start);
-        }
-
-        let mut ready = Vec::new();
-        for uid in candidates {
-            let Some(session) = store.session_for_uid(&uid) else {
-                continue;
-            };
-            let mut position = options.position(&uid);
-            let events = by_uid.remove(&uid).unwrap_or_default();
-            let mut gaps = Vec::new();
-            let (results, results_more) = if baseline {
-                let latest = store.latest_terminal_turn(&session.id);
-                if let Some(turn) = latest.as_ref() {
-                    position.x = turn.execution_seq - 1;
-                    position.px = None;
-                    position.po = 0;
-                }
-                (latest.into_iter().collect::<Vec<_>>(), false)
-            } else {
-                if position.x < store.evicted_result_seq(&uid) {
-                    gaps.push(retention_gap("results"));
-                }
-                store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
-            };
-            if !baseline && events.is_empty() && results.is_empty() {
-                continue;
-            }
-            validate_continuation(&position, &results, &[])?;
-            ready.push(BucketSource {
-                uid: uid.clone(),
-                session: self.public_session_locked(&store, &session)?,
-                gaps,
-                events,
-                results,
-                results_more,
-                stable: Vec::new(),
-                stable_start: store.stable_head(&uid),
-                stable_offset: 0,
-                stable_more: false,
-                live: Vec::new(),
-                live_truncated: false,
-                epoch: store.screen_epoch(&uid),
-                epoch_reset: false,
-                reset_reason: None,
-                screen: false,
-                incoming: position,
-            });
-        }
-        // Serve the Sessions holding the oldest pending events first, so the
-        // page cap cannot park the earliest event behind a Session that never
-        // gets a turn. A baseline keeps enumeration order instead, because its
-        // resumption position depends on it.
-        if !baseline {
-            ready.sort_by(|left, right| {
-                let key = |source: &BucketSource| {
-                    (
-                        source.events.first().map_or(i64::MAX, |event| {
-                            event.get("seq").and_then(Value::as_i64).unwrap_or(i64::MAX)
-                        }),
-                        source.uid.clone(),
-                    )
-                };
-                key(left).cmp(&key(right))
-            });
-        }
-        let overflow = ready.split_off(ready.len().min(FETCH_SESSION_PAGE));
-        let more_candidates = !overflow.is_empty();
-        let sources = ready;
-        // Events for Sessions this page never reached must not be counted as
-        // delivered by the shared watermark.
-        for event in overflow
-            .iter()
-            .flat_map(|source| source.events.iter())
-            .chain(by_uid.values().flatten())
-        {
-            let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
-            dropped_event_seq =
-                Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
-        }
+        let cut = all_sources(&store, options, FETCH_SESSION_PAGE, &|store, session| {
+            self.public_session_locked(store, session)
+        })?;
         drop(store);
-
-        Ok(Cut {
-            baseline,
-            state: None,
-            bound_seq: None,
-            bound_terminal: false,
-            full_event_watermark: event_watermark,
-            events_more,
-            dropped_event_seq,
-            scope_gaps,
-            sources,
-            more_candidates,
-            live_uids,
-        })
+        Ok(cut)
     }
 
     fn read_transcript(&self, params: &Value) -> Result<Value> {
@@ -2310,6 +2177,156 @@ impl Daemon {
             .lock()
             .map_err(|_| anyhow!("session store lock poisoned"))
     }
+}
+
+/// Select the Sessions an `--all` observation covers.
+///
+/// Ordering matters: the Session holding the oldest pending event is served
+/// first, so the page cap can never park the earliest event behind a Session
+/// that never gets a turn. `page` is a parameter so the selection can be
+/// exercised at its boundary without a live daemon.
+#[allow(clippy::too_many_lines)]
+fn all_sources(
+    store: &Store,
+    options: &FetchOptions,
+    page: usize,
+    snapshot: &dyn Fn(&Store, &SessionRecord) -> Result<Value>,
+) -> Result<Cut> {
+    let baseline = options.baseline();
+    let after = options.event_position();
+    let mut scope_gaps = Vec::new();
+    if !baseline && after < store.evicted_event_seq() {
+        scope_gaps.push(retention_gap("events"));
+    }
+    let (events, events_more, event_watermark) = if baseline {
+        // Freeze the watermark at the first baseline page so events
+        // produced while the baseline is still paging are delivered as a
+        // delta once enumeration completes.
+        let watermark = if options.cursor.is_some() {
+            after
+        } else {
+            store.latest_event_seq()
+        };
+        (Vec::new(), false, watermark)
+    } else {
+        normalized_page(store, None, after, FETCH_EVENT_PAGE)
+    };
+
+    let mut by_uid: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut dropped_event_seq: Option<i64> = None;
+    for (uid, event) in events {
+        let Some(uid) = uid else { continue };
+        by_uid.entry(uid).or_default().push(event);
+    }
+
+    let live_uids = store
+        .session_uids()
+        .into_iter()
+        .filter(|uid| {
+            store
+                .session_for_uid(uid)
+                .is_some_and(|session| !session.id.starts_with("internal:"))
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = live_uids.clone();
+    if baseline && let Some(resume) = options.resume_after() {
+        let start = candidates
+            .iter()
+            .position(|uid| uid == resume)
+            .map_or(0, |index| index + 1);
+        candidates.drain(..start);
+    }
+
+    let mut ready = Vec::new();
+    for uid in candidates {
+        let Some(session) = store.session_for_uid(&uid) else {
+            continue;
+        };
+        let mut position = options.position(&uid);
+        let events = by_uid.remove(&uid).unwrap_or_default();
+        let mut gaps = Vec::new();
+        let (results, results_more) = if baseline {
+            let latest = store.latest_terminal_turn(&session.id);
+            if let Some(turn) = latest.as_ref() {
+                position.x = turn.execution_seq - 1;
+                position.px = None;
+                position.po = 0;
+            }
+            (latest.into_iter().collect::<Vec<_>>(), false)
+        } else {
+            if position.x < store.evicted_result_seq(&uid) {
+                gaps.push(retention_gap("results"));
+            }
+            store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
+        };
+        if !baseline && events.is_empty() && results.is_empty() {
+            continue;
+        }
+        validate_continuation(&position, &results, &[])?;
+        ready.push(BucketSource {
+            uid: uid.clone(),
+            session: snapshot(store, &session)?,
+            gaps,
+            events,
+            results,
+            results_more,
+            stable: Vec::new(),
+            stable_start: store.stable_head(&uid),
+            stable_offset: 0,
+            stable_more: false,
+            live: Vec::new(),
+            live_truncated: false,
+            epoch: store.screen_epoch(&uid),
+            epoch_reset: false,
+            reset_reason: None,
+            screen: false,
+            incoming: position,
+        });
+    }
+    // Serve the Sessions holding the oldest pending events first, so the
+    // page cap cannot park the earliest event behind a Session that never
+    // gets a turn. A baseline keeps enumeration order instead, because its
+    // resumption position depends on it.
+    if !baseline {
+        ready.sort_by(|left, right| {
+            let key = |source: &BucketSource| {
+                (
+                    source.events.first().map_or(i64::MAX, |event| {
+                        event.get("seq").and_then(Value::as_i64).unwrap_or(i64::MAX)
+                    }),
+                    source.uid.clone(),
+                )
+            };
+            key(left).cmp(&key(right))
+        });
+    }
+    let overflow = ready.split_off(ready.len().min(page));
+    let more_candidates = !overflow.is_empty();
+    let sources = ready;
+    // Events for Sessions this page never reached must not be counted as
+    // delivered by the shared watermark.
+    for event in overflow
+        .iter()
+        .flat_map(|source| source.events.iter())
+        .chain(by_uid.values().flatten())
+    {
+        let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+        dropped_event_seq = Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
+    }
+
+    Ok(Cut {
+        baseline,
+        state: None,
+        bound_seq: None,
+        bound_terminal: false,
+        full_event_watermark: event_watermark,
+        events_more,
+        dropped_event_seq,
+        scope_gaps,
+        sources,
+        more_candidates,
+        live_uids,
+    })
 }
 
 fn write_semantic_input(runtime: &AgentRuntime, input: &[u8]) -> Result<()> {
@@ -3254,6 +3271,7 @@ fn fnv1a128(bytes: &[u8]) -> u128 {
     hash
 }
 
+#[derive(Clone)]
 struct FetchOptions {
     /// One Session UID, or `all`.
     scope: String,
@@ -3471,9 +3489,13 @@ enum FragmentSlot {
     Before,
     After,
 }
-/// Bytes reserved for each Session's watermarks inside the encoded cursor.
-const CURSOR_ENTRY_RESERVE: usize = 160;
+/// Fallback cursor allowance used only when the cursor cannot be encoded, in
+/// which case the document will fail to build anyway.
 const CURSOR_BASE_RESERVE: usize = 256;
+/// Room for one Session's cursor entry to grow as its watermarks advance.
+const CURSOR_GROWTH_ALLOWANCE: usize = 96;
+/// How far above the measured floor the minimum-budget search looks.
+const MINIMUM_SEARCH_SPAN: usize = 8 * 1024;
 
 impl<'a> Builder<'a> {
     fn new(cut: &'a Cut, options: &'a FetchOptions) -> Result<Self> {
@@ -3496,49 +3518,68 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// Fixed cost of the document as currently committed, including room for
-    /// the cursor entries it will carry plus the one being considered.
+    /// Fixed cost of the document as currently committed: the skeleton plus
+    /// the cursor it would carry right now. Measured rather than reserved, so
+    /// the reported minimum budget is one a caller can actually use. The
+    /// cursor grows as watermarks advance; the final measurement and rollback
+    /// loop absorb that.
     fn envelope(&self) -> usize {
-        // One allowance per bucket already committed, plus one for the next
-        // candidate if there is one. Reserving for a bucket that cannot exist
-        // would make the reported minimum budget dishonest.
-        let pending = usize::from(self.buckets.len() < self.cut.sources.len());
-        self.skeleton + CURSOR_BASE_RESERVE + CURSOR_ENTRY_RESERVE * (self.buckets.len() + pending)
+        self.skeleton
+            + self
+                .cursor()
+                .map_or(CURSOR_BASE_RESERVE, |token| token.len())
+            // Committing a unit can add continuation fields to the cursor, so
+            // the encoded token grows after the accounting that admitted the
+            // unit. Reserve for that rather than admitting a unit the final
+            // measurement would only have to roll back.
+            + CURSOR_GROWTH_ALLOWANCE * self.buckets.len().max(1)
+    }
+
+    /// Bytes available to the daemon's document. The caller's budget covers
+    /// the complete compact CLI line, so the wrapper the client adds around
+    /// this document is reserved up front.
+    fn budget(&self) -> usize {
+        self.options
+            .max_bytes
+            .saturating_sub(cli_wrapper_overhead())
     }
 
     fn remaining(&self) -> usize {
-        self.options
-            .max_bytes
-            .saturating_sub(self.envelope() + self.used)
+        self.budget().saturating_sub(self.envelope() + self.used)
+    }
+
+    fn empty_bucket(source: &BucketSource) -> Committed {
+        let mut committed = Committed {
+            uid: source.uid.clone(),
+            session: source.session.clone(),
+            gaps: source.gaps.clone(),
+            results: Vec::new(),
+            events: Vec::new(),
+            stable: Vec::new(),
+            fragment_before: None,
+            fragment_after: None,
+            live: Vec::new(),
+            live_truncated: source.live_truncated,
+            screen: source.screen,
+            epoch: source.epoch,
+            epoch_reset: source.epoch_reset,
+            reset_reason: source.reset_reason,
+            position: source.incoming,
+        };
+        // The screen projection publishes the current epoch even when no row
+        // ships, and a screenless bucket carries the head row forward.
+        committed.position.ep = source.epoch;
+        if !source.screen {
+            committed.position.r = source.stable_start;
+            committed.position.ro = 0;
+        }
+        committed
     }
 
     /// Commit the mandatory part of each Session bucket: identity and gaps.
     fn commit_buckets(&mut self) {
         for source in &self.cut.sources {
-            let mut committed = Committed {
-                uid: source.uid.clone(),
-                session: source.session.clone(),
-                gaps: source.gaps.clone(),
-                results: Vec::new(),
-                events: Vec::new(),
-                stable: Vec::new(),
-                fragment_before: None,
-                fragment_after: None,
-                live: Vec::new(),
-                live_truncated: source.live_truncated,
-                screen: source.screen,
-                epoch: source.epoch,
-                epoch_reset: source.epoch_reset,
-                reset_reason: source.reset_reason,
-                position: source.incoming,
-            };
-            // The screen projection publishes the current epoch even when no
-            // row ships, and a screenless bucket carries the head row forward.
-            committed.position.ep = source.epoch;
-            if !source.screen {
-                committed.position.r = source.stable_start;
-                committed.position.ro = 0;
-            }
+            let committed = Self::empty_bucket(source);
             let cost = json_cost(&committed.value());
             if cost > self.remaining() {
                 return;
@@ -3903,50 +3944,94 @@ impl<'a> Builder<'a> {
         }))
     }
 
-    /// Smallest response that could carry one unit of progress, used to tell a
-    /// caller what `--max-bytes` would actually work. Counts exactly one
-    /// bucket and one cursor entry, whatever this attempt happened to commit.
-    fn minimum_viable(&self) -> usize {
-        let Some(source) = self.cut.sources.first() else {
-            return self.skeleton + CURSOR_BASE_RESERVE;
-        };
-        let bucket = json_cost(&json!({
-            "session": source.session,
-            "gaps": source.gaps,
-            "results": [],
-            "events": [],
-        }));
-        let unit = source
-            .results
-            .first()
-            .map(minimum_result_cost)
-            .or_else(|| source.events.first().map(json_cost))
-            .or_else(|| {
-                source
-                    .stable
-                    .first()
-                    .map(|_| FRAGMENT_FRAME_COST + json_cost(&json!("x")))
-            })
-            .unwrap_or(8);
-        self.skeleton + CURSOR_BASE_RESERVE + CURSOR_ENTRY_RESERVE + bucket + unit
+    /// Smallest budget that would actually work, obtained by rendering the
+    /// smallest response that still makes progress. Measuring beats arithmetic:
+    /// the answer has to include the cursor entries this scope carries, the
+    /// screen object when the screen is enabled, and the CLI wrapper.
+    fn minimum_viable(&self) -> Result<usize> {
+        let mut probe = Builder::new(self.cut, self.options)?;
+        probe.commit_minimum();
+        let floor = serialized_len(&probe.document()?)? + cli_wrapper_overhead();
+        // The floor is a lower bound: the real path also reserves for the
+        // cursor growing as watermarks advance. Search for the smallest budget
+        // at which a real attempt actually makes progress, so the number the
+        // caller is told is one they can use.
+        let ceiling = floor + MINIMUM_SEARCH_SPAN;
+        if !self.would_progress(ceiling)? {
+            return Ok(ceiling);
+        }
+        let mut low = floor;
+        let mut high = ceiling;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.would_progress(middle)? {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok(low)
     }
 
-    fn finish(mut self) -> Result<Rendered> {
+    /// Whether a real attempt at `max_bytes` would deliver anything.
+    fn would_progress(&self, max_bytes: usize) -> Result<bool> {
+        let options = FetchOptions {
+            max_bytes,
+            ..self.options.clone()
+        };
+        let mut trial = Builder::new(self.cut, &options)?;
+        trial.commit_buckets();
+        trial.commit_results();
+        trial.commit_events();
+        trial.commit_screen();
+        trial.settle()?;
+        Ok(trial.progress() || !trial.pending())
+    }
+
+    /// Commit one bucket and one unit of progress, ignoring the budget.
+    fn commit_minimum(&mut self) {
+        let Some(source) = self.cut.sources.first() else {
+            return;
+        };
+        self.buckets.push(Self::empty_bucket(source));
+        self.units.push(Unit::Bucket);
+        if let Some(turn) = source.results.first() {
+            self.buckets[0].results.push(minimum_result_value(turn));
+        } else if let Some(event) = source.events.first() {
+            self.buckets[0].events.push(event.clone());
+        } else if let Some(row) = source.stable.first() {
+            let head = row.chars().next().map(String::from).unwrap_or_default();
+            self.buckets[0].fragment_after = Some(StableFragment {
+                row_id: source.stable_start + 1,
+                offset: 0,
+                text: head,
+                complete: false,
+            });
+        }
+    }
+
+    /// Roll units back until the encoded document fits the budget.
+    fn settle(&mut self) -> Result<Value> {
         let mut value = self.document()?;
-        while serialized_len(&value)? > self.options.max_bytes {
+        while serialized_len(&value)? > self.budget() {
             if !self.rollback() {
                 break;
             }
             value = self.document()?;
         }
+        Ok(value)
+    }
+
+    fn finish(mut self) -> Result<Rendered> {
+        let value = self.settle()?;
         let length = serialized_len(&value)?;
-        if length > self.options.max_bytes || (self.pending() && !self.progress()) {
+        if length > self.budget() || (self.pending() && !self.progress()) {
             // Progress must come from chunking, never from oversizing. If not
             // even one chunk fits, the request itself is unsatisfiable.
+            let minimum = self.minimum_viable()?.max(length + cli_wrapper_overhead());
             bail!(
-                "invalid max_bytes {}: too small to carry one unit of progress; retry with --max-bytes {} or more",
+                "invalid max_bytes {}: too small to carry one unit of progress; retry with --max-bytes {minimum} or more",
                 self.options.max_bytes,
-                self.minimum_viable().max(length)
             );
         }
         let settled = self.gapped()
@@ -4028,15 +4113,23 @@ fn fit_result(turn: &TurnRecord, offset: u64, budget: usize) -> Option<(Value, u
     }
 }
 
-/// Cost of a result record carrying one character of body.
-fn minimum_result_cost(turn: &TurnRecord) -> usize {
+/// A result record carrying one character of body.
+fn minimum_result_value(turn: &TurnRecord) -> Value {
     let mut value = public_result(turn);
     let text = turn.final_message.clone().unwrap_or_default();
     let head = text.chars().next().map(String::from).unwrap_or_default();
     value["final_text"] = json!(head);
     value["final_text_offset"] = json!(0);
     value["final_text_complete"] = json!(false);
-    json_cost(&value)
+    value
+}
+
+/// Bytes the client adds when it prints a daemon result as one compact line:
+/// the injected `"ok":true` member, its separating comma, and the newline.
+/// Derived rather than guessed so it cannot drift from `print_success`.
+fn cli_wrapper_overhead() -> usize {
+    // `{"ok":true}` without its braces, plus a comma and a newline.
+    serde_json::to_string(&json!({"ok": true})).map_or(11, |text| text.len() - 2) + 2
 }
 
 fn event_seq(event: &Value) -> i64 {
@@ -4175,11 +4268,11 @@ mod tests {
     use super::{
         BucketSource, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
         FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
-        TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
-        clamp_busy_metrics, classify_error, generate_alias, generate_internal_id,
-        provider_id_from_session, public_result, public_session, public_session_with_metrics,
-        retention_gap, signal_shutdown, transcript_window, validate_alias, validate_continuation,
-        wait_for_update_check,
+        TranscriptRecovery, all_sources, apply_codex_notification, apply_hook_event,
+        canonical_session_id, clamp_busy_metrics, classify_error, cli_wrapper_overhead,
+        generate_alias, generate_internal_id, provider_id_from_session, public_result,
+        public_session, public_session_with_metrics, retention_gap, signal_shutdown,
+        transcript_window, validate_alias, validate_continuation, wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -4720,76 +4813,61 @@ mod tests {
 
     #[test]
     fn events_across_capped_sessions_are_delivered_once_and_terminate() {
-        // Three Sessions interleave their events, and only two buckets fit per
-        // response. Clamping to "the earliest hole" would park seq 3 behind a
-        // Session that never gets a turn while later events redelivered
-        // forever; committing a global ascending prefix cannot.
+        // Three Sessions interleave their events and only two buckets fit per
+        // response. Clamping to "the earliest hole" would park an event behind
+        // a Session that never gets a turn while later events redelivered
+        // forever; a global ascending prefix cannot. This drives the real
+        // Session-selection path, with only the page cap parameterized.
         const CAP: usize = 2;
-        let history = [
-            ("su_a", vec![1_i64, 4, 7]),
-            ("su_b", vec![2, 5, 8]),
-            ("su_c", vec![3, 6, 9]),
-        ];
-        let mut cursor: Option<crate::cursor::Cursor> = None;
+        let store = Store::new();
+        let uids = ["a", "b", "c"]
+            .iter()
+            .map(|name| {
+                let id = format!("codex:thread-{name}");
+                store
+                    .insert_session(&NewSession {
+                        id: &id,
+                        alias: &format!("@{name}"),
+                        title: name,
+                        agent: "codex",
+                        cwd: "/tmp",
+                        model: None,
+                        effort: None,
+                        harness_options: &[],
+                        auto_approve: true,
+                    })
+                    .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
+                assert!(store.set_session_running(&id, Some(42)));
+                assert!(store.set_session_state(&id, SessionState::Idle));
+                (id.clone(), store.session_uid(&id).unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+        // Round robin, so sequences interleave across Sessions.
+        for _ in 0..3 {
+            for (id, _) in &uids {
+                store.record_event(Some(id), None, "session.ready");
+            }
+        }
+        let total = store.latest_event_seq();
+        assert_eq!(total, 9);
+
+        // Start from a delta cursor: a cursorless --all is a baseline, which
+        // deliberately subsumes prior events instead of replaying them.
+        let mut cursor = Some(crate::cursor::Cursor::new("boot", crate::cursor::SCOPE_ALL));
         let mut delivered: Vec<i64> = Vec::new();
         for _ in 0..32 {
             let options = FetchOptions {
                 scope: crate::cursor::SCOPE_ALL.to_owned(),
                 ..fetch_options(FETCH_DEFAULT_MAX_BYTES, cursor.clone())
             };
-            let after = options.event_position();
-            let mut pending = history
-                .iter()
-                .filter_map(|(uid, seqs)| {
-                    let mine = seqs
-                        .iter()
-                        .copied()
-                        .filter(|seq| *seq > after)
-                        .collect::<Vec<_>>();
-                    let first = mine.first().copied();
-                    first.map(|first| (first, *uid, mine))
-                })
-                .collect::<Vec<_>>();
-            if pending.is_empty() {
-                break;
-            }
-            // The daemon serves the oldest pending event first.
-            pending.sort();
-            let refused = pending.split_off(CAP.min(pending.len()));
-            let mut cut = test_cut(
-                pending
-                    .iter()
-                    .map(|(_, uid, seqs)| {
-                        SourceSpec {
-                            events: seqs
-                                .iter()
-                                .map(|seq| {
-                                    json!({
-                                        "schema_version": 1,
-                                        "seq": seq,
-                                        "type": "session.busy",
-                                        "session_id": uid,
-                                    })
-                                })
-                                .collect(),
-                            ..SourceSpec::new(uid)
-                        }
-                        .build()
-                    })
-                    .collect(),
-            );
-            cut.dropped_event_seq = refused.iter().map(|(first, _, _)| *first).min();
-            cut.more_candidates = !refused.is_empty();
-            cut.full_event_watermark = history
-                .iter()
-                .flat_map(|(_, seqs)| seqs.iter())
-                .copied()
-                .max()
-                .unwrap_or(0);
-
+            let cut = all_sources(&store, &options, CAP, &|_, session| {
+                Ok(json!({"id": session.id, "state": "idle"}))
+            })
+            .unwrap_or_else(|error| panic!("failed to select Sessions: {error}"));
             let rendered = cut
                 .render(&options)
                 .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
             let page = event_seqs(&rendered.value);
             assert!(!page.is_empty(), "a page made no progress");
             for seq in &page {
@@ -4807,7 +4885,7 @@ mod tests {
         delivered.sort_unstable();
         assert_eq!(
             delivered,
-            (1..=9).collect::<Vec<_>>(),
+            (1..=total).collect::<Vec<_>>(),
             "events were lost or the exchange never terminated"
         );
     }
@@ -5209,27 +5287,188 @@ mod tests {
                 "timeout",
                 Box::new(|| test_cut(vec![SourceSpec::new("su_test").build()])),
             ),
+            (
+                "change",
+                Box::new(|| {
+                    test_cut(vec![
+                        SourceSpec {
+                            events: lifecycle_events(1..=3),
+                            ..SourceSpec::new("su_test")
+                        }
+                        .build(),
+                    ])
+                }),
+            ),
+            (
+                "result",
+                Box::new(|| {
+                    let mut cut = test_cut(vec![
+                        SourceSpec {
+                            results: vec![test_turn(7, "the answer")],
+                            ..SourceSpec::new("su_test")
+                        }
+                        .build(),
+                    ]);
+                    cut.bound_seq = Some(7);
+                    cut.bound_terminal = true;
+                    cut
+                }),
+            ),
         ];
         for (name, build) in variants {
+            let mut options = fetch_options(FETCH_HARD_MAX_BYTES, None);
+            options.until_result = name == "result";
             let relaxed = build()
-                .render(&fetch_options(FETCH_HARD_MAX_BYTES, None))
+                .render(&options)
                 .unwrap_or_else(|error| panic!("{name} failed to render: {error}"));
             assert_eq!(relaxed.value["reason"], json!(name));
             let exact = serde_json::to_string(&relaxed.value)
                 .map(|text| text.len())
                 .unwrap_or_default();
             for budget in [exact.saturating_sub(1), exact, exact + 1] {
-                let Ok(rendered) = build().render(&fetch_options(budget, None)) else {
+                let mut options = fetch_options(budget, None);
+                options.until_result = name == "result";
+                let Ok(rendered) = build().render(&options) else {
                     continue;
                 };
                 let length = serde_json::to_string(&rendered.value)
                     .map(|text| text.len())
                     .unwrap_or_default();
                 assert!(
-                    length <= budget,
-                    "{name} produced {length} bytes for a {budget} byte budget"
+                    length + cli_wrapper_overhead() <= budget,
+                    "{name} produced {length} bytes plus wrapper for a {budget} byte budget"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn an_all_response_respects_an_exact_budget_including_the_wrapper() {
+        let build = || {
+            let mut cut = test_cut(vec![
+                SourceSpec {
+                    events: lifecycle_events(1..=4),
+                    ..SourceSpec::new("su_a")
+                }
+                .build(),
+                SourceSpec {
+                    results: vec![test_turn(2, "second session answer")],
+                    ..SourceSpec::new("su_b")
+                }
+                .build(),
+            ]);
+            cut.live_uids = vec!["su_a".to_owned(), "su_b".to_owned()];
+            cut
+        };
+        let scoped = |max_bytes: usize| FetchOptions {
+            scope: crate::cursor::SCOPE_ALL.to_owned(),
+            ..fetch_options(max_bytes, None)
+        };
+        let relaxed = build()
+            .render(&scoped(FETCH_HARD_MAX_BYTES))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        let exact = serde_json::to_string(&relaxed.value)
+            .map(|text| text.len())
+            .unwrap_or_default()
+            + cli_wrapper_overhead();
+
+        for budget in [exact.saturating_sub(40), exact, exact + 40] {
+            let Ok(rendered) = build().render(&scoped(budget)) else {
+                continue;
+            };
+            let length = serde_json::to_string(&rendered.value)
+                .map(|text| text.len())
+                .unwrap_or_default();
+            assert!(
+                length + cli_wrapper_overhead() <= budget,
+                "--all produced {length} bytes plus wrapper for a {budget} byte budget"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reported_minimum_holds_for_a_screen_only_and_an_all_response() {
+        // A stable-only screen response: the floor must include the fixed
+        // screen object as well as the fragment frame.
+        let screen_cut = || {
+            test_cut(vec![
+                SourceSpec {
+                    stable: vec!["q".repeat(4_000)],
+                    screen: true,
+                    ..SourceSpec::new("su_test")
+                }
+                .build(),
+            ])
+        };
+        // An --all response carrying watermarks for Sessions it does not
+        // return: the floor must include those cursor entries.
+        let mut carried = crate::cursor::Cursor::new("boot", crate::cursor::SCOPE_ALL);
+        for index in 0..12 {
+            carried.set_session(
+                &format!("su_carried_{index}"),
+                crate::cursor::SessionCursor {
+                    x: 4,
+                    r: 900,
+                    ..crate::cursor::SessionCursor::default()
+                },
+            );
+        }
+        let all_cut = || {
+            let mut cut = test_cut(vec![
+                SourceSpec {
+                    results: vec![test_turn(5, &"body ".repeat(200))],
+                    ..SourceSpec::new("su_test")
+                }
+                .build(),
+            ]);
+            cut.live_uids = (0..12)
+                .map(|index| format!("su_carried_{index}"))
+                .chain(std::iter::once("su_test".to_owned()))
+                .collect();
+            cut
+        };
+
+        for (name, cut, options) in [
+            (
+                "screen",
+                Box::new(screen_cut) as Box<dyn Fn() -> Cut>,
+                fetch_options(32, None),
+            ),
+            (
+                "all",
+                Box::new(all_cut) as Box<dyn Fn() -> Cut>,
+                FetchOptions {
+                    scope: crate::cursor::SCOPE_ALL.to_owned(),
+                    ..fetch_options(32, Some(carried))
+                },
+            ),
+        ] {
+            let error = cut()
+                .render(&options)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: an unusable budget was accepted"));
+            let message = error.to_string();
+            let minimum = message
+                .rsplit("--max-bytes ")
+                .next()
+                .and_then(|tail| tail.split(' ').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("{name}: no minimum in {message}"));
+
+            let at_minimum = FetchOptions {
+                max_bytes: minimum,
+                ..options.clone()
+            };
+            let rendered = cut()
+                .render(&at_minimum)
+                .unwrap_or_else(|error| panic!("{name}: minimum {minimum} failed: {error}"));
+            let length = serde_json::to_string(&rendered.value)
+                .map(|text| text.len())
+                .unwrap_or_default();
+            assert!(
+                length + cli_wrapper_overhead() <= minimum,
+                "{name}: {length} bytes plus wrapper exceeded the reported {minimum}"
+            );
         }
     }
 

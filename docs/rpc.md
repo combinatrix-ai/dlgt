@@ -248,15 +248,18 @@ Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
 response. `has_more: true` means data already exists beyond the returned
 cursor, and the next request returns immediately even with `wait_ms`.
 
-`max_bytes` is a hard bound on the serialized document, and the cursor is
-derived from what that document actually carries, so it can never advance past
-omitted content. Progress under a tight budget comes from chunking: a long
+`max_bytes` is a hard bound on the complete compact response line a client
+prints, wrapper and newline included; the daemon reserves that wrapper before
+committing content. An optional `info` notice and pretty-printing are outside
+the bound. The cursor is derived from what the document actually carries, so it
+can never advance past omitted content. Progress under a tight budget comes from chunking: a long
 `final_text` is chunked at a UTF-8 boundary and continued with
 `final_text_offset` and `final_text_complete`, and a screen row wider than the
 remaining budget is chunked mid-line. Every `has_more` response advances at
 least one watermark. A `max_bytes` too small for the envelope plus one chunk
 fails with `INVALID_ARGUMENT` naming the smallest workable value instead of
-emitting an oversized document.
+emitting an oversized document. That value is measured by rendering the
+minimal response, so retrying at exactly it succeeds.
 
 `screen.stable` contains complete rows only. A split row is carried in one of
 two ordered slots, each shaped

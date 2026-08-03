@@ -595,12 +595,21 @@ Response size is part of the contract:
 cursor; that response uses `reason: "page_full"` and the next call returns
 immediately even with `--wait` or `--until result`.
 
-`--max-bytes` is a hard bound: the serialized document is measured, and no
-response ever exceeds it. The cursor is derived from what the document
-actually carries, so it can never advance past content that was left out.
-When the budget squeezes a response, dlgt keeps state, then gaps, then
-terminal results, then events, then blocked information, and drops screen text
-first.
+`--max-bytes` is a hard bound on the **complete compact response line**: the
+`{"ok":true,...}` wrapper and its trailing newline are reserved before any
+content is committed, and the finished line is measured. The cursor is derived
+from what the document actually carries, so it can never advance past content
+that was left out. When the budget squeezes a response, dlgt keeps state, then
+gaps, then terminal results, then events, then blocked information, and drops
+screen text first.
+
+Two things are outside the bound, both deliberately:
+
+- an optional `info` notice, which the daemon injects rarely and independently
+  of the request (see `UPDATE_AVAILABLE` above);
+- `--pretty`, which exists for humans and inflates the output arbitrarily.
+
+The contract covers the compact response without `info`.
 
 Progress comes from chunking, never from oversizing. A long `final_text` is
 chunked at a UTF-8 boundary and continued through `final_text_offset` and
@@ -642,9 +651,10 @@ a position with nothing outstanding behind it.
 
 If `--max-bytes` is too small to carry the response envelope plus one chunk of
 progress, `fetch` fails with `INVALID_ARGUMENT` and names the smallest budget
-that would work rather than emitting an oversized document. The practical
-floor is roughly 1 KiB for a single Session; the default of 32 KiB is far
-above it.
+that would work rather than emitting an oversized document. That number is
+obtained by rendering the minimal response, not estimated, so retrying at
+exactly the reported value succeeds. The practical floor is roughly 1 KiB for a
+single Session; the default of 32 KiB is far above it.
 
 A `--all` cursor carries watermarks for at most 256 Sessions. A daemon holding
 retained state for more than that rejects `--all` with `INVALID_ARGUMENT` and

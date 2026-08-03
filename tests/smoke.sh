@@ -344,6 +344,13 @@ printf '%s\n' "$chunk_json" | grep -q '"reason":"page_full"'
 # The budget spent everything on the result body, so the event watermark must
 # not have advanced past the events this page did not carry.
 printf '%s\n' "$chunk_json" | grep -q '"events":\[\]'
+# The bound covers the complete compact response line the client prints,
+# wrapper and trailing newline included.
+chunk_bytes=$(printf '%s\n' "$chunk_json" | wc -c | tr -d ' ')
+test "$chunk_bytes" -le 2048 || {
+  printf 'squeezed fetch line was %s bytes, over its 2048 budget\n' "$chunk_bytes" >&2
+  exit 1
+}
 chunk_cursor=$(printf '%s\n' "$chunk_json" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 rest_json=$("$binary" fetch "$reused_id" --cursor "$chunk_cursor" --no-screen)
 printf '%s\n' "$rest_json" | grep -q '"final_text_complete":true'
