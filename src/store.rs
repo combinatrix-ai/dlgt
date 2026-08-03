@@ -48,15 +48,6 @@ struct StoredSession {
     terminal_cols: u16,
 }
 
-/// Observation watermarks captured atomically under the store lock.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Checkpoint {
-    pub event_seq: i64,
-    pub row_id: u64,
-    pub screen_epoch: u64,
-    pub result_seq: i64,
-}
-
 /// Live screen projection: a replaceable snapshot, never cursor history.
 #[derive(Debug, Default)]
 pub struct LiveScreen {
@@ -354,15 +345,6 @@ impl Store {
         }
     }
 
-    pub fn terminal_size(&self, session_id: &str) -> Result<(u16, u16)> {
-        self.state
-            .borrow()
-            .sessions
-            .get(session_id)
-            .map(|session| (session.terminal_rows, session.terminal_cols))
-            .context("failed to read terminal size")
-    }
-
     pub fn get_session(&self, selector: &str) -> Option<SessionRecord> {
         let state = self.state.borrow();
         if let Some(session) = state.sessions.get(selector) {
@@ -434,6 +416,15 @@ impl Store {
 
     pub fn get_turn(&self, id: &str) -> Option<TurnRecord> {
         self.state.borrow().turns.get(id).cloned()
+    }
+
+    pub fn turn_for_execution(&self, session_id: &str, execution_seq: i64) -> Option<TurnRecord> {
+        self.state
+            .borrow()
+            .turns
+            .values()
+            .find(|turn| turn.session_id == session_id && turn.execution_seq == execution_seq)
+            .cloned()
     }
 
     pub fn latest_turn(&self, session_id: &str) -> Option<TurnRecord> {
@@ -737,36 +728,6 @@ impl Store {
             .collect::<Vec<_>>();
         uids.sort_by_key(|(created, uid)| (std::cmp::Reverse(*created), uid.clone()));
         uids.into_iter().map(|(_, uid)| uid).collect()
-    }
-
-    /// Capture the current observation position. Callers hold the store lock
-    /// across this call and the mutation it precedes, so no output or result
-    /// can slip in front of the returned cursor.
-    pub fn checkpoint(&self, uid: Option<&str>) -> Checkpoint {
-        let state = self.state.borrow();
-        let screen = uid.and_then(|uid| state.screens.get(uid));
-        Checkpoint {
-            event_seq: state.next_event_seq,
-            row_id: screen.map_or(0, ScreenStore::head_row_id),
-            screen_epoch: screen.map_or(0, ScreenStore::epoch),
-            result_seq: uid
-                .and_then(|uid| {
-                    state
-                        .sessions
-                        .values()
-                        .find(|session| session.uid == uid)
-                        .map(|session| session.record.id.clone())
-                })
-                .map_or(0, |session_id| {
-                    state
-                        .turns
-                        .values()
-                        .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
-                        .map(|turn| turn.execution_seq)
-                        .max()
-                        .unwrap_or(0)
-                }),
-        }
     }
 
     /// Terminal results after `after`, oldest first.

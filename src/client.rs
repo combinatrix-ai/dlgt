@@ -423,6 +423,7 @@ fn public_rpc_method(method: &str) -> bool {
             | "session.restart"
             | "session.send"
             | "session.wait"
+            | "session.fetch"
             | "session.cancel"
             | "session.list"
             | "session.read"

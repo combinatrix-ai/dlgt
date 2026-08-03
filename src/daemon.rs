@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::codex::{CodexConnection, final_agent_message_text};
+use crate::cursor;
 use crate::paths;
 use crate::protocol::{Request, Response, SessionRecord, SessionState, TurnRecord, TurnState};
 use crate::provider::{
@@ -28,6 +29,22 @@ use crate::store::{NewSession, Store, now_ms};
 use crate::update;
 
 const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Composite read bounds. Response size is part of the protocol: an LLM caller
+/// pays for every byte, so pagination is not optional implementation tuning.
+const FETCH_DEFAULT_MAX_BYTES: usize = 32 * 1024;
+const FETCH_HARD_MAX_BYTES: usize = 256 * 1024;
+const FETCH_MIN_MAX_BYTES: usize = 2 * 1024;
+const FETCH_EVENT_PAGE: usize = 64;
+const FETCH_RESULT_PAGE: usize = 4;
+const FETCH_STABLE_PAGE: usize = 128;
+const FETCH_STABLE_MAX: usize = 512;
+const FETCH_LIVE_ROWS: usize = 40;
+const FETCH_SESSION_PAGE: usize = 32;
+/// A long poll is bounded only to catch typos and leaked waiters.
+const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
+const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FETCH_ENVELOPE_RESERVE: usize = 1024;
+const FETCH_SESSION_CURSOR_RESERVE: usize = 128;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -83,6 +100,7 @@ pub fn run() -> Result<()> {
     let reaper = Reaper::spawn()?;
     let (update_shutdown, update_wait) = mpsc::sync_channel(1);
     let daemon = Arc::new(Daemon {
+        instance_id: Uuid::new_v4().simple().to_string(),
         store: Arc::new(Mutex::new(store)),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
@@ -163,6 +181,9 @@ pub fn run() -> Result<()> {
 }
 
 struct Daemon {
+    /// Daemon boot identity. Runtime state is memory-only, so no cursor may
+    /// survive a restart.
+    instance_id: String,
     store: Arc<Mutex<Store>>,
     sessions: Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
     attach_leases: Mutex<HashMap<String, String>>,
@@ -468,6 +489,7 @@ impl Daemon {
                 }
             }
             "session.wait" => self.wait_session(params),
+            "session.fetch" => self.fetch(params),
             "session.cancel" => self.cancel_session(params),
             "transcript.read_raw" => self.read_transcript(params),
             "event.read" => self.read_events(params),
@@ -1181,11 +1203,19 @@ impl Daemon {
     }
 
     fn public_session(&self, session: &SessionRecord) -> Result<Value> {
-        let busy_metrics = self.busy_metrics(session)?;
+        let store = self.lock_store()?;
+        self.public_session_locked(&store, session)
+    }
+
+    /// Build the public snapshot from an already-held store guard. The store
+    /// mutex is not reentrant, so composite readers that take one cut under
+    /// the lock must use this instead of `public_session`.
+    fn public_session_locked(&self, store: &Store, session: &SessionRecord) -> Result<Value> {
+        let busy_metrics = self.busy_metrics(store, session)?;
         Ok(public_session_with_metrics(session, busy_metrics))
     }
 
-    fn busy_metrics(&self, session: &SessionRecord) -> Result<Option<BusyMetrics>> {
+    fn busy_metrics(&self, store: &Store, session: &SessionRecord) -> Result<Option<BusyMetrics>> {
         if session.state != SessionState::Busy {
             return Ok(None);
         }
@@ -1196,9 +1226,7 @@ impl Daemon {
         let busy_for_ms = session
             .active_turn_id
             .as_deref()
-            .map(|turn_id| self.lock_store().map(|store| store.get_turn(turn_id)))
-            .transpose()?
-            .flatten()
+            .and_then(|turn_id| store.get_turn(turn_id))
             .map_or(0, |turn| {
                 u64::try_from(now_ms().saturating_sub(turn.created_at_ms)).unwrap_or(0)
             });
@@ -1536,6 +1564,330 @@ impl Daemon {
         Ok(json!({"canceled": true, "turn_id": turn.id}))
     }
 
+    /// One composite forward-delta read: current state, newly terminalized
+    /// results, lifecycle events, and the forward screen delta, from an opaque
+    /// cursor. Every observation is a success; only malformed requests,
+    /// unknown Sessions, and unusable cursors are errors.
+    fn fetch(&self, params: &Value) -> Result<Value> {
+        let options = self.fetch_options(params)?;
+        let deadline = Instant::now() + options.wait;
+        let mut bound: Option<i64> = None;
+        loop {
+            let cut = if options.scope == cursor::SCOPE_ALL {
+                self.fetch_all_cut(&options)?
+            } else {
+                self.fetch_session_cut(&options, &mut bound)?
+            };
+            let rendered = cut.render(&options)?;
+            if rendered.settled
+                || Instant::now() >= deadline
+                || self.shutting_down.load(Ordering::SeqCst)
+            {
+                return Ok(rendered.value);
+            }
+            std::thread::sleep(FETCH_POLL_INTERVAL);
+        }
+    }
+
+    fn fetch_options(&self, params: &Value) -> Result<FetchOptions> {
+        let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
+        let selector = params.get("session").and_then(Value::as_str);
+        if all == selector.is_some() {
+            bail!("fetch requires exactly one of a Session selector or --all");
+        }
+        let until_result = match params.get("until").and_then(Value::as_str).unwrap_or("any") {
+            "any" => false,
+            "result" => true,
+            other => bail!("invalid until {other:?}; use any or result"),
+        };
+        let wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+        if wait_ms > FETCH_MAX_WAIT_MS {
+            bail!("invalid wait duration; the maximum long poll is 24h");
+        }
+        let max_bytes = usize::try_from(
+            params
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(FETCH_DEFAULT_MAX_BYTES as u64),
+        )
+        .unwrap_or(FETCH_DEFAULT_MAX_BYTES)
+        .clamp(FETCH_MIN_MAX_BYTES, FETCH_HARD_MAX_BYTES);
+        let screen = params.get("screen").unwrap_or(&Value::Null);
+        let stable_limit = match screen {
+            Value::Bool(false) => 0,
+            // Absent means the documented default: the screen delta is on for
+            // a single Session and unavailable for --all.
+            Value::Null | Value::Bool(true) => FETCH_STABLE_PAGE,
+            Value::Number(lines) => usize::try_from(
+                lines
+                    .as_u64()
+                    .context("invalid screen line budget")?
+                    .min(FETCH_STABLE_MAX as u64),
+            )
+            .unwrap_or(FETCH_STABLE_PAGE),
+            _ => bail!("invalid screen selection; use a boolean or a line count"),
+        };
+        let scope = if all {
+            if !matches!(screen, Value::Null | Value::Bool(false)) {
+                bail!("invalid screen selection; fetch --all cannot aggregate screens");
+            }
+            if until_result {
+                bail!("invalid until selection; fetch --all cannot bind to one execution");
+            }
+            cursor::SCOPE_ALL.to_owned()
+        } else {
+            let selector = selector.unwrap_or_default();
+            let session = self.resolve_session(selector)?;
+            self.lock_store()?
+                .session_uid(&session.id)
+                .with_context(|| format!("session not found: {selector}"))?
+        };
+        let cursor = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(|text| cursor::Cursor::decode(text, &self.instance_id))
+            .transpose()?;
+        if let Some(cursor) = cursor.as_ref() {
+            cursor.require_scope(&scope)?;
+        }
+        Ok(FetchOptions {
+            scope,
+            cursor,
+            wait: Duration::from_millis(wait_ms),
+            until_result,
+            stable_limit: if all { 0 } else { stable_limit },
+            max_bytes,
+            instance_id: self.instance_id.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fetch_session_cut(&self, options: &FetchOptions, bound: &mut Option<i64>) -> Result<Cut> {
+        let uid = options.scope.clone();
+        let store = self.lock_store()?;
+        let session = store
+            .session_for_uid(&uid)
+            .context("session not found: cursor no longer addresses a live Session")?;
+        let baseline = options.cursor.is_none();
+        let position = options
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.session(&uid))
+            .unwrap_or_default();
+        let mut gaps = Vec::new();
+
+        let (events, events_more, event_seq) = if baseline {
+            (Vec::new(), false, store.latest_event_seq())
+        } else {
+            let after = options.cursor.as_ref().map_or(0, |cursor| cursor.e);
+            if after < store.evicted_event_seq() {
+                gaps.push(retention_gap("events"));
+            }
+            normalized_page(&store, Some(&session.id), after, FETCH_EVENT_PAGE)
+        };
+
+        let (results, results_more) = if baseline {
+            let latest = store
+                .latest_turn(&session.id)
+                .filter(|turn| turn.state.is_terminal());
+            (latest.into_iter().collect::<Vec<_>>(), false)
+        } else {
+            if position.x < store.evicted_result_seq(&uid) {
+                gaps.push(retention_gap("results"));
+            }
+            store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
+        };
+
+        let stable = if options.stable_limit == 0 {
+            crate::screen::StablePage {
+                next_after: store.stable_head(&uid),
+                ..crate::screen::StablePage::default()
+            }
+        } else if baseline {
+            store.stable_tail(&uid, options.stable_limit)
+        } else {
+            store.stable_page(&uid, position.r, options.stable_limit)
+        };
+        if stable.gap {
+            gaps.push(retention_gap("screen"));
+        }
+        let live = if options.stable_limit == 0 {
+            crate::store::LiveScreen {
+                epoch: store.screen_epoch(&uid),
+                ..crate::store::LiveScreen::default()
+            }
+        } else {
+            store.live_screen(&uid, FETCH_LIVE_ROWS)
+        };
+        let epoch_reset = !baseline && position.ep != 0 && position.ep != live.epoch;
+
+        if bound.is_none() {
+            *bound = session
+                .active_turn_id
+                .as_deref()
+                .and_then(|id| store.get_turn(id))
+                .or_else(|| store.latest_turn(&session.id))
+                .map(|turn| turn.execution_seq);
+        }
+        let bound_terminal = bound.is_some_and(|seq| {
+            seq <= position.x
+                || store
+                    .turn_for_execution(&session.id, seq)
+                    .is_some_and(|turn| turn.state.is_terminal())
+        });
+        let public = self.public_session_locked(&store, &session)?;
+        drop(store);
+
+        Ok(Cut {
+            baseline,
+            state: Some(session.state),
+            bound_terminal,
+            event_seq,
+            events_more,
+            sessions: vec![SessionDelta {
+                uid,
+                session: public,
+                events,
+                results,
+                results_more,
+                stable,
+                live,
+                epoch_reset,
+                gaps,
+                position,
+            }],
+            sessions_more: false,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fetch_all_cut(&self, options: &FetchOptions) -> Result<Cut> {
+        let store = self.lock_store()?;
+        let baseline = options.cursor.is_none();
+        let after = options.cursor.as_ref().map_or(0, |cursor| cursor.e);
+        let mut gaps = Vec::new();
+        if !baseline && after < store.evicted_event_seq() {
+            gaps.push(retention_gap("events"));
+        }
+        let (events, mut events_more, mut event_seq) = if baseline {
+            (Vec::new(), false, store.latest_event_seq())
+        } else {
+            normalized_page(&store, None, after, FETCH_EVENT_PAGE)
+        };
+
+        // Bucket the global event page, truncating it rather than advancing
+        // the shared watermark past a Session that did not fit this page.
+        let mut order = Vec::new();
+        let mut buckets: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut delivered_events = Vec::new();
+        for event in events {
+            let Some(id) = event.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(uid) = store.session_uid(id) else {
+                continue;
+            };
+            if !buckets.contains_key(&uid) {
+                if order.len() >= FETCH_SESSION_PAGE {
+                    events_more = true;
+                    event_seq = delivered_events
+                        .last()
+                        .and_then(|value: &Value| value.get("seq"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(after);
+                    break;
+                }
+                order.push(uid.clone());
+            }
+            buckets.entry(uid).or_default().push(event.clone());
+            delivered_events.push(event);
+        }
+
+        let mut deltas = Vec::new();
+        let mut sessions_more = false;
+        for uid in store.session_uids() {
+            let Some(session) = store.session_for_uid(&uid) else {
+                continue;
+            };
+            if session.id.starts_with("internal:") {
+                continue;
+            }
+            let position = options
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.session(&uid))
+                .unwrap_or_default();
+            let (results, results_more) = if baseline {
+                (Vec::new(), false)
+            } else {
+                store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
+            };
+            let events = buckets.remove(&uid).unwrap_or_default();
+            let changed = !events.is_empty() || !results.is_empty();
+            if !baseline && !changed {
+                continue;
+            }
+            if deltas.len() >= FETCH_SESSION_PAGE {
+                sessions_more = true;
+                break;
+            }
+            let mut session_gaps = Vec::new();
+            if !baseline && position.x < store.evicted_result_seq(&uid) {
+                session_gaps.push(retention_gap("results"));
+            }
+            let baseline_result = baseline
+                .then(|| {
+                    store
+                        .latest_turn(&session.id)
+                        .filter(|turn| turn.state.is_terminal())
+                })
+                .flatten();
+            let result_seq = baseline_result
+                .as_ref()
+                .map_or(position.x, |turn| turn.execution_seq);
+            deltas.push(SessionDelta {
+                uid: uid.clone(),
+                session: self.public_session_locked(&store, &session)?,
+                events,
+                results: if baseline {
+                    baseline_result.into_iter().collect()
+                } else {
+                    results
+                },
+                results_more,
+                stable: crate::screen::StablePage {
+                    next_after: store.stable_head(&uid),
+                    ..crate::screen::StablePage::default()
+                },
+                live: crate::store::LiveScreen {
+                    epoch: store.screen_epoch(&uid),
+                    ..crate::store::LiveScreen::default()
+                },
+                epoch_reset: false,
+                gaps: session_gaps,
+                position: crate::cursor::SessionCursor {
+                    x: result_seq,
+                    ..position
+                },
+            });
+        }
+        drop(store);
+        if !gaps.is_empty()
+            && let Some(first) = deltas.first_mut()
+        {
+            first.gaps.extend(gaps);
+        }
+        Ok(Cut {
+            baseline,
+            state: None,
+            bound_terminal: false,
+            event_seq,
+            events_more,
+            sessions: deltas,
+            sessions_more,
+        })
+    }
+
     fn read_transcript(&self, params: &Value) -> Result<Value> {
         let session = self.resolve_session(params_string(params, "session")?)?;
         let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
@@ -1564,35 +1916,11 @@ impl Daemon {
         } else {
             None
         };
-        let events = self.lock_store()?.read_events(session_id.as_deref(), after);
         let store = self.lock_store()?;
-        let normalized = events
-            .into_iter()
-            .filter_map(|event| {
-                let event_type = normalize_event_type(&event.kind)?;
-                let turn = event.turn_id.as_deref().and_then(|id| store.get_turn(id));
-                let execution_seq = turn.as_ref().map(|turn| turn.execution_seq);
-                let mut value = json!({
-                    "schema_version": 1,
-                    "seq": event.seq,
-                    "type": event_type,
-                    "session_id": event.session_id,
-                });
-                if let Some(seq) = execution_seq {
-                    value["execution_seq"] = json!(seq);
-                }
-                if event_type == "provider.retrying" {
-                    value["attempt"] = json!(event.retry_attempt.unwrap_or(1));
-                }
-                if event_type == "session.idle" {
-                    value["result_status"] =
-                        turn.as_ref().map_or(Value::Null, |turn| json!(turn.state));
-                }
-                if event_type == "session.blocked" {
-                    value["reason"] = json!("user_input");
-                }
-                Some(value)
-            })
+        let normalized = store
+            .read_events(session_id.as_deref(), after)
+            .iter()
+            .filter_map(|event| normalize_event(&store, event))
             .collect::<Vec<_>>();
         Ok(Value::Array(normalized))
     }
@@ -2429,6 +2757,14 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
     if message.contains("SESSION_NOT_RUNNING") {
         "SESSION_NOT_RUNNING"
+    } else if message.contains("CURSOR_VERSION_UNSUPPORTED") {
+        "CURSOR_VERSION_UNSUPPORTED"
+    } else if message.contains("CURSOR_SCOPE_MISMATCH") {
+        "CURSOR_SCOPE_MISMATCH"
+    } else if message.contains("CURSOR_EXPIRED") {
+        "CURSOR_EXPIRED"
+    } else if message.contains("CURSOR_INVALID") {
+        "CURSOR_INVALID"
     } else if message.contains("wait timed out") {
         "WAIT_TIMEOUT"
     } else if message.contains("cancel timed out") {
@@ -2601,6 +2937,309 @@ fn generate_alias(title: &str) -> String {
         slug.chars().take(32).collect::<String>(),
         &suffix[..6]
     )
+}
+
+struct FetchOptions {
+    /// One Session UID, or `all`.
+    scope: String,
+    cursor: Option<cursor::Cursor>,
+    wait: Duration,
+    until_result: bool,
+    /// Zero disables the screen projection entirely.
+    stable_limit: usize,
+    max_bytes: usize,
+    instance_id: String,
+}
+
+/// An immutable observation cut taken under the store lock. Serialization
+/// happens after the lock is released, so output arriving during serialization
+/// belongs to the next cursor.
+#[allow(clippy::struct_excessive_bools)]
+struct Cut {
+    baseline: bool,
+    state: Option<SessionState>,
+    bound_terminal: bool,
+    event_seq: i64,
+    events_more: bool,
+    sessions: Vec<SessionDelta>,
+    sessions_more: bool,
+}
+
+struct SessionDelta {
+    uid: String,
+    session: Value,
+    events: Vec<Value>,
+    results: Vec<TurnRecord>,
+    results_more: bool,
+    stable: crate::screen::StablePage,
+    live: crate::store::LiveScreen,
+    epoch_reset: bool,
+    gaps: Vec<Value>,
+    position: cursor::SessionCursor,
+}
+
+struct Rendered {
+    value: Value,
+    /// The long poll is finished: either something wake-worthy happened or the
+    /// requested binding is satisfied.
+    settled: bool,
+}
+
+impl Cut {
+    fn render(mut self, options: &FetchOptions) -> Result<Rendered> {
+        let mut next = cursor::Cursor::new(&options.instance_id, &options.scope);
+        next.e = self.event_seq;
+        if let Some(previous) = options.cursor.as_ref() {
+            next.p.clone_from(&previous.p);
+        }
+        let mut has_more = self.events_more || self.sessions_more;
+        let mut gapped = false;
+        // Envelope, cursor, and reason are reserved before any payload so a
+        // squeezed response can still carry state and gaps.
+        let mut budget = options.max_bytes.saturating_sub(
+            FETCH_ENVELOPE_RESERVE + FETCH_SESSION_CURSOR_RESERVE * self.sessions.len().max(1),
+        );
+        let mut buckets = Vec::new();
+        for delta in &mut self.sessions {
+            let (value, position, more, gap) = delta.render(options, &mut budget);
+            has_more = has_more || more;
+            gapped = gapped || gap;
+            next.set_session(&delta.uid, position);
+            buckets.push(value);
+        }
+        let delivered = buckets.iter().any(|bucket| {
+            bucket
+                .get("events")
+                .and_then(Value::as_array)
+                .is_some_and(|events| !events.is_empty())
+                || bucket
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .is_some_and(|results| !results.is_empty())
+                || bucket
+                    .pointer("/screen/stable")
+                    .and_then(Value::as_array)
+                    .is_some_and(|stable| !stable.is_empty())
+        });
+        let blocked = self.state == Some(SessionState::Blocked);
+        let reason = if gapped {
+            "gap"
+        } else if blocked {
+            "blocked"
+        } else if options.until_result && self.bound_terminal {
+            "result"
+        } else if has_more {
+            "page_full"
+        } else if self.baseline {
+            "snapshot"
+        } else if delivered {
+            "change"
+        } else {
+            "timeout"
+        };
+        let settled = gapped
+            || blocked
+            || has_more
+            || if options.until_result {
+                self.bound_terminal
+            } else {
+                self.baseline || delivered
+            };
+        Ok(Rendered {
+            value: json!({
+                "schema_version": 1,
+                "runtime": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "instance_id": options.instance_id,
+                },
+                "reason": reason,
+                "has_more": has_more,
+                "cursor": next.encode()?,
+                "sessions": buckets,
+            }),
+            settled,
+        })
+    }
+}
+
+impl SessionDelta {
+    /// Fill one Session bucket in priority order: state, gaps, terminal
+    /// results, events, then screen text.
+    fn render(
+        &mut self,
+        options: &FetchOptions,
+        budget: &mut usize,
+    ) -> (Value, cursor::SessionCursor, bool, bool) {
+        let mut position = self.position;
+        let mut has_more = self.results_more;
+        let gapped = !self.gaps.is_empty();
+        let mut bucket = json!({
+            "session": self.session,
+            "gaps": self.gaps,
+        });
+        *budget = budget.saturating_sub(json_cost(&bucket));
+
+        let mut results = Vec::new();
+        for turn in &self.results {
+            let resume = if position.px == Some(turn.execution_seq) {
+                position.po
+            } else {
+                0
+            };
+            let (value, complete, delivered) = fetch_result(turn, resume, *budget);
+            if !complete && delivered == 0 {
+                has_more = true;
+                break;
+            }
+            *budget = budget.saturating_sub(json_cost(&value));
+            results.push(value);
+            if complete {
+                position.x = turn.execution_seq;
+                position.px = None;
+                position.po = 0;
+            } else {
+                position.px = Some(turn.execution_seq);
+                position.po = resume + delivered;
+                has_more = true;
+                break;
+            }
+        }
+        bucket["results"] = Value::Array(results);
+
+        let mut events = Vec::new();
+        for event in &self.events {
+            let cost = json_cost(event);
+            if cost > *budget {
+                has_more = true;
+                break;
+            }
+            *budget -= cost;
+            events.push(event.clone());
+        }
+        bucket["events"] = Value::Array(events);
+
+        if options.stable_limit > 0 {
+            let mut stable = Vec::new();
+            let mut row = self.stable.next_after.saturating_sub(self.delivered_rows());
+            for line in &self.stable.lines {
+                let cost = line.len() + 4;
+                if cost > *budget {
+                    has_more = true;
+                    break;
+                }
+                *budget -= cost;
+                row += 1;
+                stable.push(Value::String(line.clone()));
+            }
+            has_more = has_more || self.stable.has_more;
+            position.r = row;
+            let live = if *budget > 0 {
+                self.live.rows.clone()
+            } else {
+                Vec::new()
+            };
+            bucket["screen"] = json!({
+                "epoch": self.live.epoch,
+                "reset": self.epoch_reset,
+                "reset_reason": self.epoch_reset.then_some(self.live.reset_reason),
+                "stable": stable,
+                "live": live,
+                "live_truncated": self.live.truncated,
+            });
+        } else {
+            position.r = self.stable.next_after;
+        }
+        position.ep = self.live.epoch;
+        (bucket, position, has_more, gapped)
+    }
+
+    fn delivered_rows(&self) -> u64 {
+        u64::try_from(self.stable.lines.len()).unwrap_or(0)
+    }
+}
+
+fn json_cost(value: &Value) -> usize {
+    serde_json::to_string(value).map_or(0, |text| text.len()) + 1
+}
+
+fn retention_gap(component: &str) -> Value {
+    json!({"component": component, "reason": "retention_overrun"})
+}
+
+/// One bounded page of normalized lifecycle events plus its watermark.
+fn normalized_page(
+    store: &Store,
+    session_id: Option<&str>,
+    after: i64,
+    limit: usize,
+) -> (Vec<Value>, bool, i64) {
+    let mut page = Vec::new();
+    let mut watermark = after;
+    let mut has_more = false;
+    for event in store.read_events(session_id, after) {
+        if page.len() >= limit {
+            has_more = true;
+            break;
+        }
+        watermark = event.seq;
+        if let Some(value) = normalize_event(store, &event) {
+            page.push(value);
+        }
+    }
+    (page, has_more, watermark)
+}
+
+/// A retained result, with `final_text` chunked at a UTF-8 boundary when the
+/// remaining response budget cannot carry all of it.
+fn fetch_result(turn: &TurnRecord, offset: u64, budget: usize) -> (Value, bool, u64) {
+    let mut value = public_result(turn);
+    value["final_text"] = json!("");
+    value["final_text_offset"] = json!(offset);
+    value["final_text_complete"] = json!(true);
+    let overhead = json_cost(&value);
+    let text = turn.final_message.clone().unwrap_or_default();
+    let start = usize::try_from(offset).unwrap_or(0).min(text.len());
+    let remaining = &text[start..];
+    let mut end = remaining.len().min(budget.saturating_sub(overhead));
+    loop {
+        while end > 0 && !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        value["final_text"] = json!(&remaining[..end]);
+        // JSON escaping can inflate the encoded length past the raw byte
+        // budget, so the measured cost is authoritative.
+        if end == 0 || json_cost(&value) <= budget {
+            break;
+        }
+        end = end * 3 / 4;
+    }
+    let complete = end == remaining.len();
+    value["final_text_complete"] = json!(complete);
+    (value, complete, u64::try_from(end).unwrap_or(0))
+}
+
+fn normalize_event(store: &Store, event: &crate::protocol::EventRecord) -> Option<Value> {
+    let event_type = normalize_event_type(&event.kind)?;
+    let turn = event.turn_id.as_deref().and_then(|id| store.get_turn(id));
+    let mut value = json!({
+        "schema_version": 1,
+        "seq": event.seq,
+        "type": event_type,
+        "session_id": event.session_id,
+    });
+    if let Some(turn) = turn.as_ref() {
+        value["execution_seq"] = json!(turn.execution_seq);
+    }
+    if event_type == "provider.retrying" {
+        value["attempt"] = json!(event.retry_attempt.unwrap_or(1));
+    }
+    if event_type == "session.idle" {
+        value["result_status"] = turn.as_ref().map_or(Value::Null, |turn| json!(turn.state));
+    }
+    if event_type == "session.blocked" {
+        value["reason"] = json!("user_input");
+    }
+    Some(value)
 }
 
 fn normalize_event_type(kind: &str) -> Option<&'static str> {

@@ -1,6 +1,7 @@
 mod claude_models;
 mod client;
 mod codex;
+mod cursor;
 mod daemon;
 mod paths;
 mod protocol;
@@ -76,6 +77,7 @@ fn run() -> Result<()> {
         "restart" => command_restart(&args[1..]),
         "send" => command_send(&args[1..]),
         "wait" => command_wait(&args[1..]),
+        "fetch" => command_fetch(&args[1..]),
         "cancel" => command_cancel(&args[1..]),
         "list" | "ls" => command_list(&args[1..]),
         "show" => command_show(&args[1..]),
@@ -355,6 +357,58 @@ fn command_wait(args: &[String]) -> Result<()> {
         json!({"session":session,"timeout_ms":duration_ms(timeout)}),
     )?;
     print_execution(result, parsed.flag("--pretty"))
+}
+
+fn command_fetch(args: &[String]) -> Result<()> {
+    let parsed = Args::parse(
+        "fetch",
+        args,
+        &["--all", "--screen", "--no-screen", "--pretty"],
+        &["--cursor", "--wait", "--until", "--screen", "--max-bytes"],
+    )?;
+    let all = parsed.flag("--all");
+    let session = if all {
+        parsed.no_positionals()?;
+        None
+    } else {
+        Some(parsed.one_positional("Session selector")?)
+    };
+    if parsed.flag("--no-screen") && parsed.flag("--screen") {
+        bail!("--screen and --no-screen are mutually exclusive");
+    }
+    let screen = if parsed.flag("--no-screen") {
+        json!(false)
+    } else if let Some(lines) = parsed.one("--screen") {
+        json!(
+            lines
+                .parse::<u64>()
+                .context("invalid --screen line budget")?
+        )
+    } else if parsed.flag("--screen") {
+        json!(true)
+    } else {
+        Value::Null
+    };
+    let params = json!({
+        "session": session,
+        "all": all,
+        "cursor": parsed.one("--cursor"),
+        "wait_ms": parsed.one("--wait").map(parse_duration).transpose()?.map(duration_ms),
+        "until": parsed.one("--until").unwrap_or("any"),
+        "screen": screen,
+        "max_bytes": parsed.one("--max-bytes").map(str::parse::<u64>).transpose()
+            .context("invalid --max-bytes")?,
+    });
+    let route = session
+        .map(client::find_live_session)
+        .transpose()?
+        .flatten();
+    let result = if let Some(route) = &route {
+        client::call_socket(&route.socket, "session.fetch", params)?
+    } else {
+        client::call("session.fetch", params)?
+    };
+    print_success(result, parsed.flag("--pretty"))
 }
 
 fn command_cancel(args: &[String]) -> Result<()> {
@@ -912,7 +966,7 @@ fn exit_status(code: &str) -> i32 {
 
 fn print_usage() {
     println!(
-        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  wait         Wait for the current or latest execution\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
+        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  fetch        Read new state, results, events, and screen from a cursor\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
     );
 }
 
@@ -940,6 +994,9 @@ fn command_usage(command: &str) -> Result<&'static str> {
         }
         "wait" => {
             "dlgt wait - wait for the current or latest execution\n\nUSAGE\n  dlgt wait <SESSION_ID|@ALIAS> --timeout <DURATION> [--pretty]\n\nOPTIONS\n  --timeout <DURATION>   Positive wait timeout (required)\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"
+        }
+        "fetch" => {
+            "dlgt fetch - read everything new since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n  dlgt fetch --all [OPTIONS]\n\nOPTIONS\n  --cursor <CURSOR>       Opaque forward cursor from a previous response\n  --wait <DURATION>       Long-poll until something new arrives (max 24h)\n  --until any|result      Wake on any change, or on the bound result (default: any)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --all                   Every Session of this daemon; screens are unavailable\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."
         }
         "cancel" => {
             "dlgt cancel - interrupt the active execution\n\nUSAGE\n  dlgt cancel <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --timeout <DURATION>   Cancellation timeout (default: 30s)\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"
