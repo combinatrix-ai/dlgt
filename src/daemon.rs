@@ -83,6 +83,7 @@ fn spawn_update_checker(
 
 pub fn run() -> Result<()> {
     let socket_path = paths::socket_path()?;
+    paths::check_socket_path(&socket_path)?;
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;

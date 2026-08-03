@@ -89,11 +89,29 @@ stdio proxy rather than delegated to the daemon, so the daemon does not reread
 mutable client configuration.
 
 `request_id` is an optional caller-chosen idempotency key. The daemon retains
-the last 1,024 acceptance receipts for its lifetime. Repeating an ID with a
-byte-identical payload returns the original receipt with `replayed: true`;
-repeating it with a different payload fails with `INVALID_ARGUMENT`. The
-environment snapshot, terminal size, and correlation ID are excluded from the
-payload identity because they legitimately differ between retries.
+the last 1,024 acceptance receipts for its lifetime. Repeating an ID with the
+same payload returns the original receipt with `replayed: true`; repeating it
+with a different payload fails with `INVALID_ARGUMENT`.
+
+Payload identity is the canonical form of the RPC parameters:
+
+- every parameter except `environment`, `rows`, `cols`, `correlation_id`, and
+  `request_id`, which legitimately differ between retries of the same
+  acceptance;
+- object keys in sorted order, so a client that emits parameters in a
+  different order still matches;
+- array values in the order given, so `harness_options` must be repeated in
+  the same order;
+- `prompt` compared byte for byte. A trailing newline is significant, so
+  `--stdin` from a heredoc and the same text passed after `--` are different
+  payloads.
+
+An acceptance reserves its `request_id` before it runs. A second call arriving
+while the first is still launching blocks until the winner settles and then
+replays its receipt, so two concurrent calls can never create two Sessions.
+A different payload is rejected against an in-flight reservation as well as a
+stored receipt. A failed acceptance stores no receipt, so the same ID may be
+retried.
 
 `harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
 The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
