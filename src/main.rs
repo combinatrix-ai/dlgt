@@ -76,7 +76,6 @@ fn run() -> Result<()> {
         "new" => command_new(&args[1..]),
         "restart" => command_restart(&args[1..]),
         "send" => command_send(&args[1..]),
-        "wait" => command_wait(&args[1..]),
         "fetch" => command_fetch(&args[1..]),
         "cancel" => command_cancel(&args[1..]),
         "list" | "ls" => command_list(&args[1..]),
@@ -141,13 +140,7 @@ fn command_new(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
         "new",
         args,
-        &[
-            "--wait",
-            "--stdin",
-            "--pretty",
-            "--clean-env",
-            "--no-auto-approve",
-        ],
+        &["--stdin", "--pretty", "--clean-env", "--no-auto-approve"],
         LAUNCH_OPTIONS,
     )?;
     let title = parsed.required("--title")?;
@@ -163,15 +156,6 @@ fn command_new(args: &[String]) -> Result<()> {
         .context("missing --harness or profile harness")?;
     let prompt =
         prompt_from(&parsed, 0)?.context("missing initial prompt; use --stdin or -- PROMPT")?;
-    if !parsed.flag("--wait") && parsed.one("--timeout").is_some() {
-        bail!("--timeout requires --wait");
-    }
-    let timeout_ms = if parsed.flag("--wait") {
-        Some(parse_duration(parsed.required("--timeout")?)?.as_millis())
-    } else {
-        None
-    };
-    let timeout_ms = timeout_ms.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
     let cwd = launch_cwd(&parsed)?;
     let model = parsed.one("--model").or_else(|| {
         profile
@@ -197,10 +181,11 @@ fn command_new(args: &[String]) -> Result<()> {
     };
     let environment = launch_environment(&parsed, profile.as_ref())?;
     let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
-    let mut result = client::call(
+    let result = client::call(
         "session.create",
         json!({
             "title": title,
+            "request_id": parsed.one("--request-id"),
             "alias": parsed.one("--alias"),
             "harness": harness,
             "cwd": cwd,
@@ -216,17 +201,6 @@ fn command_new(args: &[String]) -> Result<()> {
             "cols": cols,
         }),
     )?;
-    if let Some(timeout_ms) = timeout_ms {
-        let session_id = result
-            .pointer("/session/id")
-            .and_then(Value::as_str)
-            .context("session.create response had no Session ID")?;
-        result = client::call(
-            "session.wait",
-            json!({"session":session_id,"timeout_ms":timeout_ms}),
-        )?;
-        return print_execution(result, parsed.flag("--pretty"));
-    }
     print_success(result, parsed.flag("--pretty"))
 }
 
@@ -235,7 +209,6 @@ fn command_send(args: &[String]) -> Result<()> {
         "send",
         args,
         &[
-            "--wait",
             "--stdin",
             "--pretty",
             "--resume",
@@ -249,9 +222,6 @@ fn command_send(args: &[String]) -> Result<()> {
         .first()
         .context("missing Session selector")?;
     let prompt = prompt_from(&parsed, 1)?.context("missing prompt; use --stdin or -- PROMPT")?;
-    if !parsed.flag("--wait") && parsed.one("--timeout").is_some() {
-        bail!("--timeout requires --wait");
-    }
     if parsed.one("--harness").is_some() {
         bail!("--harness is derived from the provider-qualified resume selector");
     }
@@ -260,6 +230,7 @@ fn command_send(args: &[String]) -> Result<()> {
         "session":session,
         "prompt":prompt,
         "correlation_id":correlation_id,
+        "request_id": parsed.one("--request-id"),
         "resume": parsed.flag("--resume"),
     });
     if parsed.flag("--resume") {
@@ -298,29 +269,11 @@ fn command_send(args: &[String]) -> Result<()> {
     if let Some(route) = &route {
         params["session"] = json!(route.session_id);
     }
-    let mut result = if let Some(route) = &route {
+    let result = if let Some(route) = &route {
         client::call_socket(&route.socket, "session.send", params)?
     } else {
         client::call("session.send", params)?
     };
-    let wait_selector = result
-        .pointer("/session/id")
-        .and_then(Value::as_str)
-        .unwrap_or(session);
-    if parsed.flag("--wait") {
-        let timeout = parse_duration(parsed.required("--timeout")?)?;
-        let wait_params = json!({
-            "session": wait_selector,
-            "timeout_ms": duration_ms(timeout),
-            "correlation_id": correlation_id,
-        });
-        result = if let Some(route) = &route {
-            client::call_socket(&route.socket, "session.wait", wait_params)?
-        } else {
-            client::call("session.wait", wait_params)?
-        };
-        return print_execution(result, parsed.flag("--pretty"));
-    }
     print_success(result, parsed.flag("--pretty"))
 }
 
@@ -346,17 +299,6 @@ fn command_restart(args: &[String]) -> Result<()> {
         }),
     )?;
     print_success(result, parsed.flag("--pretty"))
-}
-
-fn command_wait(args: &[String]) -> Result<()> {
-    let parsed = Args::parse("wait", args, &["--pretty"], &["--timeout"])?;
-    let session = parsed.one_positional("Session selector")?;
-    let timeout = parse_duration(parsed.required("--timeout")?)?;
-    let result = client::call(
-        "session.wait",
-        json!({"session":session,"timeout_ms":duration_ms(timeout)}),
-    )?;
-    print_execution(result, parsed.flag("--pretty"))
 }
 
 fn command_fetch(args: &[String]) -> Result<()> {
@@ -635,7 +577,7 @@ const LAUNCH_OPTIONS: &[&str] = &[
     "--cwd",
     "--harness-option",
     "--startup-timeout",
-    "--timeout",
+    "--request-id",
     "--pass-env",
     "--env",
     "--unset-env",
@@ -942,22 +884,10 @@ fn print_success(value: Value, pretty: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_execution(value: Value, pretty: bool) -> Result<()> {
-    let failed = value
-        .pointer("/result/status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| status != "completed");
-    print_success(value, pretty)?;
-    if failed {
-        std::process::exit(2);
-    }
-    Ok(())
-}
-
 fn exit_status(code: &str) -> i32 {
     match code {
         "PROVIDER_FAILED" => 2,
-        "WAIT_TIMEOUT" | "CANCEL_TIMEOUT" => 3,
+        "CANCEL_TIMEOUT" => 3,
         "SESSION_BLOCKED" => 4,
         "SESSION_BUSY" => 5,
         _ => 1,
@@ -984,16 +914,13 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt update - install the latest release and embedded Skills\n\nUSAGE\n  dlgt update [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "new" => {
-            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --wait                         Wait for the initial prompt to finish\n  --timeout <DURATION>           Required with --wait\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key; a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "restart" => {
             "dlgt restart - replace a Session process and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "send" => {
-            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> [OPTIONS] -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --wait                         Wait for the prompt to finish\n  --timeout <DURATION>           Required with --wait\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
-        }
-        "wait" => {
-            "dlgt wait - wait for the current or latest execution\n\nUSAGE\n  dlgt wait <SESSION_ID|@ALIAS> --timeout <DURATION> [--pretty]\n\nOPTIONS\n  --timeout <DURATION>   Positive wait timeout (required)\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"
+            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> [OPTIONS] -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key; a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "fetch" => {
             "dlgt fetch - read everything new since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n  dlgt fetch --all [OPTIONS]\n\nOPTIONS\n  --cursor <CURSOR>       Opaque forward cursor from a previous response\n  --wait <DURATION>       Long-poll until something new arrives (max 24h)\n  --until any|result      Wake on any change, or on the bound result (default: any)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --all                   Every Session of this daemon; screens are unavailable\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."

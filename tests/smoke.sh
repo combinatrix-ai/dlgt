@@ -62,7 +62,7 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-sess
   | "$binary" hook emit "$session_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-1","last_assistant_message":"initial-done"}' \
   | "$binary" hook emit "$session_id" claude
-"$binary" wait "$session_id" --timeout 2s | grep -q '"execution_seq":1'
+"$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":1'
 
 # A current client routes provider-qualified selectors to a live daemon on a
 # different versioned socket instead of launching a duplicate locally.
@@ -90,7 +90,7 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cros
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","last_assistant_message":"cross-version-ready"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
-DLGT_SOCKET="$old_socket" "$binary" wait "$cross_version_id" --timeout 2s >/dev/null
+DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --until result --wait 2s >/dev/null
 cross_version_send=$("$binary" send claude:provider-cross-version -- cross-version-follow-up)
 printf '%s\n' "$cross_version_send" | grep -q "\"id\":\"$cross_version_id\""
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","turn_id":"provider-cross-version-2","user_prompt":"cross-version-follow-up"}' \
@@ -129,7 +129,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","t
   | "$binary" hook emit "$session_id" claude
 printf '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-2","last_assistant_message":"done"}\n' \
   | "$binary" hook emit "$session_id" claude
-wait_json=$("$binary" wait "$session_id" --timeout 2s)
+wait_json=$("$binary" fetch "$session_id" --until result --wait 2s)
 printf '%s\n' "$wait_json" | grep -q '"status":"completed"'
 printf '%s\n' "$wait_json" | grep -q '"final_text":"done"'
 printf '%s\n' "$wait_json" | grep -q '"execution_seq":2'
@@ -179,7 +179,7 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-sess
   | "$binary" hook emit "$session_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-4","last_assistant_message":"resumed"}' \
   | "$binary" hook emit "$session_id" claude
-"$binary" wait "$session_id" --timeout 2s | grep -q '"execution_seq":4'
+"$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":4'
 "$binary" events "$session_id" | grep -q '"type":"session.restarting"'
 "$binary" stop "$session_id" --force >/dev/null
 attempt=0
@@ -208,7 +208,7 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-sess
   | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","last_assistant_message":"reused-ready"}' \
   | "$binary" hook emit "$reused_id" claude
-"$binary" wait "$reused_id" --timeout 2s | grep -q '"execution_seq":1'
+"$binary" fetch "$reused_id" --until result --wait 2s | grep -q '"execution_seq":1'
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
 
 # A default Session adds --permission-mode=auto beyond the one explicit
@@ -234,10 +234,10 @@ printf '%s\n' "$alias_json" | grep -q '"code":"ALIAS_IN_USE"' || {
 # Unexpected provider death creates a durable failed result in bounded time.
 "$binary" send "$reused_id" -- crash >/dev/null
 set +e
-crash_json=$("$binary" wait "$reused_id" --timeout 4s)
+crash_json=$("$binary" fetch "$reused_id" --until result --wait 8s)
 crash_status=$?
 set -e
-test "$crash_status" -eq 2 || {
+test "$crash_status" -eq 0 || {
   printf 'unexpected provider crash status %s: %s\n' "$crash_status" "$crash_json" >&2
   exit 1
 }

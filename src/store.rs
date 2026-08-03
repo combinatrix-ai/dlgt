@@ -730,6 +730,26 @@ impl Store {
         uids.into_iter().map(|(_, uid)| uid).collect()
     }
 
+    /// Highest execution sequence with a retained terminal result.
+    pub fn latest_result_seq(&self, uid: &str) -> i64 {
+        let state = self.state.borrow();
+        let Some(session_id) = state
+            .sessions
+            .values()
+            .find(|session| session.uid == uid)
+            .map(|session| session.record.id.clone())
+        else {
+            return 0;
+        };
+        state
+            .turns
+            .values()
+            .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+            .map(|turn| turn.execution_seq)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Terminal results after `after`, oldest first.
     pub fn results_after(&self, uid: &str, after: i64, limit: usize) -> (Vec<TurnRecord>, bool) {
         let state = self.state.borrow();

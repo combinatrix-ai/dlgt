@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt as _;
@@ -44,6 +44,8 @@ const FETCH_SESSION_PAGE: usize = 32;
 const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FETCH_ENVELOPE_RESERVE: usize = 1024;
+/// Acceptance receipts retained per daemon, evicted first-in-first-out.
+const REQUEST_RECEIPT_LIMIT: usize = 1024;
 const FETCH_SESSION_CURSOR_RESERVE: usize = 128;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
@@ -101,6 +103,7 @@ pub fn run() -> Result<()> {
     let (update_shutdown, update_wait) = mpsc::sync_channel(1);
     let daemon = Arc::new(Daemon {
         instance_id: Uuid::new_v4().simple().to_string(),
+        receipts: Mutex::new(VecDeque::new()),
         store: Arc::new(Mutex::new(store)),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
@@ -184,6 +187,10 @@ struct Daemon {
     /// Daemon boot identity. Runtime state is memory-only, so no cursor may
     /// survive a restart.
     instance_id: String,
+    /// Bounded request-id to acceptance-receipt map. A caller that never saw
+    /// its acceptance response replays the original receipt instead of
+    /// creating a duplicate Session or execution.
+    receipts: Mutex<VecDeque<Receipt>>,
     store: Arc<Mutex<Store>>,
     sessions: Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
     attach_leases: Mutex<HashMap<String, String>>,
@@ -419,7 +426,7 @@ impl Daemon {
             if (error.code == "SESSION_NOT_RUNNING"
                 || matches!(
                     request.method.as_str(),
-                    "session.send" | "session.wait" | "session.cancel"
+                    "session.send" | "session.fetch" | "session.cancel"
                 ))
                 && let Some(selector) = request.params.get("session").and_then(Value::as_str)
             {
@@ -459,7 +466,7 @@ impl Daemon {
                 self.request_shutdown();
                 Ok(json!({"stopping": true}))
             }
-            "session.create" => self.create_session(params),
+            "session.create" => self.accept_once(params, |params| self.create_session(params)),
             "session.restart" => self.restart_session(params),
             "session.list" => {
                 let include_all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
@@ -477,7 +484,7 @@ impl Daemon {
             "session.input" => self.input_session(params),
             "session.resize" => self.resize_session(params),
             "session.stop" => self.stop_session(params),
-            "session.send" => {
+            "session.send" => self.accept_once(params, |params| {
                 if params
                     .get("resume")
                     .and_then(Value::as_bool)
@@ -487,8 +494,7 @@ impl Daemon {
                 } else {
                     self.submit_turn(params)
                 }
-            }
-            "session.wait" => self.wait_session(params),
+            }),
             "session.fetch" => self.fetch(params),
             "session.cancel" => self.cancel_session(params),
             "transcript.read_raw" => self.read_transcript(params),
@@ -1379,12 +1385,16 @@ impl Daemon {
             Agent::Codex => prompt.as_bytes().to_vec(),
             Agent::Claude => agent.semantic_input(prompt)?,
         };
-        let turn = {
+        let (turn, acceptance_cursor) = {
             let mut store = self.lock_store()?;
+            // The observation cursor is captured under this lock immediately
+            // before acceptance is recorded, so a fast provider cannot emit
+            // output or finish in front of the position it names.
+            let acceptance_cursor = self.acceptance_cursor(&store, &session.id)?;
             let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
             store.allocate_input_sequence();
             store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
-            turn
+            (turn, acceptance_cursor)
         };
         match agent {
             Agent::Codex => match runtime.start_codex_turn(prompt) {
@@ -1436,6 +1446,7 @@ impl Daemon {
         let mut result = json!({
             "session": self.public_session(&current)?,
             "execution_seq": turn.execution_seq,
+            "cursor": acceptance_cursor,
         });
         if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
             && !correlation_id.is_empty()
@@ -1456,51 +1467,6 @@ impl Daemon {
             "result": latest.as_ref().filter(|turn| turn.state.is_terminal()).map(public_result),
             "execution_seq": latest.as_ref().map(|turn| turn.execution_seq),
         }))
-    }
-
-    fn wait_session(&self, params: &Value) -> Result<Value> {
-        let session = self.resolve_session(params_string(params, "session")?)?;
-        let timeout_ms = params
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .context("missing positive timeout_ms")?;
-        if timeout_ms == 0 {
-            bail!("timeout_ms must be positive");
-        }
-        if session.state == SessionState::Blocked {
-            bail!("session blocked on input");
-        }
-        let target = if let Some(id) = session.active_turn_id {
-            self.resolve_turn(&id)?
-        } else {
-            self.lock_store()?
-                .latest_turn(&session.id)
-                .context("session has no result")?
-        };
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            let turn = self.resolve_turn(&target.id)?;
-            if turn.state.is_terminal() {
-                let mut response = json!({
-                    "session": self.public_session(&self.resolve_session(&session.id)?)?,
-                    "result": public_result(&turn),
-                    "execution_seq": turn.execution_seq,
-                });
-                if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
-                    && !correlation_id.is_empty()
-                {
-                    response["correlation_id"] = json!(correlation_id);
-                }
-                return Ok(response);
-            }
-            if self.resolve_session(&session.id)?.state == SessionState::Blocked {
-                bail!("session blocked on input");
-            }
-            if Instant::now() >= deadline {
-                bail!("wait timed out; execution continues");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 
     fn cancel_session(&self, params: &Value) -> Result<Value> {
@@ -1562,6 +1528,69 @@ impl Daemon {
             runtime.write(cancel_input)?;
         }
         Ok(json!({"canceled": true, "turn_id": turn.id}))
+    }
+
+    /// Position an observation cursor immediately before an acceptance.
+    fn acceptance_cursor(&self, store: &Store, session_id: &str) -> Result<String> {
+        let uid = store
+            .session_uid(session_id)
+            .with_context(|| format!("session not found: {session_id}"))?;
+        let mut cursor = cursor::Cursor::new(&self.instance_id, &uid);
+        cursor.e = store.latest_event_seq();
+        cursor.set_session(
+            &uid,
+            cursor::SessionCursor {
+                r: store.stable_head(&uid),
+                ep: store.screen_epoch(&uid),
+                x: store.latest_result_seq(&uid),
+                px: None,
+                po: 0,
+            },
+        );
+        cursor.encode()
+    }
+
+    /// Run an acceptance exactly once per caller-supplied request ID.
+    fn accept_once(
+        &self,
+        params: &Value,
+        run: impl FnOnce(&Value) -> Result<Value>,
+    ) -> Result<Value> {
+        let Some(request_id) = params.get("request_id").and_then(Value::as_str) else {
+            return run(params);
+        };
+        let digest = request_digest(params);
+        let receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| anyhow!("request receipt lock poisoned"))?;
+        if let Some(receipt) = receipts.iter().find(|receipt| receipt.id == request_id) {
+            if receipt.digest != digest {
+                bail!(
+                    "invalid request_id reuse: {request_id:?} already accepted a different payload"
+                );
+            }
+            let mut replay = receipt.value.clone();
+            replay["replayed"] = json!(true);
+            return Ok(replay);
+        }
+        drop(receipts);
+        let result = run(params)?;
+        let mut receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| anyhow!("request receipt lock poisoned"))?;
+        if !receipts.iter().any(|receipt| receipt.id == request_id) {
+            receipts.push_back(Receipt {
+                id: request_id.to_owned(),
+                digest,
+                value: result.clone(),
+            });
+            while receipts.len() > REQUEST_RECEIPT_LIMIT {
+                receipts.pop_front();
+            }
+        }
+        Ok(result)
     }
 
     /// One composite forward-delta read: current state, newly terminalized
@@ -2765,8 +2794,6 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "CURSOR_EXPIRED"
     } else if message.contains("CURSOR_INVALID") {
         "CURSOR_INVALID"
-    } else if message.contains("wait timed out") {
-        "WAIT_TIMEOUT"
     } else if message.contains("cancel timed out") {
         "CANCEL_TIMEOUT"
     } else if message.contains("blocked on input") {
@@ -2937,6 +2964,48 @@ fn generate_alias(title: &str) -> String {
         slug.chars().take(32).collect::<String>(),
         &suffix[..6]
     )
+}
+
+struct Receipt {
+    id: String,
+    digest: u128,
+    value: Value,
+}
+
+/// Identity of an acceptance payload: the prompt and every launch option that
+/// changes what the Session does, excluding per-invocation noise such as the
+/// environment snapshot, terminal size, and correlation ID.
+fn request_digest(params: &Value) -> u128 {
+    const VOLATILE: [&str; 5] = [
+        "environment",
+        "rows",
+        "cols",
+        "correlation_id",
+        "request_id",
+    ];
+    let mut canonical = params.clone();
+    if let Some(object) = canonical.as_object_mut() {
+        for key in VOLATILE {
+            object.remove(key);
+        }
+    }
+    // serde_json orders object keys, so the canonical form is stable.
+    fnv1a128(
+        serde_json::to_string(&canonical)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+}
+
+fn fnv1a128(bytes: &[u8]) -> u128 {
+    const OFFSET: u128 = 144_066_263_297_769_815_596_495_629_667_062_367_629;
+    const PRIME: u128 = 309_485_009_821_345_068_724_781_371;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 struct FetchOptions {
