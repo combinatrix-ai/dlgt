@@ -31,6 +31,8 @@ jobs:
         run: cargo clippy --all-targets
       - name: Test
         run: cargo test
+      - name: Test installer
+        run: sh tests/install.sh
 
   docs:
     name: Docs build

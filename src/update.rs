@@ -1,5 +1,9 @@
+use std::ffi::OsString;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use attestation_verify::{
@@ -10,19 +14,23 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 const LATEST_RELEASE_URL: &str = "https://github.com/combinatrix-ai/dlgt/releases/latest";
-const INSTALLER_URL: &str = "https://raw.githubusercontent.com/combinatrix-ai/dlgt/main/install.sh";
 const RELEASE_DOWNLOAD_URL: &str = "https://github.com/combinatrix-ai/dlgt/releases/download";
+// Update code remains inside the already-trusted running binary. Fetching a
+// mutable installer after attestation would let that code ignore the verified
+// archive digest and bypass the trust decision made above.
+const INSTALLER_SCRIPT: &str = include_str!("../install.sh");
 
 const DLGT_REPOSITORY: &str = "combinatrix-ai/dlgt";
 const DLGT_SOURCE_OWNER_ID: u64 = 139_831_903;
 const DLGT_SOURCE_REPOSITORY_ID: u64 = 1_305_737_421;
 const DLGT_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 const PUBLIC_GOOD_CHECKPOINT_ORIGIN: &str = "rekor.sigstore.dev - 1193050959916656506";
+pub(crate) const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 
-pub fn check_for_update() -> Option<Value> {
-    let latest = resolve_latest_version().ok()?;
+pub fn check_for_update() -> Result<Option<Value>> {
+    let latest = resolve_latest_version()?;
     let current = env!("CARGO_PKG_VERSION");
-    version_is_newer(&latest, current).then(|| {
+    Ok(version_is_newer(&latest, current).then(|| {
         json!({
             "code": "UPDATE_AVAILABLE",
             "message": "A new version of dlgt is available.",
@@ -30,7 +38,44 @@ pub fn check_for_update() -> Option<Value> {
             "latest_version": latest,
             "command": "dlgt update",
         })
-    })
+    }))
+}
+
+pub(crate) fn refresh_notice(notice: &RwLock<Option<Value>>) {
+    apply_check_result(notice, check_for_update());
+}
+
+fn apply_check_result(notice: &RwLock<Option<Value>>, result: Result<Option<Value>>) {
+    let Ok(result) = result else {
+        // A transient network or release-metadata failure must not hide the
+        // last notice that was successfully discovered.
+        return;
+    };
+    if let Ok(mut stored) = notice.write() {
+        *stored = result;
+    }
+}
+
+pub(crate) fn run_periodic_check_loop<ShouldStop, Wait, Check>(
+    interval: Duration,
+    mut should_stop: ShouldStop,
+    mut wait: Wait,
+    mut check: Check,
+) where
+    ShouldStop: FnMut() -> bool,
+    Wait: FnMut(Duration) -> bool,
+    Check: FnMut(),
+{
+    if should_stop() {
+        return;
+    }
+    check();
+    while !should_stop() {
+        if !wait(interval) || should_stop() {
+            break;
+        }
+        check();
+    }
 }
 
 pub fn install_latest() -> Result<Value> {
@@ -44,8 +89,9 @@ pub fn install_latest() -> Result<Value> {
         }));
     }
     let tag = format!("v{latest}");
+    let target = release_target();
 
-    let verified = verify_release_attestation(&tag)?;
+    let verified = verify_release_attestation(&tag, &target)?;
     let attestation = json!({
         "verified": true,
         "source_ref": verified.source_ref,
@@ -60,14 +106,12 @@ pub fn install_latest() -> Result<Value> {
         .context("dlgt executable has no parent directory")?;
     let installer =
         std::env::temp_dir().join(format!("dlgt-installer-{}.sh", Uuid::new_v4().simple()));
-    download_installer(&installer)?;
+    write_embedded_installer(&installer)?;
     let mut command = Command::new("sh");
     command
         .arg(&installer)
-        .args(["--bin-dir", &bin_dir.to_string_lossy(), "--skill", "both"])
-        .arg("--version")
-        .arg(&tag);
-    command.args(["--expect-sha256", &expected_sha256]);
+        .args(installer_args(&tag, &target, &expected_sha256, bin_dir));
+    command.env_remove("DLGT_INSTALLER_NO_MAIN");
     let result = command.output();
     let _ = std::fs::remove_file(&installer);
     let result = result.context("failed to run dlgt installer")?;
@@ -94,6 +138,11 @@ fn resolve_latest_version() -> Result<String> {
             "--silent",
             "--show-error",
             "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
             "--max-time",
             "3",
             "--output",
@@ -121,30 +170,41 @@ fn resolve_latest_version() -> Result<String> {
     Ok(version.to_owned())
 }
 
-fn download_installer(path: &Path) -> Result<()> {
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https",
-            "--tlsv1.2",
-            "--output",
-        ])
-        .arg(path)
-        .arg(INSTALLER_URL)
-        .output()
-        .context("failed to download the dlgt installer")?;
-    if !output.status.success() {
+fn installer_args(tag: &str, target: &str, sha256: &str, bin_dir: &Path) -> Vec<OsString> {
+    [
+        OsString::from("--bin-dir"),
+        bin_dir.as_os_str().to_owned(),
+        OsString::from("--skill"),
+        OsString::from("both"),
+        OsString::from("--version"),
+        OsString::from(tag),
+        OsString::from("--target"),
+        OsString::from(target),
+        OsString::from("--expect-sha256"),
+        OsString::from(sha256),
+    ]
+    .into()
+}
+
+fn write_embedded_installer(path: &Path) -> Result<()> {
+    let mut created = false;
+    let outcome = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .context("failed to create temporary dlgt installer")?;
+        created = true;
+        file.write_all(INSTALLER_SCRIPT.as_bytes())
+            .context("failed to write embedded dlgt installer")?;
+        file.sync_all()
+            .context("failed to sync embedded dlgt installer")?;
+        Ok(())
+    })();
+    if created && outcome.is_err() {
         let _ = std::fs::remove_file(path);
-        bail!(
-            "installer download failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
     }
-    Ok(())
+    outcome
 }
 
 /// The result of a successful release-attestation verification: the facts
@@ -161,7 +221,7 @@ struct VerifiedRelease {
 /// bundle against the embedded public-good trust root and dlgt's GitHub
 /// identity policy, and extracts this platform's expected release-archive
 /// sha256 from the now-authenticated manifest.
-fn verify_release_attestation(tag: &str) -> Result<VerifiedRelease> {
+fn verify_release_attestation(tag: &str, target: &str) -> Result<VerifiedRelease> {
     let temp_dir =
         std::env::temp_dir().join(format!("dlgt-attestation-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&temp_dir).context("failed to create attestation temp directory")?;
@@ -195,7 +255,7 @@ fn verify_release_attestation(tag: &str) -> Result<VerifiedRelease> {
             .verify_bytes(&manifest_bytes, &bundle)
             .context("checksum manifest attestation did not verify")?;
 
-        let asset_name = format!("dlgt-{tag}-{}.tar.gz", release_target());
+        let asset_name = format!("dlgt-{tag}-{target}.tar.gz");
         let manifest_text =
             String::from_utf8(manifest_bytes).context("checksum manifest was not valid UTF-8")?;
         let sha256 = manifest_digest_for(&manifest_text, &asset_name)
@@ -273,7 +333,13 @@ fn download_release_asset(tag: &str, name: &str, dest: &Path) -> Result<()> {
             "--location",
             "--proto",
             "=https",
+            "--proto-redir",
+            "=https",
             "--tlsv1.2",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
             "--output",
         ])
         .arg(dest)
@@ -353,13 +419,146 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::RwLock;
+
     use attestation_verify::{RefPolicy, TrustStore, Verifier, WorkflowRevisionPolicy};
+    use serde_json::json;
+    use tempfile::tempdir;
 
     use super::{
-        format_release_target, manifest_digest_for, parse_version,
-        public_good_checkpoint_origin_policy, release_attestation_policy, release_target,
-        version_is_newer,
+        INSTALLER_SCRIPT, UPDATE_CHECK_INTERVAL, apply_check_result, format_release_target,
+        installer_args, manifest_digest_for, parse_version, public_good_checkpoint_origin_policy,
+        release_attestation_policy, release_target, run_periodic_check_loop, version_is_newer,
+        write_embedded_installer,
     };
+
+    #[test]
+    fn failed_check_preserves_the_last_update_notice() {
+        let notice = RwLock::new(Some(
+            json!({"code":"UPDATE_AVAILABLE","latest_version":"0.4.0"}),
+        ));
+        apply_check_result(&notice, Err(anyhow::anyhow!("temporary network failure")));
+        assert_eq!(
+            *notice
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(json!({"code":"UPDATE_AVAILABLE","latest_version":"0.4.0"}))
+        );
+    }
+
+    #[test]
+    fn successful_check_replaces_or_clears_the_notice() {
+        let notice = RwLock::new(Some(
+            json!({"code":"UPDATE_AVAILABLE","latest_version":"0.4.0"}),
+        ));
+        apply_check_result(
+            &notice,
+            Ok(Some(json!({
+                "code": "UPDATE_AVAILABLE",
+                "latest_version": "0.5.0"
+            }))),
+        );
+        assert_eq!(
+            *notice
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(json!({"code":"UPDATE_AVAILABLE","latest_version":"0.5.0"}))
+        );
+        apply_check_result(&notice, Ok(None));
+        assert_eq!(
+            *notice
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None
+        );
+    }
+
+    #[test]
+    fn periodic_loop_checks_immediately_and_then_at_the_configured_interval() {
+        let checks = Cell::new(0);
+        let waits = RefCell::new(Vec::new());
+        run_periodic_check_loop(
+            UPDATE_CHECK_INTERVAL,
+            || checks.get() >= 3,
+            |interval| {
+                waits.borrow_mut().push(interval);
+                true
+            },
+            || checks.set(checks.get() + 1),
+        );
+        assert_eq!(checks.get(), 3);
+        assert_eq!(*waits.borrow(), vec![UPDATE_CHECK_INTERVAL; 2]);
+    }
+
+    #[test]
+    fn embedded_installer_is_written_once_without_network_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("install.sh");
+
+        write_embedded_installer(&path)?;
+
+        assert_eq!(std::fs::read_to_string(&path)?, INSTALLER_SCRIPT);
+        assert!(write_embedded_installer(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path)?, INSTALLER_SCRIPT);
+        assert!(INSTALLER_SCRIPT.contains("--expect-sha256"));
+        assert!(INSTALLER_SCRIPT.contains("verify_expected_sha256"));
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_installer_rejects_an_unattested_archive() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let installer = directory.path().join("install.sh");
+        let archive = directory.path().join("dlgt.tar.gz");
+        write_embedded_installer(&installer)?;
+        std::fs::write(&archive, b"not the attested archive")?;
+
+        let output = Command::new("sh")
+            .args(["-c", ". \"$1\"; verify_expected_sha256 \"$2\" \"$3\""])
+            .arg("embedded-installer-test")
+            .arg(&installer)
+            .arg(&archive)
+            .arg("0".repeat(64))
+            .env("DLGT_INSTALLER_NO_MAIN", "1")
+            .output()?;
+
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("attested checksum mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn installer_arguments_bind_tag_target_digest_and_exact_bin_path() {
+        let digest = "a".repeat(64);
+        let args = installer_args(
+            "v0.3.4",
+            "x86_64-unknown-linux-musl",
+            &digest,
+            Path::new("/opt/dlgt bin"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--bin-dir"),
+                OsString::from("/opt/dlgt bin"),
+                OsString::from("--skill"),
+                OsString::from("both"),
+                OsString::from("--version"),
+                OsString::from("v0.3.4"),
+                OsString::from("--target"),
+                OsString::from("x86_64-unknown-linux-musl"),
+                OsString::from("--expect-sha256"),
+                OsString::from(digest),
+            ]
+        );
+    }
 
     #[test]
     fn compares_release_versions_numerically() {

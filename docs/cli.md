@@ -177,10 +177,18 @@ Successful commands may include an optional non-error notice:
 {"ok":true,"sessions":[],"info":{"code":"UPDATE_AVAILABLE","current_version":"0.1.4","latest_version":"0.2.0","command":"dlgt update"}}
 ```
 
-`dlgt update` downloads the latest published release through the checked-in
-installer, verifies its checksum, atomically replaces the current executable,
-and refreshes the embedded Codex and Claude Skills. Existing older-version
-daemons and their live Sessions continue on their versioned sockets.
+Each long-lived versioned daemon performs the first update check
+asynchronously at startup and repeats it every six hours. Transient check
+failures preserve the last successful notice; a successful check with no
+newer release clears the notice.
+
+`dlgt update` verifies the release's attested checksum manifest, then installs
+the archive through the installer embedded in the running binary. It never
+downloads executable installer code after verification. The embedded installer
+checks the authenticated archive digest, pins the archive target to the running
+binary's build target, atomically replaces the current executable, and
+refreshes the embedded Codex and Claude Skills. Existing older-version daemons
+and their live Sessions continue on their versioned sockets.
 
 ## `new`
 

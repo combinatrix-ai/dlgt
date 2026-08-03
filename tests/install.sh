@@ -36,6 +36,26 @@ assert_target aarch64-unknown-linux-musl Linux arm64 musl
 assert_target x86_64-unknown-linux-musl Linux amd64 musl
 assert_asset dlgt-v0.1.0-aarch64-apple-darwin.tar.gz v0.1.0 aarch64-apple-darwin
 
+for target in \
+  aarch64-apple-darwin \
+  x86_64-apple-darwin \
+  aarch64-unknown-linux-gnu \
+  x86_64-unknown-linux-gnu \
+  aarch64-unknown-linux-musl \
+  x86_64-unknown-linux-musl; do
+  (validate_target "$target") || {
+    printf 'published target was rejected: %s\n' "$target" >&2
+    exit 1
+  }
+done
+
+for target in x86_64-linux-gnu ../x86_64-unknown-linux-gnu x86_64-unknown-linux-gnu/evil; do
+  if (validate_target "$target") >/dev/null 2>&1; then
+    printf 'invalid target was accepted: %s\n' "$target" >&2
+    exit 1
+  fi
+done
+
 for version in v1.2.3 1.2.3 v1.2.3-rc.1; do
   (validate_version "$version") || {
     printf 'valid version was rejected: %s\n' "$version" >&2

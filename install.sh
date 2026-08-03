@@ -25,6 +25,7 @@ Install the published dlgt binary into a user-writable directory.
 
 Options:
   --version VERSION  Install VERSION (for example v0.1.0); default: latest
+  --target TARGET    Install a published target; default: detect this system
   --bin-dir DIR      Install into DIR; default: $DLGT_BIN_DIR or ~/.local/bin
   --skill MODE       Register the embedded skill: auto, none, codex, claude, or both
   --expect-sha256 HEX
@@ -86,6 +87,16 @@ detect_target() {
   fi
 }
 
+validate_target() {
+  candidate="$1"
+  case "$candidate" in
+    aarch64-apple-darwin|x86_64-apple-darwin|\
+    aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu|\
+    aarch64-unknown-linux-musl|x86_64-unknown-linux-musl) ;;
+    *) die "invalid target '$candidate'; expected a published dlgt target" ;;
+  esac
+}
+
 release_asset_name() {
   release_tag="$1"
   target="$2"
@@ -115,7 +126,8 @@ resolve_release_tag() {
   requested="$1"
   if [ "$requested" = "latest" ]; then
     latest_url="https://github.com/${DLGT_GITHUB_REPO}/releases/latest"
-    final_url="$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    final_url="$(curl --fail --silent --show-error --location --proto '=https' \
+      --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
       --output /dev/null --write-out '%{url_effective}' "$latest_url")" \
       || die "could not resolve the latest dlgt release"
     release_tag="${final_url##*/}"
@@ -132,7 +144,8 @@ resolve_release_tag() {
 download() {
   source_url="$1"
   destination="$2"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  curl --fail --silent --show-error --location --proto '=https' \
+    --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 300 \
     --output "$destination" "$source_url" \
     || die "download failed: $source_url"
 }
@@ -244,6 +257,7 @@ register_skills() {
 
 main() {
   requested_version="latest"
+  requested_target=""
   bin_dir="${DLGT_BIN_DIR:-$HOME/.local/bin}"
   skill_mode="auto"
   register_skills_from=""
@@ -254,6 +268,12 @@ main() {
       --version)
         [ "$#" -ge 2 ] || die "--version requires a value"
         requested_version="$2"
+        shift 2
+        ;;
+      --target)
+        [ "$#" -ge 2 ] || die "--target requires a value"
+        validate_target "$2"
+        requested_target="$2"
         shift 2
         ;;
       --bin-dir)
@@ -302,8 +322,12 @@ main() {
   need_command awk
   need_command mktemp
   need_command cmp
-  target="$(detect_target "$(uname -s)" "$(uname -m)")" \
-    || die "could not map this machine to a published dlgt target"
+  if [ -n "$requested_target" ]; then
+    target="$requested_target"
+  else
+    target="$(detect_target "$(uname -s)" "$(uname -m)")" \
+      || die "could not map this machine to a published dlgt target"
+  fi
   release_tag="$(resolve_release_tag "$requested_version")"
   archive_name="$(release_asset_name "$release_tag" "$target")"
   release_base="https://github.com/${DLGT_GITHUB_REPO}/releases/download/${release_tag}"

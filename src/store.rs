@@ -2,14 +2,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
 use anyhow::{Context, Result, bail};
-#[cfg(test)]
-use base64::Engine as _;
-use serde_json::Value;
-
-#[cfg(test)]
-use crate::protocol::InputRecord;
-use crate::protocol::{EventRecord, SessionRecord, TurnRecord};
 
 pub struct Store {
     state: RefCell<MemoryState>,
@@ -23,7 +17,6 @@ struct MemoryState {
     provider_reservations: HashMap<String, String>,
     turns: HashMap<String, TurnRecord>,
     events: Vec<EventRecord>,
-    inputs: Vec<StoredInput>,
     outputs: HashMap<String, VecDeque<OutputChunk>>,
     next_event_seq: i64,
     next_input_seq: i64,
@@ -34,17 +27,6 @@ struct StoredSession {
     record: SessionRecord,
     terminal_rows: u16,
     terminal_cols: u16,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-struct StoredInput {
-    seq: i64,
-    session_id: String,
-    turn_id: Option<String>,
-    source: String,
-    data: Vec<u8>,
-    display: String,
-    created_at_ms: i64,
 }
 
 struct OutputChunk {
@@ -70,11 +52,6 @@ pub struct NewSession<'a> {
     pub auto_approve: bool,
 }
 
-#[allow(
-    clippy::assigning_clones,
-    clippy::unnecessary_wraps,
-    clippy::unused_self
-)]
 impl Store {
     pub fn new() -> Self {
         Self {
@@ -88,7 +65,7 @@ impl Store {
             bail!("session id already exists");
         }
         if state.sessions.values().any(|existing| {
-            existing.record.alias == session.alias && !terminal_session(&existing.record)
+            existing.record.alias == session.alias && !existing.record.state.is_terminal()
         }) {
             bail!("active session alias already exists");
         }
@@ -102,7 +79,7 @@ impl Store {
                     title: session.title.to_owned(),
                     agent: session.agent.to_owned(),
                     cwd: session.cwd.to_owned(),
-                    state: "starting".to_owned(),
+                    state: SessionState::Starting,
                     model: session.model.map(str::to_owned),
                     effort: session.effort.map(str::to_owned),
                     harness_options: session.harness_options.to_vec(),
@@ -119,20 +96,23 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_session_running(&self, id: &str, pid: Option<u32>) -> Result<bool> {
+    pub fn set_session_running(&self, id: &str, pid: Option<u32>) -> bool {
         let mut state = self.state.borrow_mut();
         let Some(session) = state.sessions.get_mut(id) else {
-            return Ok(false);
+            return false;
         };
-        if !matches!(session.record.state.as_str(), "starting" | "idle") {
-            return Ok(false);
+        if !matches!(
+            session.record.state,
+            SessionState::Starting | SessionState::Idle
+        ) {
+            return false;
         }
-        if session.record.state == "starting" {
-            session.record.state = "running".to_owned();
+        if session.record.state == SessionState::Starting {
+            session.record.state = SessionState::Running;
         }
         session.record.pid = pid;
         session.record.updated_at_ms = now_ms();
-        Ok(true)
+        true
     }
 
     pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
@@ -141,8 +121,8 @@ impl Store {
             return Ok(false);
         };
         if matches!(
-            session.record.state.as_str(),
-            "starting" | "stopping" | "restarting"
+            session.record.state,
+            SessionState::Starting | SessionState::Stopping | SessionState::Restarting
         ) {
             return Ok(false);
         }
@@ -150,68 +130,68 @@ impl Store {
         if state.sessions.values().any(|candidate| {
             candidate.record.id != id
                 && candidate.record.alias == alias
-                && !terminal_session(&candidate.record)
+                && !candidate.record.state.is_terminal()
         }) {
             bail!("active session alias already exists");
         }
         let Some(session) = state.sessions.get_mut(id) else {
             return Ok(false);
         };
-        session.record.state = "restarting".to_owned();
+        session.record.state = SessionState::Restarting;
         session.record.updated_at_ms = now_ms();
         Ok(true)
     }
 
-    pub fn finish_session_restart_stop(&self, id: &str) -> Result<()> {
+    pub fn finish_session_restart_stop(&self, id: &str) {
         if let Some(session) = self.state.borrow_mut().sessions.get_mut(id)
-            && session.record.state == "restarting"
+            && session.record.state == SessionState::Restarting
         {
             session.record.pid = None;
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
-        Ok(())
     }
 
-    pub fn start_restarted_session(&self, id: &str) -> Result<bool> {
+    pub fn start_restarted_session(&self, id: &str) -> bool {
         let mut state = self.state.borrow_mut();
         let Some(session) = state.sessions.get_mut(id) else {
-            return Ok(false);
+            return false;
         };
-        if session.record.state != "restarting" {
-            return Ok(false);
+        if session.record.state != SessionState::Restarting {
+            return false;
         }
-        session.record.state = "starting".to_owned();
+        session.record.state = SessionState::Starting;
         session.record.pid = None;
         session.record.active_turn_id = None;
         session.record.updated_at_ms = now_ms();
-        Ok(true)
+        true
     }
 
-    pub fn set_session_state(&self, id: &str, state: &str) -> Result<bool> {
+    pub fn set_session_state(&self, id: &str, state: SessionState) -> bool {
         let mut memory = self.state.borrow_mut();
         let Some(session) = memory.sessions.get_mut(id) else {
-            return Ok(false);
+            return false;
         };
         if matches!(
-            session.record.state.as_str(),
-            "stopped" | "failed" | "stopping" | "restarting"
+            session.record.state,
+            SessionState::Stopped
+                | SessionState::Failed
+                | SessionState::Stopping
+                | SessionState::Restarting
         ) {
-            return Ok(false);
+            return false;
         }
-        session.record.state = state.to_owned();
+        session.record.state = state;
         session.record.updated_at_ms = now_ms();
-        Ok(true)
+        true
     }
 
-    pub fn set_session_stopped(&self, id: &str) -> Result<()> {
-        set_terminal_session(&mut self.state.borrow_mut(), id, "stopped");
-        Ok(())
+    pub fn set_session_stopped(&self, id: &str) {
+        set_terminal_session(&mut self.state.borrow_mut(), id, SessionState::Stopped);
     }
 
-    pub fn set_session_failed(&self, id: &str) -> Result<()> {
-        set_terminal_session(&mut self.state.borrow_mut(), id, "failed");
-        Ok(())
+    pub fn set_session_failed(&self, id: &str) {
+        set_terminal_session(&mut self.state.borrow_mut(), id, SessionState::Failed);
     }
 
     pub fn rekey_session(&self, from: &str, to: &str) -> Result<()> {
@@ -229,7 +209,7 @@ impl Store {
         if state
             .sessions
             .get(to)
-            .is_some_and(|session| !terminal_session(&session.record))
+            .is_some_and(|session| !session.record.state.is_terminal())
         {
             bail!("active session id already exists: {to}");
         }
@@ -241,13 +221,13 @@ impl Store {
                 .created_at_ms
                 .min(replaced.record.created_at_ms);
         }
-        session.record.id = to.to_owned();
+        to.clone_into(&mut session.record.id);
         session.record.updated_at_ms = now_ms();
         state.sessions.insert(to.to_owned(), session);
 
         for turn in state.turns.values_mut() {
             if turn.session_id == from {
-                turn.session_id = to.to_owned();
+                to.clone_into(&mut turn.session_id);
             }
         }
         for event in &mut state.events {
@@ -255,12 +235,6 @@ impl Store {
                 event.session_id = Some(to.to_owned());
             }
         }
-        for input in &mut state.inputs {
-            if input.session_id == from {
-                input.session_id = to.to_owned();
-            }
-        }
-
         let mut merged = state.outputs.remove(to).unwrap_or_default();
         if let Some(mut launched) = state.outputs.remove(from) {
             merged.append(&mut launched);
@@ -277,20 +251,20 @@ impl Store {
 
     /// Reserve a provider conversation before launching a replacement runtime.
     /// This closes the check/launch race between concurrent `--resume` calls.
-    pub fn reserve_provider_session(&self, provider_ref: &str, session_id: &str) -> Result<bool> {
+    pub fn reserve_provider_session(&self, provider_ref: &str, session_id: &str) -> bool {
         let mut state = self.state.borrow_mut();
         if state.provider_reservations.contains_key(provider_ref)
             || state
                 .sessions
                 .get(provider_ref)
-                .is_some_and(|session| !terminal_session(&session.record))
+                .is_some_and(|session| !session.record.state.is_terminal())
         {
-            return Ok(false);
+            return false;
         }
         state
             .provider_reservations
             .insert(provider_ref.to_owned(), session_id.to_owned());
-        Ok(true)
+        true
     }
 
     pub fn release_provider_session(&self, provider_ref: &str, session_id: &str) {
@@ -305,13 +279,12 @@ impl Store {
         }
     }
 
-    pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) -> Result<()> {
+    pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) {
         if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
             session.terminal_rows = rows;
             session.terminal_cols = cols;
             session.record.updated_at_ms = now_ms();
         }
-        Ok(())
     }
 
     pub fn terminal_size(&self, session_id: &str) -> Result<(u16, u16)> {
@@ -323,22 +296,22 @@ impl Store {
             .context("failed to read terminal size")
     }
 
-    pub fn get_session(&self, selector: &str) -> Result<Option<SessionRecord>> {
+    pub fn get_session(&self, selector: &str) -> Option<SessionRecord> {
         let state = self.state.borrow();
         if let Some(session) = state.sessions.get(selector) {
-            return Ok(Some(session.record.clone()));
+            return Some(session.record.clone());
         }
-        Ok(state
+        state
             .sessions
             .values()
             .filter(|session| {
-                session.record.alias == selector && !terminal_session(&session.record)
+                session.record.alias == selector && !session.record.state.is_terminal()
             })
             .max_by_key(|session| session.record.created_at_ms)
-            .map(|session| session.record.clone()))
+            .map(|session| session.record.clone())
     }
 
-    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
+    pub fn list_sessions(&self) -> Vec<SessionRecord> {
         let mut sessions = self
             .state
             .borrow()
@@ -347,7 +320,7 @@ impl Store {
             .map(|session| session.record.clone())
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at_ms));
-        Ok(sessions)
+        sessions
     }
 
     pub fn insert_turn(&mut self, id: &str, session_id: &str, prompt: &str) -> Result<TurnRecord> {
@@ -359,7 +332,7 @@ impl Store {
         let Some(session) = state.sessions.get(session_id) else {
             bail!("session not found");
         };
-        if session.record.active_turn_id.is_some() || session.record.state != "idle" {
+        if session.record.active_turn_id.is_some() || session.record.state != SessionState::Idle {
             bail!("session already has an active turn or is not ready");
         }
         let execution_seq = state
@@ -375,7 +348,7 @@ impl Store {
             session_id: session_id.to_owned(),
             execution_seq,
             prompt: prompt.to_owned(),
-            state: "submitted".to_owned(),
+            state: TurnState::Submitted,
             provider_turn_id: None,
             final_message: None,
             error: None,
@@ -392,35 +365,34 @@ impl Store {
         Ok(turn)
     }
 
-    pub fn get_turn(&self, id: &str) -> Result<Option<TurnRecord>> {
-        Ok(self.state.borrow().turns.get(id).cloned())
+    pub fn get_turn(&self, id: &str) -> Option<TurnRecord> {
+        self.state.borrow().turns.get(id).cloned()
     }
 
-    pub fn latest_turn(&self, session_id: &str) -> Result<Option<TurnRecord>> {
-        Ok(self
-            .state
+    pub fn latest_turn(&self, session_id: &str) -> Option<TurnRecord> {
+        self.state
             .borrow()
             .turns
             .values()
             .filter(|turn| turn.session_id == session_id)
             .max_by_key(|turn| turn.execution_seq)
-            .cloned())
+            .cloned()
     }
 
-    pub fn mark_turn_started(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
+    pub fn mark_turn_started(&self, id: &str, provider_turn_id: Option<&str>) -> bool {
         let mut state = self.state.borrow_mut();
         let Some(turn) = state.turns.get_mut(id) else {
-            return Ok(false);
+            return false;
         };
-        if turn.state != "submitted" {
-            return Ok(false);
+        if turn.state != TurnState::Submitted {
+            return false;
         }
-        turn.state = "running".to_owned();
+        turn.state = TurnState::Running;
         if turn.provider_turn_id.is_none() {
             turn.provider_turn_id = provider_turn_id.map(str::to_owned);
         }
         turn.started_at_ms.get_or_insert_with(now_ms);
-        Ok(true)
+        true
     }
 
     pub fn complete_turn_if_matching(
@@ -429,23 +401,29 @@ impl Store {
         provider_turn_id: Option<&str>,
         final_message: Option<&str>,
     ) -> Result<bool> {
-        self.finish_turn_if_matching(id, provider_turn_id, "completed", final_message, None)
+        self.finish_turn_if_matching(
+            id,
+            provider_turn_id,
+            TurnState::Completed,
+            final_message,
+            None,
+        )
     }
 
     pub fn finish_turn_if_matching(
         &self,
         id: &str,
         provider_turn_id: Option<&str>,
-        state: &str,
+        state: TurnState,
         final_message: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool> {
-        if !matches!(state, "completed" | "failed" | "interrupted") {
-            bail!("invalid terminal turn state {state:?}");
+        if !state.is_provider_terminal() {
+            bail!("invalid terminal turn state {:?}", state.as_str());
         }
         let mut memory = self.state.borrow_mut();
         let turn = memory.turns.get_mut(id).context("turn not found")?;
-        if !matches!(turn.state.as_str(), "submitted" | "running")
+        if !turn.state.is_active()
             || provider_turn_id.is_some()
                 && turn.provider_turn_id.is_some()
                 && turn.provider_turn_id.as_deref() != provider_turn_id
@@ -453,7 +431,7 @@ impl Store {
             return Ok(false);
         }
         let session_id = turn.session_id.clone();
-        turn.state = state.to_owned();
+        turn.state = state;
         if turn.provider_turn_id.is_none() {
             turn.provider_turn_id = provider_turn_id.map(str::to_owned);
         }
@@ -469,28 +447,22 @@ impl Store {
         Ok(true)
     }
 
-    pub fn interrupt_active_turn(&self, session_id: &str, error: &str) -> Result<Option<String>> {
+    pub fn interrupt_active_turn(&self, session_id: &str, error: &str) -> Option<String> {
         let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get(session_id) else {
-            return Ok(None);
-        };
-        let Some(turn_id) = session.record.active_turn_id.clone() else {
-            return Ok(None);
-        };
-        let Some(turn) = state.turns.get_mut(&turn_id) else {
-            return Ok(None);
-        };
-        if !matches!(turn.state.as_str(), "submitted" | "running") {
-            return Ok(None);
+        let session = state.sessions.get(session_id)?;
+        let turn_id = session.record.active_turn_id.clone()?;
+        let turn = state.turns.get_mut(&turn_id)?;
+        if !turn.state.is_active() {
+            return None;
         }
-        turn.state = "interrupted".to_owned();
+        turn.state = TurnState::Interrupted;
         turn.error = Some(error.to_owned());
         turn.completed_at_ms = Some(now_ms());
         if let Some(session) = state.sessions.get_mut(session_id) {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
-        Ok(Some(turn_id))
+        Some(turn_id)
     }
 
     pub fn cancel_turn(&mut self, id: &str) -> Result<bool> {
@@ -498,16 +470,16 @@ impl Store {
         let Some(turn) = state.turns.get_mut(id) else {
             bail!("turn not found");
         };
-        if !matches!(turn.state.as_str(), "submitted" | "running") {
+        if !turn.state.is_active() {
             return Ok(false);
         }
-        turn.state = "canceled".to_owned();
+        turn.state = TurnState::Canceled;
         turn.completed_at_ms = Some(now_ms());
         let session_id = turn.session_id.clone();
         if let Some(session) = state.sessions.get_mut(&session_id)
             && session.record.active_turn_id.as_deref() == Some(id)
         {
-            session.record.state = "quiescing".to_owned();
+            session.record.state = SessionState::Quiescing;
             session.record.updated_at_ms = now_ms();
         }
         Ok(true)
@@ -516,7 +488,7 @@ impl Store {
     pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
         let mut state = self.state.borrow_mut();
         let turn = state.turns.get(id).context("turn not found")?;
-        if turn.state != "canceled"
+        if turn.state != TurnState::Canceled
             || provider_turn_id.is_some()
                 && turn.provider_turn_id.is_some()
                 && turn.provider_turn_id.as_deref() != provider_turn_id
@@ -528,23 +500,41 @@ impl Store {
             return Ok(false);
         };
         if session.record.active_turn_id.as_deref() != Some(id)
-            || session.record.state != "quiescing"
+            || session.record.state != SessionState::Quiescing
         {
             return Ok(false);
         }
         session.record.active_turn_id = None;
-        session.record.state = "idle".to_owned();
+        session.record.state = SessionState::Idle;
         session.record.updated_at_ms = now_ms();
         Ok(true)
     }
 
-    pub fn record_event(
+    pub fn record_event(&self, session_id: Option<&str>, turn_id: Option<&str>, kind: &str) -> i64 {
+        self.record_event_with_retry_attempt(session_id, turn_id, kind, None)
+    }
+
+    pub fn record_provider_retry_event(
+        &self,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        attempt: u64,
+    ) -> i64 {
+        self.record_event_with_retry_attempt(
+            session_id,
+            turn_id,
+            "provider.error.retrying",
+            Some(attempt),
+        )
+    }
+
+    fn record_event_with_retry_attempt(
         &self,
         session_id: Option<&str>,
         turn_id: Option<&str>,
         kind: &str,
-        payload: &Value,
-    ) -> Result<i64> {
+        retry_attempt: Option<u64>,
+    ) -> i64 {
         let mut state = self.state.borrow_mut();
         state.next_event_seq += 1;
         let seq = state.next_event_seq;
@@ -553,35 +543,20 @@ impl Store {
             session_id: session_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             kind: kind.to_owned(),
-            payload: payload.clone(),
-            created_at_ms: now_ms(),
+            retry_attempt,
         });
-        Ok(seq)
+        seq
     }
 
-    pub fn record_input(
-        &self,
-        session_id: &str,
-        turn_id: Option<&str>,
-        source: &str,
-        data: &[u8],
-    ) -> Result<i64> {
+    /// Allocate an acknowledgement sequence without retaining input bytes or
+    /// metadata. The sequence is emitted in the corresponding input event.
+    pub fn allocate_input_sequence(&self) -> i64 {
         let mut state = self.state.borrow_mut();
         state.next_input_seq += 1;
-        let seq = state.next_input_seq;
-        state.inputs.push(StoredInput {
-            seq,
-            session_id: session_id.to_owned(),
-            turn_id: turn_id.map(str::to_owned),
-            source: source.to_owned(),
-            data: data.to_vec(),
-            display: display_bytes(data),
-            created_at_ms: now_ms(),
-        });
-        Ok(seq)
+        state.next_input_seq
     }
 
-    pub fn record_output(&self, session_id: &str, data: &[u8]) -> Result<()> {
+    pub fn record_output(&self, session_id: &str, data: &[u8]) {
         let mut state = self.state.borrow_mut();
         state.next_output_seq += 1;
         let seq = state.next_output_seq;
@@ -593,15 +568,9 @@ impl Store {
         while chunks.len() > OUTPUT_CHUNK_LIMIT {
             chunks.pop_front();
         }
-        Ok(())
     }
 
-    pub fn read_output_page(
-        &self,
-        session_id: &str,
-        after: i64,
-        limit_bytes: usize,
-    ) -> Result<OutputPage> {
+    pub fn read_output_page(&self, session_id: &str, after: i64, limit_bytes: usize) -> OutputPage {
         let state = self.state.borrow();
         let chunks = state.outputs.get(session_id);
         let mut output = Vec::new();
@@ -622,37 +591,15 @@ impl Store {
         }
         let has_more =
             chunks.is_some_and(|chunks| chunks.iter().any(|chunk| chunk.seq > next_after));
-        Ok(OutputPage {
+        OutputPage {
             data: output,
             next_after,
             has_more,
-        })
+        }
     }
 
-    #[cfg(test)]
-    pub fn read_inputs(&self, session_id: &str, after: i64) -> Result<Vec<InputRecord>> {
-        Ok(self
-            .state
-            .borrow()
-            .inputs
-            .iter()
-            .filter(|input| input.session_id == session_id && input.seq > after)
-            .map(|input| InputRecord {
-                seq: input.seq,
-                session_id: input.session_id.clone(),
-                turn_id: input.turn_id.clone(),
-                source: input.source.clone(),
-                data_base64: base64::engine::general_purpose::STANDARD.encode(&input.data),
-                display: input.display.clone(),
-                byte_len: input.data.len(),
-                created_at_ms: input.created_at_ms,
-            })
-            .collect())
-    }
-
-    pub fn read_events(&self, session_id: Option<&str>, after: i64) -> Result<Vec<EventRecord>> {
-        Ok(self
-            .state
+    pub fn read_events(&self, session_id: Option<&str>, after: i64) -> Vec<EventRecord> {
+        self.state
             .borrow()
             .events
             .iter()
@@ -661,17 +608,13 @@ impl Store {
                     && session_id.is_none_or(|id| event.session_id.as_deref() == Some(id))
             })
             .cloned()
-            .collect())
+            .collect()
     }
 }
 
-fn terminal_session(session: &SessionRecord) -> bool {
-    matches!(session.state.as_str(), "stopped" | "failed")
-}
-
-fn set_terminal_session(state: &mut MemoryState, id: &str, terminal_state: &str) {
+fn set_terminal_session(state: &mut MemoryState, id: &str, terminal_state: SessionState) {
     if let Some(session) = state.sessions.get_mut(id) {
-        terminal_state.clone_into(&mut session.record.state);
+        session.record.state = terminal_state;
         session.record.pid = None;
         session.record.active_turn_id = None;
         session.record.updated_at_ms = now_ms();
@@ -685,39 +628,14 @@ pub fn now_ms() -> i64 {
     i64::try_from(milliseconds).unwrap_or(i64::MAX)
 }
 
-pub fn display_bytes(data: &[u8]) -> String {
-    let mut display = String::new();
-    for &byte in data {
-        match byte {
-            b'\n' => display.push_str("\\n"),
-            b'\r' => display.push_str("\\r"),
-            b'\t' => display.push_str("\\t"),
-            0x20..=0x7e => display.push(char::from(byte)),
-            _ => {
-                use std::fmt::Write as _;
-                let _ = write!(display, "\\x{byte:02x}");
-            }
-        }
-    }
-    display
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{NewSession, Store, display_bytes};
-    use serde_json::json;
+    use super::{NewSession, Store};
+    use crate::protocol::{SessionState, TurnState};
 
     fn mark_ready(store: &Store, session_id: &str) {
-        assert!(
-            store
-                .set_session_running(session_id, Some(42))
-                .unwrap_or_else(|error| panic!("failed to start session: {error}"))
-        );
-        assert!(
-            store
-                .set_session_state(session_id, "idle")
-                .unwrap_or_else(|error| panic!("failed to mark session ready: {error}"))
-        );
+        assert!(store.set_session_running(session_id, Some(42)));
+        assert!(store.set_session_state(session_id, SessionState::Idle));
     }
 
     #[test]
@@ -738,13 +656,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         let session = store
             .get_session("claude:thread-1")
-            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert!(!session.auto_approve);
     }
 
     #[test]
-    fn retains_session_turn_event_and_input() {
+    fn retains_session_turn_event_and_input_sequence() {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
@@ -763,53 +680,79 @@ mod tests {
         let turn = store
             .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert_eq!(turn.state, "submitted");
+        assert_eq!(turn.state, TurnState::Submitted);
+        store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.submitted");
+        assert_eq!(store.allocate_input_sequence(), 1);
+        assert_eq!(store.allocate_input_sequence(), 2);
+    }
+
+    #[test]
+    fn canceled_turn_is_not_a_provider_finish_state() {
+        let mut store = Store::new();
         store
-            .record_event(
-                Some("codex:thread-1"),
-                Some("turn_1"),
-                "turn.submitted",
-                &json!({}),
+            .insert_session(&NewSession {
+                id: "codex:thread-1",
+                alias: "@test",
+                title: "test",
+                agent: "codex",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        mark_ready(&store, "codex:thread-1");
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+
+        let error = store
+            .finish_turn_if_matching(
+                "turn_1",
+                Some("provider-turn"),
+                TurnState::Canceled,
+                None,
+                None,
             )
-            .unwrap_or_else(|error| panic!("failed to record event: {error}"));
-        store
-            .record_input("codex:thread-1", Some("turn_1"), "api", b"hello\r")
-            .unwrap_or_else(|error| panic!("failed to record input: {error}"));
+            .err()
+            .unwrap_or_else(|| panic!("canceled provider finish unexpectedly succeeded"));
+        assert_eq!(
+            error.to_string(),
+            "invalid terminal turn state \"canceled\""
+        );
         assert_eq!(
             store
-                .read_inputs("codex:thread-1", 0)
-                .unwrap_or_else(|error| panic!("failed to read inputs: {error}"))[0]
-                .display,
-            "hello\\r"
+                .get_turn("turn_1")
+                .unwrap_or_else(|| panic!("turn missing"))
+                .state,
+            TurnState::Running
         );
     }
 
     #[test]
     fn unscoped_event_reads_include_session_events() {
         let store = Store::new();
-        store
-            .record_event(Some("codex:thread-1"), None, "session.started", &json!({}))
-            .unwrap_or_else(|error| panic!("failed to record session event: {error}"));
-        store
-            .record_event(None, None, "runtime.started", &json!({}))
-            .unwrap_or_else(|error| panic!("failed to record global event: {error}"));
+        store.record_event(Some("codex:thread-1"), None, "session.started");
+        store.record_event(None, None, "runtime.started");
 
-        let events = store
-            .read_events(None, 0)
-            .unwrap_or_else(|error| panic!("failed to read all events: {error}"));
+        let events = store.read_events(None, 0);
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            store
-                .read_events(Some("codex:thread-1"), 0)
-                .unwrap_or_else(|error| panic!("failed to read session events: {error}"))
-                .len(),
-            1
-        );
+        assert_eq!(store.read_events(Some("codex:thread-1"), 0).len(), 1);
     }
 
     #[test]
-    fn formats_control_bytes_without_losing_data() {
-        assert_eq!(display_bytes(b"a\n\x1b"), "a\\n\\x1b");
+    fn provider_retry_events_keep_only_the_attempt_number() {
+        let store = Store::new();
+        store.record_provider_retry_event(Some("codex:thread-1"), None, 3);
+
+        let event = store
+            .read_events(None, 0)
+            .pop()
+            .unwrap_or_else(|| panic!("retry event missing"));
+        assert_eq!(event.retry_attempt, Some(3));
+        assert_eq!(event.kind, "provider.error.retrying");
     }
 
     #[test]
@@ -829,9 +772,7 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:old-session");
-        store
-            .set_session_stopped("codex:old-session")
-            .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
+        store.set_session_stopped("codex:old-session");
         store
             .insert_session(&NewSession {
                 id: "codex:new-session",
@@ -847,13 +788,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to reuse alias: {error}"));
         let archived = store
             .get_session("codex:old-session")
-            .unwrap_or_else(|error| panic!("failed to read old session: {error}"))
             .unwrap_or_else(|| panic!("old session missing"));
         assert_eq!(archived.alias, "@worker");
         assert_eq!(
             store
                 .get_session("@worker")
-                .unwrap_or_else(|error| panic!("failed to read new session: {error}"))
                 .unwrap_or_else(|| panic!("new session missing"))
                 .id,
             "codex:new-session"
@@ -878,9 +817,7 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "claude:provider-thread");
-        store
-            .set_session_stopped("claude:provider-thread")
-            .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
+        store.set_session_stopped("claude:provider-thread");
 
         assert!(
             store
@@ -889,9 +826,8 @@ mod tests {
         );
         let session = store
             .get_session("claude:provider-thread")
-            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
-        assert_eq!(session.state, "restarting");
+        assert_eq!(session.state, SessionState::Restarting);
         assert_eq!(session.id, "claude:provider-thread");
         assert_eq!(session.alias, "@worker");
         assert_eq!(session.harness_options, harness_options);
@@ -900,18 +836,13 @@ mod tests {
                 .begin_session_restart("claude:provider-thread")
                 .unwrap_or(false)
         );
-        assert!(
-            store
-                .start_restarted_session("claude:provider-thread")
-                .unwrap_or_else(|error| panic!("failed to start restarted session: {error}"))
-        );
+        assert!(store.start_restarted_session("claude:provider-thread"));
         assert_eq!(
             store
                 .get_session("claude:provider-thread")
-                .unwrap_or_else(|error| panic!("failed to read restarted session: {error}"))
                 .unwrap_or_else(|| panic!("restarted session missing"))
                 .state,
-            "starting"
+            SessionState::Starting
         );
     }
 
@@ -934,9 +865,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
             mark_ready(&store, id);
             if id == "codex:old-session" {
-                store
-                    .set_session_stopped(id)
-                    .unwrap_or_else(|error| panic!("failed to stop old session: {error}"));
+                store.set_session_stopped(id);
             }
         }
         let error = store
@@ -976,23 +905,17 @@ mod tests {
         assert_eq!(
             store
                 .get_session("@worker")
-                .unwrap_or_else(|error| panic!("failed to resolve reserved alias: {error}"))
                 .unwrap_or_else(|| panic!("reserved alias missing"))
                 .state,
-            "restarting"
+            SessionState::Restarting
         );
-        assert!(
-            !store
-                .set_session_state("codex:thread-1", "idle")
-                .unwrap_or(true)
-        );
+        assert!(!store.set_session_state("codex:thread-1", SessionState::Idle));
         assert_eq!(
             store
                 .get_session("codex:thread-1")
-                .unwrap_or_else(|error| panic!("failed to reread restarting session: {error}"))
                 .unwrap_or_else(|| panic!("restarting session missing"))
                 .state,
-            "restarting"
+            SessionState::Restarting
         );
         assert!(
             store
@@ -1031,15 +954,12 @@ mod tests {
         store
             .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        let interrupted = store
-            .interrupt_active_turn("codex:thread-1", "agent exited")
-            .unwrap_or_else(|error| panic!("failed to interrupt turn: {error}"));
+        let interrupted = store.interrupt_active_turn("codex:thread-1", "agent exited");
         assert_eq!(interrupted.as_deref(), Some("turn_1"));
         let turn = store
             .get_turn("turn_1")
-            .unwrap_or_else(|error| panic!("failed to read turn: {error}"))
             .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, "interrupted");
+        assert_eq!(turn.state, TurnState::Interrupted);
         assert_eq!(turn.error.as_deref(), Some("agent exited"));
     }
 
@@ -1059,20 +979,12 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        store
-            .record_output("codex:thread-1", b"first")
-            .unwrap_or_else(|error| panic!("failed to write first output: {error}"));
-        store
-            .record_output("codex:thread-1", b"second")
-            .unwrap_or_else(|error| panic!("failed to write second output: {error}"));
-        let first = store
-            .read_output_page("codex:thread-1", 0, 5)
-            .unwrap_or_else(|error| panic!("failed to read first page: {error}"));
+        store.record_output("codex:thread-1", b"first");
+        store.record_output("codex:thread-1", b"second");
+        let first = store.read_output_page("codex:thread-1", 0, 5);
         assert_eq!(first.data, b"first");
         assert!(first.has_more);
-        let second = store
-            .read_output_page("codex:thread-1", first.next_after, 5)
-            .unwrap_or_else(|error| panic!("failed to read second page: {error}"));
+        let second = store.read_output_page("codex:thread-1", first.next_after, 5);
         assert_eq!(second.data, b"second");
         assert!(!second.has_more);
     }
@@ -1120,11 +1032,7 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        assert!(
-            store
-                .set_session_running("claude:session", Some(42))
-                .unwrap_or_else(|error| panic!("failed to start session: {error}"))
-        );
+        assert!(store.set_session_running("claude:session", Some(42)));
 
         assert!(
             store
@@ -1153,11 +1061,7 @@ mod tests {
         store
             .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert!(
-            store
-                .mark_turn_started("turn_1", Some("provider-1"))
-                .unwrap_or_else(|error| panic!("failed to start turn: {error}"))
-        );
+        assert!(store.mark_turn_started("turn_1", Some("provider-1")));
         assert!(
             !store
                 .complete_turn_if_matching("turn_1", Some("provider-2"), Some("wrong"))
@@ -1190,11 +1094,7 @@ mod tests {
         store
             .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert first turn: {error}"));
-        assert!(
-            store
-                .mark_turn_started("turn_1", None)
-                .unwrap_or_else(|error| panic!("failed to start first turn: {error}"))
-        );
+        assert!(store.mark_turn_started("turn_1", None));
         assert!(
             store
                 .complete_turn_if_matching("turn_1", None, Some("done"))
@@ -1210,7 +1110,6 @@ mod tests {
         );
         let session = store
             .get_session("codex:thread-1")
-            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
         assert_eq!(session.active_turn_id.as_deref(), Some("turn_2"));
     }
@@ -1235,14 +1134,8 @@ mod tests {
         store
             .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert!(
-            store
-                .mark_turn_started("turn_1", Some("provider-turn"))
-                .unwrap_or_else(|error| panic!("failed to start turn: {error}"))
-        );
-        store
-            .set_session_state("codex:thread-1", "busy")
-            .unwrap_or_else(|error| panic!("failed to mark session busy: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+        store.set_session_state("codex:thread-1", SessionState::Busy);
         assert!(
             store
                 .cancel_turn("turn_1")
@@ -1250,9 +1143,8 @@ mod tests {
         );
         let session = store
             .get_session("codex:thread-1")
-            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
-        assert_eq!(session.state, "quiescing");
+        assert_eq!(session.state, SessionState::Quiescing);
         assert_eq!(session.active_turn_id.as_deref(), Some("turn_1"));
         assert!(
             store
@@ -1261,9 +1153,8 @@ mod tests {
         );
         let session = store
             .get_session("codex:thread-1")
-            .unwrap_or_else(|error| panic!("failed to read settled session: {error}"))
             .unwrap_or_else(|| panic!("settled session missing"));
-        assert_eq!(session.state, "idle");
+        assert_eq!(session.state, SessionState::Idle);
         assert!(session.active_turn_id.is_none());
     }
 
@@ -1283,19 +1174,12 @@ mod tests {
                 auto_approve: true,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        store
-            .set_session_stopped("codex:thread-1")
-            .unwrap_or_else(|error| panic!("failed to stop session: {error}"));
-        assert!(
-            !store
-                .set_session_state("codex:thread-1", "idle")
-                .unwrap_or_else(|error| panic!("failed to reject transition: {error}"))
-        );
+        store.set_session_stopped("codex:thread-1");
+        assert!(!store.set_session_state("codex:thread-1", SessionState::Idle));
         let session = store
             .get_session("codex:thread-1")
-            .unwrap_or_else(|error| panic!("failed to read session: {error}"))
             .unwrap_or_else(|| panic!("session missing"));
-        assert_eq!(session.state, "stopped");
+        assert_eq!(session.state, SessionState::Stopped);
     }
 
     #[test]
@@ -1317,20 +1201,11 @@ mod tests {
         assert_eq!(
             store
                 .get_session("codex:shared-id")
-                .unwrap_or_else(|error| panic!("failed to resolve provider ref: {error}"))
                 .map(|session| session.id),
             Some("codex:shared-id".to_owned())
         );
-        assert!(
-            !store
-                .reserve_provider_session("codex:shared-id", "codex:new-session")
-                .unwrap_or_else(|error| panic!("failed to reserve provider ref: {error}"))
-        );
-        assert!(
-            store
-                .reserve_provider_session("claude:shared-id", "claude:session")
-                .unwrap_or_else(|error| panic!("failed to reserve scoped provider ref: {error}"))
-        );
+        assert!(!store.reserve_provider_session("codex:shared-id", "codex:new-session"));
+        assert!(store.reserve_provider_session("claude:shared-id", "claude:session"));
         store.release_provider_session("claude:shared-id", "claude:session");
     }
 
@@ -1352,12 +1227,8 @@ mod tests {
             })
             .unwrap_or_else(|error| panic!("failed to insert old Session: {error}"));
         mark_ready(&store, "codex:thread-1");
-        store
-            .record_output("codex:thread-1", b"old")
-            .unwrap_or_else(|error| panic!("failed to record old output: {error}"));
-        store
-            .set_session_stopped("codex:thread-1")
-            .unwrap_or_else(|error| panic!("failed to stop old Session: {error}"));
+        store.record_output("codex:thread-1", b"old");
+        store.set_session_stopped("codex:thread-1");
 
         store
             .insert_session(&NewSession {
@@ -1376,65 +1247,25 @@ mod tests {
         let turn = store
             .insert_turn("turn_rekey", "internal:ABC12345", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        store
-            .record_event(
-                Some("internal:ABC12345"),
-                Some(&turn.id),
-                "turn.submitted",
-                &json!({}),
-            )
-            .unwrap_or_else(|error| panic!("failed to record event: {error}"));
-        store
-            .record_input("internal:ABC12345", Some(&turn.id), "api", b"hello")
-            .unwrap_or_else(|error| panic!("failed to record input: {error}"));
-        store
-            .record_output("internal:ABC12345", b"new")
-            .unwrap_or_else(|error| panic!("failed to record new output: {error}"));
+        store.record_event(Some("internal:ABC12345"), Some(&turn.id), "turn.submitted");
+        store.record_output("internal:ABC12345", b"new");
 
         store
             .rekey_session("internal:ABC12345", "codex:thread-1")
             .unwrap_or_else(|error| panic!("failed to promote Session: {error}"));
 
-        assert!(
-            store
-                .get_session("internal:ABC12345")
-                .unwrap_or_else(|error| panic!("failed to read launch ID: {error}"))
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .list_sessions()
-                .unwrap_or_else(|error| panic!("failed to list Sessions: {error}"))
-                .len(),
-            1
-        );
+        assert!(store.get_session("internal:ABC12345").is_none());
+        assert_eq!(store.list_sessions().len(), 1);
         assert_eq!(
             store
                 .get_turn("turn_rekey")
-                .unwrap_or_else(|error| panic!("failed to read turn: {error}"))
                 .unwrap_or_else(|| panic!("turn missing"))
                 .session_id,
             "codex:thread-1"
         );
+        assert_eq!(store.read_events(Some("codex:thread-1"), 0).len(), 1);
         assert_eq!(
-            store
-                .read_events(Some("codex:thread-1"), 0)
-                .unwrap_or_else(|error| panic!("failed to read events: {error}"))
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .read_inputs("codex:thread-1", 0)
-                .unwrap_or_else(|error| panic!("failed to read inputs: {error}"))
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .read_output_page("codex:thread-1", 0, 64)
-                .unwrap_or_else(|error| panic!("failed to read output: {error}"))
-                .data,
+            store.read_output_page("codex:thread-1", 0, 64).data,
             b"oldnew"
         );
     }
