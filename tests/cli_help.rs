@@ -77,6 +77,30 @@ fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn unknown_long_options_are_named_with_the_command_usage() -> Result<(), Box<dyn std::error::Error>>
+{
+    let home = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .args(["show", "codex:test-session", "--json"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("unknown option") && stdout.contains("--json"),
+        "unexpected output: {stdout}"
+    );
+    assert!(stdout.contains("USAGE"), "unexpected output: {stdout}");
+    assert!(
+        !stdout.contains("missing value"),
+        "unknown option consumed the next token: {stdout}"
+    );
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
 fn send_rejects_timeout_before_starting_a_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))

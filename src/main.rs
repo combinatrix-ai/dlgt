@@ -130,13 +130,14 @@ fn command_server(args: &[String]) -> Result<()> {
     if args.first().is_some_and(|value| value == "--reaper") {
         return reaper::run();
     }
-    let parsed = Args::parse(args, &["--foreground", "--daemon-child"])?;
+    let parsed = Args::parse("server", args, &["--foreground", "--daemon-child"], &[])?;
     parsed.no_positionals()?;
     daemon::run()
 }
 
 fn command_new(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
+        "new",
         args,
         &[
             "--wait",
@@ -145,6 +146,7 @@ fn command_new(args: &[String]) -> Result<()> {
             "--clean-env",
             "--no-auto-approve",
         ],
+        LAUNCH_OPTIONS,
     )?;
     let title = parsed.required("--title")?;
     let profile = parsed.one("--profile").map(load_profile).transpose()?;
@@ -228,6 +230,7 @@ fn command_new(args: &[String]) -> Result<()> {
 
 fn command_send(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
+        "send",
         args,
         &[
             "--wait",
@@ -237,6 +240,7 @@ fn command_send(args: &[String]) -> Result<()> {
             "--clean-env",
             "--no-auto-approve",
         ],
+        LAUNCH_OPTIONS,
     )?;
     let session = parsed
         .positionals
@@ -319,7 +323,12 @@ fn command_send(args: &[String]) -> Result<()> {
 }
 
 fn command_restart(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty", "--clean-env"])?;
+    let parsed = Args::parse(
+        "restart",
+        args,
+        &["--pretty", "--clean-env"],
+        LAUNCH_OPTIONS,
+    )?;
     let session = parsed.one_positional("Session selector")?;
     let environment = launch_environment(&parsed, None)?;
     let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
@@ -338,7 +347,7 @@ fn command_restart(args: &[String]) -> Result<()> {
 }
 
 fn command_wait(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("wait", args, &["--pretty"], &["--timeout"])?;
     let session = parsed.one_positional("Session selector")?;
     let timeout = parse_duration(parsed.required("--timeout")?)?;
     let result = client::call(
@@ -349,7 +358,7 @@ fn command_wait(args: &[String]) -> Result<()> {
 }
 
 fn command_cancel(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("cancel", args, &["--pretty"], &["--timeout"])?;
     let session = parsed.one_positional("Session selector")?;
     let timeout = parsed
         .one("--timeout")
@@ -364,7 +373,7 @@ fn command_cancel(args: &[String]) -> Result<()> {
 }
 
 fn command_list(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--all", "--all-versions", "--pretty"])?;
+    let parsed = Args::parse("list", args, &["--all", "--all-versions", "--pretty"], &[])?;
     parsed.no_positionals()?;
     let sessions = if parsed.flag("--all-versions") {
         client::list_all_versions(parsed.flag("--all"))?
@@ -378,7 +387,7 @@ fn command_list(args: &[String]) -> Result<()> {
 }
 
 fn command_show(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("show", args, &["--pretty"], &[])?;
     let result = client::call(
         "session.read",
         json!({"session":parsed.one_positional("Session selector")?}),
@@ -387,7 +396,7 @@ fn command_show(args: &[String]) -> Result<()> {
 }
 
 fn command_attach(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--steal"])?;
+    let parsed = Args::parse("attach", args, &["--steal"], &[])?;
     client::attach(
         parsed.one_positional("Session selector")?,
         parsed.flag("--steal"),
@@ -395,7 +404,7 @@ fn command_attach(args: &[String]) -> Result<()> {
 }
 
 fn command_stop(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--force", "--pretty"])?;
+    let parsed = Args::parse("stop", args, &["--force", "--pretty"], &[])?;
     let result = client::call(
         "session.stop",
         json!({
@@ -406,7 +415,7 @@ fn command_stop(args: &[String]) -> Result<()> {
 }
 
 fn command_events(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--follow", "--pretty"])?;
+    let parsed = Args::parse("events", args, &["--follow", "--pretty"], &["--after"])?;
     if parsed.positionals.len() > 1 {
         bail!("events accepts at most one Session selector");
     }
@@ -428,7 +437,7 @@ fn command_events(args: &[String]) -> Result<()> {
 }
 
 fn command_scrollback(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("scrollback", args, &["--pretty"], &["--lines", "--before"])?;
     let session = parsed.one_positional("Session selector")?;
     let lines = parsed
         .one("--lines")
@@ -444,7 +453,7 @@ fn command_scrollback(args: &[String]) -> Result<()> {
 }
 
 fn command_logs(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--raw", "--json"])?;
+    let parsed = Args::parse("logs", args, &["--raw", "--json"], &[])?;
     let session = parsed.one_positional("Session selector")?;
     if !parsed.flag("--raw") {
         bail!("logs requires the explicit --raw capability flag");
@@ -490,7 +499,12 @@ fn command_logs(args: &[String]) -> Result<()> {
 }
 
 fn command_models(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--include-hidden", "--pretty"])?;
+    let parsed = Args::parse(
+        "models",
+        args,
+        &["--include-hidden", "--pretty"],
+        &["--harness"],
+    )?;
     parsed.no_positionals()?;
     let result = client::call(
         "model.list",
@@ -500,7 +514,7 @@ fn command_models(args: &[String]) -> Result<()> {
 }
 
 fn command_profiles(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("profiles", args, &["--pretty"], &[])?;
     let action = parsed.positionals.first().map_or("list", String::as_str);
     let profiles = load_profiles()?;
     let result = match action {
@@ -515,7 +529,7 @@ fn command_profiles(args: &[String]) -> Result<()> {
 }
 
 fn command_harnesses(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("harnesses", args, &["--pretty"], &[])?;
     if parsed.positionals.len() > 1 {
         bail!("harnesses accepts at most one Harness name");
     }
@@ -527,7 +541,7 @@ fn command_harnesses(args: &[String]) -> Result<()> {
 }
 
 fn command_rpc(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--stdio"])?;
+    let parsed = Args::parse("rpc", args, &["--stdio"], &[])?;
     parsed.no_positionals()?;
     if !parsed.flag("--stdio") {
         bail!("rpc requires --stdio");
@@ -536,7 +550,7 @@ fn command_rpc(args: &[String]) -> Result<()> {
 }
 
 fn command_update(args: &[String]) -> Result<()> {
-    let parsed = Args::parse(args, &["--pretty"])?;
+    let parsed = Args::parse("update", args, &["--pretty"], &[])?;
     parsed.no_positionals()?;
     print_success(update::install_latest()?, parsed.flag("--pretty"))
 }
@@ -555,6 +569,24 @@ fn command_hook(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Options accepted by the Session launch commands. `new` and `send` share
+/// this set so a Profile-driven launch and a `--resume` launch stay aligned.
+const LAUNCH_OPTIONS: &[&str] = &[
+    "--title",
+    "--alias",
+    "--profile",
+    "--harness",
+    "--model",
+    "--effort",
+    "--cwd",
+    "--harness-option",
+    "--startup-timeout",
+    "--timeout",
+    "--pass-env",
+    "--env",
+    "--unset-env",
+];
+
 #[derive(Default)]
 struct Args {
     positionals: Vec<String>,
@@ -563,8 +595,14 @@ struct Args {
 }
 
 impl Args {
-    fn parse(args: &[String], flags: &[&str]) -> Result<Self> {
+    /// Parse one command's arguments against its declared flags and options.
+    ///
+    /// An unrecognized long option is rejected by name instead of silently
+    /// consuming the next token as its value, which used to turn a typo into
+    /// an unrelated "missing value for --json" style failure.
+    fn parse(command: &str, args: &[String], flags: &[&str], options: &[&str]) -> Result<Self> {
         let known_flags = flags.iter().copied().collect::<HashSet<_>>();
+        let known_options = options.iter().copied().collect::<HashSet<_>>();
         let mut parsed = Self::default();
         let mut index = 0;
         let mut positional = false;
@@ -574,10 +612,26 @@ impl Args {
                 parsed.positionals.push(value.clone());
             } else if value == "--" {
                 positional = true;
+            } else if let Some((name, inline)) = value
+                .starts_with("--")
+                .then(|| value.split_once('='))
+                .flatten()
+            {
+                if !known_flags.contains(name) && !known_options.contains(name) {
+                    return Err(unknown_option(command, name));
+                }
+                if known_flags.contains(name) {
+                    parsed.flags.insert(name.to_owned());
+                }
+                parsed
+                    .options
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push(inline.to_owned());
             } else if value.starts_with("--") {
                 if known_flags.contains(value.as_str()) {
                     parsed.flags.insert(value.clone());
-                } else {
+                } else if known_options.contains(value.as_str()) {
                     index += 1;
                     let option = args
                         .get(index)
@@ -587,6 +641,8 @@ impl Args {
                         .entry(value.clone())
                         .or_default()
                         .push(option.clone());
+                } else {
+                    return Err(unknown_option(command, value));
                 }
             } else {
                 parsed.positionals.push(value.clone());
@@ -631,6 +687,13 @@ impl Args {
             )
         }
     }
+}
+
+fn unknown_option(command: &str, name: &str) -> anyhow::Error {
+    command_usage(command).map_or_else(
+        |_| anyhow::anyhow!("unknown option {name:?}"),
+        |usage| anyhow::anyhow!("unknown option {name:?}\n\n{usage}"),
+    )
 }
 
 fn prompt_from(parsed: &Args, skip: usize) -> Result<Option<String>> {
@@ -854,6 +917,11 @@ fn print_usage() {
 }
 
 fn print_command_usage(command: &str) -> Result<()> {
+    println!("{}", command_usage(command)?);
+    Ok(())
+}
+
+fn command_usage(command: &str) -> Result<&'static str> {
     let usage = match command {
         "server" => {
             "dlgt server - run or stop the local daemon\n\nUSAGE\n  dlgt server [--foreground]\n  dlgt server stop\n\nOPTIONS\n  --foreground   Run in the foreground\n  -h, --help     Print this help"
@@ -920,8 +988,7 @@ fn print_command_usage(command: &str) -> Result<()> {
         }
         _ => bail!("unknown help topic {command:?}; run `dlgt help`"),
     };
-    println!("{usage}");
-    Ok(())
+    Ok(usage)
 }
 
 #[cfg(test)]
