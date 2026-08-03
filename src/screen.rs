@@ -21,52 +21,6 @@ pub const LIVE_ROW_LIMIT: usize = 40;
 const TRANSFER_SCROLLBACK: usize = 1024;
 const REBASE_THRESHOLD: usize = 512;
 const FEED_PIECE: usize = 256;
-/// Longest boundary sequence recognized by the scanner, minus one byte.
-const BOUNDARY_CARRY: usize = 7;
-
-/// A byte sequence the promotion accounting has to see, rather than discover
-/// after the fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Boundary {
-    /// History is destroyed: promote first, re-anchor, and start a new epoch.
-    Reset(EpochReason),
-    /// The main grid stops receiving output: promote everything it holds
-    /// before the switch, or it stays invisible until the application leaves
-    /// the alternate screen, which may be never.
-    AlternateEnter,
-    /// The main grid resumes: re-anchor and promote whatever it still holds.
-    AlternateExit,
-}
-
-/// Sequences the promotion accounting has to see, and the bytes actually fed
-/// to the emulator for each.
-///
-/// Alternate-grid switches are drain boundaries, not resets: no epoch changes,
-/// because stable history is untouched. `?1047` is rewritten to `?47` because
-/// the pinned emulator implements only modes 47 and 1049 and would otherwise
-/// ignore `?1047h` entirely, leaving the application's full-screen output to
-/// paint the main grid and scroll into stable history. Rewriting keeps the
-/// scanner and the emulator on the same grid; dropping 1047 from the scanner
-/// would keep them consistent but would not stop that leak.
-const BOUNDARIES: [(&[u8], &[u8], Boundary); 8] = [
-    (
-        b"\x1bc",
-        b"\x1bc",
-        Boundary::Reset(EpochReason::TerminalReset),
-    ),
-    (
-        b"\x1b[3J",
-        b"\x1b[3J",
-        Boundary::Reset(EpochReason::EraseScrollback),
-    ),
-    (b"\x1b[?1049h", b"\x1b[?1049h", Boundary::AlternateEnter),
-    (b"\x1b[?1049l", b"\x1b[?1049l", Boundary::AlternateExit),
-    (b"\x1b[?1047h", b"\x1b[?47h", Boundary::AlternateEnter),
-    (b"\x1b[?1047l", b"\x1b[?47l", Boundary::AlternateExit),
-    (b"\x1b[?47h", b"\x1b[?47h", Boundary::AlternateEnter),
-    (b"\x1b[?47l", b"\x1b[?47l", Boundary::AlternateExit),
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpochReason {
     ProcessRestart,
@@ -96,6 +50,41 @@ pub struct StablePage {
     pub has_more: bool,
     /// The requested watermark predates the retained floor.
     pub gap: bool,
+}
+
+/// Longest boundary sequence the scanner will wait for. A private-mode
+/// sequence is variable length, so an unterminated one longer than this is
+/// treated as ordinary output rather than stalling the screen forever.
+const MAX_BOUNDARY_LEN: usize = 32;
+/// Exact-length sequences that destroy history.
+const RESETS: [(&[u8], EpochReason); 2] = [
+    (b"\x1bc", EpochReason::TerminalReset),
+    (b"\x1b[3J", EpochReason::EraseScrollback),
+];
+/// Private modes that switch between the main and alternate grids.
+const ALTERNATE_MODES: [u32; 3] = [47, 1047, 1049];
+
+/// A byte sequence the promotion accounting has to see, rather than discover
+/// after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// History is destroyed: promote first, re-anchor, and start a new epoch.
+    Reset(EpochReason),
+    /// The main grid stops receiving output: promote everything it holds
+    /// before the switch, or it stays invisible until the application leaves
+    /// the alternate screen, which may be never.
+    AlternateEnter,
+    /// The main grid resumes: re-anchor and promote whatever it still holds.
+    AlternateExit,
+}
+
+/// One recognized boundary: where it sits in the window, and the bytes to feed
+/// the emulator in its place.
+struct Boundaries {
+    begin: usize,
+    end: usize,
+    emit: Vec<u8>,
+    boundary: Boundary,
 }
 
 pub struct ScreenStore {
@@ -170,10 +159,10 @@ impl ScreenStore {
         window.truncate(split);
 
         let mut start = 0;
-        for (begin, end, emit, boundary) in scan_boundaries(&window) {
-            self.feed_pieces(&window[start..begin]);
-            self.parser.process(emit);
-            match boundary {
+        for found in scan_boundaries(&window) {
+            self.feed_pieces(&window[start..found.begin]);
+            self.parser.process(&found.emit);
+            match found.boundary {
                 Boundary::Reset(reason) => {
                     self.resync();
                     self.bump_epoch(reason);
@@ -186,7 +175,7 @@ impl ScreenStore {
                     self.drain();
                 }
             }
-            start = end;
+            start = found.end;
         }
         self.feed_pieces(&window[start..]);
     }
@@ -386,16 +375,81 @@ impl ScreenStore {
     }
 }
 
+/// Parse `ESC [ ? <params> (h|l)`.
+///
+/// Applications combine private modes freely, so `ESC[?1047;25h` must be
+/// recognized as an alternate-screen switch rather than missed by an
+/// exact-string match. Any `1047` parameter is rewritten to `47` because the
+/// pinned emulator implements only modes 47 and 1049 and would otherwise
+/// ignore the switch, leaving full-screen output to scroll into stable
+/// history. Every other parameter is preserved in its original order.
+fn private_mode(bytes: &[u8]) -> Option<(usize, Boundary, Vec<u8>)> {
+    let rest = bytes.strip_prefix(b"\x1b[?")?;
+    let mut end = 0;
+    while end < rest.len()
+        && 3 + end < MAX_BOUNDARY_LEN
+        && (rest[end].is_ascii_digit() || rest[end] == b';')
+    {
+        end += 1;
+    }
+    let final_byte = *rest.get(end)?;
+    if !matches!(final_byte, b'h' | b'l') {
+        return None;
+    }
+    let params = rest[..end]
+        .split(|byte| *byte == b';')
+        .map(|param| {
+            std::str::from_utf8(param)
+                .ok()
+                .and_then(|text| text.parse::<u32>().ok())
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    if !params.iter().any(|param| ALTERNATE_MODES.contains(param)) {
+        return None;
+    }
+    let rewritten = params
+        .iter()
+        .map(|param| if *param == 1047 { 47 } else { *param }.to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+    let emit = format!("\x1b[?{rewritten}{}", char::from(final_byte)).into_bytes();
+    let boundary = if final_byte == b'h' {
+        Boundary::AlternateEnter
+    } else {
+        Boundary::AlternateExit
+    };
+    Some((3 + end + 1, boundary, emit))
+}
+
+/// Whether `tail` could still become a boundary once more output arrives.
+fn is_partial_boundary(tail: &[u8]) -> bool {
+    if tail.is_empty() || tail.len() >= MAX_BOUNDARY_LEN {
+        return false;
+    }
+    if RESETS
+        .iter()
+        .any(|(pattern, _)| pattern.len() > tail.len() && pattern.starts_with(tail))
+    {
+        return true;
+    }
+    if tail.len() < 3 {
+        return b"\x1b[?".starts_with(tail);
+    }
+    let Some(rest) = tail.strip_prefix(b"\x1b[?") else {
+        return false;
+    };
+    // Still collecting parameters: the final byte has not arrived yet.
+    rest.iter()
+        .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
 /// Bytes withheld from the emulator because they might still become a
 /// boundary once more output arrives.
 fn boundary_prefix_len(window: &[u8]) -> usize {
-    let start = window.len().saturating_sub(BOUNDARY_CARRY);
+    let start = window.len().saturating_sub(MAX_BOUNDARY_LEN);
     for begin in start..window.len() {
-        let tail = &window[begin..];
-        if BOUNDARIES
-            .iter()
-            .any(|(pattern, _, _)| pattern.len() > tail.len() && pattern.starts_with(tail))
-        {
+        if window[begin] == 0x1b && is_partial_boundary(&window[begin..]) {
             return window.len() - begin;
         }
     }
@@ -405,7 +459,7 @@ fn boundary_prefix_len(window: &[u8]) -> usize {
 /// Locate every boundary sequence in a window that is known to hold no partial
 /// match, returning each match's range and the bytes to feed the emulator in
 /// its place.
-fn scan_boundaries(window: &[u8]) -> Vec<(usize, usize, &'static [u8], Boundary)> {
+fn scan_boundaries(window: &[u8]) -> Vec<Boundaries> {
     let mut found = Vec::new();
     let mut index = 0;
     while index < window.len() {
@@ -413,15 +467,30 @@ fn scan_boundaries(window: &[u8]) -> Vec<(usize, usize, &'static [u8], Boundary)
             index += 1;
             continue;
         }
-        let matched = BOUNDARIES
+        let reset = RESETS
             .iter()
-            .find(|(pattern, _, _)| window[index..].starts_with(pattern));
-        if let Some((pattern, emit, boundary)) = matched {
-            found.push((index, index + pattern.len(), *emit, *boundary));
+            .find(|(pattern, _)| window[index..].starts_with(pattern));
+        if let Some((pattern, reason)) = reset {
+            found.push(Boundaries {
+                begin: index,
+                end: index + pattern.len(),
+                emit: (*pattern).to_vec(),
+                boundary: Boundary::Reset(*reason),
+            });
             index += pattern.len();
-        } else {
-            index += 1;
+            continue;
         }
+        if let Some((length, boundary, emit)) = private_mode(&window[index..]) {
+            found.push(Boundaries {
+                begin: index,
+                end: index + length,
+                emit,
+                boundary,
+            });
+            index += length;
+            continue;
+        }
+        index += 1;
     }
     found
 }
@@ -643,6 +712,102 @@ mod tests {
             feed_lines(&mut store, 20);
             assert!(promoted(&store).iter().any(|row| row == "line-15"));
         }
+    }
+
+    /// Feed main-screen rows, run `body` inside the alternate screen, and
+    /// return the promoted rows plus what was promoted before entering.
+    fn alternate_round_trip(enter: &[u8], exit: &[u8]) -> (Vec<String>, Vec<String>) {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+        let before = promoted(&store);
+
+        store.feed(enter);
+        for index in 0..30 {
+            store.feed(format!("alt-{index}\r\n").as_bytes());
+        }
+        assert_eq!(promoted(&store), before, "alternate rows were promoted");
+        store.feed(exit);
+        feed_lines(&mut store, 8);
+        (promoted(&store), before)
+    }
+
+    #[test]
+    fn a_combined_private_mode_is_still_an_alternate_screen_switch() {
+        // Applications set several private modes at once. Exact-string
+        // matching missed these entirely.
+        for (enter, exit) in [
+            (&b"\x1b[?1047;25h"[..], &b"\x1b[?1047;25l"[..]),
+            (&b"\x1b[?25;1049h"[..], &b"\x1b[?25;1049l"[..]),
+            (&b"\x1b[?1;47;2004h"[..], &b"\x1b[?1;47;2004l"[..]),
+        ] {
+            let (rows, before) = alternate_round_trip(enter, exit);
+            assert!(
+                !rows.iter().any(|row| row.starts_with("alt-")),
+                "alternate contents leaked for {:?}: {rows:?}",
+                String::from_utf8_lossy(enter)
+            );
+            assert!(rows.starts_with(&before), "history was rewritten");
+        }
+    }
+
+    #[test]
+    fn a_combined_private_mode_keeps_every_other_parameter() {
+        assert_eq!(
+            super::private_mode(b"\x1b[?1047;25h").map(|(length, _, emit)| (length, emit)),
+            Some((11, b"\x1b[?47;25h".to_vec()))
+        );
+        assert_eq!(
+            super::private_mode(b"\x1b[?1;1047;2004l").map(|(_, _, emit)| emit),
+            Some(b"\x1b[?1;47;2004l".to_vec())
+        );
+        // 1049 is implemented by the emulator and passes through untouched.
+        assert_eq!(
+            super::private_mode(b"\x1b[?1049h").map(|(_, _, emit)| emit),
+            Some(b"\x1b[?1049h".to_vec())
+        );
+        // A private mode with no alternate-screen parameter is not a boundary.
+        assert!(super::private_mode(b"\x1b[?25;2004h").is_none());
+        assert!(super::private_mode(b"\x1b[?1047").is_none());
+    }
+
+    #[test]
+    fn a_combined_private_mode_survives_every_split_position() {
+        let enter = b"\x1b[?1047;25h";
+        for split in 0..=enter.len() {
+            let mut store = ScreenStore::new(4, 20);
+            feed_lines(&mut store, 10);
+            let before = promoted(&store);
+
+            store.feed(&enter[..split]);
+            store.feed(&enter[split..]);
+            for index in 0..30 {
+                store.feed(format!("alt-{index}\r\n").as_bytes());
+            }
+
+            let rows = promoted(&store);
+            assert_eq!(
+                rows, before,
+                "split at {split} let alternate output into history: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlong_private_mode_prefix_flushes_instead_of_stalling() {
+        let mut store = ScreenStore::new(4, 20);
+        let bogus = format!("\x1b[?{}", "9".repeat(64));
+        store.feed(bogus.as_bytes());
+        // The sequence is handed to the emulator rather than withheld, so it
+        // consumes the next byte as its final byte exactly as a real terminal
+        // would. What matters is that output keeps flowing.
+        store.feed(b"h");
+        store.feed(b"visible\r\n");
+        let (live, _) = store.live_rows(40);
+        assert!(
+            live.iter().any(|row| row.contains("visible")),
+            "output stalled behind an unterminated sequence: {live:?}"
+        );
+        assert_eq!(store.epoch(), 1);
     }
 
     #[test]
