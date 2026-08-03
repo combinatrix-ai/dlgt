@@ -21,8 +21,36 @@ pub const LIVE_ROW_LIMIT: usize = 40;
 const TRANSFER_SCROLLBACK: usize = 1024;
 const REBASE_THRESHOLD: usize = 512;
 const FEED_PIECE: usize = 256;
-/// Longest reset sequence recognized by the scanner, minus one byte.
-const RESET_CARRY: usize = 3;
+/// Longest boundary sequence recognized by the scanner, minus one byte.
+const BOUNDARY_CARRY: usize = 7;
+
+/// A byte sequence the promotion accounting has to see, rather than discover
+/// after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// History is destroyed: promote first, re-anchor, and start a new epoch.
+    Reset(EpochReason),
+    /// The main grid stops receiving output: promote everything it holds
+    /// before the switch, or it stays invisible until the application leaves
+    /// the alternate screen, which may be never.
+    AlternateEnter,
+    /// The main grid resumes: re-anchor and promote whatever it still holds.
+    AlternateExit,
+}
+
+/// Sequences that move between the main and alternate grids. They are drain
+/// boundaries, not resets: no epoch changes, because stable history is
+/// untouched.
+const BOUNDARIES: [(&[u8], Boundary); 8] = [
+    (b"\x1bc", Boundary::Reset(EpochReason::TerminalReset)),
+    (b"\x1b[3J", Boundary::Reset(EpochReason::EraseScrollback)),
+    (b"\x1b[?1049h", Boundary::AlternateEnter),
+    (b"\x1b[?1049l", Boundary::AlternateExit),
+    (b"\x1b[?1047h", Boundary::AlternateEnter),
+    (b"\x1b[?1047l", Boundary::AlternateExit),
+    (b"\x1b[?47h", Boundary::AlternateEnter),
+    (b"\x1b[?47l", Boundary::AlternateExit),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpochReason {
@@ -111,29 +139,42 @@ impl ScreenStore {
         (self.rows, self.cols)
     }
 
-    /// Feed PTY bytes. A reset splits the feed immediately *before* its own
-    /// bytes: everything it is about to destroy is promoted first, then the
-    /// reset is applied on its own and the promotion accounting is re-anchored.
+    /// Feed PTY bytes. A boundary splits the feed immediately *before* its own
+    /// bytes, so everything the boundary is about to hide or destroy is
+    /// promoted first; only then is the boundary applied and the promotion
+    /// accounting re-anchored.
     pub fn feed(&mut self, data: &[u8]) {
         let mut start = 0;
-        for (begin, end, reason) in self.scan_resets(data) {
+        for (begin, end, boundary) in self.scan_boundaries(data) {
             self.feed_pieces(&data[start..begin]);
             self.parser.process(&data[begin..end]);
-            self.resync_after_reset();
-            self.bump_epoch(reason);
+            match boundary {
+                Boundary::Reset(reason) => {
+                    self.resync();
+                    self.bump_epoch(reason);
+                }
+                // The main grid was drained by feed_pieces above, before the
+                // switch took effect.
+                Boundary::AlternateEnter => {}
+                Boundary::AlternateExit => {
+                    self.resync();
+                    self.drain();
+                }
+            }
             start = end;
         }
         self.feed_pieces(&data[start..]);
     }
 
-    /// Re-anchor the promoted-row count after a reset dropped the emulator's
-    /// own scrollback, without re-promoting anything.
-    fn resync_after_reset(&mut self) {
+    /// Re-anchor the promoted-row count to the emulator's own scrollback
+    /// without re-promoting anything, after a boundary changed which grid the
+    /// count refers to or dropped it entirely.
+    fn resync(&mut self) {
         if self.parser.screen().alternate_screen() {
             return;
         }
         self.parser.screen_mut().set_scrollback(usize::MAX);
-        self.consumed = self.parser.screen().scrollback();
+        self.consumed = self.consumed.min(self.parser.screen().scrollback());
         self.parser.screen_mut().set_scrollback(0);
     }
 
@@ -158,6 +199,14 @@ impl ScreenStore {
     /// Start a new process generation. A new PTY is always a new terminal
     /// generation even when the provider-qualified Session ID is unchanged.
     pub fn restart(&mut self) {
+        // A provider that died inside the alternate screen still has main-grid
+        // history that never scrolled out. Leave the alternate screen
+        // logically first so that history is reachable; alternate contents are
+        // ephemeral by design and are dropped.
+        if self.parser.screen().alternate_screen() {
+            self.parser.process(b"\x1b[?1049l\x1b[?1047l\x1b[?47l");
+            self.resync();
+        }
         self.drain();
         // The dead process's last screen never scrolled out, so promote it
         // before the emulator is replaced or it disappears from history.
@@ -311,11 +360,11 @@ impl ScreenStore {
         }
     }
 
-    /// Locate `ESC c` and `CSI 3 J`, returning the byte range of each match in
-    /// `data`. A match that began in a previous feed reports an empty leading
-    /// range, because those bytes were already delivered to the emulator.
-    /// Matches split across feeds are recovered from the carry buffer.
-    fn scan_resets(&mut self, data: &[u8]) -> Vec<(usize, usize, EpochReason)> {
+    /// Locate every boundary sequence, returning its byte range in `data`. A
+    /// match that began in a previous feed reports an empty leading range,
+    /// because those bytes were already delivered to the emulator. Matches
+    /// split across feeds are recovered from the carry buffer.
+    fn scan_boundaries(&mut self, data: &[u8]) -> Vec<(usize, usize, Boundary)> {
         let carry_len = self.carry.len();
         let mut window = std::mem::take(&mut self.carry);
         window.extend_from_slice(data);
@@ -327,28 +376,26 @@ impl ScreenStore {
                 index += 1;
                 continue;
             }
-            let reason = if window[index..].starts_with(b"\x1bc") {
-                Some((2, EpochReason::TerminalReset))
-            } else if window[index..].starts_with(b"\x1b[3J") {
-                Some((4, EpochReason::EraseScrollback))
-            } else {
-                None
-            };
-            if let Some((length, reason)) = reason {
+            let matched = BOUNDARIES
+                .iter()
+                .find(|(pattern, _)| window[index..].starts_with(pattern));
+            if let Some((pattern, boundary)) = matched {
                 let begin = index.saturating_sub(carry_len).min(data.len());
-                let end = (index + length).saturating_sub(carry_len).min(data.len());
-                found.push((begin, end, reason));
-                index += length;
+                let end = (index + pattern.len())
+                    .saturating_sub(carry_len)
+                    .min(data.len());
+                found.push((begin, end, *boundary));
+                index += pattern.len();
                 matched_end = index;
             } else {
                 index += 1;
             }
         }
         // Bytes already consumed by a match must never be replayed into the
-        // next scan, or the same reset would be reported twice.
+        // next scan, or the same boundary would be reported twice.
         let tail = window
             .len()
-            .saturating_sub(RESET_CARRY)
+            .saturating_sub(BOUNDARY_CARRY)
             .max(matched_end)
             .min(window.len());
         self.carry = window[tail..].to_vec();
@@ -573,6 +620,76 @@ mod tests {
             feed_lines(&mut store, 20);
             assert!(promoted(&store).iter().any(|row| row == "line-15"));
         }
+    }
+
+    #[test]
+    fn entering_the_alternate_screen_promotes_the_main_grid_first() {
+        for enter in [&b"\x1b[?1049h"[..], &b"\x1b[?47h"[..]] {
+            let mut store = ScreenStore::new(4, 20);
+            let mut piece = String::new();
+            for index in 0..10 {
+                let _ = writeln!(piece, "{}\r", format_args!("m-{index}"));
+            }
+            let mut piece = piece.into_bytes();
+            piece.extend_from_slice(enter);
+            assert!(piece.len() < super::FEED_PIECE, "must share one piece");
+
+            store.feed(&piece);
+
+            // The rows must be observable immediately, not only once the
+            // application leaves the alternate screen.
+            let rows = promoted(&store);
+            assert_eq!(rows.len(), 7, "pre-entry rows were hidden: {rows:?}");
+            assert_eq!(rows[0], "m-0");
+            assert_eq!(store.epoch(), 1, "an alternate switch is not a reset");
+        }
+    }
+
+    #[test]
+    fn a_provider_that_dies_in_the_alternate_screen_keeps_main_history() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+        store.feed(b"\x1b[?1049h");
+        for index in 0..20 {
+            store.feed(format!("alt-{index}\r\n").as_bytes());
+        }
+
+        store.restart();
+
+        let rows = promoted(&store);
+        assert!(rows.iter().any(|row| row == "line-0"));
+        assert!(rows.iter().any(|row| row == "line-9"), "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.starts_with("alt-")),
+            "alternate contents leaked: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn entering_and_leaving_the_alternate_screen_in_one_piece_keeps_history() {
+        let mut store = ScreenStore::new(4, 20);
+        let mut piece = String::new();
+        for index in 0..10 {
+            let _ = writeln!(piece, "{}\r", format_args!("m-{index}"));
+        }
+        let mut piece = piece.into_bytes();
+        piece.extend_from_slice(b"\x1b[?1049hALT\x1b[?1049l");
+        let mut tail = String::new();
+        for index in 10..14 {
+            let _ = writeln!(tail, "{}\r", format_args!("m-{index}"));
+        }
+        piece.extend_from_slice(tail.as_bytes());
+
+        store.feed(&piece);
+
+        let rows = promoted(&store);
+        assert!(
+            rows.starts_with(&["m-0".to_owned(), "m-1".to_owned()]),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("ALT")), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "m-9"), "{rows:?}");
+        assert_eq!(store.epoch(), 1);
     }
 
     #[test]
