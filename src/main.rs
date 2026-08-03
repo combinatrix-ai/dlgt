@@ -394,10 +394,29 @@ fn command_show(args: &[String]) -> Result<()> {
 
 fn command_attach(args: &[String]) -> Result<()> {
     let parsed = Args::parse("attach", args, &["--steal"], &[])?;
-    client::attach(
-        parsed.one_positional("Session selector")?,
-        parsed.flag("--steal"),
-    )
+    let selector = parsed.one_positional("Session selector")?;
+    // attach is an interactive terminal takeover. Without a TTY on both ends
+    // it would dump raw ANSI into a pipe and read input that no one is typing.
+    if !is_tty(libc::STDIN_FILENO) || !is_tty(libc::STDOUT_FILENO) {
+        return Err(client::RpcFailure {
+            code: "ATTACH_REQUIRES_TTY".to_owned(),
+            message: "attach requires an interactive terminal on stdin and stdout".to_owned(),
+            session_id: None,
+            launch_id: None,
+            correlation_id: None,
+            hint: Some(format!("dlgt fetch {selector}")),
+            session_state: None,
+            action: Some(format!("dlgt fetch {selector}")),
+        }
+        .into());
+    }
+    client::attach(selector, parsed.flag("--steal"))
+}
+
+fn is_tty(descriptor: i32) -> bool {
+    // SAFETY: isatty only inspects the descriptor and has no memory-safety
+    // preconditions.
+    unsafe { libc::isatty(descriptor) == 1 }
 }
 
 fn command_stop(args: &[String]) -> Result<()> {
