@@ -33,58 +33,101 @@ Profile   A reusable client-side launch specification.
 
 ## Delegate and read the answer
 
-`new` and `send` only accept work; they return immediately. `fetch` is the one
-command that reads state, results, events, and screen. Compound them in a
-single shell call so the acceptance and the read happen in one tool result:
+Delegation is two phases. `new` and `send` only accept work and return as soon
+as the prompt is accepted; `fetch` is the only command that reads state,
+results, events, and screen. Run them as two commands and parse the acceptance
+before you wait on anything.
+
+### Phase 1: accept the work
 
 ```bash
-dlgt new \
+receipt=$(dlgt new \
   --title "counterpart review" \
   --harness claude \
   --cwd . \
-  --alias @review \
   --request-id review-1 \
-  -- "Review the uncommitted changes in this repository. Do not edit files and do not delegate again. Report findings and trade-offs only." \
-  && dlgt fetch @review --until result --wait 60s
+  -- "Review the uncommitted changes in this repository. Do not edit files and do not delegate again. Report findings and trade-offs only.")
+
+session_id=$(printf '%s\n' "$receipt" | jq -er '.session.id')
+cursor=$(printf '%s\n' "$receipt" | jq -er '.cursor')
+```
+
+Retain both before doing anything else:
+
+- `session.id` is provider-qualified (`codex:<thread-id>` or
+  `claude:<session-id>`) and is the single address for live commands, provider
+  correlation, and later resume.
+- `cursor` is positioned immediately before the work you just accepted, so
+  reading from it cannot miss output the provider produced in between.
+- `--request-id` makes the acceptance replayable. If you never see this
+  response, re-run the identical command with the same ID: it returns the
+  original receipt with `"replayed": true` instead of starting a second
+  worker.
+
+### Phase 2: read the answer
+
+```bash
+answered=$(dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 60s)
+printf '%s\n' "$answered" | jq -er '.sessions[0].results[0].status'
+printf '%s\n' "$answered" | jq -er '.sessions[0].results[0].final_text'
+cursor=$(printf '%s\n' "$answered" | jq -er '.cursor')
 ```
 
 The counterpart's answer is `sessions[0].results[0].final_text`. Check
 `status` first: it is `completed`, `failed`, `canceled`, or `interrupted`, and
 only `completed` means the text is a finished answer. Parse with a real JSON
-tool, never a regex:
-
-```bash
-answered=$(dlgt fetch @review --until result --wait 60s)
-printf '%s\n' "$answered" | jq -er '.sessions[0].results[0].status'
-printf '%s\n' "$answered" | jq -er '.sessions[0].results[0].final_text'
-session_id=$(printf '%s\n' "$answered" | jq -er '.sessions[0].session.id')
-cursor=$(printf '%s\n' "$answered" | jq -er '.cursor')
-```
+tool, never a regex.
 
 Every `fetch` exits 0 and says why it returned in `reason`: `result`,
 `change`, `snapshot`, `blocked`, `page_full`, `gap`, or `timeout`. `timeout`
 with empty `results` means the work is still running, never that it finished.
-A non-zero exit means the request itself was wrong.
+`page_full` means more is already waiting: call again immediately with the
+returned cursor. A non-zero exit means the request itself was wrong.
 
-Keep the returned `cursor` and pass it to the next `fetch --cursor`. It makes
-each read a forward delta instead of a re-download of the same tail. `new` and
-`send` also return a `cursor` positioned just before the work they accepted.
+Keep the returned `cursor` and pass it to the next `fetch --cursor`. That
+makes each read a forward delta instead of a re-download of the same tail.
 
 Follow up on the same Session, then release it:
 
 ```bash
-dlgt send "$session_id" -- "Rank those findings by severity and name the one to fix first." \
-  && dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 60s \
+receipt=$(dlgt send "$session_id" -- "Rank those findings by severity and name the one to fix first.")
+cursor=$(printf '%s\n' "$receipt" | jq -er '.cursor')
+dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 60s \
   | jq -er '.sessions[0].results[0].final_text'
 
 dlgt stop "$session_id"
 ```
 
-Retain `session.id`. It is provider-qualified (`codex:<thread-id>` or
-`claude:<session-id>`) and is the single address for live commands, provider
-correlation, and later resume. Stopping a Session ends its process, not the
-provider conversation: the same `session.id` still resumes. An Alias is a
-convenience only and may be reused by a new Session after this one stops.
+Stopping a Session ends its process, not the provider conversation: the same
+`session.id` still resumes. An Alias is a convenience only and may be reused by
+a new Session after this one stops.
+
+### Optimization: one call for a short task
+
+When the task is short and the extra round trip matters, the two phases can
+share one shell call. This is an optimization, not the default:
+
+```bash
+dlgt new --title "quick check" --harness claude --cwd . \
+  --alias @quick --request-id quick-1 -- "..." \
+  && dlgt fetch @quick --until result --wait 60s
+```
+
+The output is **two JSON documents, one per line**. Parse line 1 first:
+
+```bash
+out=$(dlgt new ... --alias @quick --request-id quick-1 -- "..." \
+  && dlgt fetch @quick --until result --wait 60s)
+receipt=$(printf '%s\n' "$out" | sed -n 1p)
+answered=$(printf '%s\n' "$out" | sed -n 2p)
+session_id=$(printf '%s\n' "$receipt" | jq -er '.session.id')
+```
+
+Line 1 is the acceptance receipt and is authoritative. If the second document
+is missing, truncated, or the whole command was killed, the receipt still holds
+the Session ID and cursor you need, and the work is still running. A missing
+second line never means the acceptance failed, and it is never a reason to run
+`new` again.
 
 ## Watch a long task
 
@@ -92,9 +135,11 @@ A long delegation outlives one foreground command, so run the long `fetch` the
 way your own harness supports and never fuse it with acceptance:
 
 - Running as Claude: accept the work first, then run
-  `dlgt fetch <session.id> --until result --wait 30m` through the background
-  mechanism your harness offers. The acceptance receipt is already in hand, so
-  a lost or backgrounded read costs nothing.
+  `dlgt fetch <session.id> --cursor <cursor> --until result --wait 30m` through
+  the background mechanism your harness offers. The acceptance receipt is
+  already in hand, so a lost or backgrounded read costs nothing.
+  Never use the one-call optimization for a long task: it puts the receipt and
+  a 30-minute wait in the same killable command.
 - Running as Codex: run the same long `fetch` inside one exec cell and then
   issue a single long cell wait. Output produced before the cell yields is
   retained and delivered at that wait.
@@ -163,13 +208,15 @@ over a shell-quoted argument. It reads standard input as the exact prompt and
 is mutually exclusive with a prompt after `--`.
 
 ```bash
-dlgt new --title "counterpart review" --harness claude --cwd . --alias @review \
-  --stdin <<'PROMPT'
+receipt=$(dlgt new --title "counterpart review" --harness claude --cwd . \
+  --request-id review-1 --stdin <<'PROMPT'
 Review the uncommitted changes in this repository.
 Do not edit files and do not delegate again.
 Report findings and trade-offs only.
 PROMPT
-dlgt fetch @review --until result --wait 60s
+)
+dlgt fetch "$(printf '%s\n' "$receipt" | jq -er '.session.id')" \
+  --cursor "$(printf '%s\n' "$receipt" | jq -er '.cursor')" --until result --wait 60s
 ```
 
 Quote the heredoc delimiter as `<<'PROMPT'`. Left unquoted, the shell expands
@@ -272,7 +319,7 @@ when a delegation must keep the Harness's own permission prompts.
 | `CURSOR_EXPIRED` / `CURSOR_VERSION_UNSUPPORTED` / `CURSOR_SCOPE_MISMATCH` / `CURSOR_INVALID` | Drop the cursor and run one cursorless `fetch <session.id>` to rebase. |
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address the existing Session by ID. |
-| `LAUNCH_FAILED` / `PROVIDER_FAILED` | Read `fetch` and `show`, and only then the sensitive `logs --raw`. If present, retain `error.launch_id` for startup diagnostics only. |
+| `LAUNCH_FAILED` | Read `fetch` and `show`, and only then the sensitive `logs --raw`. If present, retain `error.launch_id` for startup diagnostics only. A failed execution is not an error: it is reported as `results[].status`. |
 
 ## Observation and control
 

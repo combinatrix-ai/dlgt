@@ -930,7 +930,6 @@ fn print_success(value: Value, pretty: bool) -> Result<()> {
 
 fn exit_status(code: &str) -> i32 {
     match code {
-        "PROVIDER_FAILED" => 2,
         "CANCEL_TIMEOUT" => 3,
         "SESSION_BLOCKED" => 4,
         "SESSION_BUSY" => 5,

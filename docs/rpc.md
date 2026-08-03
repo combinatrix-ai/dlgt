@@ -342,7 +342,6 @@ CURSOR_SCOPE_MISMATCH  Cursor addresses a different Session or scope
 CURSOR_INVALID         Cursor payload is not decodable
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-PROVIDER_FAILED        Provider terminalized work as failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```

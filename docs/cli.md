@@ -270,7 +270,8 @@ dlgt new \
   --title "prompting Claude worker" \
   --harness claude \
   --no-auto-approve \
-  --cwd .
+  --cwd . \
+  -- "Review the current design"
 ```
 
 The unsafe full bypass remains available only when deliberately requested:
@@ -280,7 +281,8 @@ dlgt new \
   --title "unrestricted Claude worker" \
   --harness claude \
   --harness-option dangerously-skip-permissions=true \
-  --cwd .
+  --cwd . \
+  -- "Review the current design"
 ```
 
 ```bash
@@ -887,7 +889,6 @@ They configure the provider CLI rather than the launch environment.
 ```text
 0  command succeeded, including every fetch observation
 1  usage, configuration, identity, launch, cursor, or RPC error
-2  a command reported a provider-terminalized failure
 3  bounded cancellation timeout; the cancellation continues
 4  Session is blocked on input
 5  Session is busy and rejected a send
@@ -924,7 +925,6 @@ CURSOR_SCOPE_MISMATCH  Cursor addresses a different Session or scope
 CURSOR_INVALID         Cursor payload is not decodable
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-PROVIDER_FAILED        Provider terminalized work as failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```

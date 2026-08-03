@@ -116,7 +116,10 @@ dlgt new \
 
 `new` returns as soon as the prompt is accepted, and `fetch` is the one
 observation command: it returns current state, new results, lifecycle events,
-and the forward screen delta from an opaque cursor.
+and the forward screen delta from an opaque cursor. Chaining them prints two
+JSON documents, one per line; the first is the acceptance receipt and carries
+the Session ID and cursor. For anything longer than a quick check, run the two
+commands separately so a lost read never costs you the receipt.
 
 Create a Codex Session:
 

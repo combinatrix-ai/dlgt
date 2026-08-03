@@ -212,8 +212,9 @@ dlgt new \
   && dlgt fetch @dlgt-verify --until result --wait 5m
 ~~~
 
-The `fetch` must return `ok: true` with `reason: "result"` and a completed
-result containing `DLGT_OK`. Retain the returned Session ID, stop that verification Session with
+Both commands print one JSON document each, on their own line. The `fetch`
+must return `ok: true` with `reason: "result"` and a completed result
+containing `DLGT_OK`. Retain the returned Session ID, stop that verification Session with
 `dlgt stop <SESSION_ID>`, and only then report that installation and end-to-end
 verification succeeded. A launch failure, timeout, blocked Session, or missing
 result means verification did not pass.
