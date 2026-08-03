@@ -379,6 +379,19 @@ impl Daemon {
             }
         };
 
+        if request.id_too_long() {
+            return write_response(
+                &mut stream,
+                &Response::error(
+                    request.short_id(),
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "request id must be at most {} bytes",
+                        crate::protocol::MAX_REQUEST_ID_LEN
+                    ),
+                ),
+            );
+        }
         if request.method == "view.subscribe" {
             return self.subscribe_view(&mut stream, &request);
         }
@@ -3474,14 +3487,11 @@ struct Builder<'a> {
     options: &'a FetchOptions,
     buckets: Vec<Committed>,
     units: Vec<Unit>,
-    /// Exact serialized cost of the committed payload.
-    used: usize,
-    /// Serialized cost of the fixed document skeleton, cursor excluded.
-    skeleton: usize,
 }
 
-/// Encoded cost of the frame around a chunked screen row.
-const FRAGMENT_FRAME_COST: usize = 96;
+/// How many times a chunk is resized before the unit is abandoned. Each
+/// attempt strictly shrinks, so this only bounds pathological input.
+const MAX_FIT_ATTEMPTS: usize = 24;
 
 /// Where a chunked row sits relative to the whole rows in the same response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3489,33 +3499,15 @@ enum FragmentSlot {
     Before,
     After,
 }
-/// Fallback cursor allowance used only when the cursor cannot be encoded, in
-/// which case the document will fail to build anyway.
-const CURSOR_BASE_RESERVE: usize = 256;
-/// Room for one Session's cursor entry to grow as its watermarks advance.
-const CURSOR_GROWTH_ALLOWANCE: usize = 96;
-/// How far above the measured floor the minimum-budget search looks.
-const MINIMUM_SEARCH_SPAN: usize = 8 * 1024;
 
 impl<'a> Builder<'a> {
-    fn new(cut: &'a Cut, options: &'a FetchOptions) -> Result<Self> {
-        let skeleton = json!({
-            "schema_version": 1,
-            "runtime": {"version": env!("CARGO_PKG_VERSION"), "instance_id": options.instance_id},
-            "reason": "page_full",
-            "has_more": true,
-            "gaps": cut.scope_gaps,
-            "cursor": "",
-            "sessions": [],
-        });
-        Ok(Self {
+    const fn new(cut: &'a Cut, options: &'a FetchOptions) -> Self {
+        Self {
             cut,
             options,
             buckets: Vec::new(),
             units: Vec::new(),
-            used: 0,
-            skeleton: serialized_len(&skeleton)?,
-        })
+        }
     }
 
     /// Fixed cost of the document as currently committed: the skeleton plus
@@ -3523,16 +3515,22 @@ impl<'a> Builder<'a> {
     /// the reported minimum budget is one a caller can actually use. The
     /// cursor grows as watermarks advance; the final measurement and rollback
     /// loop absorb that.
-    fn envelope(&self) -> usize {
-        self.skeleton
-            + self
-                .cursor()
-                .map_or(CURSOR_BASE_RESERVE, |token| token.len())
-            // Committing a unit can add continuation fields to the cursor, so
-            // the encoded token grows after the accounting that admitted the
-            // unit. Reserve for that rather than admitting a unit the final
-            // measurement would only have to roll back.
-            + CURSOR_GROWTH_ALLOWANCE * self.buckets.len().max(1)
+    /// Keep everything committed since `mark` only if the finished document
+    /// fits the budget, and report by how much it did not.
+    ///
+    /// Every commit is measured rather than estimated. No arithmetic can
+    /// predict the encoded size, because committing a unit also lengthens the
+    /// cursor the same document has to carry.
+    fn verify(&mut self, mark: usize) -> Result<Option<usize>> {
+        let length = serialized_len(&self.document()?)?;
+        let budget = self.budget();
+        if length <= budget {
+            return Ok(None);
+        }
+        while self.units.len() > mark {
+            self.rollback();
+        }
+        Ok(Some(length - budget))
     }
 
     /// Bytes available to the daemon's document. The caller's budget covers
@@ -3542,10 +3540,6 @@ impl<'a> Builder<'a> {
         self.options
             .max_bytes
             .saturating_sub(cli_wrapper_overhead())
-    }
-
-    fn remaining(&self) -> usize {
-        self.budget().saturating_sub(self.envelope() + self.used)
     }
 
     fn empty_bucket(source: &BucketSource) -> Committed {
@@ -3577,53 +3571,78 @@ impl<'a> Builder<'a> {
     }
 
     /// Commit the mandatory part of each Session bucket: identity and gaps.
-    fn commit_buckets(&mut self) {
+    fn commit_buckets(&mut self) -> Result<()> {
         for source in &self.cut.sources {
-            let committed = Self::empty_bucket(source);
-            let cost = json_cost(&committed.value());
-            if cost > self.remaining() {
-                return;
-            }
-            self.used += cost;
-            self.buckets.push(committed);
+            let mark = self.units.len();
+            self.buckets.push(Self::empty_bucket(source));
             self.units.push(Unit::Bucket);
+            if self.verify(mark)?.is_some() {
+                return Ok(());
+            }
         }
+        Ok(())
     }
 
-    fn commit_results(&mut self) {
+    fn commit_results(&mut self) -> Result<()> {
         for index in 0..self.buckets.len() {
-            let source = &self.cut.sources[index];
-            for turn in &source.results {
-                let offset = if self.buckets[index].position.px == Some(turn.execution_seq) {
-                    self.buckets[index].position.po
-                } else {
-                    0
-                };
-                let Some((value, take, complete)) = fit_result(turn, offset, self.remaining())
-                else {
-                    return;
-                };
-                let previous = self.buckets[index].position;
-                self.used += json_cost(&value);
-                self.buckets[index].results.push(value);
-                let position = &mut self.buckets[index].position;
-                if complete {
-                    position.x = turn.execution_seq;
-                    position.px = None;
-                    position.po = 0;
-                } else {
-                    position.px = Some(turn.execution_seq);
-                    position.po = offset + u64::try_from(take).unwrap_or(0);
-                }
-                self.units.push(Unit::Result {
-                    bucket: index,
-                    previous,
-                });
+            for position in 0..self.cut.sources[index].results.len() {
+                let complete = self.commit_result(index, position)?;
                 if !complete {
-                    return;
+                    return Ok(());
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Commit one result, chunked to fit. Returns whether the whole body
+    /// shipped; anything else ends the results for this response.
+    fn commit_result(&mut self, index: usize, position: usize) -> Result<bool> {
+        let turn = self.cut.sources[index].results[position].clone();
+        let offset = if self.buckets[index].position.px == Some(turn.execution_seq) {
+            self.buckets[index].position.po
+        } else {
+            0
+        };
+        // Try the whole body first. Chunking adds continuation fields to the
+        // cursor, so a chunk can cost more than the complete record it
+        // replaces; only measurement can tell.
+        let mut hint = usize::MAX;
+        for _ in 0..MAX_FIT_ATTEMPTS {
+            let separator = usize::from(!self.buckets[index].results.is_empty());
+            let Some((value, take, complete)) =
+                fit_result(&turn, offset, hint.saturating_sub(separator))
+            else {
+                return Ok(false);
+            };
+            let attempted = serialized_len(&value)?;
+            let mark = self.units.len();
+            let previous = self.buckets[index].position;
+            self.buckets[index].results.push(value);
+            let watermark = &mut self.buckets[index].position;
+            if complete {
+                watermark.x = turn.execution_seq;
+                watermark.px = None;
+                watermark.po = 0;
+            } else {
+                watermark.px = Some(turn.execution_seq);
+                watermark.po = offset + u64::try_from(take).unwrap_or(0);
+            }
+            self.units.push(Unit::Result {
+                bucket: index,
+                previous,
+            });
+            let Some(excess) = self.verify(mark)? else {
+                return Ok(complete);
+            };
+            // Trim from what was actually attempted by exactly the overshoot,
+            // rather than dropping a result the caller is waiting for.
+            hint = attempted.saturating_sub(excess.max(1));
+            if hint == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     /// Commit events as a global sequence-ascending prefix.
@@ -3633,7 +3652,7 @@ impl<'a> Builder<'a> {
     /// the same later events on every call forever. Committing in order and
     /// stopping at the first refusal makes the watermark a true prefix by
     /// construction.
-    fn commit_events(&mut self) {
+    fn commit_events(&mut self) -> Result<()> {
         // Anything belonging to a Session this response cannot carry is a
         // hole: nothing at or after it may be committed.
         let mut limit = self.cut.dropped_event_seq.unwrap_or(i64::MAX);
@@ -3651,83 +3670,27 @@ impl<'a> Builder<'a> {
         queue.sort_unstable();
         for (seq, index, offset) in queue {
             if seq >= limit {
-                return;
+                return Ok(());
             }
-            let event = &self.cut.sources[index].events[offset];
-            let cost = json_cost(event);
-            if cost > self.remaining() {
-                return;
-            }
-            self.used += cost;
-            self.buckets[index].events.push(event.clone());
+            let event = self.cut.sources[index].events[offset].clone();
+            let mark = self.units.len();
+            self.buckets[index].events.push(event);
             self.units.push(Unit::Event { bucket: index });
+            if self.verify(mark)?.is_some() {
+                return Ok(());
+            }
         }
+        Ok(())
     }
 
-    fn commit_screen(&mut self) {
+    fn commit_screen(&mut self) -> Result<()> {
         for index in 0..self.buckets.len() {
-            let source = &self.cut.sources[index];
-            if !source.screen {
+            if !self.cut.sources[index].screen {
                 continue;
             }
-            for (row, line) in source.stable.iter().enumerate() {
-                let start = if row == 0 { source.stable_offset } else { 0 };
-                let start = char_floor(line, start.min(line.len()));
-                let remainder = &line[start..];
-                let Some(take) = fit_text(remainder, self.remaining()) else {
-                    return;
-                };
-                let complete = take == remainder.len();
-                // A row already partly delivered continues in the leading
-                // slot; a row this response has to split fills the trailing
-                // one. A whole row is never framed.
-                let slot = if start > 0 {
-                    Some(FragmentSlot::Before)
-                } else if complete {
-                    None
-                } else {
-                    Some(FragmentSlot::After)
-                };
-                let previous = self.buckets[index].position;
-                let id = source.stable_start + u64::try_from(row).unwrap_or(0) + 1;
-                let text = remainder[..take].to_owned();
-                self.used += json_cost(&Value::String(text.clone()));
-                match slot {
-                    Some(FragmentSlot::Before) => {
-                        self.used += FRAGMENT_FRAME_COST;
-                        self.buckets[index].fragment_before = Some(StableFragment {
-                            row_id: id,
-                            offset: u64::try_from(start).unwrap_or(0),
-                            text,
-                            complete,
-                        });
-                    }
-                    Some(FragmentSlot::After) => {
-                        self.used += FRAGMENT_FRAME_COST;
-                        self.buckets[index].fragment_after = Some(StableFragment {
-                            row_id: id,
-                            offset: 0,
-                            text,
-                            complete: false,
-                        });
-                    }
-                    None => self.buckets[index].stable.push(text),
-                }
-                let position = &mut self.buckets[index].position;
-                if complete {
-                    position.r = id;
-                    position.ro = 0;
-                } else {
-                    position.r = id - 1;
-                    position.ro = u64::try_from(start + take).unwrap_or(0);
-                }
-                self.units.push(Unit::Stable {
-                    bucket: index,
-                    previous,
-                    slot,
-                });
-                if !complete {
-                    return;
+            for row in 0..self.cut.sources[index].stable.len() {
+                if !self.commit_row(index, row)? {
+                    return Ok(());
                 }
             }
         }
@@ -3736,20 +3699,92 @@ impl<'a> Builder<'a> {
             if !source.screen || source.live.is_empty() {
                 continue;
             }
-            let cost = json_cost(&Value::Array(
-                source
-                    .live
-                    .iter()
-                    .map(|line| Value::String(line.clone()))
-                    .collect(),
-            ));
-            if cost > self.remaining() {
-                continue;
-            }
-            self.used += cost;
+            // The empty `live` array is already part of the bucket, so only
+            // its contents and their separators are new.
+            let mark = self.units.len();
             self.buckets[index].live.clone_from(&source.live);
             self.units.push(Unit::Live { bucket: index });
+            let _ = self.verify(mark)?;
         }
+        Ok(())
+    }
+
+    /// Commit one screen row, chunked to fit. Returns whether the whole row
+    /// shipped; anything else ends the screen delta for this response.
+    fn commit_row(&mut self, index: usize, row: usize) -> Result<bool> {
+        let line = self.cut.sources[index].stable[row].clone();
+        let start = if row == 0 {
+            self.cut.sources[index].stable_offset
+        } else {
+            0
+        };
+        let start = char_floor(&line, start.min(line.len()));
+        let id = self.cut.sources[index].stable_start + u64::try_from(row).unwrap_or(0) + 1;
+        // Same reasoning as a result body: try the whole row first, because
+        // splitting it adds a frame and a cursor continuation.
+        let mut hint = usize::MAX;
+        for _ in 0..MAX_FIT_ATTEMPTS {
+            let remainder = &line[start..];
+            let separator = usize::from(!self.buckets[index].stable.is_empty());
+            let Some(take) = fit_text(remainder, hint.saturating_sub(separator)) else {
+                return Ok(false);
+            };
+            let complete = take == remainder.len();
+            // A row already partly delivered continues in the leading slot; a
+            // row this response has to split fills the trailing one. A whole
+            // row is never framed.
+            let slot = if start > 0 {
+                Some(FragmentSlot::Before)
+            } else if complete {
+                None
+            } else {
+                Some(FragmentSlot::After)
+            };
+            let mark = self.units.len();
+            let previous = self.buckets[index].position;
+            let text = remainder[..take].to_owned();
+            let attempted = serialized_len(&Value::String(text.clone()))?;
+            match slot {
+                Some(FragmentSlot::Before) => {
+                    self.buckets[index].fragment_before = Some(StableFragment {
+                        row_id: id,
+                        offset: u64::try_from(start).unwrap_or(0),
+                        text,
+                        complete,
+                    });
+                }
+                Some(FragmentSlot::After) => {
+                    self.buckets[index].fragment_after = Some(StableFragment {
+                        row_id: id,
+                        offset: 0,
+                        text,
+                        complete: false,
+                    });
+                }
+                None => self.buckets[index].stable.push(text),
+            }
+            let watermark = &mut self.buckets[index].position;
+            if complete {
+                watermark.r = id;
+                watermark.ro = 0;
+            } else {
+                watermark.r = id - 1;
+                watermark.ro = u64::try_from(start + take).unwrap_or(0);
+            }
+            self.units.push(Unit::Stable {
+                bucket: index,
+                previous,
+                slot,
+            });
+            let Some(excess) = self.verify(mark)? else {
+                return Ok(complete);
+            };
+            hint = attempted.saturating_sub(excess.max(1));
+            if hint == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     /// Undo the most recent commit, including the watermark it recorded.
@@ -3944,48 +3979,42 @@ impl<'a> Builder<'a> {
         }))
     }
 
-    /// Smallest budget that would actually work, obtained by rendering the
-    /// smallest response that still makes progress. Measuring beats arithmetic:
-    /// the answer has to include the cursor entries this scope carries, the
-    /// screen object when the screen is enabled, and the CLI wrapper.
-    fn minimum_viable(&self) -> Result<usize> {
-        let mut probe = Builder::new(self.cut, self.options)?;
+    /// A budget that demonstrably works for this cut, or `None` if none does.
+    ///
+    /// Only a value that has actually rendered is ever returned. Searching is
+    /// not an option: whether a budget makes progress is not monotonic in the
+    /// budget, so a bisection can converge on a value that fails.
+    fn workable_budget(&self) -> Result<Option<usize>> {
+        let mut probe = Builder::new(self.cut, self.options);
         probe.commit_minimum();
         let floor = serialized_len(&probe.document()?)? + cli_wrapper_overhead();
-        // The floor is a lower bound: the real path also reserves for the
-        // cursor growing as watermarks advance. Search for the smallest budget
-        // at which a real attempt actually makes progress, so the number the
-        // caller is told is one they can use.
-        let ceiling = floor + MINIMUM_SEARCH_SPAN;
-        if !self.would_progress(ceiling)? {
-            return Ok(ceiling);
-        }
-        let mut low = floor;
-        let mut high = ceiling;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.would_progress(middle)? {
-                high = middle;
-            } else {
-                low = middle + 1;
+        // Recommend something strictly larger than the budget that just
+        // failed, so the advice cannot repeat the caller's mistake.
+        let mut candidate = floor.max(self.options.max_bytes.saturating_add(1)).max(1);
+        while candidate <= FETCH_HARD_MAX_BYTES {
+            if self.renders_at(candidate)? {
+                return Ok(Some(candidate));
             }
+            candidate = candidate.saturating_mul(2);
         }
-        Ok(low)
+        // Chunking means the hard limit should always suffice; report no
+        // recommendation rather than one that was never verified.
+        Ok(None)
     }
 
-    /// Whether a real attempt at `max_bytes` would deliver anything.
-    fn would_progress(&self, max_bytes: usize) -> Result<bool> {
+    /// Whether a real attempt at `max_bytes` would succeed.
+    fn renders_at(&self, max_bytes: usize) -> Result<bool> {
         let options = FetchOptions {
             max_bytes,
             ..self.options.clone()
         };
-        let mut trial = Builder::new(self.cut, &options)?;
-        trial.commit_buckets();
-        trial.commit_results();
-        trial.commit_events();
-        trial.commit_screen();
-        trial.settle()?;
-        Ok(trial.progress() || !trial.pending())
+        let mut trial = Builder::new(self.cut, &options);
+        trial.commit_buckets()?;
+        trial.commit_results()?;
+        trial.commit_events()?;
+        trial.commit_screen()?;
+        let value = trial.settle()?;
+        Ok(serialized_len(&value)? <= trial.budget() && (!trial.pending() || trial.progress()))
     }
 
     /// Commit one bucket and one unit of progress, ignoring the budget.
@@ -4028,7 +4057,12 @@ impl<'a> Builder<'a> {
         if length > self.budget() || (self.pending() && !self.progress()) {
             // Progress must come from chunking, never from oversizing. If not
             // even one chunk fits, the request itself is unsatisfiable.
-            let minimum = self.minimum_viable()?.max(length + cli_wrapper_overhead());
+            let Some(minimum) = self.workable_budget()? else {
+                bail!(
+                    "invalid max_bytes {}: too small to carry one unit of progress",
+                    self.options.max_bytes,
+                );
+            };
             bail!(
                 "invalid max_bytes {}: too small to carry one unit of progress; retry with --max-bytes {minimum} or more",
                 self.options.max_bytes,
@@ -4048,11 +4082,11 @@ impl<'a> Builder<'a> {
 
 impl Cut {
     fn render(self, options: &FetchOptions) -> Result<Rendered> {
-        let mut builder = Builder::new(&self, options)?;
-        builder.commit_buckets();
-        builder.commit_results();
-        builder.commit_events();
-        builder.commit_screen();
+        let mut builder = Builder::new(&self, options);
+        builder.commit_buckets()?;
+        builder.commit_results()?;
+        builder.commit_events()?;
+        builder.commit_screen()?;
         builder.finish()
     }
 }
@@ -4071,7 +4105,7 @@ fn char_floor(text: &str, index: usize) -> usize {
 fn fit_text(text: &str, budget: usize) -> Option<usize> {
     let mut take = text.len();
     loop {
-        if json_cost(&Value::String(text[..take].to_owned())) <= budget {
+        if encoded_len(&Value::String(text[..take].to_owned())) <= budget {
             return Some(take);
         }
         if take == 0 {
@@ -4098,7 +4132,7 @@ fn fit_result(turn: &TurnRecord, offset: u64, budget: usize) -> Option<(Value, u
     loop {
         value["final_text"] = json!(&remainder[..take]);
         value["final_text_complete"] = json!(take == remainder.len());
-        if json_cost(&value) <= budget {
+        if encoded_len(&value) <= budget {
             return Some((value, take, take == remainder.len()));
         }
         if take == 0 {
@@ -4136,12 +4170,14 @@ fn event_seq(event: &Value) -> i64 {
     event.get("seq").and_then(Value::as_i64).unwrap_or(0)
 }
 
-fn serialized_len(value: &Value) -> Result<usize> {
-    Ok(serde_json::to_string(value)?.len())
+/// Encoded length of a value, saturating when it cannot be encoded so a
+/// caller sizing a chunk never admits one by accident.
+fn encoded_len(value: &Value) -> usize {
+    serde_json::to_string(value).map_or(usize::MAX, |text| text.len())
 }
 
-fn json_cost(value: &Value) -> usize {
-    serde_json::to_string(value).map_or(0, |text| text.len()) + 1
+fn serialized_len(value: &Value) -> Result<usize> {
+    Ok(serde_json::to_string(value)?.len())
 }
 
 fn retention_gap(component: &str) -> Value {
@@ -4740,6 +4776,14 @@ mod tests {
         .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"))
     }
 
+    /// Length of the complete compact response line a client would print.
+    fn line_length(value: &Value) -> usize {
+        serde_json::to_string(value)
+            .map(|text| text.len())
+            .unwrap_or_default()
+            + cli_wrapper_overhead()
+    }
+
     fn fragment_text<'a>(screen: &'a Value, slot: &str) -> &'a str {
         screen
             .get(slot)
@@ -5242,6 +5286,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn every_reason_variant_respects_an_exact_budget() {
         type Variant = (&'static str, Box<dyn Fn() -> Cut>);
         let variants: Vec<Variant> = vec![
@@ -5322,21 +5367,36 @@ mod tests {
                 .render(&options)
                 .unwrap_or_else(|error| panic!("{name} failed to render: {error}"));
             assert_eq!(relaxed.value["reason"], json!(name));
-            let exact = serde_json::to_string(&relaxed.value)
-                .map(|text| text.len())
-                .unwrap_or_default();
-            for budget in [exact.saturating_sub(1), exact, exact + 1] {
+            // The budget covers the complete response line, wrapper included.
+            let exact = line_length(&relaxed.value);
+
+            // At exactly that budget the response must render unchanged.
+            for budget in [exact, exact + 64] {
                 let mut options = fetch_options(budget, None);
                 options.until_result = name == "result";
-                let Ok(rendered) = build().render(&options) else {
-                    continue;
-                };
-                let length = serde_json::to_string(&rendered.value)
-                    .map(|text| text.len())
-                    .unwrap_or_default();
+                let rendered = build()
+                    .render(&options)
+                    .unwrap_or_else(|error| panic!("{name} failed at {budget}: {error}"));
+                assert_eq!(
+                    rendered.value["reason"],
+                    json!(name),
+                    "{name} changed reason at {budget}"
+                );
                 assert!(
-                    length + cli_wrapper_overhead() <= budget,
-                    "{name} produced {length} bytes plus wrapper for a {budget} byte budget"
+                    line_length(&rendered.value) <= budget,
+                    "{name} exceeded a {budget} byte budget"
+                );
+            }
+
+            // One byte short may legitimately fail or shed content, but must
+            // never overflow.
+            let mut options = fetch_options(exact.saturating_sub(1), None);
+            options.until_result = name == "result";
+            if let Ok(rendered) = build().render(&options) {
+                assert!(
+                    line_length(&rendered.value) < exact,
+                    "{name} exceeded a {} byte budget",
+                    exact - 1
                 );
             }
         }
@@ -5367,22 +5427,19 @@ mod tests {
         let relaxed = build()
             .render(&scoped(FETCH_HARD_MAX_BYTES))
             .unwrap_or_else(|error| panic!("failed to render: {error}"));
-        let exact = serde_json::to_string(&relaxed.value)
-            .map(|text| text.len())
-            .unwrap_or_default()
-            + cli_wrapper_overhead();
+        let exact = line_length(&relaxed.value);
 
-        for budget in [exact.saturating_sub(40), exact, exact + 40] {
-            let Ok(rendered) = build().render(&scoped(budget)) else {
-                continue;
-            };
-            let length = serde_json::to_string(&rendered.value)
-                .map(|text| text.len())
-                .unwrap_or_default();
+        for budget in [exact, exact + 40] {
+            let rendered = build()
+                .render(&scoped(budget))
+                .unwrap_or_else(|error| panic!("--all failed at {budget}: {error}"));
             assert!(
-                length + cli_wrapper_overhead() <= budget,
-                "--all produced {length} bytes plus wrapper for a {budget} byte budget"
+                line_length(&rendered.value) <= budget,
+                "--all exceeded a {budget} byte budget"
             );
+        }
+        if let Ok(rendered) = build().render(&scoped(exact.saturating_sub(40))) {
+            assert!(line_length(&rendered.value) <= exact - 40);
         }
     }
 
@@ -5462,12 +5519,125 @@ mod tests {
             let rendered = cut()
                 .render(&at_minimum)
                 .unwrap_or_else(|error| panic!("{name}: minimum {minimum} failed: {error}"));
-            let length = serde_json::to_string(&rendered.value)
-                .map(|text| text.len())
-                .unwrap_or_default();
             assert!(
-                length + cli_wrapper_overhead() <= minimum,
-                "{name}: {length} bytes plus wrapper exceeded the reported {minimum}"
+                line_length(&rendered.value) <= minimum,
+                "{name}: the response exceeded the reported minimum {minimum}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
+    fn a_reported_minimum_budget_always_renders() {
+        // Each of these fails at a tiny budget for a different reason: an
+        // oversized Session record, an oversized result body, an oversized
+        // screen row, and a wide --all cursor.
+        let mut carried = crate::cursor::Cursor::new("boot", crate::cursor::SCOPE_ALL);
+        for index in 0..24 {
+            carried.set_session(
+                &format!("su_carried_{index}"),
+                crate::cursor::SessionCursor {
+                    x: 9,
+                    r: 4_096,
+                    ro: 12,
+                    px: Some(10),
+                    po: 64,
+                    ep: 3,
+                },
+            );
+        }
+        type Case = (&'static str, Box<dyn Fn() -> Cut>, FetchOptions);
+        let cases: Vec<Case> = vec![
+            (
+                "wide session record",
+                Box::new(|| {
+                    let mut source = SourceSpec {
+                        events: lifecycle_events(1..=4),
+                        ..SourceSpec::new("su_test")
+                    };
+                    source.session = json!({"id": "claude:x", "title": "t".repeat(6_000)});
+                    test_cut(vec![source.build()])
+                }),
+                fetch_options(16, None),
+            ),
+            (
+                "oversized result body",
+                Box::new(|| {
+                    test_cut(vec![
+                        SourceSpec {
+                            results: vec![test_turn(1, &"body ".repeat(20_000))],
+                            ..SourceSpec::new("su_test")
+                        }
+                        .build(),
+                    ])
+                }),
+                fetch_options(16, None),
+            ),
+            (
+                "oversized screen row",
+                Box::new(|| {
+                    test_cut(vec![
+                        SourceSpec {
+                            stable: vec!["w".repeat(80_000)],
+                            screen: true,
+                            ..SourceSpec::new("su_test")
+                        }
+                        .build(),
+                    ])
+                }),
+                fetch_options(16, None),
+            ),
+            (
+                "wide carried cursor",
+                Box::new(|| {
+                    let mut cut = test_cut(vec![
+                        SourceSpec {
+                            results: vec![test_turn(11, &"answer ".repeat(500))],
+                            ..SourceSpec::new("su_test")
+                        }
+                        .build(),
+                    ]);
+                    cut.live_uids = (0..24)
+                        .map(|index| format!("su_carried_{index}"))
+                        .chain(std::iter::once("su_test".to_owned()))
+                        .collect();
+                    cut
+                }),
+                FetchOptions {
+                    scope: crate::cursor::SCOPE_ALL.to_owned(),
+                    ..fetch_options(16, Some(carried))
+                },
+            ),
+        ];
+
+        for (name, cut, options) in cases {
+            let error = cut()
+                .render(&options)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a 16 byte budget was accepted"));
+            let message = error.to_string();
+            let minimum = message
+                .rsplit("--max-bytes ")
+                .next()
+                .and_then(|tail| tail.split(' ').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("{name}: no recommendation in {message}"));
+            assert!(
+                minimum > options.max_bytes,
+                "{name}: recommended {minimum}, which is not above the budget that failed"
+            );
+
+            // The recommendation is only useful if it actually renders.
+            let retry = FetchOptions {
+                max_bytes: minimum,
+                ..options.clone()
+            };
+            let rendered = cut()
+                .render(&retry)
+                .unwrap_or_else(|error| panic!("{name}: minimum {minimum} failed: {error}"));
+            assert!(
+                line_length(&rendered.value) <= minimum,
+                "{name}: the response exceeded its own recommendation"
             );
         }
     }

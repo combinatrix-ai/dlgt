@@ -42,6 +42,10 @@ Raw RPC responses do not use the CLI's `ok:true` or `ok:false` wrapper. Blank
 input lines are ignored. Invalid JSON, framing failures, and a closed transport
 terminate the stdio proxy.
 
+A request `id` is echoed in the response envelope, so it is bounded: an id
+longer than 200 bytes is rejected with `INVALID_ARGUMENT`, and the rejection
+echoes only a truncated prefix of it.
+
 ## Public methods
 
 ```text
@@ -248,9 +252,14 @@ Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
 response. `has_more: true` means data already exists beyond the returned
 cursor, and the next request returns immediately even with `wait_ms`.
 
-`max_bytes` is a hard bound on the complete compact response line a client
-prints, wrapper and newline included; the daemon reserves that wrapper before
-committing content. An optional `info` notice and pretty-printing are outside
+`max_bytes` bounds two things: the `result` document itself, and the complete
+compact response line the CLI prints, whose `{"ok":true,...}` wrapper and
+newline the daemon reserves before committing content.
+
+It does not bound the raw JSONL envelope. That envelope carries a
+caller-supplied request `id`, so its size is the caller's to control; the id is
+capped at 200 bytes, which bounds the excess to roughly 220 bytes over the
+result document. An optional `info` notice and pretty-printing are also outside
 the bound. The cursor is derived from what the document actually carries, so it
 can never advance past omitted content. Progress under a tight budget comes from chunking: a long
 `final_text` is chunked at a UTF-8 boundary and continued with

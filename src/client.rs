@@ -299,6 +299,20 @@ pub fn rpc_stdio() -> Result<()> {
             continue;
         }
         let request: Request = serde_json::from_str(&line).context("invalid RPC request")?;
+        if request.id_too_long() {
+            write_json_line(
+                &mut stdout,
+                &Response::error(
+                    request.short_id(),
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "request id must be at most {} bytes",
+                        crate::protocol::MAX_REQUEST_ID_LEN
+                    ),
+                ),
+            )?;
+            continue;
+        }
         if !public_rpc_method(&request.method) {
             write_json_line(
                 &mut stdout,

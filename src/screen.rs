@@ -386,11 +386,15 @@ impl ScreenStore {
 fn private_mode(bytes: &[u8]) -> Option<(usize, Boundary, Vec<u8>)> {
     let rest = bytes.strip_prefix(b"\x1b[?")?;
     let mut end = 0;
-    while end < rest.len()
-        && 3 + end < MAX_BOUNDARY_LEN
-        && (rest[end].is_ascii_digit() || rest[end] == b';')
-    {
+    while end < rest.len() && (rest[end].is_ascii_digit() || rest[end] == b';') {
         end += 1;
+    }
+    // MAX_BOUNDARY_LEN is authoritative for both halves of the contract: a
+    // sequence this long is never withheld while it is incomplete, so one
+    // longer than it must be ordinary output here too, or a split feed would
+    // behave differently from a contiguous one.
+    if b"\x1b[?".len() + end + 1 > MAX_BOUNDARY_LEN {
+        return None;
     }
     let final_byte = *rest.get(end)?;
     if !matches!(final_byte, b'h' | b'l') {
@@ -419,7 +423,7 @@ fn private_mode(bytes: &[u8]) -> Option<(usize, Boundary, Vec<u8>)> {
     } else {
         Boundary::AlternateExit
     };
-    Some((3 + end + 1, boundary, emit))
+    Some((b"\x1b[?".len() + end + 1, boundary, emit))
 }
 
 /// Whether `tail` could still become a boundary once more output arrives.
@@ -788,6 +792,84 @@ mod tests {
             assert_eq!(
                 rows, before,
                 "split at {split} let alternate output into history: {rows:?}"
+            );
+        }
+    }
+
+    /// A private-mode sequence of exactly `total` bytes that switches grids.
+    fn sized_private_mode(total: usize, final_byte: char) -> Vec<u8> {
+        let mut params = String::from("1047");
+        while params.len() + 6 <= total {
+            params.push_str(";1");
+        }
+        while params.len() + 4 < total {
+            params.push(';');
+        }
+        assert_eq!(
+            params.len() + 4,
+            total,
+            "cannot build a {total} byte sequence"
+        );
+        format!("\x1b[?{params}{final_byte}").into_bytes()
+    }
+
+    #[test]
+    fn a_boundary_length_private_mode_works_at_every_split_position() {
+        let enter = sized_private_mode(super::MAX_BOUNDARY_LEN, 'h');
+        let exit = sized_private_mode(super::MAX_BOUNDARY_LEN, 'l');
+        assert_eq!(enter.len(), super::MAX_BOUNDARY_LEN);
+        assert_eq!(exit.len(), super::MAX_BOUNDARY_LEN);
+
+        for split in 0..=enter.len() {
+            let mut store = ScreenStore::new(4, 20);
+            feed_lines(&mut store, 10);
+            let before = promoted(&store);
+
+            store.feed(&enter[..split]);
+            store.feed(&enter[split..]);
+            for index in 0..30 {
+                store.feed(format!("alt-{index}\r\n").as_bytes());
+            }
+            assert_eq!(
+                promoted(&store),
+                before,
+                "enter split at {split} let alternate output into history"
+            );
+
+            store.feed(&exit[..split]);
+            store.feed(&exit[split..]);
+            feed_lines(&mut store, 8);
+            let rows = promoted(&store);
+            assert!(
+                !rows.iter().any(|row| row.starts_with("alt-")),
+                "exit split at {split} leaked alternate contents: {rows:?}"
+            );
+            assert!(rows.starts_with(&before), "history was rewritten");
+        }
+    }
+
+    #[test]
+    fn a_private_mode_over_the_boundary_length_is_ordinary_output() {
+        let long = sized_private_mode(super::MAX_BOUNDARY_LEN + 1, 'h');
+        assert!(
+            super::private_mode(&long).is_none(),
+            "an over-length sequence must not be treated as a boundary"
+        );
+
+        // Contiguous and split must agree: neither switches grids, so the
+        // rows that follow are promoted from the main grid either way.
+        for split in [0, 8, super::MAX_BOUNDARY_LEN, long.len()] {
+            let mut store = ScreenStore::new(4, 20);
+            feed_lines(&mut store, 10);
+            let before = promoted(&store).len();
+
+            store.feed(&long[..split]);
+            store.feed(&long[split..]);
+            feed_lines(&mut store, 20);
+
+            assert!(
+                promoted(&store).len() > before,
+                "split at {split} stalled promotion behind an over-length sequence"
             );
         }
     }

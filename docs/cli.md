@@ -603,13 +603,15 @@ that was left out. When the budget squeezes a response, dlgt keeps state, then
 gaps, then terminal results, then events, then blocked information, and drops
 screen text first.
 
-Two things are outside the bound, both deliberately:
+Three things are outside the bound, all deliberately:
 
 - an optional `info` notice, which the daemon injects rarely and independently
   of the request (see `UPDATE_AVAILABLE` above);
-- `--pretty`, which exists for humans and inflates the output arbitrarily.
+- `--pretty`, which exists for humans and inflates the output arbitrarily;
+- the raw JSONL RPC envelope, whose request `id` the caller chooses. See
+  [RPC](rpc.md#transport-and-framing); that id is capped at 200 bytes.
 
-The contract covers the compact response without `info`.
+The contract covers the compact CLI response without `info`.
 
 Progress comes from chunking, never from oversizing. A long `final_text` is
 chunked at a UTF-8 boundary and continued through `final_text_offset` and

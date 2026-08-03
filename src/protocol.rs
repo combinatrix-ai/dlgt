@@ -96,12 +96,32 @@ impl std::fmt::Display for TurnState {
     }
 }
 
+/// Longest RPC request id accepted. The id is echoed in the response
+/// envelope, so an unbounded one would let a caller inflate a reply past any
+/// size the request itself agreed to.
+pub const MAX_REQUEST_ID_LEN: usize = 200;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Request {
     pub id: String,
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+impl Request {
+    /// A bounded, safely truncated form of the id for use in an error reply.
+    pub fn short_id(&self) -> &str {
+        let mut end = self.id.len().min(64);
+        while end > 0 && !self.id.is_char_boundary(end) {
+            end -= 1;
+        }
+        &self.id[..end]
+    }
+
+    pub fn id_too_long(&self) -> bool {
+        self.id.len() > MAX_REQUEST_ID_LEN
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

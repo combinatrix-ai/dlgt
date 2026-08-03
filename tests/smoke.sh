@@ -204,6 +204,24 @@ done
 kill "$follow_pid"
 wait "$follow_pid" 2>/dev/null || true
 grep -q '"schema_version":1' "$state_dir/follow.jsonl"
+# The response envelope echoes the request id, so the id is bounded.
+long_rpc_id=$(awk 'BEGIN { for (i = 0; i < 300; i++) printf "i" }')
+printf '{"id":"%s","method":"session.list","params":{}}\n' "$long_rpc_id" \
+  | "$binary" rpc --stdio >"$state_dir/rpc-long-id.json"
+grep -q '"code":"INVALID_ARGUMENT"' "$state_dir/rpc-long-id.json"
+test "$(wc -c <"$state_dir/rpc-long-id.json" | tr -d ' ')" -lt 300
+
+# A fetch through the stdio proxy still respects the result-document bound;
+# only the JSONL envelope and its short id sit outside it.
+printf '{"id":"r1","method":"session.fetch","params":{"session":"%s","max_bytes":2048,"screen":false}}\n' \
+  "$session_id" | "$binary" rpc --stdio >"$state_dir/rpc-fetch.json"
+grep -q '"cursor":"f1\.' "$state_dir/rpc-fetch.json"
+rpc_bytes=$(wc -c <"$state_dir/rpc-fetch.json" | tr -d ' ')
+test "$rpc_bytes" -le 2148 || {
+  printf 'rpc fetch line was %s bytes, over 2048 plus its envelope\n' "$rpc_bytes" >&2
+  exit 1
+}
+
 "$binary" models --harness claude | grep -q '"id":"default"'
 "$binary" harnesses | grep -q '"codex"'
 "$binary" profiles | grep -q '"profiles"'
@@ -341,9 +359,9 @@ printf '%s\n' "$chunk_json" | grep -q '"final_text_complete":false'
 printf '%s\n' "$chunk_json" | grep -q '"final_text_offset":0'
 printf '%s\n' "$chunk_json" | grep -q '"has_more":true'
 printf '%s\n' "$chunk_json" | grep -q '"reason":"page_full"'
-# The budget spent everything on the result body, so the event watermark must
-# not have advanced past the events this page did not carry.
-printf '%s\n' "$chunk_json" | grep -q '"events":\[\]'
+# The budget went mostly to the result body, so the terminal event is left for
+# the next page and the watermark must not have advanced past it.
+if printf '%s\n' "$chunk_json" | grep -q '"type":"session.idle"'; then exit 1; fi
 # The bound covers the complete compact response line the client prints,
 # wrapper and trailing newline included.
 chunk_bytes=$(printf '%s\n' "$chunk_json" | wc -c | tr -d ' ')
