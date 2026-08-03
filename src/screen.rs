@@ -38,18 +38,33 @@ enum Boundary {
     AlternateExit,
 }
 
-/// Sequences that move between the main and alternate grids. They are drain
-/// boundaries, not resets: no epoch changes, because stable history is
-/// untouched.
-const BOUNDARIES: [(&[u8], Boundary); 8] = [
-    (b"\x1bc", Boundary::Reset(EpochReason::TerminalReset)),
-    (b"\x1b[3J", Boundary::Reset(EpochReason::EraseScrollback)),
-    (b"\x1b[?1049h", Boundary::AlternateEnter),
-    (b"\x1b[?1049l", Boundary::AlternateExit),
-    (b"\x1b[?1047h", Boundary::AlternateEnter),
-    (b"\x1b[?1047l", Boundary::AlternateExit),
-    (b"\x1b[?47h", Boundary::AlternateEnter),
-    (b"\x1b[?47l", Boundary::AlternateExit),
+/// Sequences the promotion accounting has to see, and the bytes actually fed
+/// to the emulator for each.
+///
+/// Alternate-grid switches are drain boundaries, not resets: no epoch changes,
+/// because stable history is untouched. `?1047` is rewritten to `?47` because
+/// the pinned emulator implements only modes 47 and 1049 and would otherwise
+/// ignore `?1047h` entirely, leaving the application's full-screen output to
+/// paint the main grid and scroll into stable history. Rewriting keeps the
+/// scanner and the emulator on the same grid; dropping 1047 from the scanner
+/// would keep them consistent but would not stop that leak.
+const BOUNDARIES: [(&[u8], &[u8], Boundary); 8] = [
+    (
+        b"\x1bc",
+        b"\x1bc",
+        Boundary::Reset(EpochReason::TerminalReset),
+    ),
+    (
+        b"\x1b[3J",
+        b"\x1b[3J",
+        Boundary::Reset(EpochReason::EraseScrollback),
+    ),
+    (b"\x1b[?1049h", b"\x1b[?1049h", Boundary::AlternateEnter),
+    (b"\x1b[?1049l", b"\x1b[?1049l", Boundary::AlternateExit),
+    (b"\x1b[?1047h", b"\x1b[?47h", Boundary::AlternateEnter),
+    (b"\x1b[?1047l", b"\x1b[?47l", Boundary::AlternateExit),
+    (b"\x1b[?47h", b"\x1b[?47h", Boundary::AlternateEnter),
+    (b"\x1b[?47l", b"\x1b[?47l", Boundary::AlternateExit),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,10 +159,20 @@ impl ScreenStore {
     /// promoted first; only then is the boundary applied and the promotion
     /// accounting re-anchored.
     pub fn feed(&mut self, data: &[u8]) {
+        let mut window = std::mem::take(&mut self.carry);
+        window.extend_from_slice(data);
+        // Hold back a trailing partial boundary instead of feeding it. A
+        // boundary is then always whole when it is recognized, which is what
+        // lets an unsupported alternate mode be rewritten even when the
+        // provider split it across two PTY reads.
+        let split = window.len() - boundary_prefix_len(&window);
+        self.carry = window[split..].to_vec();
+        window.truncate(split);
+
         let mut start = 0;
-        for (begin, end, boundary) in self.scan_boundaries(data) {
-            self.feed_pieces(&data[start..begin]);
-            self.parser.process(&data[begin..end]);
+        for (begin, end, emit, boundary) in scan_boundaries(&window) {
+            self.feed_pieces(&window[start..begin]);
+            self.parser.process(emit);
             match boundary {
                 Boundary::Reset(reason) => {
                     self.resync();
@@ -163,7 +188,7 @@ impl ScreenStore {
             }
             start = end;
         }
-        self.feed_pieces(&data[start..]);
+        self.feed_pieces(&window[start..]);
     }
 
     /// Re-anchor the promoted-row count to the emulator's own scrollback
@@ -336,10 +361,10 @@ impl ScreenStore {
     ///
     /// Accepted residual on the main screen, recorded in docs/design.md:
     /// scroll margins (DECSTBM), origin mode, the saved cursor, and pending
-    /// wrap are not carried by `state_formatted` and are lost across a rebase. vt100 exposes none of
-    /// them, so they cannot be preserved without forking the emulator. Full
-    /// screen applications re-issue them on their next repaint, and a lost
-    /// margin only affects live-grid rendering, never already-promoted rows.
+    /// wrap are not carried by `state_formatted` and are lost across a rebase.
+    /// vt100 exposes none of them, so they cannot be preserved without forking
+    /// the emulator, and a lost margin can change how the live grid scrolls
+    /// afterwards until the application happens to set it again.
     fn rebase(&mut self) {
         if self.consumed < REBASE_THRESHOLD || self.parser.screen().alternate_screen() {
             return;
@@ -359,48 +384,46 @@ impl ScreenStore {
             self.floor_row_id += 1;
         }
     }
+}
 
-    /// Locate every boundary sequence, returning its byte range in `data`. A
-    /// match that began in a previous feed reports an empty leading range,
-    /// because those bytes were already delivered to the emulator. Matches
-    /// split across feeds are recovered from the carry buffer.
-    fn scan_boundaries(&mut self, data: &[u8]) -> Vec<(usize, usize, Boundary)> {
-        let carry_len = self.carry.len();
-        let mut window = std::mem::take(&mut self.carry);
-        window.extend_from_slice(data);
-        let mut found = Vec::new();
-        let mut index = 0;
-        let mut matched_end = 0;
-        while index < window.len() {
-            if window[index] != 0x1b {
-                index += 1;
-                continue;
-            }
-            let matched = BOUNDARIES
-                .iter()
-                .find(|(pattern, _)| window[index..].starts_with(pattern));
-            if let Some((pattern, boundary)) = matched {
-                let begin = index.saturating_sub(carry_len).min(data.len());
-                let end = (index + pattern.len())
-                    .saturating_sub(carry_len)
-                    .min(data.len());
-                found.push((begin, end, *boundary));
-                index += pattern.len();
-                matched_end = index;
-            } else {
-                index += 1;
-            }
+/// Bytes withheld from the emulator because they might still become a
+/// boundary once more output arrives.
+fn boundary_prefix_len(window: &[u8]) -> usize {
+    let start = window.len().saturating_sub(BOUNDARY_CARRY);
+    for begin in start..window.len() {
+        let tail = &window[begin..];
+        if BOUNDARIES
+            .iter()
+            .any(|(pattern, _, _)| pattern.len() > tail.len() && pattern.starts_with(tail))
+        {
+            return window.len() - begin;
         }
-        // Bytes already consumed by a match must never be replayed into the
-        // next scan, or the same boundary would be reported twice.
-        let tail = window
-            .len()
-            .saturating_sub(BOUNDARY_CARRY)
-            .max(matched_end)
-            .min(window.len());
-        self.carry = window[tail..].to_vec();
-        found
     }
+    0
+}
+
+/// Locate every boundary sequence in a window that is known to hold no partial
+/// match, returning each match's range and the bytes to feed the emulator in
+/// its place.
+fn scan_boundaries(window: &[u8]) -> Vec<(usize, usize, &'static [u8], Boundary)> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < window.len() {
+        if window[index] != 0x1b {
+            index += 1;
+            continue;
+        }
+        let matched = BOUNDARIES
+            .iter()
+            .find(|(pattern, _, _)| window[index..].starts_with(pattern));
+        if let Some((pattern, emit, boundary)) = matched {
+            found.push((index, index + pattern.len(), *emit, *boundary));
+            index += pattern.len();
+        } else {
+            index += 1;
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -620,6 +643,61 @@ mod tests {
             feed_lines(&mut store, 20);
             assert!(promoted(&store).iter().any(|row| row == "line-15"));
         }
+    }
+
+    #[test]
+    fn an_unsupported_alternate_mode_is_rewritten_to_one_the_emulator_has() {
+        // vt100 implements modes 47 and 1049 only. Feeding ?1047h verbatim
+        // would leave the emulator on the main grid, so every full-screen
+        // repaint would scroll into stable history.
+        for (enter, exit) in [
+            (&b"\x1b[?1047h"[..], &b"\x1b[?1047l"[..]),
+            (&b"\x1b[?47h"[..], &b"\x1b[?47l"[..]),
+        ] {
+            let mut store = ScreenStore::new(4, 20);
+            feed_lines(&mut store, 10);
+            let before = promoted(&store);
+
+            store.feed(enter);
+            for index in 0..30 {
+                store.feed(format!("alt-{index}\r\n").as_bytes());
+            }
+            assert_eq!(promoted(&store), before, "alternate rows were promoted");
+
+            store.feed(exit);
+            feed_lines(&mut store, 8);
+            let rows = promoted(&store);
+            assert!(
+                !rows.iter().any(|row| row.starts_with("alt-")),
+                "alternate contents leaked into stable history: {rows:?}"
+            );
+            assert!(rows.starts_with(&before), "history was rewritten");
+            assert_eq!(store.epoch(), 1);
+        }
+    }
+
+    #[test]
+    fn an_unsupported_alternate_mode_split_across_feeds_still_switches() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+        let before = promoted(&store);
+
+        // The scanner recovers the match from its carry buffer; the leading
+        // bytes were already delivered, so the switch is applied verbatim.
+        store.feed(b"\x1b[?10");
+        store.feed(b"47h");
+        for index in 0..30 {
+            store.feed(format!("alt-{index}\r\n").as_bytes());
+        }
+        store.feed(b"\x1b[?1047l");
+        feed_lines(&mut store, 8);
+
+        let rows = promoted(&store);
+        assert!(
+            !rows.iter().any(|row| row.starts_with("alt-")),
+            "alternate contents leaked into stable history: {rows:?}"
+        );
+        assert!(rows.starts_with(&before), "history was rewritten");
     }
 
     #[test]
