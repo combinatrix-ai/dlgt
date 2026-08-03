@@ -114,33 +114,33 @@ USAGE
   dlgt <COMMAND> [OPTIONS]
 
 DELEGATION
-  new          Create a new Session with its first prompt
+  new          Create a Session with its first prompt
   restart      Restart a Session
-  send         Send work to an existing idle Session
+  send         Send work to an existing idle Session or --resume a provider conversation
   fetch        Read new state, results, events, and screen from a cursor
-  cancel       Interrupt the Session's active execution
+  cancel       Interrupt the active execution
 
 SESSIONS
   list, ls     List Sessions
-  show         Show Session state or historical result
+  show         Show Session state and latest result
   attach       Attach to the Session screen
-  stop         Stop the Session and its process group
+  stop         Stop the Session
 
 OBSERVABILITY
-  events       Read or follow normalized lifecycle events
-  scrollback   Read rendered plain-text terminal scrollback
-  logs         Read raw retained PTY bytes for diagnosis
+  events       Read or follow lifecycle events
+  scrollback   Read rendered terminal scrollback
+  logs         Read raw retained PTY bytes (requires --raw)
 
 CONFIGURATION
-  models       Discover models supported by a Harness
-  profiles     List or inspect launch Profiles
-  harnesses    List Harnesses and supported options
+  models       Discover Harness models
+  profiles     List or inspect Profiles
+  harnesses    List Harness capabilities
   skill        Print the embedded dlgt skill
 
 RUNTIME
-  server       Run or stop the local daemon
+  server       Run or stop the daemon
   update       Install the latest release and embedded Skills
-  rpc          Use the JSONL RPC interface
+  rpc          Use JSONL RPC
 ```
 
 Each release uses its own socket at
