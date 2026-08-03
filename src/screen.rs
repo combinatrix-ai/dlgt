@@ -111,16 +111,30 @@ impl ScreenStore {
         (self.rows, self.cols)
     }
 
-    /// Feed PTY bytes. Reset sequences split the feed so the epoch boundary
-    /// lands exactly between the rows they separate.
+    /// Feed PTY bytes. A reset splits the feed immediately *before* its own
+    /// bytes: everything it is about to destroy is promoted first, then the
+    /// reset is applied on its own and the promotion accounting is re-anchored.
     pub fn feed(&mut self, data: &[u8]) {
         let mut start = 0;
-        for (end, reason) in self.scan_resets(data) {
-            self.feed_pieces(&data[start..end]);
+        for (begin, end, reason) in self.scan_resets(data) {
+            self.feed_pieces(&data[start..begin]);
+            self.parser.process(&data[begin..end]);
+            self.resync_after_reset();
             self.bump_epoch(reason);
             start = end;
         }
         self.feed_pieces(&data[start..]);
+    }
+
+    /// Re-anchor the promoted-row count after a reset dropped the emulator's
+    /// own scrollback, without re-promoting anything.
+    fn resync_after_reset(&mut self) {
+        if self.parser.screen().alternate_screen() {
+            return;
+        }
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.consumed = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(0);
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -145,6 +159,14 @@ impl ScreenStore {
     /// generation even when the provider-qualified Session ID is unchanged.
     pub fn restart(&mut self) {
         self.drain();
+        // The dead process's last screen never scrolled out, so promote it
+        // before the emulator is replaced or it disappears from history.
+        if !self.parser.screen().alternate_screen() {
+            let (rows, _) = self.live_rows(usize::MAX);
+            for row in rows {
+                self.push_stable(row);
+            }
+        }
         self.parser = vt100::Parser::new(self.rows, self.cols, TRANSFER_SCROLLBACK);
         self.consumed = 0;
         self.carry.clear();
@@ -212,8 +234,11 @@ impl ScreenStore {
         for piece in data.chunks(FEED_PIECE) {
             self.parser.process(piece);
             self.drain();
+            // Rebase inside the loop: one large feed can otherwise push the
+            // emulator past TRANSFER_SCROLLBACK and evict rows that were
+            // never promoted.
+            self.rebase();
         }
-        self.rebase();
     }
 
     fn bump_epoch(&mut self, reason: EpochReason) {
@@ -223,8 +248,17 @@ impl ScreenStore {
 
     /// Promote rows that scrolled out of the live grid.
     fn drain(&mut self) {
+        // The alternate screen is a live-only overlay: vt100 gives it its own
+        // grid with no scrollback, so nothing is ever promoted from it and the
+        // main grid's promotion state must survive the round trip untouched.
+        if self.parser.screen().alternate_screen() {
+            return;
+        }
         self.parser.screen_mut().set_scrollback(usize::MAX);
         let history = self.parser.screen().scrollback();
+        // A reset drops the emulator's own scrollback. Re-anchor rather than
+        // skip every later row up to a now-stale count.
+        self.consumed = self.consumed.min(history);
         if history > self.consumed {
             let cols = self.cols;
             for index in self.consumed..history {
@@ -243,9 +277,22 @@ impl ScreenStore {
     }
 
     /// Replace the emulator with one whose transfer buffer is empty while
-    /// preserving the live grid, cursor, and terminal modes.
+    /// preserving the live grid, cursor, and input modes.
+    ///
+    /// `state_formatted` serializes only the *visible* grid. It cannot restore
+    /// the main/alternate grid pair, and rebasing while the alternate screen is
+    /// active would fold alternate contents into the main grid and leak them
+    /// into stable history. Deferring is safe and bounded: the alternate grid
+    /// has no scrollback, so `consumed` cannot grow while it is active.
+    ///
+    /// Known residual on the main screen: scroll margins (DECSTBM), origin
+    /// mode, the saved cursor, and pending wrap are not carried by
+    /// `state_formatted` and are lost across a rebase. vt100 exposes none of
+    /// them, so they cannot be preserved without forking the emulator. Full
+    /// screen applications re-issue them on their next repaint, and a lost
+    /// margin only affects live-grid rendering, never already-promoted rows.
     fn rebase(&mut self) {
-        if self.consumed < REBASE_THRESHOLD {
+        if self.consumed < REBASE_THRESHOLD || self.parser.screen().alternate_screen() {
             return;
         }
         let state = self.parser.screen().state_formatted();
@@ -264,9 +311,11 @@ impl ScreenStore {
         }
     }
 
-    /// Locate `ESC c` and `CSI 3 J`, returning byte offsets just past each
-    /// match. Matches split across feeds are recovered from the carry buffer.
-    fn scan_resets(&mut self, data: &[u8]) -> Vec<(usize, EpochReason)> {
+    /// Locate `ESC c` and `CSI 3 J`, returning the byte range of each match in
+    /// `data`. A match that began in a previous feed reports an empty leading
+    /// range, because those bytes were already delivered to the emulator.
+    /// Matches split across feeds are recovered from the carry buffer.
+    fn scan_resets(&mut self, data: &[u8]) -> Vec<(usize, usize, EpochReason)> {
         let carry_len = self.carry.len();
         let mut window = std::mem::take(&mut self.carry);
         window.extend_from_slice(data);
@@ -286,10 +335,9 @@ impl ScreenStore {
                 None
             };
             if let Some((length, reason)) = reason {
-                found.push((
-                    (index + length).saturating_sub(carry_len).min(data.len()),
-                    reason,
-                ));
+                let begin = index.saturating_sub(carry_len).min(data.len());
+                let end = (index + length).saturating_sub(carry_len).min(data.len());
+                found.push((begin, end, reason));
                 index += length;
                 matched_end = index;
             } else {
@@ -310,6 +358,8 @@ impl ScreenStore {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::{EpochReason, ScreenStore};
 
     fn feed_lines(store: &mut ScreenStore, count: usize) {
@@ -401,12 +451,20 @@ mod tests {
         let mut store = ScreenStore::new(4, 20);
         feed_lines(&mut store, 10);
         let head = store.head_row_id();
+        let (last_screen, _) = store.live_rows(40);
+        assert!(!last_screen.is_empty());
 
         store.restart();
         assert_eq!(store.epoch(), 2);
         assert_eq!(store.last_reset_reason(), Some(EpochReason::ProcessRestart));
-        assert_eq!(store.head_row_id(), head);
         assert_eq!(store.stable_page(0, 1).lines[0], "line-0");
+        // The dead process's final screen survives in history.
+        assert_eq!(
+            store.head_row_id(),
+            head + u64::try_from(last_screen.len()).unwrap_or(0)
+        );
+        assert_eq!(store.stable_tail(last_screen.len()).lines, last_screen);
+        assert!(store.live_rows(40).0.is_empty());
     }
 
     #[test]
@@ -421,6 +479,130 @@ mod tests {
         let tail = store.stable_tail(3);
         assert_eq!(tail.lines.len(), 3);
         assert!(tail.lines.iter().all(|row| row.starts_with("line-")));
+    }
+
+    fn promoted(store: &ScreenStore) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut after = store.floor_row_id().saturating_sub(1);
+        loop {
+            let page = store.stable_page(after, 512);
+            if page.lines.is_empty() {
+                break;
+            }
+            after = page.next_after;
+            rows.extend(page.lines);
+        }
+        rows
+    }
+
+    #[test]
+    fn one_feed_larger_than_the_transfer_buffer_promotes_every_row_in_order() {
+        let mut store = ScreenStore::new(4, 20);
+        let mut burst = String::new();
+        for index in 0..3_000 {
+            let _ = writeln!(burst, "{}\r", format_args!("b-{index}"));
+        }
+
+        store.feed(burst.as_bytes());
+
+        let rows = promoted(&store);
+        assert_eq!(store.head_row_id(), 2_997, "burst lost rows");
+        let expected = (0..2_997).map(|i| format!("b-{i}")).collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+        let (live, _) = store.live_rows(40);
+        assert_eq!(live, ["b-2997", "b-2998", "b-2999"]);
+    }
+
+    #[test]
+    fn rows_scrolled_in_the_same_piece_as_a_reset_survive_it() {
+        for (reset, reason) in [
+            (&b"\x1bc"[..], EpochReason::TerminalReset),
+            (&b"\x1b[3J"[..], EpochReason::EraseScrollback),
+        ] {
+            let mut store = ScreenStore::new(4, 20);
+            let mut text = String::new();
+            for index in 0..10 {
+                let _ = writeln!(text, "{}\r", format_args!("p-{index}"));
+            }
+            let mut piece = text.into_bytes();
+            piece.extend_from_slice(reset);
+            assert!(
+                piece.len() < super::FEED_PIECE,
+                "reset must share one piece"
+            );
+
+            store.feed(&piece);
+
+            assert_eq!(store.epoch(), 2);
+            assert_eq!(store.last_reset_reason(), Some(reason));
+            let rows = promoted(&store);
+            assert!(
+                rows.starts_with(&["p-0".to_owned(), "p-1".to_owned()]),
+                "rows before the reset were wiped: {rows:?}"
+            );
+            assert_eq!(rows.len(), 7, "unexpected promoted rows: {rows:?}");
+
+            // Rows produced after the reset are still promoted.
+            feed_lines(&mut store, 20);
+            let after = promoted(&store);
+            assert!(
+                after.iter().any(|row| row == "line-15"),
+                "post-reset rows skipped: {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_split_across_feeds_preserves_rows_on_both_sides() {
+        for (head, tail, reason) in [
+            (&b"\x1b"[..], &b"c"[..], EpochReason::TerminalReset),
+            (&b"\x1b["[..], &b"3J"[..], EpochReason::EraseScrollback),
+        ] {
+            let mut store = ScreenStore::new(4, 20);
+            feed_lines(&mut store, 10);
+            let before = promoted(&store);
+            assert_eq!(before.len(), 7);
+
+            store.feed(head);
+            assert_eq!(store.epoch(), 1);
+            store.feed(tail);
+            assert_eq!(store.epoch(), 2);
+            assert_eq!(store.last_reset_reason(), Some(reason));
+            assert_eq!(promoted(&store), before);
+
+            feed_lines(&mut store, 20);
+            assert!(promoted(&store).iter().any(|row| row == "line-15"));
+        }
+    }
+
+    #[test]
+    fn alternate_screen_contents_never_reach_stable_history() {
+        let mut store = ScreenStore::new(4, 20);
+        // Push past the rebase threshold so the alternate screen is entered
+        // while a rebase is pending.
+        feed_lines(&mut store, 600);
+        let main_rows = promoted(&store);
+        let head = store.head_row_id();
+
+        store.feed(b"\x1b[?1049h");
+        for index in 0..100 {
+            store.feed(format!("alt-{index}\r\n").as_bytes());
+        }
+        assert_eq!(store.head_row_id(), head, "alternate rows were promoted");
+        let (live, _) = store.live_rows(40);
+        assert!(live.iter().any(|row| row.starts_with("alt-")));
+
+        store.feed(b"\x1b[?1049l");
+        assert_eq!(promoted(&store), main_rows, "history changed across alt");
+
+        feed_lines(&mut store, 20);
+        let rows = promoted(&store);
+        assert!(
+            !rows.iter().any(|row| row.starts_with("alt-")),
+            "alternate contents leaked into stable history"
+        );
+        assert!(rows.starts_with(&main_rows), "history was rewritten");
+        assert!(rows.iter().any(|row| row == "line-15"));
     }
 
     #[test]
