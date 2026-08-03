@@ -534,7 +534,7 @@ Response:
 {
   "ok": true,
   "schema_version": 1,
-  "runtime": {"version":"0.3.4","instance_id":"1f2c…"},
+  "runtime": {"version":"0.4.0","instance_id":"1f2c…"},
   "reason": "result",
   "has_more": false,
   "cursor": "f1.eyJ2IjoxLCJi...",
