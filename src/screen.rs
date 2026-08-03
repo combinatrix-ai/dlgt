@@ -1,0 +1,437 @@
+//! Persistent incremental VT emulation per process generation.
+//!
+//! The raw PTY ring cannot back a forward cursor: eviction can cut mid escape
+//! sequence, which changes the interpretation and the row indexing of every
+//! remaining byte. This module keeps one live VT emulator per Session process
+//! generation, promotes rows that scroll out of the live grid into an
+//! append-only vector with monotonically increasing absolute row IDs, and
+//! renders the live grid on demand.
+
+use std::collections::VecDeque;
+
+/// Stable rows retained per Session before the oldest rows are evicted.
+pub const STABLE_ROW_RETENTION: usize = 10_000;
+/// Live grid rows returned by a bounded observation.
+pub const LIVE_ROW_LIMIT: usize = 40;
+
+/// Scrollback used purely as a transfer buffer between the emulator and the
+/// stable-row vector. Rows are promoted after every small feed, and the
+/// emulator is rebased well before this bound, so no row can be evicted by
+/// vt100 itself.
+const TRANSFER_SCROLLBACK: usize = 1024;
+const REBASE_THRESHOLD: usize = 512;
+const FEED_PIECE: usize = 256;
+/// Longest reset sequence recognized by the scanner, minus one byte.
+const RESET_CARRY: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochReason {
+    ProcessRestart,
+    TerminalReset,
+    EraseScrollback,
+    Resize,
+}
+
+impl EpochReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessRestart => "process_restart",
+            Self::TerminalReset => "terminal_reset",
+            Self::EraseScrollback => "erase_scrollback",
+            Self::Resize => "resize",
+        }
+    }
+}
+
+/// A bounded forward page of stable rows.
+#[derive(Debug, Default)]
+pub struct StablePage {
+    pub lines: Vec<String>,
+    /// Absolute row ID of the last delivered row, or the requested watermark
+    /// when nothing was delivered.
+    pub next_after: u64,
+    pub has_more: bool,
+    /// The requested watermark predates the retained floor.
+    pub gap: bool,
+}
+
+pub struct ScreenStore {
+    parser: vt100::Parser,
+    rows: u16,
+    cols: u16,
+    stable: VecDeque<String>,
+    /// Absolute row ID of `stable.front()`.
+    floor_row_id: u64,
+    /// Absolute row ID that the next promoted row will receive.
+    next_row_id: u64,
+    /// Rows of the emulator scrollback already promoted.
+    consumed: usize,
+    epoch: u64,
+    last_reset: Option<EpochReason>,
+    carry: Vec<u8>,
+}
+
+impl ScreenStore {
+    pub fn new(rows: u16, cols: u16) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        Self {
+            parser: vt100::Parser::new(rows, cols, TRANSFER_SCROLLBACK),
+            rows,
+            cols,
+            stable: VecDeque::new(),
+            floor_row_id: 1,
+            next_row_id: 1,
+            consumed: 0,
+            epoch: 1,
+            last_reset: None,
+            carry: Vec::new(),
+        }
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn last_reset_reason(&self) -> Option<EpochReason> {
+        self.last_reset
+    }
+
+    /// Absolute row ID of the newest promoted row. Zero before any row is
+    /// promoted, so it doubles as the initial cursor watermark.
+    pub const fn head_row_id(&self) -> u64 {
+        self.next_row_id - 1
+    }
+
+    pub const fn floor_row_id(&self) -> u64 {
+        self.floor_row_id
+    }
+
+    pub const fn size(&self) -> (u16, u16) {
+        (self.rows, self.cols)
+    }
+
+    /// Feed PTY bytes. Reset sequences split the feed so the epoch boundary
+    /// lands exactly between the rows they separate.
+    pub fn feed(&mut self, data: &[u8]) {
+        let mut start = 0;
+        for (end, reason) in self.scan_resets(data) {
+            self.feed_pieces(&data[start..end]);
+            self.bump_epoch(reason);
+            start = end;
+        }
+        self.feed_pieces(&data[start..]);
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if rows == self.rows && cols == self.cols {
+            return;
+        }
+        self.drain();
+        // vt100 unwraps every row when the column count changes, so the
+        // rendering of history is no longer continuous with the live grid.
+        let reflowed = cols != self.cols;
+        self.rows = rows;
+        self.cols = cols;
+        self.parser.screen_mut().set_size(rows, cols);
+        if reflowed {
+            self.bump_epoch(EpochReason::Resize);
+        }
+    }
+
+    /// Start a new process generation. A new PTY is always a new terminal
+    /// generation even when the provider-qualified Session ID is unchanged.
+    pub fn restart(&mut self) {
+        self.drain();
+        self.parser = vt100::Parser::new(self.rows, self.cols, TRANSFER_SCROLLBACK);
+        self.consumed = 0;
+        self.carry.clear();
+        self.bump_epoch(EpochReason::ProcessRestart);
+    }
+
+    /// Forward page of stable rows after `after`.
+    pub fn stable_page(&self, after: u64, limit: usize) -> StablePage {
+        let head = self.head_row_id();
+        if after >= head {
+            return StablePage {
+                next_after: after.min(head),
+                ..StablePage::default()
+            };
+        }
+        let gap = after + 1 < self.floor_row_id;
+        let start = after.max(self.floor_row_id - 1);
+        let available = usize::try_from(head - start).unwrap_or(usize::MAX);
+        let take = available.min(limit);
+        let offset = usize::try_from(start + 1 - self.floor_row_id).unwrap_or(0);
+        let lines = self
+            .stable
+            .iter()
+            .skip(offset)
+            .take(take)
+            .cloned()
+            .collect::<Vec<_>>();
+        let delivered = u64::try_from(lines.len()).unwrap_or(0);
+        StablePage {
+            lines,
+            next_after: start + delivered,
+            has_more: start + delivered < head,
+            gap,
+        }
+    }
+
+    /// Bounded tail of stable rows for a baseline snapshot.
+    pub fn stable_tail(&self, limit: usize) -> StablePage {
+        let head = self.head_row_id();
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        self.stable_page(
+            head.saturating_sub(limit),
+            usize::try_from(limit).unwrap_or(0),
+        )
+    }
+
+    /// Current live grid, trailing blank rows trimmed, cropped to `limit`.
+    pub fn live_rows(&self, limit: usize) -> (Vec<String>, bool) {
+        let mut rows = self
+            .parser
+            .screen()
+            .rows(0, self.cols)
+            .collect::<Vec<String>>();
+        while rows.last().is_some_and(|row| row.trim().is_empty()) {
+            rows.pop();
+        }
+        let truncated = rows.len() > limit;
+        if truncated {
+            rows.drain(..rows.len() - limit);
+        }
+        (rows, truncated)
+    }
+
+    fn feed_pieces(&mut self, data: &[u8]) {
+        for piece in data.chunks(FEED_PIECE) {
+            self.parser.process(piece);
+            self.drain();
+        }
+        self.rebase();
+    }
+
+    fn bump_epoch(&mut self, reason: EpochReason) {
+        self.epoch += 1;
+        self.last_reset = Some(reason);
+    }
+
+    /// Promote rows that scrolled out of the live grid.
+    fn drain(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let history = self.parser.screen().scrollback();
+        if history > self.consumed {
+            let cols = self.cols;
+            for index in self.consumed..history {
+                self.parser.screen_mut().set_scrollback(history - index);
+                let row = self
+                    .parser
+                    .screen()
+                    .rows(0, cols)
+                    .next()
+                    .unwrap_or_default();
+                self.push_stable(row);
+            }
+            self.consumed = history;
+        }
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Replace the emulator with one whose transfer buffer is empty while
+    /// preserving the live grid, cursor, and terminal modes.
+    fn rebase(&mut self) {
+        if self.consumed < REBASE_THRESHOLD {
+            return;
+        }
+        let state = self.parser.screen().state_formatted();
+        let mut parser = vt100::Parser::new(self.rows, self.cols, TRANSFER_SCROLLBACK);
+        parser.process(&state);
+        self.parser = parser;
+        self.consumed = 0;
+    }
+
+    fn push_stable(&mut self, row: String) {
+        self.stable.push_back(row);
+        self.next_row_id += 1;
+        while self.stable.len() > STABLE_ROW_RETENTION {
+            self.stable.pop_front();
+            self.floor_row_id += 1;
+        }
+    }
+
+    /// Locate `ESC c` and `CSI 3 J`, returning byte offsets just past each
+    /// match. Matches split across feeds are recovered from the carry buffer.
+    fn scan_resets(&mut self, data: &[u8]) -> Vec<(usize, EpochReason)> {
+        let carry_len = self.carry.len();
+        let mut window = std::mem::take(&mut self.carry);
+        window.extend_from_slice(data);
+        let mut found = Vec::new();
+        let mut index = 0;
+        let mut matched_end = 0;
+        while index < window.len() {
+            if window[index] != 0x1b {
+                index += 1;
+                continue;
+            }
+            let reason = if window[index..].starts_with(b"\x1bc") {
+                Some((2, EpochReason::TerminalReset))
+            } else if window[index..].starts_with(b"\x1b[3J") {
+                Some((4, EpochReason::EraseScrollback))
+            } else {
+                None
+            };
+            if let Some((length, reason)) = reason {
+                found.push((
+                    (index + length).saturating_sub(carry_len).min(data.len()),
+                    reason,
+                ));
+                index += length;
+                matched_end = index;
+            } else {
+                index += 1;
+            }
+        }
+        // Bytes already consumed by a match must never be replayed into the
+        // next scan, or the same reset would be reported twice.
+        let tail = window
+            .len()
+            .saturating_sub(RESET_CARRY)
+            .max(matched_end)
+            .min(window.len());
+        self.carry = window[tail..].to_vec();
+        found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EpochReason, ScreenStore};
+
+    fn feed_lines(store: &mut ScreenStore, count: usize) {
+        for index in 0..count {
+            store.feed(format!("line-{index}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn rows_leaving_the_live_grid_receive_monotonic_absolute_ids() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+
+        assert!(store.head_row_id() >= 6);
+        let page = store.stable_page(0, 4);
+        assert_eq!(page.lines.len(), 4);
+        assert_eq!(page.lines[0], "line-0");
+        assert_eq!(page.next_after, 4);
+        assert!(page.has_more);
+        let next = store.stable_page(page.next_after, 4);
+        assert_eq!(next.lines[0], "line-4");
+        assert!(!next.gap);
+    }
+
+    #[test]
+    fn replaying_a_cursor_returns_the_same_window() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+
+        let first = store.stable_page(2, 3);
+        let replay = store.stable_page(2, 3);
+        assert_eq!(first.lines, replay.lines);
+        assert_eq!(first.next_after, replay.next_after);
+    }
+
+    #[test]
+    fn live_grid_holds_the_newest_rows() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+
+        let (live, _truncated) = store.live_rows(40);
+        assert!(live.iter().any(|row| row == "line-9"));
+        assert!(!live.iter().any(|row| row == "line-0"));
+    }
+
+    #[test]
+    fn terminal_reset_and_erase_scrollback_advance_the_epoch() {
+        let mut store = ScreenStore::new(4, 20);
+        assert_eq!(store.epoch(), 1);
+
+        store.feed(b"before\r\n\x1bc");
+        assert_eq!(store.epoch(), 2);
+        assert_eq!(store.last_reset_reason(), Some(EpochReason::TerminalReset));
+
+        store.feed(b"after\r\n\x1b[3J");
+        assert_eq!(store.epoch(), 3);
+        assert_eq!(
+            store.last_reset_reason(),
+            Some(EpochReason::EraseScrollback)
+        );
+    }
+
+    #[test]
+    fn reset_sequences_split_across_feeds_still_advance_the_epoch() {
+        let mut store = ScreenStore::new(4, 20);
+        store.feed(b"x\x1b[");
+        assert_eq!(store.epoch(), 1);
+        store.feed(b"3J");
+        assert_eq!(store.epoch(), 2);
+        assert_eq!(
+            store.last_reset_reason(),
+            Some(EpochReason::EraseScrollback)
+        );
+    }
+
+    #[test]
+    fn only_a_column_change_reflows_history() {
+        let mut store = ScreenStore::new(4, 20);
+        store.resize(8, 20);
+        assert_eq!(store.epoch(), 1);
+        store.resize(8, 40);
+        assert_eq!(store.epoch(), 2);
+        assert_eq!(store.last_reset_reason(), Some(EpochReason::Resize));
+        assert_eq!(store.size(), (8, 40));
+    }
+
+    #[test]
+    fn a_new_process_generation_advances_the_epoch_without_losing_history() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 10);
+        let head = store.head_row_id();
+
+        store.restart();
+        assert_eq!(store.epoch(), 2);
+        assert_eq!(store.last_reset_reason(), Some(EpochReason::ProcessRestart));
+        assert_eq!(store.head_row_id(), head);
+        assert_eq!(store.stable_page(0, 1).lines[0], "line-0");
+    }
+
+    #[test]
+    fn rebasing_the_emulator_keeps_promoting_rows_without_duplication() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, 1_500);
+
+        let head = store.head_row_id();
+        assert!(head >= 1_496, "unexpected head row {head}");
+        let page = store.stable_page(0, 3);
+        assert_eq!(page.lines, ["line-0", "line-1", "line-2"]);
+        let tail = store.stable_tail(3);
+        assert_eq!(tail.lines.len(), 3);
+        assert!(tail.lines.iter().all(|row| row.starts_with("line-")));
+    }
+
+    #[test]
+    fn a_cursor_older_than_the_retained_floor_reports_a_gap() {
+        let mut store = ScreenStore::new(4, 20);
+        feed_lines(&mut store, super::STABLE_ROW_RETENTION + 200);
+
+        assert!(store.floor_row_id() > 1);
+        let page = store.stable_page(0, 8);
+        assert!(page.gap);
+        assert_eq!(page.lines.len(), 8);
+        assert!(!store.stable_page(store.floor_row_id(), 8).gap);
+    }
+}

@@ -924,6 +924,9 @@ impl Daemon {
         if !self.lock_store()?.start_restarted_session(&session.id) {
             bail!("session left restarting state before launch");
         }
+        // A replacement PTY is a new terminal generation even when the
+        // provider-qualified Session ID does not rotate.
+        self.lock_store()?.restart_screen(&session.id);
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             self.lock_store()?.set_session_failed(&session.id);
@@ -1604,55 +1607,23 @@ impl Daemon {
                 .clamp(1, 10_000),
         )
         .unwrap_or(100);
-        let mut raw = Vec::new();
-        let mut after = 0;
-        loop {
-            let page = self
-                .lock_store()?
-                .read_output_page(&session.id, after, 8 * 1024 * 1024);
-            raw.extend_from_slice(&page.data);
-            if !page.has_more || page.next_after <= after {
-                break;
-            }
-            after = page.next_after;
-        }
-        let (stored_rows, stored_cols) = self.lock_store()?.terminal_size(&session.id)?;
-        let mut parser = vt100::Parser::new(stored_rows, stored_cols, 10_000);
-        parser.process(&raw);
-        parser.screen_mut().set_scrollback(usize::MAX);
-        let history = parser.screen().scrollback();
-        let (rows, cols) = parser.screen().size();
-        let total = history + usize::from(rows);
         let before = params
             .get("before")
             .and_then(Value::as_str)
             .and_then(|cursor| cursor.strip_prefix("scr_"))
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(total)
-            .min(total);
-        let start = before.saturating_sub(lines);
-        let mut selected = Vec::with_capacity(before.saturating_sub(start));
-        for index in start..before {
-            if index < history {
-                parser.screen_mut().set_scrollback(history - index);
-                selected.push(parser.screen().rows(0, cols).next().unwrap_or_default());
-            } else {
-                parser.screen_mut().set_scrollback(0);
-                selected.push(
-                    parser
-                        .screen()
-                        .rows(0, cols)
-                        .nth(index - history)
-                        .unwrap_or_default(),
-                );
-            }
-        }
+            .and_then(|value| value.parse::<u64>().ok());
+        let store = self.lock_store()?;
+        let uid = store
+            .session_uid(&session.id)
+            .context("session has no retained screen")?;
+        let page = store.rendered_rows(&uid, before, lines);
+        drop(store);
         Ok(json!({
             "session_id": session.id,
-            "screen": {"rows": rows, "cols": cols},
-            "lines": selected,
-            "truncated": start > 0 || history == 10_000,
-            "before": (start > 0).then(|| format!("scr_{start}")),
+            "screen": {"rows": page.rows, "cols": page.cols},
+            "lines": page.lines,
+            "truncated": page.truncated,
+            "before": page.before.map(|row| format!("scr_{row}")),
         }))
     }
 

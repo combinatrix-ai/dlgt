@@ -3,20 +3,36 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
+use crate::screen::{EpochReason, LIVE_ROW_LIMIT, ScreenStore, StablePage};
 use anyhow::{Context, Result, bail};
+use uuid::Uuid;
 
 pub struct Store {
     state: RefCell<MemoryState>,
 }
 
 const OUTPUT_CHUNK_LIMIT: usize = 8192;
+/// Lifecycle events retained per daemon before the oldest are evicted.
+const EVENT_RETENTION: usize = 50_000;
+/// Terminal results retained per Session.
+const RESULT_RETENTION: usize = 128;
+/// Retained result bodies per Session.
+const RESULT_BODY_RETENTION: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct MemoryState {
     sessions: HashMap<String, StoredSession>,
+    /// Every public Session ID this daemon has published, including
+    /// pre-rekey identities, mapped to the immutable internal Session UID.
+    uid_index: HashMap<String, String>,
     provider_reservations: HashMap<String, String>,
     turns: HashMap<String, TurnRecord>,
-    events: Vec<EventRecord>,
+    events: VecDeque<EventRecord>,
+    /// Highest lifecycle sequence already evicted by retention.
+    evicted_event_seq: i64,
+    /// Highest execution sequence whose result was evicted, per Session UID.
+    evicted_result_seq: HashMap<String, i64>,
+    screens: HashMap<String, ScreenStore>,
     outputs: HashMap<String, VecDeque<OutputChunk>>,
     next_event_seq: i64,
     next_input_seq: i64,
@@ -25,8 +41,29 @@ struct MemoryState {
 
 struct StoredSession {
     record: SessionRecord,
+    /// Immutable internal identity. Public Session IDs rotate when Claude
+    /// reports a new provider session, so cursors bind to this instead.
+    uid: String,
     terminal_rows: u16,
     terminal_cols: u16,
+}
+
+/// Observation watermarks captured atomically under the store lock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub event_seq: i64,
+    pub row_id: u64,
+    pub screen_epoch: u64,
+    pub result_seq: i64,
+}
+
+/// Live screen projection: a replaceable snapshot, never cursor history.
+#[derive(Debug, Default)]
+pub struct LiveScreen {
+    pub epoch: u64,
+    pub reset_reason: Option<&'static str>,
+    pub rows: Vec<String>,
+    pub truncated: bool,
 }
 
 struct OutputChunk {
@@ -70,6 +107,9 @@ impl Store {
             bail!("active session alias already exists");
         }
         let now = now_ms();
+        let uid = format!("su_{}", Uuid::new_v4().simple());
+        state.uid_index.insert(session.id.to_owned(), uid.clone());
+        state.screens.insert(uid.clone(), ScreenStore::new(24, 80));
         state.sessions.insert(
             session.id.to_owned(),
             StoredSession {
@@ -89,6 +129,7 @@ impl Store {
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
+                uid,
                 terminal_rows: 24,
                 terminal_cols: 80,
             },
@@ -220,9 +261,18 @@ impl Store {
                 .record
                 .created_at_ms
                 .min(replaced.record.created_at_ms);
+            state.screens.remove(&replaced.uid);
+            state.evicted_result_seq.remove(&replaced.uid);
+            state
+                .uid_index
+                .retain(|_, uid| uid.as_str() != replaced.uid.as_str());
         }
         to.clone_into(&mut session.record.id);
         session.record.updated_at_ms = now_ms();
+        // The pre-rekey ID stays resolvable for the daemon lifetime so a
+        // concurrent cursor keeps addressing the same logical Session.
+        state.uid_index.insert(to.to_owned(), session.uid.clone());
+        state.uid_index.insert(from.to_owned(), session.uid.clone());
         state.sessions.insert(to.to_owned(), session);
 
         for turn in state.turns.values_mut() {
@@ -280,10 +330,27 @@ impl Store {
     }
 
     pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) {
-        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
-            session.terminal_rows = rows;
-            session.terminal_cols = cols;
-            session.record.updated_at_ms = now_ms();
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return;
+        };
+        session.terminal_rows = rows;
+        session.terminal_cols = cols;
+        session.record.updated_at_ms = now_ms();
+        let uid = session.uid.clone();
+        if let Some(screen) = state.screens.get_mut(&uid) {
+            screen.resize(rows, cols);
+        }
+    }
+
+    /// Start a new terminal generation for a replacement provider process.
+    pub fn restart_screen(&self, session_id: &str) {
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+            return;
+        };
+        if let Some(screen) = state.screens.get_mut(&uid) {
+            screen.restart();
         }
     }
 
@@ -444,6 +511,7 @@ impl Store {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
+        enforce_result_retention(&mut memory, &session_id);
         Ok(true)
     }
 
@@ -462,6 +530,7 @@ impl Store {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
+        enforce_result_retention(&mut state, session_id);
         Some(turn_id)
     }
 
@@ -482,6 +551,7 @@ impl Store {
             session.record.state = SessionState::Quiescing;
             session.record.updated_at_ms = now_ms();
         }
+        enforce_result_retention(&mut state, &session_id);
         Ok(true)
     }
 
@@ -538,13 +608,18 @@ impl Store {
         let mut state = self.state.borrow_mut();
         state.next_event_seq += 1;
         let seq = state.next_event_seq;
-        state.events.push(EventRecord {
+        state.events.push_back(EventRecord {
             seq,
             session_id: session_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             kind: kind.to_owned(),
             retry_attempt,
         });
+        while state.events.len() > EVENT_RETENTION {
+            if let Some(evicted) = state.events.pop_front() {
+                state.evicted_event_seq = state.evicted_event_seq.max(evicted.seq);
+            }
+        }
         seq
     }
 
@@ -567,6 +642,10 @@ impl Store {
         });
         while chunks.len() > OUTPUT_CHUNK_LIMIT {
             chunks.pop_front();
+        }
+        let uid = state.sessions.get(session_id).map(|s| s.uid.clone());
+        if let Some(screen) = uid.and_then(|uid| state.screens.get_mut(&uid)) {
+            screen.feed(data);
         }
     }
 
@@ -609,6 +688,253 @@ impl Store {
             })
             .cloned()
             .collect()
+    }
+
+    /// Highest lifecycle sequence already dropped by event retention.
+    pub fn evicted_event_seq(&self) -> i64 {
+        self.state.borrow().evicted_event_seq
+    }
+
+    pub fn latest_event_seq(&self) -> i64 {
+        self.state.borrow().next_event_seq
+    }
+
+    /// Immutable internal identity for any public Session ID or alias,
+    /// including identities this daemon has already rekeyed away from.
+    pub fn session_uid(&self, selector: &str) -> Option<String> {
+        let state = self.state.borrow();
+        if let Some(session) = state.sessions.get(selector) {
+            return Some(session.uid.clone());
+        }
+        if let Some(uid) = state.uid_index.get(selector) {
+            return Some(uid.clone());
+        }
+        drop(state);
+        self.get_session(selector).and_then(|session| {
+            self.state
+                .borrow()
+                .sessions
+                .get(&session.id)
+                .map(|s| s.uid.clone())
+        })
+    }
+
+    pub fn session_for_uid(&self, uid: &str) -> Option<SessionRecord> {
+        self.state
+            .borrow()
+            .sessions
+            .values()
+            .find(|session| session.uid == uid)
+            .map(|session| session.record.clone())
+    }
+
+    pub fn session_uids(&self) -> Vec<String> {
+        let state = self.state.borrow();
+        let mut uids = state
+            .sessions
+            .values()
+            .map(|session| (session.record.created_at_ms, session.uid.clone()))
+            .collect::<Vec<_>>();
+        uids.sort_by_key(|(created, uid)| (std::cmp::Reverse(*created), uid.clone()));
+        uids.into_iter().map(|(_, uid)| uid).collect()
+    }
+
+    /// Capture the current observation position. Callers hold the store lock
+    /// across this call and the mutation it precedes, so no output or result
+    /// can slip in front of the returned cursor.
+    pub fn checkpoint(&self, uid: Option<&str>) -> Checkpoint {
+        let state = self.state.borrow();
+        let screen = uid.and_then(|uid| state.screens.get(uid));
+        Checkpoint {
+            event_seq: state.next_event_seq,
+            row_id: screen.map_or(0, ScreenStore::head_row_id),
+            screen_epoch: screen.map_or(0, ScreenStore::epoch),
+            result_seq: uid
+                .and_then(|uid| {
+                    state
+                        .sessions
+                        .values()
+                        .find(|session| session.uid == uid)
+                        .map(|session| session.record.id.clone())
+                })
+                .map_or(0, |session_id| {
+                    state
+                        .turns
+                        .values()
+                        .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+                        .map(|turn| turn.execution_seq)
+                        .max()
+                        .unwrap_or(0)
+                }),
+        }
+    }
+
+    /// Terminal results after `after`, oldest first.
+    pub fn results_after(&self, uid: &str, after: i64, limit: usize) -> (Vec<TurnRecord>, bool) {
+        let state = self.state.borrow();
+        let Some(session_id) = state
+            .sessions
+            .values()
+            .find(|session| session.uid == uid)
+            .map(|session| session.record.id.clone())
+        else {
+            return (Vec::new(), false);
+        };
+        let mut results = state
+            .turns
+            .values()
+            .filter(|turn| {
+                turn.session_id == session_id
+                    && turn.state.is_terminal()
+                    && turn.execution_seq > after
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        results.sort_by_key(|turn| turn.execution_seq);
+        let has_more = results.len() > limit;
+        results.truncate(limit);
+        (results, has_more)
+    }
+
+    /// Highest execution sequence whose retained result was evicted.
+    pub fn evicted_result_seq(&self, uid: &str) -> i64 {
+        self.state
+            .borrow()
+            .evicted_result_seq
+            .get(uid)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn screen_epoch(&self, uid: &str) -> u64 {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or(0, ScreenStore::epoch)
+    }
+
+    pub fn stable_page(&self, uid: &str, after: u64, limit: usize) -> StablePage {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or_else(StablePage::default, |screen| {
+                screen.stable_page(after, limit)
+            })
+    }
+
+    pub fn stable_tail(&self, uid: &str, limit: usize) -> StablePage {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or_else(StablePage::default, |screen| screen.stable_tail(limit))
+    }
+
+    pub fn stable_head(&self, uid: &str) -> u64 {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or(0, ScreenStore::head_row_id)
+    }
+
+    pub fn live_screen(&self, uid: &str, limit: usize) -> LiveScreen {
+        let state = self.state.borrow();
+        let Some(screen) = state.screens.get(uid) else {
+            return LiveScreen::default();
+        };
+        let (rows, truncated) = screen.live_rows(limit.min(LIVE_ROW_LIMIT));
+        LiveScreen {
+            epoch: screen.epoch(),
+            reset_reason: screen.last_reset_reason().map(EpochReason::as_str),
+            rows,
+            truncated,
+        }
+    }
+
+    /// Rendered rows addressed by absolute row ID, live grid included.
+    pub fn rendered_rows(&self, uid: &str, before: Option<u64>, lines: usize) -> RenderedRows {
+        let state = self.state.borrow();
+        let Some(screen) = state.screens.get(uid) else {
+            return RenderedRows::default();
+        };
+        let head = screen.head_row_id();
+        let (live, _) = screen.live_rows(usize::MAX);
+        let live_len = u64::try_from(live.len()).unwrap_or(0);
+        let (rows, cols) = screen.size();
+        let end = before
+            .unwrap_or(head + live_len + 1)
+            .min(head + live_len + 1);
+        let floor = screen.floor_row_id();
+        let start = end
+            .saturating_sub(u64::try_from(lines).unwrap_or(0))
+            .max(floor);
+        let mut selected = Vec::new();
+        if start < end.min(head + 1) {
+            let page = screen.stable_page(
+                start - 1,
+                usize::try_from(end.min(head + 1) - start).unwrap_or(0),
+            );
+            selected.extend(page.lines);
+        }
+        for (index, row) in live.into_iter().enumerate() {
+            let id = head + u64::try_from(index).unwrap_or(0) + 1;
+            if id >= start && id < end {
+                selected.push(row);
+            }
+        }
+        RenderedRows {
+            rows,
+            cols,
+            lines: selected,
+            truncated: start > floor || floor > 1,
+            before: (start > floor).then_some(start),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RenderedRows {
+    pub rows: u16,
+    pub cols: u16,
+    pub lines: Vec<String>,
+    pub truncated: bool,
+    pub before: Option<u64>,
+}
+
+/// Evict the oldest retained results once a Session exceeds either bound.
+/// Eviction is recorded so a cursor that predates it reports a gap instead of
+/// silently skipping a result.
+fn enforce_result_retention(state: &mut MemoryState, session_id: &str) {
+    let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+        return;
+    };
+    let mut terminal = state
+        .turns
+        .values()
+        .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+        .map(|turn| {
+            (
+                turn.execution_seq,
+                turn.id.clone(),
+                turn.final_message.as_ref().map_or(0, String::len),
+            )
+        })
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|(seq, _, _)| *seq);
+    let mut bytes = terminal.iter().map(|(_, _, len)| *len).sum::<usize>();
+    let mut index = 0;
+    while index + 1 < terminal.len()
+        && (terminal.len() - index > RESULT_RETENTION || bytes > RESULT_BODY_RETENTION)
+    {
+        let (seq, id, len) = &terminal[index];
+        state.turns.remove(id);
+        bytes = bytes.saturating_sub(*len);
+        let floor = state.evicted_result_seq.entry(uid.clone()).or_default();
+        *floor = (*floor).max(*seq);
+        index += 1;
     }
 }
 

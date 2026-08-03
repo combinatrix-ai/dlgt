@@ -7,6 +7,7 @@ mod protocol;
 mod provider;
 mod raw_mode;
 mod reaper;
+mod screen;
 mod session;
 mod skill;
 mod store;
