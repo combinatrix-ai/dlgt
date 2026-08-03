@@ -246,14 +246,24 @@ Rules:
 Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
 64 events, 4 results, 128 stable lines (512 on request), and 40 live rows per
 response. `has_more: true` means data already exists beyond the returned
-cursor, and the next request returns immediately even with `wait_ms`. The
-cursor advances only over delivered content, and a long `final_text` is chunked
-at a UTF-8 boundary and continued with `final_text_offset` and
-`final_text_complete`.
+cursor, and the next request returns immediately even with `wait_ms`.
+
+`max_bytes` is a hard bound on the serialized document, and the cursor is
+derived from what that document actually carries, so it can never advance past
+omitted content. Progress under a tight budget comes from chunking: a long
+`final_text` is chunked at a UTF-8 boundary and continued with
+`final_text_offset` and `final_text_complete`, and a screen row wider than the
+remaining budget is chunked mid-line and continued through the cursor. Every
+`has_more` response advances at least one watermark. A `max_bytes` too small
+for the envelope plus one chunk fails with `INVALID_ARGUMENT` naming the
+smallest workable value instead of emitting an oversized document.
 
 Cursors are opaque, prefixed `f1.`, and carry the codec version, the daemon
 boot identity, the addressed scope, and per-Session watermarks. They bind to an
 internal Session identity, so a Claude provider-ID rotation keeps them valid.
+An `all` cursor keeps entries only for Sessions that still exist and carry
+state, and addresses at most 256 of them; a daemon holding more rejects `all`
+with `INVALID_ARGUMENT` and must be read one Session at a time.
 
 Retention is bounded to 10,000 stable rows per Session, 50,000 lifecycle events
 per daemon, and 128 results or 16 MiB of result bodies per Session. A cursor
