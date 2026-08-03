@@ -64,6 +64,25 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_i
   | "$binary" hook emit "$session_id" claude
 "$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":1'
 
+# Acceptance returns an observation cursor positioned before the accepted work.
+grep -q '"cursor":"f1\.' "$state_dir/new.json"
+
+# A cursorless fetch is the documented baseline recovery path.
+baseline_json=$("$binary" fetch "$session_id")
+printf '%s\n' "$baseline_json" | grep -q '"reason":"snapshot"'
+printf '%s\n' "$baseline_json" | grep -q '"final_text":"initial-done"'
+printf '%s\n' "$baseline_json" | grep -q '"final_text_source":"hook"'
+printf '%s\n' "$baseline_json" | grep -q '"screen"'
+baseline_cursor=$(printf '%s\n' "$baseline_json" \
+  | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+test -n "$baseline_cursor"
+
+# An exhausted cursor is a successful empty observation, not an error.
+empty_json=$("$binary" fetch "$session_id" --cursor "$baseline_cursor")
+printf '%s\n' "$empty_json" | grep -q '"reason":"timeout"'
+printf '%s\n' "$empty_json" | grep -q '"results":\[\]'
+printf '%s\n' "$empty_json" | grep -q '"has_more":false'
+
 # A current client routes provider-qualified selectors to a live daemon on a
 # different versioned socket instead of launching a duplicate locally.
 DLGT_SOCKET="$old_socket" "$binary" server --foreground >"$state_dir/old-server.log" 2>&1 &
@@ -97,7 +116,28 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cros
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-2","last_assistant_message":"cross-version-done"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
+stale_cursor=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all \
+  | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+test -n "$stale_cursor"
 DLGT_SOCKET="$old_socket" "$binary" stop "$cross_version_id" --force >/dev/null
+DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
+wait "$old_server_pid"
+old_server_pid=
+
+# Runtime state is memory-only, so no cursor may survive a daemon instance.
+DLGT_SOCKET="$old_socket" "$binary" server --foreground >"$state_dir/old-server-2.log" 2>&1 &
+old_server_pid=$!
+attempt=0
+while [ ! -S "$old_socket" ]; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
+done
+set +e
+expired_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all --cursor "$stale_cursor")
+expired_status=$?
+set -e
+test "$expired_status" -eq 1
+printf '%s\n' "$expired_json" | grep -q '"code":"CURSOR_EXPIRED"'
+DLGT_SOCKET="$old_socket" "$binary" fetch --all | grep -q '"reason":"snapshot"'
 DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
@@ -155,7 +195,16 @@ wait "$follow_pid" 2>/dev/null || true
 grep -q '"schema_version":1' "$state_dir/follow.jsonl"
 "$binary" models --harness claude | grep -q '"id":"default"'
 "$binary" harnesses | grep -q '"codex"'
+"$binary" profiles | grep -q '"profiles"'
 "$binary" skill | grep -q '^name: dlgt$'
+
+# attach is an interactive takeover and must refuse a piped stdout.
+set +e
+attach_json=$("$binary" attach "$session_id")
+attach_status=$?
+set -e
+test "$attach_status" -eq 1
+printf '%s\n' "$attach_json" | grep -q '"code":"ATTACH_REQUIRES_TTY"'
 
 # Restart interrupts active work while preserving identity, provider binding, and history.
 "$binary" send "$session_id" -- interrupted-by-restart >/dev/null
@@ -210,6 +259,78 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn
   | "$binary" hook emit "$reused_id" claude
 "$binary" fetch "$reused_id" --until result --wait 2s | grep -q '"execution_seq":1'
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
+
+# A long poll completes on the authoritative Stop hook, and the delta carries
+# the hydrated result exactly once.
+poll_send=$("$binary" send "$reused_id" -- long-poll)
+poll_cursor=$(printf '%s\n' "$poll_send" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+test -n "$poll_cursor"
+"$binary" fetch "$reused_id" --cursor "$poll_cursor" --until result --wait 10s \
+  >"$state_dir/poll.json" &
+poll_pid=$!
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-2","user_prompt":"long-poll"}' \
+  | "$binary" hook emit "$reused_id" claude
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-2","last_assistant_message":"poll-done"}' \
+  | "$binary" hook emit "$reused_id" claude
+wait "$poll_pid"
+grep -q '"reason":"result"' "$state_dir/poll.json"
+grep -q '"final_text":"poll-done"' "$state_dir/poll.json"
+grep -q '"execution_seq":2' "$state_dir/poll.json"
+advanced_cursor=$(sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p' "$state_dir/poll.json")
+
+# Replaying the acceptance cursor replays the same immutable window, while the
+# advanced cursor no longer redelivers it.
+"$binary" fetch "$reused_id" --cursor "$poll_cursor" | grep -q '"final_text":"poll-done"'
+"$binary" fetch "$reused_id" --cursor "$advanced_cursor" | grep -q '"results":\[\]'
+
+# A retried acceptance replays its receipt instead of creating a second
+# execution, and the same request ID with a different payload is rejected.
+retry_first=$("$binary" send "$reused_id" --request-id retry-1 -- retry-payload)
+printf '%s\n' "$retry_first" | grep -q '"execution_seq":3'
+retry_replay=$("$binary" send "$reused_id" --request-id retry-1 -- retry-payload)
+printf '%s\n' "$retry_replay" | grep -q '"replayed":true'
+printf '%s\n' "$retry_replay" | grep -q '"execution_seq":3'
+set +e
+retry_mismatch=$("$binary" send "$reused_id" --request-id retry-1 -- other-payload)
+retry_mismatch_status=$?
+set -e
+test "$retry_mismatch_status" -eq 1
+printf '%s\n' "$retry_mismatch" | grep -q '"code":"INVALID_ARGUMENT"'
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-3","user_prompt":"retry-payload"}' \
+  | "$binary" hook emit "$reused_id" claude
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-3","last_assistant_message":"retry-done"}' \
+  | "$binary" hook emit "$reused_id" claude
+"$binary" fetch "$reused_id" --until result --wait 4s | grep -q '"final_text":"retry-done"'
+
+# Retention overrun is a structured gap with a recoverable baseline, never a
+# silent reset.
+flood_send=$("$binary" send "$reused_id" -- flood-the-screen)
+flood_cursor=$(printf '%s\n' "$flood_send" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+attempt=0
+until "$binary" fetch "$reused_id" --cursor "$flood_cursor" \
+  | grep -q '"reason":"gap"'; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 400 || exit 1; sleep 0.05
+done
+gap_json=$("$binary" fetch "$reused_id" --cursor "$flood_cursor")
+printf '%s\n' "$gap_json" | grep -q '"component":"screen","reason":"retention_overrun"'
+printf '%s\n' "$gap_json" | grep -q '"stable":\["flood-'
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","user_prompt":"flood-the-screen"}' \
+  | "$binary" hook emit "$reused_id" claude
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","last_assistant_message":"flood-done"}' \
+  | "$binary" hook emit "$reused_id" claude
+"$binary" fetch "$reused_id" --until result --wait 4s | grep -q '"final_text":"flood-done"'
+"$binary" scrollback "$reused_id" --lines 5 | grep -q '"truncated":true'
+
+# fetch --all reports every Session of one daemon without a screen projection.
+all_json=$("$binary" fetch --all)
+printf '%s\n' "$all_json" | grep -q "\"id\":\"$reused_id\""
+if printf '%s\n' "$all_json" | grep -q '"screen"'; then exit 1; fi
+set +e
+all_screen=$("$binary" fetch --all --screen)
+all_screen_status=$?
+set -e
+test "$all_screen_status" -eq 1
+printf '%s\n' "$all_screen" | grep -q '"code":"INVALID_ARGUMENT"'
 
 # A default Session adds --permission-mode=auto beyond the one explicit
 # harness option, and never the dangerous bypass flag.
