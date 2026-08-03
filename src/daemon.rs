@@ -2059,8 +2059,16 @@ impl Daemon {
                 *binding = Some(provider_id.to_owned());
             }
         }
+        // The transcript fallback reads an untrusted provider file, so it runs
+        // with no store lock held and is revalidated before it terminalizes
+        // anything.
+        let recovery = if event_name == "Stop" {
+            self.recover_final_text(&session, &payload)?
+        } else {
+            None
+        };
         let mut store = self.lock_store()?;
-        let outcome = apply_hook_event(&mut store, &session, event_name, &payload)?;
+        let outcome = apply_hook_event(&mut store, &session, event_name, &payload, recovery)?;
         let seq = store.record_event(Some(&session.id), outcome.turn_id.as_deref(), outcome.kind);
         Ok(json!({
             "accepted": true,
@@ -2068,6 +2076,65 @@ impl Daemon {
             "event": outcome.kind,
             "turn_id": outcome.turn_id,
         }))
+    }
+
+    /// Recover a missing Claude `final_text` from the Session transcript.
+    /// Returns the guard values the caller must revalidate before use.
+    fn recover_final_text(
+        &self,
+        session: &SessionRecord,
+        payload: &Value,
+    ) -> Result<Option<TranscriptRecovery>> {
+        if payload
+            .get("last_assistant_message")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        {
+            return Ok(None);
+        }
+        let Some(provider_session_id) = provider_id_from_session(session).map(str::to_owned) else {
+            return Ok(None);
+        };
+        let captured = {
+            let store = self.lock_store()?;
+            let Some(current) = store.get_session(&session.id) else {
+                return Ok(None);
+            };
+            let Some(turn_id) = current.active_turn_id else {
+                return Ok(None);
+            };
+            let Some(turn) = store.get_turn(&turn_id) else {
+                return Ok(None);
+            };
+            let Some(uid) = store.session_uid(&session.id) else {
+                return Ok(None);
+            };
+            let Some(path) = turn.transcript_path.clone().or_else(|| {
+                payload
+                    .get("transcript_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }) else {
+                return Ok(None);
+            };
+            TranscriptRecovery {
+                // A new PTY is a new screen epoch, so it doubles as the
+                // process-generation guard.
+                generation: store.screen_epoch(&uid),
+                provider_turn_id: turn.provider_turn_id.clone(),
+                boundary: turn.transcript_offset.unwrap_or(0),
+                turn_id,
+                uid,
+                path,
+                text: String::new(),
+            }
+        };
+        let Some(text) =
+            crate::transcript::recover(&captured.path, &provider_session_id, captured.boundary)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TranscriptRecovery { text, ..captured }))
     }
 
     fn subscribe_view(&self, stream: &mut UnixStream, request: &Request) -> Result<()> {
@@ -2256,11 +2323,24 @@ struct HookOutcome {
     turn_id: Option<String>,
 }
 
+/// A transcript fallback captured outside the store lock, together with the
+/// identity it was captured against.
+struct TranscriptRecovery {
+    turn_id: String,
+    uid: String,
+    generation: u64,
+    provider_turn_id: Option<String>,
+    boundary: u64,
+    path: String,
+    text: String,
+}
+
 fn apply_hook_event(
     store: &mut Store,
     session: &SessionRecord,
     event_name: &str,
     payload: &Value,
+    recovery: Option<TranscriptRecovery>,
 ) -> Result<HookOutcome> {
     match event_name {
         "SessionStart" => {
@@ -2271,7 +2351,7 @@ fn apply_hook_event(
             })
         }
         "UserPromptSubmit" => start_hook_turn(store, session, payload),
-        "Stop" => complete_hook_turn(store, session, payload),
+        "Stop" => complete_hook_turn(store, session, payload, recovery),
         "StopFailure" => fail_hook_turn(store, session, payload),
         "Notification"
             if payload
@@ -2362,6 +2442,11 @@ fn start_hook_turn(
     let started = store.mark_turn_started(&turn_id, provider_turn_id);
     if started {
         store.set_session_state(&session.id, SessionState::Busy);
+        // Record where this execution starts in the provider transcript so a
+        // later fallback cannot return the previous turn's answer.
+        if let Some(path) = payload.get("transcript_path").and_then(Value::as_str) {
+            store.set_turn_transcript(&turn_id, path, crate::transcript::boundary(path));
+        }
     }
     Ok(HookOutcome {
         kind: if started {
@@ -2389,6 +2474,7 @@ fn complete_hook_turn(
     store: &Store,
     session: &SessionRecord,
     payload: &Value,
+    recovery: Option<TranscriptRecovery>,
 ) -> Result<HookOutcome> {
     let current = store
         .get_session(&session.id)
@@ -2401,10 +2487,36 @@ fn complete_hook_turn(
         });
     };
     let provider_turn_id = payload.get("turn_id").and_then(Value::as_str);
-    let final_message = payload
+    let hook_message = payload
         .get("last_assistant_message")
-        .and_then(Value::as_str);
-    let completed = store.complete_turn_if_matching(&turn_id, provider_turn_id, final_message)?;
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    // The fallback text is only usable if the Session identity, process
+    // generation, active execution, and provider turn are all unchanged since
+    // it was read outside the lock. Failing that check never fails the
+    // execution; it only leaves the text missing.
+    let recovered = recovery.filter(|recovery| {
+        hook_message.is_none()
+            && recovery.turn_id == turn_id
+            && store.session_uid(&session.id).as_deref() == Some(recovery.uid.as_str())
+            && store.screen_epoch(&recovery.uid) == recovery.generation
+            && store
+                .get_turn(&turn_id)
+                .and_then(|turn| turn.provider_turn_id)
+                .as_deref()
+                == recovery.provider_turn_id.as_deref()
+    });
+    let final_message = hook_message.or(recovered.as_ref().map(|recovery| recovery.text.as_str()));
+    let completed = store.complete_turn_if_matching(
+        &turn_id,
+        provider_turn_id,
+        final_message.or_else(|| {
+            payload
+                .get("last_assistant_message")
+                .and_then(Value::as_str)
+        }),
+        recovered.is_some(),
+    )?;
     if completed {
         store.set_session_state(&session.id, SessionState::Idle);
     }
@@ -2908,11 +3020,28 @@ fn public_result(turn: &TurnRecord) -> Value {
         "execution_seq": turn.execution_seq,
         "status": status,
         "final_text": turn.final_message.clone().unwrap_or_default(),
+        "final_text_source": final_text_source(turn),
         "error": turn.error,
         "started_at_ms": turn.started_at_ms.unwrap_or(turn.created_at_ms),
         "completed_at_ms": turn.completed_at_ms,
         "usage": turn.usage,
     })
+}
+
+/// Where a retained `final_text` came from. `missing` is an explicit
+/// diagnostic: the execution still completed, but no answer was recovered.
+fn final_text_source(turn: &TurnRecord) -> &'static str {
+    if turn.final_text_recovered {
+        "transcript"
+    } else if turn
+        .final_message
+        .as_deref()
+        .is_some_and(|text| !text.is_empty())
+    {
+        "hook"
+    } else {
+        "missing"
+    }
 }
 
 fn generate_internal_id() -> String {
@@ -3340,8 +3469,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BusyMetrics, ProviderReservation, apply_codex_notification, apply_hook_event,
-        canonical_session_id, clamp_busy_metrics, classify_error, generate_alias,
+        BusyMetrics, ProviderReservation, TranscriptRecovery, apply_codex_notification,
+        apply_hook_event, canonical_session_id, clamp_busy_metrics, classify_error, generate_alias,
         generate_internal_id, provider_id_from_session, public_result, public_session,
         public_session_with_metrics, signal_shutdown, validate_alias, wait_for_update_check,
     };
@@ -3532,7 +3661,12 @@ mod tests {
         assert!(store.mark_turn_started("turn_private", Some("provider_private")));
         assert!(
             store
-                .complete_turn_if_matching("turn_private", Some("provider_private"), Some("done"))
+                .complete_turn_if_matching(
+                    "turn_private",
+                    Some("provider_private"),
+                    Some("done"),
+                    false,
+                )
                 .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
         );
         let value = public_result(
@@ -3565,6 +3699,7 @@ mod tests {
                 "error": "invalid_request",
                 "error_details": "bad model",
             }),
+            None,
         )
         .unwrap_or_else(|error| panic!("failed to apply StopFailure: {error}"));
         assert_eq!(outcome.kind, "turn.failed");
@@ -3576,6 +3711,106 @@ mod tests {
             turn.error
                 .is_some_and(|error| error.contains("invalid_request"))
         );
+    }
+
+    fn started_claude_turn(store: &mut Store) -> (crate::protocol::SessionRecord, String) {
+        store
+            .insert_turn("turn_1", "claude:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let uid = store
+            .session_uid("claude:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        (session, uid)
+    }
+
+    fn recovery(turn_id: &str, uid: &str, generation: u64) -> TranscriptRecovery {
+        TranscriptRecovery {
+            turn_id: turn_id.to_owned(),
+            uid: uid.to_owned(),
+            generation,
+            provider_turn_id: Some("provider-turn".to_owned()),
+            boundary: 0,
+            path: "/transcript.jsonl".to_owned(),
+            text: "recovered answer".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_missing_hook_final_text_is_recovered_from_the_transcript() {
+        let mut store = ready_store("claude");
+        let (session, uid) = started_claude_turn(&mut store);
+        let generation = store.screen_epoch(&uid);
+
+        let outcome = apply_hook_event(
+            &mut store,
+            &session,
+            "Stop",
+            &json!({"turn_id": "provider-turn", "last_assistant_message": ""}),
+            Some(recovery("turn_1", &uid, generation)),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply Stop: {error}"));
+
+        assert_eq!(outcome.kind, "turn.completed");
+        let turn = store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"));
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(turn.final_message.as_deref(), Some("recovered answer"));
+        assert_eq!(public_result(&turn)["final_text_source"], "transcript");
+    }
+
+    #[test]
+    fn a_stale_recovery_never_replaces_text_or_fails_the_execution() {
+        let mut store = ready_store("claude");
+        let (session, uid) = started_claude_turn(&mut store);
+        let generation = store.screen_epoch(&uid);
+
+        let outcome = apply_hook_event(
+            &mut store,
+            &session,
+            "Stop",
+            &json!({"turn_id": "provider-turn", "last_assistant_message": ""}),
+            Some(recovery(
+                "turn_from_a_previous_generation",
+                &uid,
+                generation,
+            )),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply Stop: {error}"));
+
+        assert_eq!(outcome.kind, "turn.completed");
+        let turn = store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"));
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(public_result(&turn)["final_text"], "");
+        assert_eq!(public_result(&turn)["final_text_source"], "missing");
+    }
+
+    #[test]
+    fn a_reported_hook_final_text_always_wins_over_the_transcript() {
+        let mut store = ready_store("claude");
+        let (session, uid) = started_claude_turn(&mut store);
+        let generation = store.screen_epoch(&uid);
+
+        apply_hook_event(
+            &mut store,
+            &session,
+            "Stop",
+            &json!({"turn_id": "provider-turn", "last_assistant_message": "hook answer"}),
+            Some(recovery("turn_1", &uid, generation)),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply Stop: {error}"));
+
+        let turn = store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"));
+        assert_eq!(turn.final_message.as_deref(), Some("hook answer"));
+        assert_eq!(public_result(&turn)["final_text_source"], "hook");
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod screen;
 mod session;
 mod skill;
 mod store;
+mod transcript;
 mod update;
 
 use std::collections::{HashMap, HashSet};

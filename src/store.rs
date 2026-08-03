@@ -68,6 +68,15 @@ pub struct OutputPage {
     pub has_more: bool,
 }
 
+struct FinishTurn<'a> {
+    id: &'a str,
+    provider_turn_id: Option<&'a str>,
+    state: TurnState,
+    final_message: Option<&'a str>,
+    recovered: bool,
+    error: Option<&'a str>,
+}
+
 pub struct NewSession<'a> {
     pub id: &'a str,
     pub alias: &'a str,
@@ -400,6 +409,9 @@ impl Store {
             state: TurnState::Submitted,
             provider_turn_id: None,
             final_message: None,
+            final_text_recovered: false,
+            transcript_path: None,
+            transcript_offset: None,
             error: None,
             created_at_ms: now,
             started_at_ms: None,
@@ -458,14 +470,16 @@ impl Store {
         id: &str,
         provider_turn_id: Option<&str>,
         final_message: Option<&str>,
+        recovered: bool,
     ) -> Result<bool> {
-        self.finish_turn_if_matching(
+        self.finish_turn(&FinishTurn {
             id,
             provider_turn_id,
-            TurnState::Completed,
+            state: TurnState::Completed,
             final_message,
-            None,
-        )
+            recovered,
+            error: None,
+        })
     }
 
     pub fn finish_turn_if_matching(
@@ -476,6 +490,34 @@ impl Store {
         final_message: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool> {
+        self.finish_turn(&FinishTurn {
+            id,
+            provider_turn_id,
+            state,
+            final_message,
+            recovered: false,
+            error,
+        })
+    }
+
+    /// Record the provider transcript boundary for an execution, so a later
+    /// fallback can never read a previous turn's assistant message.
+    pub fn set_turn_transcript(&self, id: &str, path: &str, offset: Option<u64>) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+            turn.transcript_path = Some(path.to_owned());
+            turn.transcript_offset = offset;
+        }
+    }
+
+    fn finish_turn(&self, finish: &FinishTurn<'_>) -> Result<bool> {
+        let FinishTurn {
+            id,
+            provider_turn_id,
+            state,
+            final_message,
+            recovered,
+            error,
+        } = *finish;
         if !state.is_provider_terminal() {
             bail!("invalid terminal turn state {:?}", state.as_str());
         }
@@ -494,6 +536,7 @@ impl Store {
             turn.provider_turn_id = provider_turn_id.map(str::to_owned);
         }
         turn.final_message = final_message.map(str::to_owned);
+        turn.final_text_recovered = recovered;
         turn.error = error.map(str::to_owned);
         turn.completed_at_ms = Some(now_ms());
         if let Some(session) = memory.sessions.get_mut(&session_id)
@@ -1371,12 +1414,12 @@ mod tests {
         assert!(store.mark_turn_started("turn_1", Some("provider-1")));
         assert!(
             !store
-                .complete_turn_if_matching("turn_1", Some("provider-2"), Some("wrong"))
+                .complete_turn_if_matching("turn_1", Some("provider-2"), Some("wrong"), false)
                 .unwrap_or_else(|error| panic!("failed to reject stop: {error}"))
         );
         assert!(
             store
-                .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"))
+                .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"), false)
                 .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
         );
     }
@@ -1404,7 +1447,7 @@ mod tests {
         assert!(store.mark_turn_started("turn_1", None));
         assert!(
             store
-                .complete_turn_if_matching("turn_1", None, Some("done"))
+                .complete_turn_if_matching("turn_1", None, Some("done"), false)
                 .unwrap_or_else(|error| panic!("failed to complete first turn: {error}"))
         );
         store

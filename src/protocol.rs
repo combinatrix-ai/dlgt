@@ -224,6 +224,13 @@ pub struct TurnRecord {
     pub state: TurnState,
     pub provider_turn_id: Option<String>,
     pub final_message: Option<String>,
+    /// The hook did not report the final message and it was recovered from
+    /// the provider transcript instead.
+    pub final_text_recovered: bool,
+    /// Provider transcript path and the byte offset recorded when this
+    /// execution was accepted, used only for that bounded recovery.
+    pub transcript_path: Option<String>,
+    pub transcript_offset: Option<u64>,
     pub error: Option<String>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
