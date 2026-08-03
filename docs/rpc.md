@@ -258,7 +258,8 @@ newline the daemon reserves before committing content.
 
 It does not bound the raw JSONL envelope. That envelope carries a
 caller-supplied request `id`, so its size is the caller's to control; the id is
-capped at 200 bytes, which bounds the excess to roughly 220 bytes over the
+capped at 200 bytes before JSON escaping; an id full of control characters can
+escape to about six times that, so the excess stays under roughly 1.3 KiB over the
 result document. An optional `info` notice and pretty-printing are also outside
 the bound. The cursor is derived from what the document actually carries, so it
 can never advance past omitted content. Progress under a tight budget comes from chunking: a long
@@ -266,9 +267,11 @@ can never advance past omitted content. Progress under a tight budget comes from
 `final_text_offset` and `final_text_complete`, and a screen row wider than the
 remaining budget is chunked mid-line. Every `has_more` response advances at
 least one watermark. A `max_bytes` too small for the envelope plus one chunk
-fails with `INVALID_ARGUMENT` naming the smallest workable value instead of
-emitting an oversized document. That value is measured by rendering the
-minimal response, so retrying at exactly it succeeds.
+fails with `INVALID_ARGUMENT` naming a verified workable value instead of
+emitting an oversized document. That value is verified by actually rendering a
+response at it, so retrying at exactly it succeeds; it is a verified
+candidate, not a guaranteed minimum, because progress is not monotonic in the
+budget.
 
 `screen.stable` contains complete rows only. A split row is carried in one of
 two ordered slots, each shaped

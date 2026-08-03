@@ -652,11 +652,14 @@ never skips an event to deliver a later one, so the event watermark is always
 a position with nothing outstanding behind it.
 
 If `--max-bytes` is too small to carry the response envelope plus one chunk of
-progress, `fetch` fails with `INVALID_ARGUMENT` and names the smallest budget
-that would work rather than emitting an oversized document. That number is
-obtained by rendering the minimal response, not estimated, so retrying at
-exactly the reported value succeeds. The practical floor is roughly 1 KiB for a
-single Session; the default of 32 KiB is far above it.
+progress, `fetch` fails with `INVALID_ARGUMENT` and names a budget verified to
+work rather than emitting an oversized document. That number is obtained by
+actually rendering a response at it, not estimated, so retrying at exactly the
+reported value succeeds. It is a verified candidate, not a minimum: whether a
+budget makes progress is not monotonic, so a value between the rejected budget
+and the reported one may or may not work, and only the reported value carries
+the guarantee. The practical floor is roughly 1 KiB for a single Session; the
+default of 32 KiB is far above it.
 
 A `--all` cursor carries watermarks for at most 256 Sessions. A daemon holding
 retained state for more than that rejects `--all` with `INVALID_ARGUMENT` and

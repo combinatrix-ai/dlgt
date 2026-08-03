@@ -3482,6 +3482,11 @@ struct Rendered {
 /// a watermark past data the caller never received. Byte accounting is exact
 /// per unit; the finished document is measured once and units are rolled back
 /// until it fits, which can only shrink the cursor further.
+///
+/// Measuring the full document per committed unit is bounded-quadratic in the
+/// unit count (page caps keep the worst case around a few hundred cycles of a
+/// ≤256 KiB serialization). Accepted trade-off for exactness; benchmark before
+/// optimizing.
 struct Builder<'a> {
     cut: &'a Cut,
     options: &'a FetchOptions,
@@ -3991,15 +3996,18 @@ impl<'a> Builder<'a> {
         // Recommend something strictly larger than the budget that just
         // failed, so the advice cannot repeat the caller's mistake.
         let mut candidate = floor.max(self.options.max_bytes.saturating_add(1)).max(1);
-        while candidate <= FETCH_HARD_MAX_BYTES {
-            if self.renders_at(candidate)? {
-                return Ok(Some(candidate));
+        loop {
+            let clamped = candidate.min(FETCH_HARD_MAX_BYTES);
+            if self.renders_at(clamped)? {
+                return Ok(Some(clamped));
             }
-            candidate = candidate.saturating_mul(2);
+            if clamped == FETCH_HARD_MAX_BYTES {
+                // Chunking means the hard limit should always suffice; report
+                // no recommendation rather than one that was never verified.
+                return Ok(None);
+            }
+            candidate = clamped.saturating_mul(2);
         }
-        // Chunking means the hard limit should always suffice; report no
-        // recommendation rather than one that was never verified.
-        Ok(None)
     }
 
     /// Whether a real attempt at `max_bytes` would succeed.
@@ -4064,7 +4072,7 @@ impl<'a> Builder<'a> {
                 );
             };
             bail!(
-                "invalid max_bytes {}: too small to carry one unit of progress; retry with --max-bytes {minimum} or more",
+                "invalid max_bytes {}: too small to carry one unit of progress; --max-bytes {minimum} is verified to work for the current state",
                 self.options.max_bytes,
             );
         }
@@ -5044,7 +5052,9 @@ mod tests {
             .unwrap_or_else(|| panic!("an unsatisfiable budget was accepted"));
         assert_eq!(classify_error(&error), "INVALID_ARGUMENT");
         assert!(
-            error.to_string().contains("retry with --max-bytes"),
+            error
+                .to_string()
+                .contains("is verified to work for the current state"),
             "the error must name a workable budget: {error}"
         );
     }
