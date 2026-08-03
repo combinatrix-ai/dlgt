@@ -655,8 +655,9 @@ Claude Code does not currently expose an equivalent documented non-interactive
 picker API. dlgt always returns the stable Claude Code aliases, then augments
 them with current canonical IDs from the public, daily refreshed
 [`claude-models-list`](https://github.com/combinatrix-ai/claude-models-list)
-snapshot. Date-pinned IDs ending in `-YYYYMMDD` are omitted. The snapshot is
-account-scoped and is not presented as the Claude Code subscription picker. If
+snapshot. Date-pinned IDs ending in `-YYYYMMDD` are normalized to their undated
+alias, so `claude-haiku-4-5-20251001` is reported as `claude-haiku-4-5`. The
+snapshot is account-scoped and is not presented as the Claude Code picker. If
 it cannot be fetched or validated, dlgt falls back to the aliases and reports
 discovery as `partial`.
 

@@ -102,10 +102,16 @@ fn parse_snapshot(snapshot: &Value) -> Result<Snapshot> {
         .iter()
         .filter_map(|model| {
             let id = model.get("id").and_then(Value::as_str)?;
-            if !valid_model_id(id) || dated_snapshot_id(id) || !seen.insert(id.to_owned()) {
+            if !valid_model_id(id) {
                 return None;
             }
-            Some(model.clone())
+            let id = undated_model_id(id);
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            let mut model = model.clone();
+            model.as_object_mut()?.insert("id".to_owned(), json!(id));
+            Some(model)
         })
         .collect();
     let retrieved_at = snapshot
@@ -119,10 +125,11 @@ fn parse_snapshot(snapshot: &Value) -> Result<Snapshot> {
 }
 
 fn validate_against_snapshot(snapshot: &Snapshot, model_id: &str, effort: &str) -> Result<()> {
+    let normalized = undated_model_id(model_id);
     let Some(model) = snapshot
         .models
         .iter()
-        .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(model_id))
+        .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(normalized.as_str()))
     else {
         return Ok(());
     };
@@ -174,10 +181,17 @@ fn valid_model_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn dated_snapshot_id(id: &str) -> bool {
-    id.rsplit_once('-').is_some_and(|(_, suffix)| {
-        suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    })
+/// Claude Code accepts the undated alias for every date-pinned ID the public
+/// snapshot still returns, so the alias is the form worth presenting.
+fn undated_model_id(id: &str) -> String {
+    match id.rsplit_once('-') {
+        Some((head, suffix))
+            if suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            head.to_owned()
+        }
+        _ => id.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -185,20 +199,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn date_filter_only_matches_terminal_yyyymmdd() {
-        assert!(dated_snapshot_id("claude-opus-4-5-20251101"));
-        assert!(!dated_snapshot_id("claude-opus-5"));
-        assert!(!dated_snapshot_id("claude-20251101-preview"));
-        assert!(!dated_snapshot_id("claude-opus-2025110"));
+    fn normalization_only_strips_a_terminal_yyyymmdd() {
+        assert_eq!(
+            undated_model_id("claude-opus-4-5-20251101"),
+            "claude-opus-4-5"
+        );
+        assert_eq!(undated_model_id("claude-opus-5"), "claude-opus-5");
+        assert_eq!(
+            undated_model_id("claude-20251101-preview"),
+            "claude-20251101-preview"
+        );
+        assert_eq!(
+            undated_model_id("claude-opus-2025110"),
+            "claude-opus-2025110"
+        );
     }
 
     #[test]
-    fn snapshot_filters_dated_invalid_and_duplicate_ids() {
+    fn snapshot_normalizes_dated_ids_and_drops_invalid_and_duplicates() {
         let snapshot = json!({
             "retrieved_at": "2026-08-01T00:00:00Z",
             "data": [
                 {"id":"claude-opus-5", "display_name":"Claude Opus 5"},
-                {"id":"claude-opus-4-5-20251101"},
+                {"id":"claude-opus-4-5-20251101", "display_name":"Claude Opus 4.5"},
                 {"id":"not-claude"},
                 {"id":"claude-opus-5", "display_name":"duplicate"},
                 {"id":"claude-sonnet-5"}
@@ -210,9 +233,25 @@ mod tests {
             snapshot.retrieved_at.as_deref(),
             Some("2026-08-01T00:00:00Z")
         );
-        assert_eq!(snapshot.models.len(), 2);
+        assert_eq!(snapshot.models.len(), 3);
         assert_eq!(snapshot.models[0]["id"], "claude-opus-5");
-        assert_eq!(snapshot.models[1]["id"], "claude-sonnet-5");
+        assert_eq!(snapshot.models[1]["id"], "claude-opus-4-5");
+        assert_eq!(snapshot.models[1]["display_name"], "Claude Opus 4.5");
+        assert_eq!(snapshot.models[2]["id"], "claude-sonnet-5");
+    }
+
+    #[test]
+    fn undated_and_dated_ids_collapse_to_one_entry() {
+        let snapshot = json!({
+            "data": [
+                {"id":"claude-haiku-4-5", "display_name":"alias"},
+                {"id":"claude-haiku-4-5-20251001", "display_name":"dated"}
+            ]
+        });
+        let snapshot =
+            parse_snapshot(&snapshot).unwrap_or_else(|error| panic!("parse failed: {error:#}"));
+        assert_eq!(snapshot.models.len(), 1);
+        assert_eq!(snapshot.models[0]["display_name"], "alias");
     }
 
     #[test]
@@ -245,6 +284,31 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("supported efforts: low, medium, high, max"));
+    }
+
+    #[test]
+    fn dated_model_input_validates_against_its_alias() {
+        let snapshot = Snapshot {
+            retrieved_at: None,
+            models: vec![json!({
+                "id":"claude-opus-4-5",
+                "capabilities":{"effort":{
+                    "supported":true,
+                    "low":{"supported":true},
+                    "medium":{"supported":true},
+                    "high":{"supported":true},
+                    "xhigh":{"supported":false},
+                    "max":{"supported":false}
+                }}
+            })],
+        };
+        assert!(validate_against_snapshot(&snapshot, "claude-opus-4-5-20251101", "high").is_ok());
+        let error = match validate_against_snapshot(&snapshot, "claude-opus-4-5-20251101", "max") {
+            Ok(()) => panic!("unsupported effort unexpectedly passed validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("claude-opus-4-5-20251101"));
+        assert!(error.contains("supported efforts: low, medium, high"));
     }
 
     #[test]
