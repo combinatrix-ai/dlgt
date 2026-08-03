@@ -526,9 +526,11 @@ Rules:
   stable rows. Nothing is consumed or advanced server-side; the Session
   snapshot and live screen are always current.
 - `--all` covers every Session of the addressed daemon. It returns one bucket
-  per Session, includes only Sessions with changes after a baseline call, and
-  pages at 32 Sessions with `has_more`. Screen aggregation and `--until result`
-  are rejected with `INVALID_ARGUMENT`.
+  per Session and pages at 32 Sessions. A cursorless `--all` enumerates every
+  Session, carrying its position in the cursor and staying in baseline mode
+  with `has_more: true` until enumeration completes; after that, only Sessions
+  with changes are returned. Screen aggregation and `--until result` are
+  rejected with `INVALID_ARGUMENT`.
 
 Response:
 
@@ -539,6 +541,7 @@ Response:
   "runtime": {"version":"0.4.0","instance_id":"1f2c…"},
   "reason": "result",
   "has_more": false,
+  "gaps": [],
   "cursor": "f1.eyJ2IjoxLCJi...",
   "sessions": [
     {
@@ -626,7 +629,10 @@ silently resets.
 {"gaps":[{"component":"screen","reason":"retention_overrun"}]}
 ```
 
-`component` is `screen`, `events`, or `results`.
+`component` is `screen`, `events`, or `results`. Per-Session gaps (`screen`,
+`results`) appear on the Session bucket; scope-wide gaps (`events`) appear in
+the top-level `gaps` array, so a gap cannot disappear with a bucket that the
+response did not carry.
 
 ### Waiting from an agent harness
 

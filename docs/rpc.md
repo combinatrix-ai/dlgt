@@ -204,6 +204,7 @@ variant and no partial output.
   "runtime": {"version":"0.4.0","instance_id":"1f2c…"},
   "reason": "result",
   "has_more": false,
+  "gaps": [],
   "cursor": "f1.eyJ2IjoxLCJi...",
   "sessions": [
     {
@@ -236,9 +237,11 @@ Rules:
   rows. The Session snapshot and live screen are current snapshots and may be
   newer on replay. Nothing is advanced or consumed server-side.
 - A live-screen repaint alone never completes a wait.
-- `all:true` covers only the addressed daemon, returns changed Sessions after a
-  baseline call, pages at 32 Sessions, and rejects both screen aggregation and
-  `until:"result"`.
+- `all:true` covers only the addressed daemon, pages at 32 Sessions, and
+  rejects both screen aggregation and `until:"result"`. A cursorless call
+  enumerates every Session, carries its enumeration position in the cursor,
+  and stays in baseline mode with `has_more: true` until it finishes; later
+  calls return only changed Sessions.
 
 Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
 64 events, 4 results, 128 stable lines (512 on request), and 40 live rows per
@@ -254,9 +257,17 @@ internal Session identity, so a Claude provider-ID rotation keeps them valid.
 
 Retention is bounded to 10,000 stable rows per Session, 50,000 lifecycle events
 per daemon, and 128 results or 16 MiB of result bodies per Session. A cursor
-that predates an eviction returns `reason:"gap"`, a `gaps` array of
+that predates an eviction returns `reason:"gap"`, a `gaps` entry of
 `{"component":"screen"|"events"|"results","reason":"retention_overrun"}`, a
-bounded baseline, and a fresh cursor. dlgt never silently resets a cursor.
+bounded baseline, and a fresh cursor. Per-Session components (`screen`,
+`results`) are reported on the Session bucket and scope-wide components
+(`events`) in the top-level `gaps` array. dlgt never silently resets a cursor.
+
+Lifecycle events are materialized when they are recorded and are scoped by an
+internal Session identity, so replaying a cursor returns byte-identical events
+even after the execution they describe has been evicted or the public Session
+ID has rotated. `session_id` on an event is the ID that was published when the
+event happened.
 
 ## Lifecycle events
 
