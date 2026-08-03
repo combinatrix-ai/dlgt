@@ -515,7 +515,8 @@ fn command_profiles(args: &[String]) -> Result<()> {
     let action = parsed.positionals.first().map_or("list", String::as_str);
     let profiles = load_profiles()?;
     let result = match action {
-        "list" if parsed.positionals.len() == 1 => json!({"profiles":profiles}),
+        // Bare `dlgt profiles` is the same request as `profiles list`.
+        "list" if parsed.positionals.len() <= 1 => json!({"profiles":profiles}),
         "show" if parsed.positionals.len() == 2 => {
             let name = &parsed.positionals[1];
             json!({"name":name,"profile":profiles.get(name).with_context(|| format!("profile not found: {name}"))?})
