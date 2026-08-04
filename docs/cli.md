@@ -715,8 +715,10 @@ carries a fresh position) or one cursorless `fetch`.
 
 The daemon retains the most recent 64 positions per Session and 256 for
 `--all`, within a global cap of 4,096 across every scope; beyond either bound
-the oldest are dropped. A response that observed nothing keeps the position you
-sent instead of minting a new one, so an idle long poll spends none of them.
+the oldest are dropped. A response whose watermark vector did not move keeps
+the position you sent instead of minting a new one, so an idle long poll
+normally spends none of them; internal bookkeeping can still advance the
+vector beneath an empty public delta and mint.
 
 ```text
 CURSOR_EXPIRED   the position was never minted, or is no longer retained

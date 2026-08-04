@@ -1623,10 +1623,11 @@ impl Daemon {
 
     /// Attach the response to a position.
     ///
-    /// A poll that observed nothing keeps the caller's own position rather
-    /// than minting a new one: there is nothing new to name, the caller has
-    /// nothing to update, and an idle long poll cannot churn the bounded set
-    /// of retained positions.
+    /// A poll whose watermark vector did not move keeps the caller's own
+    /// position rather than minting a new one: there is nothing new to name,
+    /// the caller has nothing to update, and an idle long poll cannot churn
+    /// the bounded set of retained positions. Internal bookkeeping can still
+    /// advance the vector beneath an empty public delta, which mints.
     fn publish(&self, options: &FetchOptions, rendered: Rendered) -> Result<Value> {
         let mut value = rendered.value;
         if let Some(previous) = options.cursor.as_ref()

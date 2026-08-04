@@ -401,8 +401,8 @@ when the unit it describes is committed and survives the final measurement, and
 the published vector is derived last from the committed set, so a squeezed
 response cannot leave a watermark past data the caller never received. The
 position number itself is reserved before rendering, so the document carries
-its own number while it is being measured; a response that observed nothing
-keeps the caller's position instead of spending a new one.
+its own number while it is being measured; a response whose watermark vector
+did not move keeps the caller's position instead of spending a new one.
 
 ### Known limitations
 

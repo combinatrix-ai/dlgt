@@ -336,8 +336,10 @@ cursorless baseline.
 
 The daemon retains the most recent 64 positions per Session and 256 for `all`,
 within a global cap of 4,096 across every scope; beyond either bound the oldest
-are dropped. A response that observed nothing keeps the caller's position
-rather than minting a new one, so an idle long poll spends none of them. One
+are dropped. A response whose watermark vector did not move keeps the caller's
+position rather than minting a new one, so an idle long poll normally spends
+none of them; internal bookkeeping can still advance the vector beneath an
+empty public delta and mint. One
 `all` position keeps entries only for Sessions that still exist and carry
 state, and addresses at most 256 of them; a daemon holding more rejects `all`
 with `INVALID_ARGUMENT` and must be read one Session at a time.
