@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cursor::{Cursor, CursorTable};
 use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
 use crate::screen::{EpochReason, LIVE_ROW_LIMIT, ScreenStore, StablePage};
 use anyhow::{Context, Result, bail};
@@ -33,6 +34,9 @@ struct MemoryState {
     /// Highest execution sequence whose result was evicted, per Session UID.
     evicted_result_seq: HashMap<String, i64>,
     screens: HashMap<String, ScreenStore>,
+    /// Observation positions and the watermarks behind them. Held here so
+    /// minting a position is atomic with the state capture it describes.
+    cursors: CursorTable,
     outputs: HashMap<String, VecDeque<OutputChunk>>,
     next_event_seq: i64,
     next_input_seq: i64,
@@ -270,6 +274,7 @@ impl Store {
             // and retire the launch identity that was only ever a placeholder.
             let launch_uid = std::mem::replace(&mut session.uid, replaced.uid.clone());
             state.screens.remove(&launch_uid);
+            state.cursors.forget(&launch_uid);
             state.evicted_result_seq.remove(&launch_uid);
             state
                 .uid_index
@@ -758,6 +763,20 @@ impl Store {
             })
             .cloned()
             .collect()
+    }
+
+    /// Take the next observation position for a scope.
+    pub fn reserve_cursor(&self, scope: &str) -> u64 {
+        self.state.borrow_mut().cursors.reserve(scope)
+    }
+
+    /// Bind a reserved position to the watermarks it stands for.
+    pub fn store_cursor(&self, scope: &str, number: u64, cursor: Cursor) -> Result<()> {
+        self.state.borrow_mut().cursors.store(scope, number, cursor)
+    }
+
+    pub fn resolve_cursor(&self, scope: &str, value: &str) -> Result<Cursor> {
+        self.state.borrow().cursors.resolve(scope, value)
     }
 
     /// Highest lifecycle sequence already dropped by event retention.

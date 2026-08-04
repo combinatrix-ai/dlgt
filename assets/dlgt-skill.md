@@ -57,8 +57,10 @@ Retain both before doing anything else:
 - `session.id` is provider-qualified (`codex:<thread-id>` or
   `claude:<session-id>`) and is the single address for live commands, provider
   correlation, and later resume.
-- `cursor` is positioned immediately before the work you just accepted, so
-  reading from it cannot miss output the provider produced in between.
+- `cursor` is a small number: this Session's observation position, taken
+  immediately before the work you just accepted, so reading from it cannot
+  miss output the provider produced in between. Every response mints the next
+  one, so they count up: 1, 2, 3. Carry the latest.
 - `--request-id` is required on every `new` and `send`, and makes the
   acceptance replayable. If you never see this response, re-run the identical
   command with the same ID: it returns the original receipt with
@@ -89,7 +91,8 @@ with empty `results` means the work is still running, never that it finished.
 returned cursor. A non-zero exit means the request itself was wrong.
 
 Keep the returned `cursor` and pass it to the next `fetch --cursor`. That
-makes each read a forward delta instead of a re-download of the same tail.
+makes each read a forward delta instead of a re-download of the same tail. It
+is a plain number, short enough to keep in your own notes across turns.
 
 Follow up on the same Session, then release it:
 
@@ -168,7 +171,7 @@ work. Recover instead:
 | Lost | Recovery |
 | --- | --- |
 | The `new` or `send` response | Re-run the identical command with the same `--request-id`. It replays the original receipt with `"replayed": true` and never creates a second Session or execution. |
-| A `fetch` response or its cursor | Run `dlgt fetch <session.id\|@alias>` with no `--cursor`. That returns a bounded baseline: current state, the latest retained result, a screen tail, and a fresh cursor. |
+| A `fetch` response or its cursor | Run `dlgt fetch <session.id\|@alias>` with no `--cursor`. That returns a bounded baseline: current state, the latest retained result, a screen tail, and a fresh position. The same applies to `CURSOR_EXPIRED`, which means the daemon no longer holds that position. |
 | The Session ID itself | `dlgt list` finds it, but prefer a stable `--alias` on `new` so you never need to search. |
 
 Never re-issue a bare `dlgt new` because you are unsure whether the first one
@@ -322,7 +325,7 @@ when a delegation must keep the Harness's own permission prompts.
 | `SESSION_NOT_RUNNING` | Use the saved `session.id` with `send <session.id> --resume --request-id <ID> -- <prompt>`. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. Use `--steal` only for a known stale attach client. |
 | `ATTACH_REQUIRES_TTY` | You have no terminal. Use `fetch <session.id>` and read `screen.live` instead. |
-| `CURSOR_EXPIRED` / `CURSOR_VERSION_UNSUPPORTED` / `CURSOR_SCOPE_MISMATCH` / `CURSOR_INVALID` | Drop the cursor and run one cursorless `fetch <session.id>` to rebase. |
+| `CURSOR_EXPIRED` / `CURSOR_INVALID` | Drop the cursor and run one cursorless `fetch <session.id>` to rebase. |
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address the existing Session by ID. |
 | `LAUNCH_FAILED` | Read `fetch` and `show`, and only then the sensitive `logs --raw`. If present, retain `error.launch_id` for startup diagnostics only. A failed execution is not an error: it is reported as `results[].status`. |

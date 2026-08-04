@@ -312,18 +312,18 @@ dlgt new \
     "state": "busy"
   },
   "execution_seq": 1,
-  "cursor": "f1.eyJ2IjoxLCJi..."
+  "cursor": "4"
 }
 ```
 
-`cursor` is an observation cursor positioned immediately before this
-acceptance. It is captured under the runtime lock before the prompt is
-recorded, so passing it to `fetch --cursor` cannot miss output a fast provider
-emitted in between. Follow the acceptance with:
+`cursor` is this Session's observation position, taken immediately before the
+acceptance is recorded, so passing it to `fetch --cursor` cannot miss output a
+fast provider emitted in between. Positions are small counting numbers, so
+they survive an agent's conversation context. Follow the acceptance with:
 
 ```bash
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 \
-  --cursor "f1.eyJ2IjoxLCJi..." --until result --wait 15m
+  --cursor 4 --until result --wait 15m
 ```
 
 ## `restart`
@@ -432,7 +432,7 @@ dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-3 \
 ```
 
 ```json
-{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2,"cursor":"f1.eyJ2IjoxLCJi..."}
+{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2,"cursor":"4"}
 ```
 
 Busy rejection:
@@ -492,7 +492,7 @@ A failed recovery never turns a completed execution into a failure.
 
 ```text
 dlgt fetch (<SESSION_ID|@ALIAS> | --all)
-  [--cursor <CURSOR>]
+  [--cursor <N>]
   [--wait <DURATION>]
   [--until any|result]
   [--screen[=<MAX_STABLE_LINES>] | --no-screen]
@@ -522,8 +522,8 @@ Rules:
 
 - Without `--cursor`, `fetch` returns a bounded baseline: current state, the
   latest retained result, the last 128 stable screen lines, the live screen,
-  and a fresh cursor. This is the documented recovery path after a lost
-  cursor or a lost response.
+  and a fresh position. This is the documented recovery path after a lost
+  position or a lost response.
 - `--wait` requires an explicit duration and accepts up to 24h. Omitted, the
   command returns immediately.
 - `--until result` binds to the execution that is active, or latest, at the
@@ -553,7 +553,7 @@ Response:
   "reason": "result",
   "has_more": false,
   "gaps": [],
-  "cursor": "f1.eyJ2IjoxLCJi...",
+  "cursor": "4",
   "sessions": [
     {
       "session": {"id":"claude:8bc7859c","state":"idle"},
@@ -672,26 +672,41 @@ and the reported one may or may not work, and only the reported value carries
 the guarantee. The practical floor is roughly 1 KiB for a single Session; the
 default of 32 KiB is far above it.
 
-A `--all` cursor carries watermarks for at most 256 Sessions. A daemon holding
-retained state for more than that rejects `--all` with `INVALID_ARGUMENT` and
-must be read one Session at a time.
+One `--all` position carries watermarks for at most 256 Sessions. A daemon
+holding retained state for more than that rejects `--all` with
+`INVALID_ARGUMENT` and must be read one Session at a time.
 
 ### Cursors
 
-A cursor is opaque. It begins with `f1.` and encodes the codec version, the
-daemon boot identity, the addressed scope, and the per-Session watermarks. It
-binds to an internal Session identity, so a Claude provider-ID rotation does
-not invalidate it.
+A cursor is a position, not a token. Every acceptance and every `fetch`
+response mints the addressed scope's next position -- 1, 2, 3 -- and the daemon
+holds the watermarks behind it. `--all` numbers independently of any Session.
 
-```text
-CURSOR_VERSION_UNSUPPORTED   the prefix or payload version is not understood
-CURSOR_EXPIRED               the cursor belongs to a previous daemon instance
-CURSOR_SCOPE_MISMATCH        the cursor addresses a different Session or --all
-CURSOR_INVALID               the payload is not a decodable cursor
+```json
+{"cursor":"4"}
 ```
 
-All four are non-zero exits, and the recovery for every one of them is a single
-cursorless `fetch`.
+Positions are deliberately small: a caller carries one across turns, and an
+opaque 200-character token does not survive an agent's context. The number is
+an ordinal within the scope you address, not a capability: `fetch B --cursor 3`
+returns Session B's own third observation window, which is a legitimate replay,
+not an error. Idempotency is carried by `--request-id`, never by the cursor.
+
+Positions bind to an internal Session identity, so a Claude provider-ID
+rotation does not invalidate them. A daemon restart does, by construction: a
+new daemon mints new internal identities, so an old number has nothing to
+resolve against.
+
+The daemon retains the most recent 64 positions per Session and 256 for
+`--all`. Beyond that the oldest are dropped.
+
+```text
+CURSOR_EXPIRED   the position was never minted, or is no longer retained
+CURSOR_INVALID   the value is not a number
+```
+
+Both are non-zero exits, and the recovery for both is a single cursorless
+`fetch`.
 
 ### Retention gaps
 
@@ -979,8 +994,8 @@ They configure the provider CLI rather than the launch environment.
 The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
 5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ATTACH_REQUIRES_TTY`,
-`ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, and every
-`CURSOR_*` code use exit 1. `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
+`ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`, and
+`CURSOR_INVALID` use exit 1. `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
 idempotent exit-0 no-op.
 
 `fetch` never uses a non-zero exit to describe an execution. A failed,
@@ -1001,10 +1016,8 @@ SESSION_ATTACHED       Exclusive attach lease prevents semantic send
 SESSION_UNAVAILABLE    Session state cannot accept the requested operation
 ALREADY_ATTACHED       Another client owns the attach lease
 ATTACH_REQUIRES_TTY    attach needs an interactive terminal; use fetch
-CURSOR_VERSION_UNSUPPORTED  Cursor codec is not understood
-CURSOR_EXPIRED         Cursor belongs to a previous daemon instance
-CURSOR_SCOPE_MISMATCH  Cursor addresses a different Session or scope
-CURSOR_INVALID         Cursor payload is not decodable
+CURSOR_EXPIRED         Cursor position was never minted or is no longer held
+CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed

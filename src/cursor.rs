@@ -1,83 +1,75 @@
-//! Opaque forward-observation cursor.
+//! Forward-observation cursors: per-scope ordinal positions.
 //!
-//! A cursor is `f1.` followed by base64url of a compact serialized struct. The
-//! codec version lives inside the payload and unknown fields are tolerated, so
-//! a later delivery mode can extend the struct without breaking readers. The
-//! scope binds to the immutable internal Session UID, never to the public
+//! A cursor is a plain number. Every acceptance and every fetch response mints
+//! the addressed scope's next position -- 1, 2, 3 -- and the daemon keeps the
+//! watermark vector behind it.
+//!
+//! The vector used to be encoded into the token itself, which bought nothing:
+//! it was bound to the daemon instance either way, because the state it points
+//! at is memory-only. What it cost was 200-300 characters per response, and up
+//! to tens of kilobytes for a daemon-wide scope -- context an LLM caller has to
+//! carry across every turn and reliably loses to compaction. A one- or
+//! two-digit number survives that.
+//!
+//! Restart safety is by construction rather than by a boot identifier: a new
+//! daemon mints fresh Session UIDs, so a number from a previous boot has
+//! nothing to resolve against and reads as expired.
+//!
+//! Scope binds to the immutable internal Session UID, never to the public
 //! Session ID, because Claude rotates that ID on rekey.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::{Result, bail};
-use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 
-pub const CURSOR_PREFIX: &str = "f1.";
-pub const CURSOR_CODEC_VERSION: u32 = 1;
 /// Scope covering every Session owned by one daemon.
 pub const SCOPE_ALL: &str = "all";
-/// Longest cursor token accepted. A cursor is daemon-issued; anything larger
-/// is a hostile or corrupted token, not a token this daemon wrote. The bound
-/// is wide enough to represent a full `MAX_SESSIONS` cursor.
-const MAX_TOKEN_LEN: usize = 64 * 1024;
-/// Most per-Session watermarks a cursor may carry. A daemon with more
-/// Sessions than this holding retained state must be read per Session.
+
+/// Vectors retained per single-Session scope.
+const MAX_SESSION_CURSORS: usize = 64;
+/// Vectors retained for the daemon-wide scope, which pages further.
+const MAX_ALL_CURSORS: usize = 256;
+/// Vectors retained across every scope.
+const MAX_TOTAL_CURSORS: usize = 4096;
+/// Most per-Session watermarks one cursor may carry.
 const MAX_SESSIONS: usize = 256;
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// The watermarks one observation position stands for. Internal: a caller
+/// only ever sees the position number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor {
-    /// Codec version of the payload itself.
-    pub v: u32,
-    /// Daemon boot UUID. State is memory-only, so a cursor never survives it.
-    pub b: String,
     /// One Session UID, or `all`.
     pub s: String,
     /// Global lifecycle event watermark.
-    #[serde(default)]
     pub e: i64,
     /// Baseline enumeration position for `all` scope: the Session UID after
     /// which the next baseline page resumes. Present only while a baseline is
     /// still paging, so a caller cannot lose the Sessions it has not seen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bl: Option<String>,
     /// Per-Session watermarks keyed by Session UID.
-    #[serde(default)]
     pub p: BTreeMap<String, SessionCursor>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionCursor {
     /// Stable absolute row watermark: the last row delivered in full.
-    #[serde(default)]
     pub r: u64,
     /// Bytes of row `r + 1` a previous response already delivered. Non-zero
     /// only while one oversized row is being chunked across responses.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub ro: u64,
     /// Screen epoch observed when the cursor was issued.
-    #[serde(default)]
     pub ep: u64,
     /// Highest fully delivered terminal result execution sequence.
-    #[serde(default)]
     pub x: i64,
     /// Execution sequence of a partially delivered final text, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub px: Option<i64>,
     /// Byte offset already delivered for that final text.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub po: u64,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_zero(value: &u64) -> bool {
-    *value == 0
-}
-
 impl Cursor {
-    pub fn new(instance_id: &str, scope: &str) -> Self {
+    pub fn new(scope: &str) -> Self {
         Self {
-            v: CURSOR_CODEC_VERSION,
-            b: instance_id.to_owned(),
             s: scope.to_owned(),
             e: 0,
             bl: None,
@@ -92,92 +84,111 @@ impl Cursor {
     pub fn set_session(&mut self, uid: &str, session: SessionCursor) {
         self.p.insert(uid.to_owned(), session);
     }
+}
 
-    /// Encode a cursor, enforcing the same bounds the decoder enforces. A
-    /// daemon must never issue a token it would refuse to accept back.
-    pub fn encode(&self) -> Result<String> {
-        if self.p.len() > MAX_SESSIONS {
-            bail!(
-                "invalid scope: {} Sessions carry retained state, more than the {MAX_SESSIONS} a cursor can address; fetch Sessions individually instead of --all",
-                self.p.len()
-            );
-        }
-        let payload = serde_json::to_vec(self)?;
-        let token = format!(
-            "{CURSOR_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-        );
-        if token.len() > MAX_TOKEN_LEN {
-            bail!(
-                "invalid scope: the cursor would be {} bytes, over the {MAX_TOKEN_LEN} byte limit; fetch Sessions individually instead of --all",
-                token.len()
-            );
-        }
-        Ok(token)
+/// Ordinal positions and the vectors behind them.
+///
+/// Numbering is per scope, so a number denotes *that* scope's Nth observation
+/// position. Using one scope's number against another is therefore not an
+/// error: it names a genuine position in the scope addressed. The cursor is a
+/// position, not a capability; `request_id` carries idempotency.
+#[derive(Default)]
+pub struct CursorTable {
+    entries: HashMap<(String, u64), Cursor>,
+    next: HashMap<String, u64>,
+    /// Issue order per scope, so one busy Session cannot evict another's.
+    order: HashMap<String, VecDeque<u64>>,
+    /// Issue order across all scopes, for the total bound.
+    issued: VecDeque<(String, u64)>,
+}
+
+impl CursorTable {
+    /// Take the scope's next position. The vector is stored afterwards, so a
+    /// response can carry its own number while it is still being measured.
+    pub fn reserve(&mut self, scope: &str) -> u64 {
+        let next = self.next.entry(scope.to_owned()).or_insert(0);
+        *next += 1;
+        *next
     }
 
-    /// Decode a caller-supplied cursor and validate it against this daemon.
-    ///
-    /// Every failure is a structured, non-zero error whose recovery is one
-    /// cursorless baseline fetch.
-    pub fn decode(text: &str, instance_id: &str) -> Result<Self> {
-        if text.len() > MAX_TOKEN_LEN {
-            bail!("CURSOR_INVALID: cursor token is larger than this daemon ever issues");
-        }
-        let Some(payload) = text.strip_prefix(CURSOR_PREFIX) else {
-            bail!(
-                "CURSOR_VERSION_UNSUPPORTED: cursor prefix is not {CURSOR_PREFIX:?}; fetch without --cursor to recover"
-            );
-        };
-        let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-            bail!("CURSOR_INVALID: cursor payload is not valid base64url");
-        };
-        let Ok(cursor) = serde_json::from_slice::<Self>(&bytes) else {
-            bail!("CURSOR_INVALID: cursor payload is not a valid cursor document");
-        };
-        // Exactly one codec is understood. Accepting anything else would mean
-        // guessing the meaning of watermarks this build never wrote.
-        if cursor.v != CURSOR_CODEC_VERSION {
-            bail!(
-                "CURSOR_VERSION_UNSUPPORTED: cursor codec version {} is not {CURSOR_CODEC_VERSION}",
-                cursor.v
-            );
-        }
+    /// Bind a reserved position to the watermarks it stands for. The vector
+    /// behind a position is never mutated, which is what makes replaying a
+    /// number return an identical window.
+    pub fn store(&mut self, scope: &str, number: u64, cursor: Cursor) -> Result<()> {
         if cursor.p.len() > MAX_SESSIONS {
-            bail!("CURSOR_INVALID: cursor carries more Sessions than this daemon ever issues");
-        }
-        if cursor.b != instance_id {
             bail!(
-                "CURSOR_EXPIRED: cursor belongs to a previous daemon instance; fetch without --cursor to recover"
+                "invalid scope: {} Sessions carry retained state, more than the {MAX_SESSIONS} one cursor can address; fetch Sessions individually instead of --all",
+                cursor.p.len()
             );
         }
-        Ok(cursor)
+        self.entries.insert((scope.to_owned(), number), cursor);
+        self.issued.push_back((scope.to_owned(), number));
+        let limit = if scope == SCOPE_ALL {
+            MAX_ALL_CURSORS
+        } else {
+            MAX_SESSION_CURSORS
+        };
+        let order = self.order.entry(scope.to_owned()).or_default();
+        order.push_back(number);
+        let mut retired = Vec::new();
+        while order.len() > limit {
+            if let Some(expired) = order.pop_front() {
+                retired.push(expired);
+            }
+        }
+        for expired in retired {
+            self.entries.remove(&(scope.to_owned(), expired));
+        }
+        while self.issued.len() > MAX_TOTAL_CURSORS {
+            if let Some(expired) = self.issued.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+        Ok(())
     }
 
-    /// Reject a cursor addressed at a different Session or aggregation scope.
-    pub fn require_scope(&self, scope: &str) -> Result<()> {
-        if self.s == scope {
-            return Ok(());
-        }
-        bail!(
-            "CURSOR_SCOPE_MISMATCH: cursor scope {:?} does not address {scope:?}; fetch without --cursor to recover",
-            self.s
-        )
+    /// Resolve a caller-supplied position within one scope.
+    ///
+    /// Every failure is structured and non-zero, and the recovery for both is
+    /// one cursorless baseline fetch.
+    pub fn resolve(&self, scope: &str, value: &str) -> Result<Cursor> {
+        let Ok(number) = value.parse::<u64>() else {
+            bail!("CURSOR_INVALID: {value:?} is not a cursor position");
+        };
+        let Some(cursor) = self.entries.get(&(scope.to_owned(), number)) else {
+            bail!(
+                "CURSOR_EXPIRED: this daemon no longer holds position {number}; fetch without --cursor to recover"
+            );
+        };
+        Ok(cursor.clone())
+    }
+
+    /// Forget everything a Session ever positioned, when it is replaced.
+    pub fn forget(&mut self, scope: &str) {
+        self.entries.retain(|(entry, _), _| entry != scope);
+        self.order.remove(scope);
+        self.next.remove(scope);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CURSOR_PREFIX, Cursor, SCOPE_ALL, SessionCursor};
-    use base64::Engine as _;
+    use super::{
+        Cursor, CursorTable, MAX_ALL_CURSORS, MAX_SESSION_CURSORS, SCOPE_ALL, SessionCursor,
+    };
 
-    fn sample() -> Cursor {
-        let mut cursor = Cursor::new("boot-1", "su_abc");
+    fn sample(scope: &str, row: u64) -> Cursor {
+        let mut cursor = Cursor::new(scope);
         cursor.e = 104;
         cursor.set_session(
             "su_abc",
             SessionCursor {
-                r: 512,
+                r: row,
                 ro: 0,
                 ep: 3,
                 x: 7,
@@ -188,80 +199,157 @@ mod tests {
         cursor
     }
 
-    #[test]
-    fn round_trips_every_watermark_through_an_opaque_token() {
-        let encoded = sample()
-            .encode()
-            .unwrap_or_else(|error| panic!("failed to encode cursor: {error}"));
-        assert!(encoded.starts_with(CURSOR_PREFIX));
-        assert!(!encoded.contains('='), "cursor must be base64url unpadded");
-
-        let decoded = Cursor::decode(&encoded, "boot-1")
-            .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"));
-        assert_eq!(decoded, sample());
-        assert_eq!(decoded.session("su_abc").r, 512);
-        assert_eq!(decoded.session("su_missing"), SessionCursor::default());
+    fn mint(table: &mut CursorTable, scope: &str, row: u64) -> u64 {
+        let number = table.reserve(scope);
+        table
+            .store(scope, number, sample(scope, row))
+            .unwrap_or_else(|error| panic!("failed to store: {error}"));
+        number
     }
 
     #[test]
-    fn an_unknown_prefix_is_an_unsupported_codec() {
-        let error = Cursor::decode("v1.abc", "boot-1")
-            .err()
-            .unwrap_or_else(|| panic!("unsupported prefix unexpectedly decoded"));
-        assert!(error.to_string().contains("CURSOR_VERSION_UNSUPPORTED"));
+    fn positions_count_up_from_one_per_scope() {
+        let mut table = CursorTable::default();
+        assert_eq!(mint(&mut table, "su_abc", 1), 1);
+        assert_eq!(mint(&mut table, "su_abc", 2), 2);
+        assert_eq!(mint(&mut table, "su_abc", 3), 3);
+        // A second Session numbers independently, and so does the daemon-wide
+        // scope.
+        assert_eq!(mint(&mut table, "su_other", 1), 1);
+        assert_eq!(mint(&mut table, SCOPE_ALL, 1), 1);
+        assert_eq!(mint(&mut table, SCOPE_ALL, 2), 2);
+        assert_eq!(mint(&mut table, "su_abc", 4), 4);
     }
 
     #[test]
-    fn only_the_exact_codec_version_is_accepted() {
-        for version in [0, 2, 99] {
-            let mut cursor = sample();
-            cursor.v = version;
-            let encoded = cursor
-                .encode()
-                .unwrap_or_else(|error| panic!("failed to encode cursor: {error}"));
-            let error = Cursor::decode(&encoded, "boot-1")
-                .err()
-                .unwrap_or_else(|| panic!("version {version} unexpectedly decoded"));
-            assert!(
-                error.to_string().contains("CURSOR_VERSION_UNSUPPORTED"),
-                "version {version} produced {error}"
-            );
-        }
-    }
+    fn a_position_resolves_to_the_identical_vector_every_time() {
+        let mut table = CursorTable::default();
+        mint(&mut table, "su_abc", 10);
+        let second = mint(&mut table, "su_abc", 20);
 
-    #[test]
-    fn every_issued_cursor_round_trips_through_decode() {
-        for count in [0, 1, 32, super::MAX_SESSIONS] {
-            let mut cursor = Cursor::new("boot-1", SCOPE_ALL);
-            cursor.e = 4_096;
-            for index in 0..count {
-                cursor.set_session(
-                    &format!("su_{}", "0".repeat(24) + &index.to_string()),
-                    SessionCursor {
-                        r: 9_999,
-                        ro: 12,
-                        ep: 7,
-                        x: 128,
-                        px: Some(129),
-                        po: 4_096,
-                    },
-                );
-            }
-            let encoded = cursor
-                .encode()
-                .unwrap_or_else(|error| panic!("{count} Sessions failed to encode: {error}"));
-            assert!(encoded.len() <= super::MAX_TOKEN_LEN);
+        for _ in 0..3 {
             assert_eq!(
-                Cursor::decode(&encoded, "boot-1")
-                    .unwrap_or_else(|error| panic!("{count} Sessions failed to decode: {error}")),
-                cursor
+                table
+                    .resolve("su_abc", &second.to_string())
+                    .unwrap_or_else(|error| panic!("failed to resolve: {error}")),
+                sample("su_abc", 20),
+                "replaying a position must return the same watermarks"
+            );
+        }
+        assert_eq!(
+            table
+                .resolve("su_abc", "1")
+                .unwrap_or_else(|error| panic!("failed to resolve: {error}")),
+            sample("su_abc", 10)
+        );
+    }
+
+    #[test]
+    fn a_position_names_the_addressed_scope_not_the_one_that_minted_it() {
+        let mut table = CursorTable::default();
+        mint(&mut table, "su_abc", 10);
+        mint(&mut table, "su_other", 99);
+
+        // Not an error: position 1 of su_other is a genuine position.
+        assert_eq!(
+            table
+                .resolve("su_other", "1")
+                .unwrap_or_else(|error| panic!("failed to resolve: {error}")),
+            sample("su_other", 99)
+        );
+        // A position that Session never reached is simply not held.
+        assert!(
+            table
+                .resolve("su_other", "2")
+                .err()
+                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_position_is_invalid_and_an_unminted_one_is_expired() {
+        let mut table = CursorTable::default();
+        mint(&mut table, "su_abc", 10);
+
+        for malformed in ["", "one", "c_AAAA", "f1.eyJ2IjoxfQ", "-1", "1.5", " 1"] {
+            let error = table
+                .resolve("su_abc", malformed)
+                .err()
+                .unwrap_or_else(|| panic!("{malformed:?} unexpectedly resolved"));
+            assert!(
+                error.to_string().contains("CURSOR_INVALID"),
+                "{malformed:?} produced {error}"
+            );
+        }
+
+        // Well formed but never minted, which is also what a number from a
+        // previous daemon boot looks like: the table is memory-only and the
+        // Session UIDs are new.
+        for unminted in ["0", "2", "9999999999"] {
+            let error = table
+                .resolve("su_abc", unminted)
+                .err()
+                .unwrap_or_else(|| panic!("{unminted:?} unexpectedly resolved"));
+            assert!(
+                error.to_string().contains("CURSOR_EXPIRED"),
+                "{unminted:?} produced {error}"
             );
         }
     }
 
     #[test]
-    fn a_scope_wider_than_the_codec_allows_is_rejected_when_issued() {
-        let mut cursor = Cursor::new("boot-1", SCOPE_ALL);
+    fn each_scope_keeps_its_own_bounded_history() {
+        let mut table = CursorTable::default();
+        let oldest = mint(&mut table, "su_abc", 1);
+        for row in 0..MAX_SESSION_CURSORS {
+            mint(&mut table, "su_abc", u64::try_from(row).unwrap_or(0));
+        }
+        assert!(
+            table
+                .resolve("su_abc", &oldest.to_string())
+                .err()
+                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
+        );
+
+        // A busy Session cannot evict another scope's positions.
+        let other = mint(&mut table, "su_other", 7);
+        for row in 0..MAX_SESSION_CURSORS {
+            mint(&mut table, "su_abc", u64::try_from(row).unwrap_or(0));
+        }
+        assert!(table.resolve("su_other", &other.to_string()).is_ok());
+
+        // The daemon-wide scope keeps more, because it pages further.
+        let mut table = CursorTable::default();
+        let first_all = mint(&mut table, SCOPE_ALL, 1);
+        for row in 0..MAX_SESSION_CURSORS {
+            mint(&mut table, SCOPE_ALL, u64::try_from(row).unwrap_or(0));
+        }
+        assert!(table.resolve(SCOPE_ALL, &first_all.to_string()).is_ok());
+        for row in 0..MAX_ALL_CURSORS {
+            mint(&mut table, SCOPE_ALL, u64::try_from(row).unwrap_or(0));
+        }
+        assert!(table.resolve(SCOPE_ALL, &first_all.to_string()).is_err());
+        assert!(table.len() <= MAX_ALL_CURSORS);
+    }
+
+    #[test]
+    fn a_replaced_session_forgets_its_positions() {
+        let mut table = CursorTable::default();
+        let number = mint(&mut table, "su_abc", 1);
+        table.forget("su_abc");
+
+        assert!(
+            table
+                .resolve("su_abc", &number.to_string())
+                .err()
+                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
+        );
+        assert_eq!(table.reserve("su_abc"), 1, "numbering restarts");
+    }
+
+    #[test]
+    fn a_scope_wider_than_the_table_allows_is_rejected() {
+        let mut cursor = Cursor::new(SCOPE_ALL);
         for index in 0..300 {
             cursor.set_session(
                 &format!("su_{index}"),
@@ -271,102 +359,15 @@ mod tests {
                 },
             );
         }
-        let error = cursor
-            .encode()
+        let mut table = CursorTable::default();
+        let number = table.reserve(SCOPE_ALL);
+        let error = table
+            .store(SCOPE_ALL, number, cursor)
             .err()
-            .unwrap_or_else(|| panic!("an unusable cursor was issued"));
+            .unwrap_or_else(|| panic!("an unusable cursor was stored"));
         assert!(
             error.to_string().contains("invalid scope"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn hostile_cursors_are_rejected_without_panicking() {
-        let oversized = format!("{CURSOR_PREFIX}{}", "A".repeat(super::MAX_TOKEN_LEN));
-        let mut oversized_scope = Cursor::new("boot-1", "su_abc");
-        for index in 0..=super::MAX_SESSIONS {
-            oversized_scope.set_session(
-                &format!("su_{index}"),
-                SessionCursor {
-                    x: 1,
-                    ..SessionCursor::default()
-                },
-            );
-        }
-        // Built by hand: the encoder refuses to issue this, but a caller can
-        // still hand it to the decoder.
-        let crowded = format!(
-            "{CURSOR_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(serde_json::to_vec(&oversized_scope).unwrap_or_default())
-        );
-        let cases = [
-            String::new(),
-            "f1.".to_owned(),
-            "f1.!!!!".to_owned(),
-            format!(
-                "{CURSOR_PREFIX}{}",
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json")
-            ),
-            format!(
-                "{CURSOR_PREFIX}{}",
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"v":1}"#)
-            ),
-            format!(
-                "{CURSOR_PREFIX}{}",
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-                    br#"{"v":1,"b":"boot-1","s":"su_abc","e":-9223372036854775808,"p":{"su_abc":{"r":18446744073709551615,"x":-1,"px":9223372036854775807,"po":18446744073709551615}}}"#
-                )
-            ),
-            oversized,
-            crowded,
-            "\u{feff}f1.AAAA".to_owned(),
-        ];
-        for case in cases {
-            // Only the last case is well formed enough to decode; none may
-            // panic, and every rejection is a structured cursor error.
-            if let Err(error) = Cursor::decode(&case, "boot-1") {
-                let message = error.to_string();
-                assert!(
-                    message.starts_with("CURSOR_"),
-                    "unstructured cursor failure: {message}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn another_daemon_instance_expires_the_cursor() {
-        let encoded = sample()
-            .encode()
-            .unwrap_or_else(|error| panic!("failed to encode cursor: {error}"));
-        let error = Cursor::decode(&encoded, "boot-2")
-            .err()
-            .unwrap_or_else(|| panic!("foreign cursor unexpectedly decoded"));
-        assert!(error.to_string().contains("CURSOR_EXPIRED"));
-    }
-
-    #[test]
-    fn scope_mismatch_is_reported_instead_of_silently_rebasing() {
-        let cursor = sample();
-        assert!(cursor.require_scope("su_abc").is_ok());
-        let error = cursor
-            .require_scope(SCOPE_ALL)
-            .err()
-            .unwrap_or_else(|| panic!("scope mismatch unexpectedly accepted"));
-        assert!(error.to_string().contains("CURSOR_SCOPE_MISMATCH"));
-    }
-
-    #[test]
-    fn unknown_payload_fields_are_tolerated_for_forward_compatibility() {
-        let payload = br#"{"v":1,"b":"boot-1","s":"su_abc","e":9,"consumer":"leader"}"#;
-        let encoded = format!(
-            "{CURSOR_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-        );
-        let decoded = Cursor::decode(&encoded, "boot-1")
-            .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"));
-        assert_eq!(decoded.e, 9);
     }
 }

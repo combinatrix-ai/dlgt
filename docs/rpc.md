@@ -19,7 +19,7 @@ Request:
 Success:
 
 ```json
-{"id":"req_1","result":{"schema_version":1,"reason":"result","cursor":"f1.eyJ2IjoxLCJi...","sessions":[]}}
+{"id":"req_1","result":{"schema_version":1,"reason":"result","cursor":"4","sessions":[]}}
 ```
 
 A successful non-streaming response may also carry an informational notice
@@ -200,9 +200,10 @@ boundary, and `missing` when no text was recovered. A failed recovery never
 changes the execution status.
 
 `session.create` and `session.send` return `{session, execution_seq, cursor}`.
-The `cursor` is captured under the runtime lock immediately before the
-acceptance is recorded, so the first `session.fetch` from it cannot miss output
-produced between acceptance and the caller's next request.
+The `cursor` is the Session's next observation position, taken under the
+runtime lock immediately before the acceptance is recorded, so the first
+`session.fetch` from it cannot miss output produced between acceptance and the
+caller's next request.
 
 ## Composite reads
 
@@ -216,7 +217,7 @@ variant and no partial output.
   "reason": "result",
   "has_more": false,
   "gaps": [],
-  "cursor": "f1.eyJ2IjoxLCJi...",
+  "cursor": "4",
   "sessions": [
     {
       "session": {"id":"claude:8bc7859c","state":"idle"},
@@ -299,12 +300,25 @@ Lifecycle events are committed as a strictly ascending prefix across every
 Session in the response, so a Session that did not fit the page can never park
 an earlier event behind a later one that keeps redelivering.
 
-Cursors are opaque, prefixed `f1.`, and carry the codec version, the daemon
-boot identity, the addressed scope, and per-Session watermarks. They bind to an
-internal Session identity, so a Claude provider-ID rotation keeps them valid.
-An `all` cursor keeps entries only for Sessions that still exist and carry
-state, and addresses at most 256 of them; a daemon holding more rejects `all`
-with `INVALID_ARGUMENT` and must be read one Session at a time.
+A cursor is an ordinal position, serialized as a string of digits for field
+stability. Every acceptance and every fetch response mints the addressed
+scope's next position; `all` numbers independently of any Session. The daemon
+holds the watermarks behind each position and never mutates them, which is
+what makes replaying a position return an identical window.
+
+The position is an ordinal within the scope addressed, not a capability
+token: using one Session's number against another resolves that other
+Session's own position of the same number, which is a legitimate replay.
+Idempotency belongs to `request_id`.
+
+Positions bind to an internal Session identity, so a Claude provider-ID
+rotation keeps them valid. A daemon restart invalidates them by construction,
+because a new daemon mints new internal identities; no boot identifier is
+needed in the value. The daemon retains the most recent 64 positions per
+Session and 256 for `all`. One `all` position keeps entries only for Sessions
+that still exist and carry state, and addresses at most 256 of them; a daemon
+holding more rejects `all` with `INVALID_ARGUMENT` and must be read one
+Session at a time.
 
 Retention is bounded to 10,000 stable rows per Session, 50,000 lifecycle events
 per daemon, and 128 results or 16 MiB of result bodies per Session. A cursor
@@ -416,10 +430,8 @@ SESSION_BLOCKED        Human input is required
 SESSION_ATTACHED       Exclusive attach lease prevents semantic send
 SESSION_UNAVAILABLE    Session state cannot accept the operation
 ALREADY_ATTACHED       Another client owns the attach lease
-CURSOR_VERSION_UNSUPPORTED  Cursor codec is not understood
-CURSOR_EXPIRED         Cursor belongs to a previous daemon instance
-CURSOR_SCOPE_MISMATCH  Cursor addresses a different Session or scope
-CURSOR_INVALID         Cursor payload is not decodable
+CURSOR_EXPIRED         Cursor position was never minted or is no longer held
+CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed

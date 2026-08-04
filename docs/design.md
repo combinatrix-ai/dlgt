@@ -368,19 +368,23 @@ acceptance is recorded, so a provider that emits output or finishes instantly
 cannot move in front of the position the caller was handed.
 
 `fetch` joins the lifecycle event log to retained results, forward stable rows,
-and the live screen. A cursor is opaque, carries the codec version, the daemon
-boot identity, one Session UID or the daemon-wide scope, and per-Session
-watermarks. It binds to the immutable Session UID rather than the public
-Session ID, so a Claude rekey does not invalidate it, and pre-rekey IDs stay
-resolvable for the daemon lifetime.
+and the live screen. A cursor is an ordinal position within one scope: the
+daemon mints the next number per Session, or per daemon for the aggregate
+scope, and holds the watermark vector behind it. Encoding that vector into the
+token bought no durability -- it addresses memory-only state either way -- while
+costing an LLM caller hundreds of characters of context per turn. Restart
+safety comes from the identities themselves: a new daemon mints new Session
+UIDs, so an old number resolves to nothing. Positions bind to the immutable
+Session UID rather than the public Session ID, so a Claude rekey does not
+invalidate them, and pre-rekey IDs stay resolvable for the daemon lifetime.
 
 Retention is bounded and eviction is observable: 10,000 stable rows per
 Session, 50,000 lifecycle events per daemon, and 128 results or 16 MiB of
 result bodies per Session. A cursor that predates an eviction returns a
 structured gap with a bounded baseline and a fresh cursor; a silent reset is
-never acceptable. A cursor from another daemon boot, a newer codec, or a
-different scope is a structured error whose recovery is one cursorless
-baseline fetch.
+never acceptable. A position the daemon never minted or no longer
+retains is a structured error whose recovery is one cursorless baseline
+fetch.
 
 Every observation is a success. Timeout, blocked input, a failed execution, and
 a canceled result all exit zero and are described by the response `reason` and

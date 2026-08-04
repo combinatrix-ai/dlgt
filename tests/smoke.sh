@@ -64,8 +64,8 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_i
   | "$binary" hook emit "$session_id" claude
 "$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":1'
 
-# Acceptance returns an observation cursor positioned before the accepted work.
-grep -q '"cursor":"f1\.' "$state_dir/new.json"
+# Acceptance returns an observation position taken before the accepted work.
+grep -q '"cursor":"[0-9]*"' "$state_dir/new.json"
 
 # A cursorless fetch is the documented baseline recovery path.
 baseline_json=$("$binary" fetch "$session_id")
@@ -125,7 +125,8 @@ DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
 
-# Runtime state is memory-only, so no cursor may survive a daemon instance.
+# Runtime state is memory-only, so no position may survive a daemon instance:
+# a restarted daemon has never minted it.
 DLGT_SOCKET="$old_socket" "$binary" server --foreground >"$state_dir/old-server-2.log" 2>&1 &
 old_server_pid=$!
 attempt=0
@@ -226,7 +227,7 @@ test "$(wc -c <"$state_dir/rpc-long-id.json" | tr -d ' ')" -lt 300
 # only the JSONL envelope and its short id sit outside it.
 printf '{"id":"r1","method":"session.fetch","params":{"session":"%s","max_bytes":2048,"screen":false}}\n' \
   "$session_id" | "$binary" rpc --stdio >"$state_dir/rpc-fetch.json"
-grep -q '"cursor":"f1\.' "$state_dir/rpc-fetch.json"
+grep -q '"cursor":"[0-9]*"' "$state_dir/rpc-fetch.json"
 rpc_bytes=$(wc -c <"$state_dir/rpc-fetch.json" | tr -d ' ')
 test "$rpc_bytes" -le 2148 || {
   printf 'rpc fetch line was %s bytes, over 2048 plus its envelope\n' "$rpc_bytes" >&2
@@ -385,6 +386,36 @@ rest_json=$("$binary" fetch "$reused_id" --cursor "$chunk_cursor" --no-screen)
 printf '%s\n' "$rest_json" | grep -q '"final_text_complete":true'
 if printf '%s\n' "$rest_json" | grep -q '"final_text_offset":0'; then exit 1; fi
 printf '%s\n' "$rest_json" | grep -q '"type":"session.idle"'
+
+# A position is a small number a caller can carry, and it counts up per
+# Session from its first acceptance.
+printf '%s\n' "$baseline_json" | grep -q '"cursor":"[0-9]*"'
+test "$(printf '%s\n' "$baseline_json" | sed -n 's/.*"cursor":"\([0-9]*\)".*/\1/p')" -gt 0
+
+# Positions are retained in bounded number: an evicted one expires, and the
+# documented recovery is one cursorless baseline.
+evicted_cursor=$("$binary" fetch "$reused_id" --no-screen \
+  | sed -n 's/.*"cursor":"\([0-9]*\)".*/\1/p')
+attempt=0
+while [ "$attempt" -lt 80 ]; do
+  "$binary" fetch "$reused_id" --no-screen >/dev/null
+  attempt=$((attempt + 1))
+done
+set +e
+expired_position=$("$binary" fetch "$reused_id" --cursor "$evicted_cursor" --no-screen)
+expired_position_status=$?
+set -e
+test "$expired_position_status" -eq 1
+printf '%s\n' "$expired_position" | grep -q '"code":"CURSOR_EXPIRED"'
+"$binary" fetch "$reused_id" --no-screen | grep -q '"reason":"snapshot"'
+
+# A non-numeric position is malformed rather than expired.
+set +e
+bad_position=$("$binary" fetch "$reused_id" --cursor not-a-number)
+bad_position_status=$?
+set -e
+test "$bad_position_status" -eq 1
+printf '%s\n' "$bad_position" | grep -q '"code":"CURSOR_INVALID"'
 
 # fetch --all reports every Session of one daemon without a screen projection.
 all_json=$("$binary" fetch --all)

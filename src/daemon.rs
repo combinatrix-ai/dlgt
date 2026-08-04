@@ -1418,7 +1418,7 @@ impl Daemon {
             // The observation cursor is captured under this lock immediately
             // before acceptance is recorded, so a fast provider cannot emit
             // output or finish in front of the position it names.
-            let acceptance_cursor = self.acceptance_cursor(&store, &session.id)?;
+            let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
             let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
             store.allocate_input_sequence();
             store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
@@ -1564,11 +1564,11 @@ impl Daemon {
     }
 
     /// Position an observation cursor immediately before an acceptance.
-    fn acceptance_cursor(&self, store: &Store, session_id: &str) -> Result<String> {
+    fn acceptance_cursor(store: &Store, session_id: &str) -> Result<String> {
         let uid = store
             .session_uid(session_id)
             .with_context(|| format!("session not found: {session_id}"))?;
-        let mut cursor = cursor::Cursor::new(&self.instance_id, &uid);
+        let mut cursor = cursor::Cursor::new(&uid);
         cursor.e = store.latest_event_seq();
         cursor.set_session(
             &uid,
@@ -1581,7 +1581,9 @@ impl Daemon {
                 po: 0,
             },
         );
-        cursor.encode()
+        let position = store.reserve_cursor(&uid);
+        store.store_cursor(&uid, position, cursor)?;
+        Ok(position.to_string())
     }
 
     /// Run an acceptance exactly once per caller-supplied request ID.
@@ -1616,6 +1618,11 @@ impl Daemon {
                 || Instant::now() >= deadline
                 || self.shutting_down.load(Ordering::SeqCst)
             {
+                self.lock_store()?.store_cursor(
+                    &options.scope,
+                    options.position,
+                    rendered.cursor,
+                )?;
                 return Ok(rendered.value);
             }
             std::thread::sleep(FETCH_POLL_INTERVAL);
@@ -1683,13 +1690,15 @@ impl Daemon {
         let cursor = params
             .get("cursor")
             .and_then(Value::as_str)
-            .map(|text| cursor::Cursor::decode(text, &self.instance_id))
+            .map(|position| self.lock_store()?.resolve_cursor(&scope, position))
             .transpose()?;
-        if let Some(cursor) = cursor.as_ref() {
-            cursor.require_scope(&scope)?;
-        }
+        // Every response mints the scope's next position. It is taken before
+        // rendering so the document can carry its own number while it is being
+        // measured.
+        let position = self.lock_store()?.reserve_cursor(&scope);
         Ok(FetchOptions {
             scope,
+            position,
             cursor,
             wait: Duration::from_millis(wait_ms),
             until_result,
@@ -2964,10 +2973,6 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
     if message.contains("SESSION_NOT_RUNNING") {
         "SESSION_NOT_RUNNING"
-    } else if message.contains("CURSOR_VERSION_UNSUPPORTED") {
-        "CURSOR_VERSION_UNSUPPORTED"
-    } else if message.contains("CURSOR_SCOPE_MISMATCH") {
-        "CURSOR_SCOPE_MISMATCH"
     } else if message.contains("CURSOR_EXPIRED") {
         "CURSOR_EXPIRED"
     } else if message.contains("CURSOR_INVALID") {
@@ -3314,6 +3319,8 @@ fn fnv1a128(bytes: &[u8]) -> u128 {
 struct FetchOptions {
     /// One Session UID, or `all`.
     scope: String,
+    /// Observation position this response will publish.
+    position: u64,
     cursor: Option<cursor::Cursor>,
     wait: Duration,
     until_result: bool,
@@ -3496,6 +3503,9 @@ enum Unit {
 
 struct Rendered {
     value: Value,
+    /// Watermarks for exactly what `value` carries. The caller stores this and
+    /// substitutes the handle it gets back.
+    cursor: cursor::Cursor,
     /// The long poll is finished: either something wake-worthy happened or the
     /// requested binding is satisfied.
     settled: bool,
@@ -3553,7 +3563,7 @@ impl<'a> Builder<'a> {
     /// predict the encoded size, because committing a unit also lengthens the
     /// cursor the same document has to carry.
     fn verify(&mut self, mark: usize) -> Result<Option<usize>> {
-        let length = serialized_len(&self.document()?)?;
+        let length = serialized_len(&self.document())?;
         let budget = self.budget();
         if length <= budget {
             return Ok(None);
@@ -3901,9 +3911,9 @@ impl<'a> Builder<'a> {
         self.delivered()
     }
 
-    /// Encode the cursor from the committed set only.
-    fn cursor(&self) -> Result<String> {
-        let mut next = cursor::Cursor::new(&self.options.instance_id, &self.options.scope);
+    /// Derive the cursor from the committed set only.
+    fn cursor(&self) -> cursor::Cursor {
+        let mut next = cursor::Cursor::new(&self.options.scope);
         if let Some(previous) = self.options.cursor.as_ref() {
             // Carry only watermarks that still mean something: a Session that
             // no longer exists, or one whose entry is the default, adds bytes
@@ -3954,7 +3964,7 @@ impl<'a> Builder<'a> {
                 .then(|| self.buckets.last().map(|bucket| bucket.uid.clone()))
                 .flatten();
         }
-        next.encode()
+        next
     }
 
     fn gapped(&self) -> bool {
@@ -3991,8 +4001,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn document(&self) -> Result<Value> {
-        Ok(json!({
+    fn document(&self) -> Value {
+        json!({
             "schema_version": 1,
             "runtime": {
                 "version": env!("CARGO_PKG_VERSION"),
@@ -4001,13 +4011,13 @@ impl<'a> Builder<'a> {
             "reason": self.reason(),
             "has_more": self.pending(),
             "gaps": self.cut.scope_gaps,
-            "cursor": self.cursor()?,
+            "cursor": self.options.position.to_string(),
             "sessions": self
                 .buckets
                 .iter()
                 .map(Committed::value)
                 .collect::<Vec<_>>(),
-        }))
+        })
     }
 
     /// A budget that demonstrably works for this cut, or `None` if none does.
@@ -4018,7 +4028,7 @@ impl<'a> Builder<'a> {
     fn workable_budget(&self) -> Result<Option<usize>> {
         let mut probe = Builder::new(self.cut, self.options);
         probe.commit_minimum();
-        let floor = serialized_len(&probe.document()?)? + cli_wrapper_overhead();
+        let floor = serialized_len(&probe.document())? + cli_wrapper_overhead();
         // Recommend something strictly larger than the budget that just
         // failed, so the advice cannot repeat the caller's mistake.
         let mut candidate = floor.max(self.options.max_bytes.saturating_add(1)).max(1);
@@ -4075,12 +4085,12 @@ impl<'a> Builder<'a> {
 
     /// Roll units back until the encoded document fits the budget.
     fn settle(&mut self) -> Result<Value> {
-        let mut value = self.document()?;
+        let mut value = self.document();
         while serialized_len(&value)? > self.budget() {
             if !self.rollback() {
                 break;
             }
-            value = self.document()?;
+            value = self.document();
         }
         Ok(value)
     }
@@ -4110,7 +4120,11 @@ impl<'a> Builder<'a> {
             } else {
                 self.cut.baseline || self.delivered()
             };
-        Ok(Rendered { value, settled })
+        Ok(Rendered {
+            value,
+            cursor: self.cursor(),
+            settled,
+        })
     }
 }
 
@@ -4686,6 +4700,7 @@ mod tests {
     fn fetch_options(max_bytes: usize, cursor: Option<crate::cursor::Cursor>) -> FetchOptions {
         FetchOptions {
             scope: "su_test".to_owned(),
+            position: 1,
             cursor,
             wait: Duration::from_millis(0),
             until_result: false,
@@ -4800,14 +4815,13 @@ mod tests {
         }
     }
 
-    fn decode(value: &Value) -> crate::cursor::Cursor {
-        crate::cursor::Cursor::decode(
-            value["cursor"]
-                .as_str()
-                .unwrap_or_else(|| panic!("no cursor")),
-            "boot",
-        )
-        .unwrap_or_else(|error| panic!("failed to decode cursor: {error}"))
+    /// The published position, which a real daemon would have bound to the
+    /// returned vector.
+    fn position(value: &Value) -> u64 {
+        value["cursor"]
+            .as_str()
+            .and_then(|position| position.parse().ok())
+            .unwrap_or_else(|| panic!("no cursor position"))
     }
 
     /// Length of the complete compact response line a client would print.
@@ -4836,6 +4850,24 @@ mod tests {
     }
 
     #[test]
+    fn a_response_publishes_its_position_as_a_plain_number() {
+        let mut options = fetch_options(FETCH_HARD_MAX_BYTES, None);
+        options.position = 42;
+        let rendered = test_cut(vec![SourceSpec::new("su_test").build()])
+            .render(&options)
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+
+        // A caller carries this across turns, so it stays short and typed as
+        // a string for field stability.
+        assert_eq!(rendered.value["cursor"], json!("42"));
+        assert_eq!(position(&rendered.value), 42);
+        assert_eq!(
+            rendered.cursor.s, "su_test",
+            "the stored vector names the scope it positions"
+        );
+    }
+
+    #[test]
     fn the_event_watermark_never_passes_an_event_the_response_dropped() {
         let cut = test_cut(vec![
             SourceSpec {
@@ -4852,7 +4884,7 @@ mod tests {
         assert!(delivered.len() < 8, "budget did not drop any event");
         assert_eq!(rendered.value["has_more"], true);
         assert_eq!(
-            decode(&rendered.value).e,
+            rendered.cursor.e,
             delivered.last().copied().unwrap_or(0),
             "watermark passed an undelivered event"
         );
@@ -4883,8 +4915,7 @@ mod tests {
         assert_eq!(buckets, 1, "budget did not drop the second bucket");
         assert_eq!(rendered.value["has_more"], true);
         assert_eq!(
-            decode(&rendered.value).e,
-            2,
+            rendered.cursor.e, 2,
             "watermark passed the dropped bucket's events"
         );
     }
@@ -4931,7 +4962,7 @@ mod tests {
 
         // Start from a delta cursor: a cursorless --all is a baseline, which
         // deliberately subsumes prior events instead of replaying them.
-        let mut cursor = Some(crate::cursor::Cursor::new("boot", crate::cursor::SCOPE_ALL));
+        let mut cursor = Some(crate::cursor::Cursor::new(crate::cursor::SCOPE_ALL));
         let mut delivered: Vec<i64> = Vec::new();
         for _ in 0..32 {
             let options = FetchOptions {
@@ -4955,7 +4986,7 @@ mod tests {
                 );
             }
             delivered.extend(page);
-            cursor = Some(decode(&rendered.value));
+            cursor = Some(rendered.cursor.clone());
             if rendered.value["has_more"] != json!(true) {
                 break;
             }
@@ -4991,7 +5022,7 @@ mod tests {
         let result = &first.value["sessions"][0]["results"][0];
         assert_eq!(result["final_text_complete"], false);
         assert_eq!(result["final_text_offset"], 0);
-        let cursor = decode(&first.value);
+        let cursor = first.cursor.clone();
         let position = cursor.session("su_test");
         assert_eq!(position.px, Some(7));
         assert_eq!(position.x, 6, "an incomplete result must not advance x");
@@ -5010,7 +5041,7 @@ mod tests {
         let result = &second.value["sessions"][0]["results"][0];
         assert_eq!(result["final_text_complete"], true);
         assert_eq!(result["final_text_offset"], json!(position.po));
-        let position = decode(&second.value).session("su_test");
+        let position = second.cursor.session("su_test");
         assert_eq!(position.x, 7);
         assert_eq!(position.px, None);
     }
@@ -5172,7 +5203,7 @@ mod tests {
                 screen.push_str(line);
             }
             screen.push_str(fragment_text(view, "fragment_after"));
-            cursor = Some(decode(&rendered.value));
+            cursor = Some(rendered.cursor.clone());
             if rendered.value["has_more"] != json!(true) {
                 return (seen_events, body, screen);
             }
@@ -5254,7 +5285,7 @@ mod tests {
                     assert_eq!(rebuilt, row, "the fragments must rebuild the row");
                 }
             }
-            cursor = Some(decode(&rendered.value));
+            cursor = Some(rendered.cursor.clone());
             if rendered.value["has_more"] != json!(true) {
                 break;
             }
@@ -5495,7 +5526,7 @@ mod tests {
         };
         // An --all response carrying watermarks for Sessions it does not
         // return: the floor must include those cursor entries.
-        let mut carried = crate::cursor::Cursor::new("boot", crate::cursor::SCOPE_ALL);
+        let mut carried = crate::cursor::Cursor::new(crate::cursor::SCOPE_ALL);
         for index in 0..12 {
             carried.set_session(
                 &format!("su_carried_{index}"),
@@ -5568,7 +5599,7 @@ mod tests {
         // Each of these fails at a tiny budget for a different reason: an
         // oversized Session record, an oversized result body, an oversized
         // screen row, and a wide --all cursor.
-        let mut carried = crate::cursor::Cursor::new("boot", crate::cursor::SCOPE_ALL);
+        let mut carried = crate::cursor::Cursor::new(crate::cursor::SCOPE_ALL);
         for index in 0..24 {
             carried.set_session(
                 &format!("su_carried_{index}"),
@@ -5745,7 +5776,7 @@ mod tests {
             for bucket in rendered.value["sessions"].as_array().into_iter().flatten() {
                 seen.push(bucket["session"]["id"].clone());
             }
-            let next = decode(&rendered.value);
+            let next = rendered.cursor.clone();
             let paging = next.bl.is_some();
             cursor = Some(next);
             if !paging {
