@@ -1597,8 +1597,8 @@ impl Daemon {
     }
 
     /// One composite forward-delta read: current state, newly terminalized
-    /// results, lifecycle events, and the forward screen delta, from an opaque
-    /// cursor. Every observation is a success; only malformed requests,
+    /// results, lifecycle events, and the forward screen delta, from a cursor
+    /// position. Every observation is a success; only malformed requests,
     /// unknown Sessions, and unusable cursors are errors.
     fn fetch(&self, params: &Value) -> Result<Value> {
         let options = self.fetch_options(params)?;

@@ -136,8 +136,9 @@ wait "$old_server_pid"
 old_server_pid=
 
 # A position is meaningful only within one daemon lifetime. Nothing marks a
-# number as belonging to a previous daemon, and nothing needs to: the state it
-# described is gone, so there is nothing to be lost by reusing the number.
+# number as belonging to a previous daemon: it resolves against the new
+# daemon's table (or expires), returning current data -- though as a starting
+# position it may skip earlier new-daemon records, hence the discard rule.
 DLGT_SOCKET="$old_socket" "$binary" server --foreground >"$state_dir/old-server-2.log" 2>&1 &
 old_server_pid=$!
 attempt=0

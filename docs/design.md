@@ -386,8 +386,9 @@ never acceptable. A position the daemon never minted or no longer
 retains is a structured error whose recovery is one cursorless baseline fetch.
 Positions are meaningful only within one daemon lifetime: resolution is
 `(scope, number)` alone, so a number kept across a restart names the new
-daemon's window rather than being detected as stale. That is sound because the
-old daemon's state does not survive either, but callers re-enter through an
+daemon's window rather than being detected as stale. What comes back is
+current data, but as a starting position a stale number skips whatever the
+new daemon recorded before that window, so callers re-enter through an
 acceptance cursor or a baseline rather than a remembered number.
 
 Every observation is a success. Timeout, blocked input, a failed execution, and

@@ -1,8 +1,9 @@
 //! Forward-observation cursors: per-scope ordinal positions.
 //!
-//! A cursor is a plain number. Every acceptance and every fetch response mints
-//! the addressed scope's next position -- 1, 2, 3 -- and the daemon keeps the
-//! watermark vector behind it.
+//! A cursor is a plain number. Every acceptance, and every fetch response
+//! whose watermark vector advanced, mints the addressed scope's next position
+//! -- 1, 2, 3 -- and the daemon keeps the watermark vector behind it. A fetch
+//! whose vector did not move returns the caller's own position.
 //!
 //! The vector used to be encoded into the token itself, which bought nothing:
 //! it was bound to the daemon instance either way, because the state it points

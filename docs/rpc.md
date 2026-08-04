@@ -305,9 +305,11 @@ for field stability; requests accept either spelling, a JSON number or a string
 of digits. Absent or `null` requests a baseline. Any other type, and any string
 that is not a position, is `CURSOR_INVALID` rather than a silent baseline.
 Leading zeros are accepted and canonicalized: responses always spell the
-position without them. Every acceptance, and every fetch response that
-advances the observation, mints the addressed scope's next position; a fetch
-that observed nothing new returns the caller's own position unchanged. `all`
+position without them. Every acceptance, and every fetch response whose
+watermark vector advanced, mints the addressed scope's next position; a fetch
+whose vector did not move returns the caller's own position, though an empty
+public delta can still mint a new position when internal bookkeeping advanced
+beneath it. `all`
 numbers independently of any Session. The daemon holds the watermarks behind
 each position and never mutates them, which is what makes replaying a position
 return an identical window.

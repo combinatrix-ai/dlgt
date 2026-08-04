@@ -505,8 +505,10 @@ the current Session snapshot, every terminal result and lifecycle event after
 the cursor, the forward screen delta, and the response's cursor position.
 
 Every observation succeeds. A long poll that expires with nothing new is
-`{"ok":true,"reason":"timeout"}` with empty deltas and the same cursor
-position, not an error. `reason` is one of:
+`{"ok":true,"reason":"timeout"}` with empty deltas, not an error. The same
+cursor position is returned whenever the underlying watermark vector did not
+move; an empty public delta can still mint a new position when internal
+bookkeeping advanced beneath it. `reason` is one of:
 
 ```text
 snapshot    bounded baseline; no cursor was supplied
@@ -679,9 +681,10 @@ holding retained state for more than that rejects `--all` with
 ### Cursors
 
 A cursor is a position, not a token. Every acceptance, and every `fetch`
-response that advances the observation, mints the addressed scope's next
+response whose watermark vector advanced, mints the addressed scope's next
 position -- 1, 2, 3 -- and the daemon holds the watermarks behind it. A fetch
-that observed nothing new returns the caller's own position unchanged.
+whose vector did not move returns the caller's own position; an empty public
+delta can still mint a new position when internal bookkeeping advanced.
 Leading zeros in a supplied position are accepted and canonicalized away.
 `--all` numbers independently of any Session.
 
