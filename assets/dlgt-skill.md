@@ -59,10 +59,14 @@ Retain both before doing anything else:
   correlation, and later resume.
 - `cursor` is positioned immediately before the work you just accepted, so
   reading from it cannot miss output the provider produced in between.
-- `--request-id` makes the acceptance replayable. If you never see this
-  response, re-run the identical command with the same ID: it returns the
-  original receipt with `"replayed": true` instead of starting a second
-  worker.
+- `--request-id` is required on every `new` and `send`, and makes the
+  acceptance replayable. If you never see this response, re-run the identical
+  command with the same ID: it returns the original receipt with
+  `"replayed": true` instead of starting a second worker. It is required
+  because a key invented after a response goes missing is already too late to
+  deduplicate anything. Choose it before you run the command, and reuse it
+  verbatim on any retry. An `--alias` is a human convenience and does not
+  deduplicate.
 
 ### Phase 2: read the answer
 
@@ -90,7 +94,8 @@ makes each read a forward delta instead of a re-download of the same tail.
 Follow up on the same Session, then release it:
 
 ```bash
-receipt=$(dlgt send "$session_id" -- "Rank those findings by severity and name the one to fix first.")
+receipt=$(dlgt send "$session_id" --request-id review-2 \
+  -- "Rank those findings by severity and name the one to fix first.")
 cursor=$(printf '%s\n' "$receipt" | jq -er '.cursor')
 dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 60s \
   | jq -er '.sessions[0].results[0].final_text'
@@ -167,8 +172,9 @@ work. Recover instead:
 | The Session ID itself | `dlgt list` finds it, but prefer a stable `--alias` on `new` so you never need to search. |
 
 Never re-issue a bare `dlgt new` because you are unsure whether the first one
-landed. That is how duplicate workers get created. Give every `new` and `send`
-a `--request-id` when the caller cannot observe the outcome reliably.
+landed. That is how duplicate workers get created. Every `new` and `send`
+carries a `--request-id` for exactly this reason: retry the identical command
+with the identical key instead.
 
 ## Clean up provider history
 
@@ -260,10 +266,10 @@ when a delegation must keep the Harness's own permission prompts.
 | Start work with no existing provider conversation | `new` with its required first prompt |
 | Follow up on a live, idle Session | `send <session.id\|@alias>` |
 | Replace the provider process but keep history and conversation | `restart <session.id>` |
-| Continue after the owning daemon or Session is gone | `send <session.id> --resume -- "<prompt>"` |
+| Continue after the owning daemon or Session is gone | `send <session.id> --resume --request-id <ID> -- "<prompt>"` |
 
-- `new` requires its first prompt and atomically starts the Harness and accepts
-  that prompt. It returns as soon as the prompt is accepted; it never waits for
+- `new` requires its first prompt and a `--request-id`, and atomically starts
+  the Harness and accepts that prompt. It returns as soon as the prompt is accepted; it never waits for
   the answer.
 - Plain `send` never launches, restarts, resumes, or queues. It submits work
   only to a live, idle Session; rejection is side-effect-free, and accepted
@@ -313,7 +319,7 @@ when a delegation must keep the Harness's own permission prompts.
 | --- | --- |
 | `SESSION_BUSY` | Do not resend. Run `fetch <session.id> --until result --wait <duration>`, or explicitly `cancel` the active work. |
 | `SESSION_BLOCKED` | `fetch` reports this as `reason: "blocked"` with the live screen. Read the question, `attach`, answer it, detach with `Ctrl-b d`, then `fetch` again. |
-| `SESSION_NOT_RUNNING` | Use the saved `session.id` with `send <session.id> --resume -- <prompt>`. |
+| `SESSION_NOT_RUNNING` | Use the saved `session.id` with `send <session.id> --resume --request-id <ID> -- <prompt>`. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. Use `--steal` only for a known stale attach client. |
 | `ATTACH_REQUIRES_TTY` | You have no terminal. Use `fetch <session.id>` and read `screen.live` instead. |
 | `CURSOR_EXPIRED` / `CURSOR_VERSION_UNSUPPORTED` / `CURSOR_SCOPE_MISMATCH` / `CURSOR_INVALID` | Drop the cursor and run one cursorless `fetch <session.id>` to rebase. |

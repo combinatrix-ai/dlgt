@@ -40,7 +40,7 @@ done
 
 # `new` is readiness-bounded. Start it while the fixture emits the authoritative hook.
 "$binary" new --title smoke --alias @smoke --harness claude --cwd "$repo_root" \
-  --harness-option permission-mode=auto -- smoke-initial >"$state_dir/new.json" &
+  --request-id smoke-1 --harness-option permission-mode=auto -- smoke-initial >"$state_dir/new.json" &
 new_pid=$!
 attempt=0
 launch_id=
@@ -92,7 +92,7 @@ while [ ! -S "$old_socket" ]; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
 DLGT_SOCKET="$old_socket" "$binary" new --title cross-version --alias @cross-version \
-  --harness claude --cwd "$repo_root" -- cross-version-initial >"$state_dir/cross-version.json" &
+  --harness claude --cwd "$repo_root" --request-id cross-1 -- cross-version-initial >"$state_dir/cross-version.json" &
 cross_version_new_pid=$!
 attempt=0
 cross_version_launch_id=
@@ -110,7 +110,8 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cros
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","last_assistant_message":"cross-version-ready"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --until result --wait 2s >/dev/null
-cross_version_send=$("$binary" send claude:provider-cross-version -- cross-version-follow-up)
+cross_version_send=$("$binary" send claude:provider-cross-version --request-id cross-2 \
+  -- cross-version-follow-up)
 printf '%s\n' "$cross_version_send" | grep -q "\"id\":\"$cross_version_id\""
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","turn_id":"provider-cross-version-2","user_prompt":"cross-version-follow-up"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
@@ -142,10 +143,20 @@ DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
 
+# Every acceptance must carry an idempotency key.
+set +e
+no_id_json=$("$binary" send "$session_id" -- no-key)
+no_id_status=$?
+set -e
+test "$no_id_status" -eq 1
+printf '%s\n' "$no_id_json" | grep -q '"code":"INVALID_ARGUMENT"'
+printf '%s\n' "$no_id_json" | grep -q -- '--request-id'
+
 # Bounded launch failures retain the failed audit Session ID for diagnostics.
 set +e
 launch_failure_json=$("$binary" new --title launch-failure --alias @launch-failure \
-  --harness claude --cwd "$repo_root" --startup-timeout 50ms -- launch-failure)
+  --harness claude --cwd "$repo_root" --request-id launch-failure-1 --startup-timeout 50ms \
+  -- launch-failure)
 launch_failure_status=$?
 set -e
 test "$launch_failure_status" -eq 1
@@ -155,7 +166,7 @@ launch_failure_id=$(printf '%s\n' "$launch_failure_json" \
   | sed -n 's/.*"launch_id":"\([^"]*\)".*/\1/p')
 
 long_message=$(awk 'BEGIN { for (i = 0; i < 12000; i++) printf "x" }')
-send_json=$("$binary" send "$session_id" -- "$long_message")
+send_json=$("$binary" send "$session_id" --request-id smoke-2 -- "$long_message")
 printf '%s\n' "$send_json" | grep -q '"execution_seq":2'
 
 # A running execution must not hide the answer to the previous one.
@@ -165,7 +176,7 @@ printf '%s\n' "$busy_baseline" | grep -q '"final_text":"initial-done"'
 "$binary" show "$session_id" | grep -q '"final_text":"initial-done"'
 
 set +e
-busy_json=$("$binary" send "$session_id" -- second)
+busy_json=$("$binary" send "$session_id" --request-id smoke-busy -- second)
 busy_status=$?
 set -e
 test "$busy_status" -eq 5
@@ -236,7 +247,7 @@ test "$attach_status" -eq 1
 printf '%s\n' "$attach_json" | grep -q '"code":"ATTACH_REQUIRES_TTY"'
 
 # Restart interrupts active work while preserving identity, provider binding, and history.
-"$binary" send "$session_id" -- interrupted-by-restart >/dev/null
+"$binary" send "$session_id" --request-id smoke-3 -- interrupted-by-restart >/dev/null
 option_count_before=$(grep -c -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE")
 "$binary" restart "$session_id" >"$state_dir/restart.json" &
 restart_pid=$!
@@ -252,7 +263,7 @@ test "$option_count_after" -gt "$option_count_before"
 grep -q "\"id\":\"$session_id\"" "$state_dir/restart.json"
 "$binary" show "$session_id" | grep -q '"execution_seq":3'
 "$binary" show "$session_id" | grep -q '"status":"interrupted"'
-"$binary" send "$session_id" -- after-restart >/dev/null
+"$binary" send "$session_id" --request-id smoke-4 -- after-restart >/dev/null
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-4","user_prompt":"after-restart"}' \
   | "$binary" hook emit "$session_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-4","last_assistant_message":"resumed"}' \
@@ -267,7 +278,7 @@ done
 
 # Exact aliases are reusable after terminal stop, while the old Session ID remains readable.
 "$binary" new --title reused --alias @smoke --harness claude --cwd "$repo_root" \
-  -- reused-initial >"$state_dir/reused.json" &
+  --request-id reused-1 -- reused-initial >"$state_dir/reused.json" &
 new_pid=$!
 attempt=0
 reused_launch_id=
@@ -291,7 +302,7 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn
 
 # A long poll completes on the authoritative Stop hook, and the delta carries
 # the hydrated result exactly once.
-poll_send=$("$binary" send "$reused_id" -- long-poll)
+poll_send=$("$binary" send "$reused_id" --request-id reused-2 -- long-poll)
 poll_cursor=$(printf '%s\n' "$poll_send" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 test -n "$poll_cursor"
 "$binary" fetch "$reused_id" --cursor "$poll_cursor" --until result --wait 10s \
@@ -333,7 +344,7 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn
 
 # Retention overrun is a structured gap with a recoverable baseline, never a
 # silent reset.
-flood_send=$("$binary" send "$reused_id" -- flood-the-screen)
+flood_send=$("$binary" send "$reused_id" --request-id reused-4 -- flood-the-screen)
 flood_cursor=$(printf '%s\n' "$flood_send" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 attempt=0
 until "$binary" fetch "$reused_id" --cursor "$flood_cursor" \
@@ -407,7 +418,7 @@ printf '%s\n' "$alias_json" | grep -q '"code":"ALIAS_IN_USE"' || {
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
 
 # Unexpected provider death creates a durable failed result in bounded time.
-"$binary" send "$reused_id" -- crash >/dev/null
+"$binary" send "$reused_id" --request-id reused-5 -- crash >/dev/null
 set +e
 crash_json=$("$binary" fetch "$reused_id" --until result --wait 8s)
 crash_status=$?
@@ -424,7 +435,7 @@ printf '%s\n' "$crash_json" | grep -q '"status":"failed"' || {
 # A rotated provider Session ID keeps the pre-rekey address and its cursor
 # usable, and resuming the conversation keeps the retained screen history.
 "$binary" new --title rekey --alias @rekey --harness claude --cwd "$repo_root" \
-  -- rekey-initial >"$state_dir/rekey.json" &
+  --request-id rekey-1 -- rekey-initial >"$state_dir/rekey.json" &
 new_pid=$!
 attempt=0
 rekey_launch_id=
@@ -466,7 +477,7 @@ attempt=0
 while "$binary" show @rekey >/dev/null 2>&1; do
   attempt=$((attempt + 1)); test "$attempt" -lt 200 || exit 1; sleep 0.02
 done
-"$binary" send "$rotated_id" --resume -- resumed-prompt >"$state_dir/rekey-resume.json" &
+"$binary" send "$rotated_id" --resume --request-id rekey-2 -- resumed-prompt >"$state_dir/rekey-resume.json" &
 resume_pid=$!
 attempt=0
 resume_launch_id=

@@ -101,6 +101,30 @@ fn unknown_long_options_are_named_with_the_command_usage() -> Result<(), Box<dyn
 }
 
 #[test]
+fn acceptance_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    for command in [
+        vec!["new", "--title", "t", "--harness", "claude", "--", "hello"],
+        vec!["send", "codex:test-session", "--", "hello"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+            .env("DLGT_HOME", home.path())
+            .args(&command)
+            .output()?;
+
+        assert!(!output.status.success(), "{command:?} was accepted");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains("--request-id"),
+            "the error must name the flag: {stdout}"
+        );
+        assert!(stdout.contains("USAGE"), "unexpected output: {stdout}");
+    }
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
 fn send_no_longer_accepts_the_removed_wait_flags() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     for flag in [["--wait", "--timeout"], ["--timeout", "1s"]] {
@@ -141,6 +165,8 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
             "t",
             "--harness",
             "claude",
+            "--request-id",
+            "r1",
             "--cwd",
             "./missing",
             "--",

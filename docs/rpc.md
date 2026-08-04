@@ -72,9 +72,9 @@ parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, optional `request_id`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, required `request_id`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
-| `session.send` | `session`, `prompt`, optional `request_id`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
+| `session.send` | `session`, `prompt`, required `request_id`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
 | `session.fetch` | exactly one of `session` or `all:true`; optional `cursor`, `wait_ms` (max 86,400,000), `until` (`any` or `result`), `screen` (boolean or stable-line count), `max_bytes` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
@@ -92,10 +92,17 @@ Profiles are expanded by the client. `profile.list` is implemented by the
 stdio proxy rather than delegated to the daemon, so the daemon does not reread
 mutable client configuration.
 
-`request_id` is an optional caller-chosen idempotency key. The daemon retains
-the last 1,024 acceptance receipts for its lifetime. Repeating an ID with the
-same payload returns the original receipt with `replayed: true`; repeating it
-with a different payload fails with `INVALID_ARGUMENT`.
+`request_id` is a required caller-chosen idempotency key: non-empty and at
+most 128 bytes. A missing, empty, or over-long key fails with
+`INVALID_ARGUMENT`. The daemon retains the last 1,024 acceptance receipts for
+its lifetime. Repeating an ID with the same payload returns the original
+receipt with `replayed: true`; repeating it with a different payload fails with
+`INVALID_ARGUMENT`.
+
+It is required rather than optional because a key that first appears on the
+retry cannot deduplicate anything: the original attempt has already created a
+Session. This is separate from the RPC envelope's `id`, which correlates one
+request and is capped at 200 bytes.
 
 Payload identity is the canonical form of the RPC parameters:
 

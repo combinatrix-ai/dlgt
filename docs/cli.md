@@ -219,7 +219,7 @@ dlgt new
   [--pass-env <KEY>]...
   [--env <KEY=VALUE>]...
   [--unset-env <KEY>]...
-  [--request-id <ID>]
+  --request-id <ID>         (required)
   [--stdin | -- <PROMPT>]   (required)
 ```
 
@@ -249,13 +249,18 @@ Rules:
 - `--stdin` reads the exact prompt from standard input and is mutually exclusive
   with a prompt after `--`. It avoids argv disclosure and length limits.
 - Use `--stdin` when the required prompt should not appear in argv.
-- `--request-id` is an optional idempotency key. Retrying the same ID with a
-  byte-identical payload returns the original acceptance receipt with
-  `"replayed": true` instead of creating a second Session, even if the Session
-  has since moved on. The same ID with a different payload is
-  `INVALID_ARGUMENT`. The daemon retains the last 1,024 receipts for its
-  lifetime. Use it whenever a caller cannot tell whether an earlier `new`
-  reached the daemon; never re-issue a bare `new` on that ambiguity.
+- `--request-id` is required, and must be non-empty and at most 128 bytes.
+  Retrying the same ID with a byte-identical payload returns the original
+  acceptance receipt with `"replayed": true` instead of creating a second
+  Session, even if the Session has since moved on. The same ID with a
+  different payload is `INVALID_ARGUMENT`. The daemon retains the last 1,024
+  receipts for its lifetime.
+
+  It is required rather than optional because an idempotency key only works if
+  it exists *before* the first attempt: by the time a caller notices a lost
+  response, an optional key would already be too late, and callers reliably do
+  not add safety options they were not forced to. `--alias` is unaffected and
+  remains a human convenience, not the deduplication key.
 - If an exact requested alias is active, `new` fails with `ALIAS_IN_USE` and
   creates no Session or provider process.
 - If startup succeeds but prompt acceptance fails, dlgt terminates the Harness,
@@ -271,6 +276,7 @@ dlgt new \
   --harness claude \
   --no-auto-approve \
   --cwd . \
+  --request-id review-1 \
   -- "Review the current design"
 ```
 
@@ -282,6 +288,7 @@ dlgt new \
   --harness claude \
   --harness-option dangerously-skip-permissions=true \
   --cwd . \
+  --request-id review-2 \
   -- "Review the current design"
 ```
 
@@ -290,6 +297,7 @@ dlgt new \
   --title "run review" \
   --profile fable-review \
   --cwd . \
+  --request-id run-review-1 \
   -- "Review the current design"
 ```
 
@@ -359,7 +367,7 @@ Rules:
 
 ```text
 dlgt send <SESSION_ID|@ALIAS>
-  [--request-id <ID>]
+  --request-id <ID>         (required)
   [--pretty]
   [--stdin | -- <PROMPT>]   (required)
 ```
@@ -379,7 +387,7 @@ dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
   [--pass-env <KEY>]...
   [--env <KEY=VALUE>]...
   [--unset-env <KEY>]...
-  [--request-id <ID>]
+  --request-id <ID>         (required)
   [--pretty]
   [--stdin | -- <PROMPT>]   (required)
 ```
@@ -408,9 +416,10 @@ Rules:
   canceling return `SESSION_BUSY`; blocked returns `SESSION_BLOCKED`; attached
   returns `SESSION_ATTACHED`; other non-idle states return
   `SESSION_UNAVAILABLE`.
-- `--request-id` behaves exactly as it does for `new`: the same ID and payload
-  replay the original receipt with `"replayed": true`, and the same ID with a
-  different payload is `INVALID_ARGUMENT`.
+- `--request-id` is required and behaves exactly as it does for `new`,
+  including with `--resume`: the same ID and payload replay the original
+  receipt with `"replayed": true`, and the same ID with a different payload is
+  `INVALID_ARGUMENT`.
 - There is no `--wait`, `--create`, `--enqueue`, `--after`, or `--fail-if-busy`.
   Creation, queueing, and waiting are not `send` responsibilities, and busy
   rejection is always the default.
@@ -418,7 +427,8 @@ Rules:
 Asynchronous example:
 
 ```bash
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revised design"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-3 \
+  -- "Review the revised design"
 ```
 
 ```json
@@ -434,7 +444,8 @@ Busy rejection:
 Read the answer with one `fetch`:
 
 ```bash
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revised design" \
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-4 \
+  -- "Review the revised design" \
   && dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
 ```
 

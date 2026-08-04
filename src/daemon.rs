@@ -44,6 +44,9 @@ const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Acceptance receipts retained per daemon, evicted first-in-first-out.
 const REQUEST_RECEIPT_LIMIT: usize = 1024;
+/// Longest caller-supplied idempotency key. The key is retained for the
+/// daemon's lifetime, so it is bounded.
+const MAX_ACCEPTANCE_REQUEST_ID_LEN: usize = 128;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -477,7 +480,10 @@ impl Daemon {
                 self.request_shutdown();
                 Ok(json!({"stopping": true}))
             }
-            "session.create" => self.accept_once(params, |params| self.create_session(params)),
+            "session.create" => {
+                validate_request_id(params)?;
+                self.accept_once(params, |params| self.create_session(params))
+            }
             "session.restart" => self.restart_session(params),
             "session.list" => {
                 let include_all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
@@ -495,17 +501,20 @@ impl Daemon {
             "session.input" => self.input_session(params),
             "session.resize" => self.resize_session(params),
             "session.stop" => self.stop_session(params),
-            "session.send" => self.accept_once(params, |params| {
-                if params
-                    .get("resume")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    self.resume_session(params)
-                } else {
-                    self.submit_turn(params)
-                }
-            }),
+            "session.send" => {
+                validate_request_id(params)?;
+                self.accept_once(params, |params| {
+                    if params
+                        .get("resume")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        self.resume_session(params)
+                    } else {
+                        self.submit_turn(params)
+                    }
+                })
+            }
             "session.fetch" => self.fetch(params),
             "session.cancel" => self.cancel_session(params),
             "transcript.read_raw" => self.read_transcript(params),
@@ -3251,6 +3260,23 @@ impl ReceiptLedger {
 /// Identity of an acceptance payload: the prompt and every launch option that
 /// changes what the Session does, excluding per-invocation noise such as the
 /// environment snapshot, terminal size, and correlation ID.
+/// Every acceptance carries an idempotency key.
+///
+/// A key that only shows up on the retry is useless: the first attempt has
+/// already created a Session by then. Requiring it up front is what makes a
+/// lost acceptance response recoverable at all.
+fn validate_request_id(params: &Value) -> Result<()> {
+    let request_id = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|request_id| !request_id.is_empty())
+        .context("missing request_id: every acceptance must carry an idempotency key")?;
+    if request_id.len() > MAX_ACCEPTANCE_REQUEST_ID_LEN {
+        bail!("invalid request_id: must be at most {MAX_ACCEPTANCE_REQUEST_ID_LEN} bytes");
+    }
+    Ok(())
+}
+
 fn request_digest(params: &Value) -> u128 {
     const VOLATILE: [&str; 5] = [
         "environment",

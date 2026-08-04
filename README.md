@@ -110,6 +110,7 @@ dlgt new \
   --effort high \
   --cwd . \
   --alias @review \
+  --request-id review-1 \
   -- "Review this repository. Return findings and trade-offs only." \
   && dlgt fetch @review --until result --wait 15m
 ```
@@ -130,6 +131,7 @@ dlgt new \
   --model gpt-5.6-luna \
   --effort xhigh \
   --cwd . \
+  --request-id codex-review-1 \
   -- "Review the implementation and report correctness risks."
 ```
 
@@ -138,10 +140,10 @@ The command returns one provider-qualified Session ID, such as
 
 ```bash
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 -- "Review the revision"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-2 -- "Review the revision"
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --cursor "$cursor"
 dlgt restart codex:019f6307-341e-7e81-8a33-7ab61e804345
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume -- "Continue the review"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume --request-id review-3 -- "Continue the review"
 dlgt show codex:019f6307-341e-7e81-8a33-7ab61e804345
 dlgt scrollback codex:019f6307-341e-7e81-8a33-7ab61e804345 --lines 100
 dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345

@@ -157,6 +157,7 @@ fn command_new(args: &[String]) -> Result<()> {
         .context("missing --harness or profile harness")?;
     let prompt =
         prompt_from(&parsed, 0)?.context("missing initial prompt; use --stdin or -- PROMPT")?;
+    let request_id = require_request_id("new", &parsed)?;
     let cwd = launch_cwd(&parsed)?;
     let model = parsed.one("--model").or_else(|| {
         profile
@@ -186,7 +187,7 @@ fn command_new(args: &[String]) -> Result<()> {
         "session.create",
         json!({
             "title": title,
-            "request_id": parsed.one("--request-id"),
+            "request_id": request_id,
             "alias": parsed.one("--alias"),
             "harness": harness,
             "cwd": cwd,
@@ -223,6 +224,7 @@ fn command_send(args: &[String]) -> Result<()> {
         .first()
         .context("missing Session selector")?;
     let prompt = prompt_from(&parsed, 1)?.context("missing prompt; use --stdin or -- PROMPT")?;
+    let request_id = require_request_id("send", &parsed)?;
     if parsed.one("--harness").is_some() {
         bail!("--harness is derived from the provider-qualified resume selector");
     }
@@ -231,7 +233,7 @@ fn command_send(args: &[String]) -> Result<()> {
         "session":session,
         "prompt":prompt,
         "correlation_id":correlation_id,
-        "request_id": parsed.one("--request-id"),
+        "request_id": request_id,
         "resume": parsed.flag("--resume"),
     });
     if parsed.flag("--resume") {
@@ -729,6 +731,22 @@ impl Args {
     }
 }
 
+/// Acceptance idempotency only works when the key exists before the first
+/// attempt, so it cannot be something a caller remembers to add afterwards.
+fn require_request_id<'a>(command: &str, parsed: &'a Args) -> Result<&'a str> {
+    parsed
+        .one("--request-id")
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            let reason = "missing required option --request-id; every acceptance needs an \
+idempotency key so a lost response can be retried without creating a second Session";
+            command_usage(command).map_or_else(
+                |_| anyhow::anyhow!("{reason}"),
+                |usage| anyhow::anyhow!("{reason}\n\n{usage}"),
+            )
+        })
+}
+
 fn unknown_option(command: &str, name: &str) -> anyhow::Error {
     command_usage(command).map_or_else(
         |_| anyhow::anyhow!("unknown option {name:?}"),
@@ -957,13 +975,13 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt update - install the latest release and embedded Skills\n\nUSAGE\n  dlgt update [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "new" => {
-            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key; a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "restart" => {
             "dlgt restart - replace a Session process and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "send" => {
-            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> [OPTIONS] -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key; a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "fetch" => {
             "dlgt fetch - read everything new since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n  dlgt fetch --all [OPTIONS]\n\nOPTIONS\n  --cursor <CURSOR>       Opaque forward cursor from a previous response\n  --wait <DURATION>       Long-poll until something new arrives (max 24h)\n  --until any|result      Wake on any change, or on the bound result (default: any)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --all                   Every Session of this daemon; screens are unavailable\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."

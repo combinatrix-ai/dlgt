@@ -196,6 +196,7 @@ dlgt new \
   --harness claude \
   --cwd . \
   --alias @dlgt-verify \
+  --request-id dlgt-verify-1 \
   -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
   && dlgt fetch @dlgt-verify --until result --wait 5m
 ~~~
@@ -208,6 +209,7 @@ dlgt new \
   --harness codex \
   --cwd . \
   --alias @dlgt-verify \
+  --request-id dlgt-verify-1 \
   -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
   && dlgt fetch @dlgt-verify --until result --wait 5m
 ~~~
