@@ -35,7 +35,7 @@ must obtain user confirmation before acting on `UPDATE_AVAILABLE`.
 Failure:
 
 ```json
-{"id":"req_1","error":{"code":"CURSOR_EXPIRED","message":"cursor belongs to a previous daemon instance"}}
+{"id":"req_1","error":{"code":"CURSOR_EXPIRED","message":"this daemon no longer holds position 3"}}
 ```
 
 Raw RPC responses do not use the CLI's `ok:true` or `ok:false` wrapper. Blank
@@ -75,7 +75,7 @@ parameter shapes are stable for v1:
 | `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, required `request_id`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
 | `session.send` | `session`, `prompt`, required `request_id`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
-| `session.fetch` | exactly one of `session` or `all:true`; optional `cursor`, `wait_ms` (max 86,400,000), `until` (`any` or `result`), `screen` (boolean or stable-line count), `max_bytes` |
+| `session.fetch` | exactly one of `session` or `all:true`; optional `cursor` (a position, as a number or a string of digits), `wait_ms` (max 86,400,000), `until` (`any` or `result`), `screen` (boolean or stable-line count), `max_bytes` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
 | `session.read` | `session` |
@@ -300,8 +300,10 @@ Lifecycle events are committed as a strictly ascending prefix across every
 Session in the response, so a Session that did not fit the page can never park
 an earlier event behind a later one that keeps redelivering.
 
-A cursor is an ordinal position, serialized as a string of digits for field
-stability. Every acceptance and every fetch response mints the addressed
+A cursor is an ordinal position. Responses serialize it as a string of digits
+for field stability; requests accept either spelling, a JSON number or a string
+of digits. Absent or `null` requests a baseline. Any other type, and any string
+that is not a position, is `CURSOR_INVALID` rather than a silent baseline. Every acceptance and every fetch response mints the addressed
 scope's next position; `all` numbers independently of any Session. The daemon
 holds the watermarks behind each position and never mutates them, which is
 what makes replaying a position return an identical window.
@@ -312,13 +314,26 @@ Session's own position of the same number, which is a legitimate replay.
 Idempotency belongs to `request_id`.
 
 Positions bind to an internal Session identity, so a Claude provider-ID
-rotation keeps them valid. A daemon restart invalidates them by construction,
-because a new daemon mints new internal identities; no boot identifier is
-needed in the value. The daemon retains the most recent 64 positions per
-Session and 256 for `all`. One `all` position keeps entries only for Sessions
-that still exist and carry state, and addresses at most 256 of them; a daemon
-holding more rejects `all` with `INVALID_ARGUMENT` and must be read one
-Session at a time.
+rotation keeps them valid.
+
+A position is meaningful only within one daemon lifetime. Nothing in the value
+marks which daemon minted it, and resolution is `(scope, number)` alone, so a
+number from a previous daemon is not rejected: it names *this* daemon's window
+of that position, or fails `CURSOR_EXPIRED` if this daemon has not minted that
+far. That is safe rather than merely tolerated -- the previous daemon's state
+is gone, so what comes back is current data and never a stale world -- but it
+means a client must not carry positions across a restart. After
+`RPC_UNAVAILABLE`, `SESSION_NOT_RUNNING`, or any daemon restart, discard
+remembered positions and re-enter through a resume acceptance cursor or a
+cursorless baseline.
+
+The daemon retains the most recent 64 positions per Session and 256 for `all`,
+within a global cap of 4,096 across every scope; beyond either bound the oldest
+are dropped. A response that observed nothing keeps the caller's position
+rather than minting a new one, so an idle long poll spends none of them. One
+`all` position keeps entries only for Sessions that still exist and carry
+state, and addresses at most 256 of them; a daemon holding more rejects `all`
+with `INVALID_ARGUMENT` and must be read one Session at a time.
 
 Retention is bounded to 10,000 stable rows per Session, 50,000 lifecycle events
 per daemon, and 128 results or 16 MiB of result bodies per Session. A cursor

@@ -125,6 +125,73 @@ fn acceptance_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn an_idempotency_key_is_validated_before_the_prompt_is_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let workdir = tempfile::tempdir()?;
+    let at_limit = "k".repeat(128);
+    let over_limit = "k".repeat(129);
+    let cases = [
+        ("", true),
+        (at_limit.as_str(), false),
+        (over_limit.as_str(), true),
+    ];
+    for (key, rejected) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+            .env("DLGT_HOME", home.path())
+            .current_dir(workdir.path())
+            // A missing --cwd fails after the key check, so it marks how far
+            // the invocation got without needing a daemon.
+            .args([
+                "new",
+                "--title",
+                "t",
+                "--harness",
+                "claude",
+                "--request-id",
+                key,
+                "--cwd",
+                "./missing",
+                "--",
+                "hello",
+            ])
+            .output()?;
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout)?;
+        if rejected {
+            assert!(
+                stdout.contains("--request-id"),
+                "key of {} bytes should be rejected: {stdout}",
+                key.len()
+            );
+        } else {
+            assert!(
+                stdout.contains("./missing"),
+                "key of {} bytes should be accepted: {stdout}",
+                key.len()
+            );
+        }
+    }
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn resuming_also_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .args(["send", "claude:some-session", "--resume", "--", "hello"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stdout)?.contains("--request-id"));
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
 fn send_no_longer_accepts_the_removed_wait_flags() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     for flag in [["--wait", "--timeout"], ["--timeout", "1s"]] {

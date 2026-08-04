@@ -687,18 +687,30 @@ holds the watermarks behind it. `--all` numbers independently of any Session.
 ```
 
 Positions are deliberately small: a caller carries one across turns, and an
-opaque 200-character token does not survive an agent's context. The number is
+opaque 200-character token does not survive an agent's context. Over RPC the
+value may be spelled as a JSON number or a string of digits; anything else is
+`CURSOR_INVALID`. The number is
 an ordinal within the scope you address, not a capability: `fetch B --cursor 3`
 returns Session B's own third observation window, which is a legitimate replay,
 not an error. Idempotency is carried by `--request-id`, never by the cursor.
 
 Positions bind to an internal Session identity, so a Claude provider-ID
-rotation does not invalidate them. A daemon restart does, by construction: a
-new daemon mints new internal identities, so an old number has nothing to
-resolve against.
+rotation does not invalidate them.
+
+A position is meaningful only within one daemon lifetime. Nothing in the number
+says which daemon minted it, so a number kept across a restart is not rejected:
+it names the *new* daemon's window of that position, or fails `CURSOR_EXPIRED`
+if that daemon has not minted that far. What comes back is always current data
+-- the previous daemon's state is gone, so there is nothing stale to return --
+but the number no longer means what you think it means. After
+`RPC_UNAVAILABLE`, `SESSION_NOT_RUNNING`, or any daemon restart, drop
+remembered positions and re-enter with `send --resume` (whose acceptance
+carries a fresh position) or one cursorless `fetch`.
 
 The daemon retains the most recent 64 positions per Session and 256 for
-`--all`. Beyond that the oldest are dropped.
+`--all`, within a global cap of 4,096 across every scope; beyond either bound
+the oldest are dropped. A response that observed nothing keeps the position you
+sent instead of minting a new one, so an idle long poll spends none of them.
 
 ```text
 CURSOR_EXPIRED   the position was never minted, or is no longer retained

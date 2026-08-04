@@ -11,9 +11,13 @@
 //! carry across every turn and reliably loses to compaction. A one- or
 //! two-digit number survives that.
 //!
-//! Restart safety is by construction rather than by a boot identifier: a new
-//! daemon mints fresh Session UIDs, so a number from a previous boot has
-//! nothing to resolve against and reads as expired.
+//! A position is meaningful only within one daemon lifetime. Nothing marks a
+//! number as belonging to a previous daemon, and nothing needs to: a restarted
+//! daemon retains none of the state the old numbers described, so there is
+//! nothing to be lost by confusing them. A number from a previous daemon
+//! resolves against the current table -- returning the current daemon's window
+//! of that position, or `CURSOR_EXPIRED` if it has not minted that far. Callers
+//! re-enter through a resume acceptance cursor or a cursorless baseline.
 //!
 //! Scope binds to the immutable internal Session UID, never to the public
 //! Session ID, because Claude rotates that ID on rekey.
@@ -149,6 +153,12 @@ impl CursorTable {
 
     /// Resolve a caller-supplied position within one scope.
     ///
+    /// The lookup is `(scope, number)` and nothing else, so a number minted by
+    /// a previous daemon is not detectable and resolves as this daemon's
+    /// position of the same number. That is safe rather than merely tolerated:
+    /// the old daemon's state is gone, so the window returned is current data,
+    /// never a stale world.
+    ///
     /// Every failure is structured and non-zero, and the recovery for both is
     /// one cursorless baseline fetch.
     pub fn resolve(&self, scope: &str, value: &str) -> Result<Cursor> {
@@ -282,9 +292,7 @@ mod tests {
             );
         }
 
-        // Well formed but never minted, which is also what a number from a
-        // previous daemon boot looks like: the table is memory-only and the
-        // Session UIDs are new.
+        // Well formed but never minted.
         for unminted in ["0", "2", "9999999999"] {
             let error = table
                 .resolve("su_abc", unminted)
@@ -330,6 +338,31 @@ mod tests {
         }
         assert!(table.resolve(SCOPE_ALL, &first_all.to_string()).is_err());
         assert!(table.len() <= MAX_ALL_CURSORS);
+    }
+
+    #[test]
+    fn a_position_from_another_table_resolves_against_this_one() {
+        // Nothing distinguishes a number minted by a previous daemon. It names
+        // this table's position of the same number, which is current data.
+        let mut old = CursorTable::default();
+        let number = mint(&mut old, "su_abc", 111);
+
+        let mut fresh = CursorTable::default();
+        assert!(
+            fresh
+                .resolve("su_abc", &number.to_string())
+                .err()
+                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED")),
+            "a position this table has not minted is simply not held"
+        );
+        mint(&mut fresh, "su_abc", 222);
+        assert_eq!(
+            fresh
+                .resolve("su_abc", &number.to_string())
+                .unwrap_or_else(|error| panic!("failed to resolve: {error}")),
+            sample("su_abc", 222),
+            "the number names this table's window, not the other table's"
+        );
     }
 
     #[test]

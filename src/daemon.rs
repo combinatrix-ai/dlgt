@@ -44,9 +44,6 @@ const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Acceptance receipts retained per daemon, evicted first-in-first-out.
 const REQUEST_RECEIPT_LIMIT: usize = 1024;
-/// Longest caller-supplied idempotency key. The key is retained for the
-/// daemon's lifetime, so it is bounded.
-const MAX_ACCEPTANCE_REQUEST_ID_LEN: usize = 128;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -1618,15 +1615,31 @@ impl Daemon {
                 || Instant::now() >= deadline
                 || self.shutting_down.load(Ordering::SeqCst)
             {
-                self.lock_store()?.store_cursor(
-                    &options.scope,
-                    options.position,
-                    rendered.cursor,
-                )?;
-                return Ok(rendered.value);
+                return self.publish(&options, rendered);
             }
             std::thread::sleep(FETCH_POLL_INTERVAL);
         }
+    }
+
+    /// Attach the response to a position.
+    ///
+    /// A poll that observed nothing keeps the caller's own position rather
+    /// than minting a new one: there is nothing new to name, the caller has
+    /// nothing to update, and an idle long poll cannot churn the bounded set
+    /// of retained positions.
+    fn publish(&self, options: &FetchOptions, rendered: Rendered) -> Result<Value> {
+        let mut value = rendered.value;
+        if let Some(previous) = options.cursor.as_ref()
+            && *previous == rendered.cursor
+        {
+            // Never longer than the reserved number, so the measured document
+            // can only shrink.
+            value["cursor"] = json!(options.incoming.clone().unwrap_or_default());
+            return Ok(value);
+        }
+        self.lock_store()?
+            .store_cursor(&options.scope, options.position, rendered.cursor)?;
+        Ok(value)
     }
 
     fn fetch_options(&self, params: &Value) -> Result<FetchOptions> {
@@ -1687,18 +1700,27 @@ impl Daemon {
                 .session_uid(selector)
                 .with_context(|| format!("session not found: {selector}"))?
         };
-        let cursor = params
-            .get("cursor")
-            .and_then(Value::as_str)
+        // A position is a number, so accept it spelled either way. Anything
+        // that is not a position at all is a malformed request rather than a
+        // silent baseline.
+        let incoming = match params.get("cursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(position)) => Some(position.clone()),
+            Some(Value::Number(position)) => Some(position.to_string()),
+            Some(_) => bail!("CURSOR_INVALID: cursor must be a position number"),
+        };
+        let cursor = incoming
+            .as_deref()
             .map(|position| self.lock_store()?.resolve_cursor(&scope, position))
             .transpose()?;
-        // Every response mints the scope's next position. It is taken before
-        // rendering so the document can carry its own number while it is being
-        // measured.
+        // A response that advances the observation takes the scope's next
+        // position. It is reserved before rendering so the document can carry
+        // its own number while it is being measured.
         let position = self.lock_store()?.reserve_cursor(&scope);
         Ok(FetchOptions {
             scope,
             position,
+            incoming,
             cursor,
             wait: Duration::from_millis(wait_ms),
             until_result,
@@ -3276,8 +3298,11 @@ fn validate_request_id(params: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .filter(|request_id| !request_id.is_empty())
         .context("missing request_id: every acceptance must carry an idempotency key")?;
-    if request_id.len() > MAX_ACCEPTANCE_REQUEST_ID_LEN {
-        bail!("invalid request_id: must be at most {MAX_ACCEPTANCE_REQUEST_ID_LEN} bytes");
+    if request_id.len() > crate::protocol::MAX_ACCEPTANCE_REQUEST_ID_LEN {
+        bail!(
+            "invalid request_id: must be at most {} bytes",
+            crate::protocol::MAX_ACCEPTANCE_REQUEST_ID_LEN
+        );
     }
     Ok(())
 }
@@ -3319,8 +3344,10 @@ fn fnv1a128(bytes: &[u8]) -> u128 {
 struct FetchOptions {
     /// One Session UID, or `all`.
     scope: String,
-    /// Observation position this response will publish.
+    /// Observation position this response publishes when it advances.
     position: u64,
+    /// The position the caller supplied, kept when nothing advanced.
+    incoming: Option<String>,
     cursor: Option<cursor::Cursor>,
     wait: Duration,
     until_result: bool,
@@ -3514,8 +3541,10 @@ struct Rendered {
 /// Assembles a response one unit at a time.
 ///
 /// A watermark is recorded only when the unit it describes is committed, and
-/// the cursor is encoded last from the committed set, so shedding cannot leave
-/// a watermark past data the caller never received. Byte accounting is exact
+/// the published vector is derived last from the committed set, so shedding
+/// cannot leave a watermark past data the caller never received. The position
+/// number is reserved before rendering, so the document can carry its own
+/// number while it is being measured. Byte accounting is exact
 /// per unit; the finished document is measured once and units are rolled back
 /// until it fits, which can only shrink the cursor further.
 ///
@@ -4701,6 +4730,7 @@ mod tests {
         FetchOptions {
             scope: "su_test".to_owned(),
             position: 1,
+            incoming: None,
             cursor,
             wait: Duration::from_millis(0),
             until_result: false,

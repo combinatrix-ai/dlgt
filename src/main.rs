@@ -155,9 +155,11 @@ fn command_new(args: &[String]) -> Result<()> {
                 .and_then(Value::as_str)
         })
         .context("missing --harness or profile harness")?;
+    // Validated before the prompt so a caller is never asked for stdin only to
+    // be told the invocation was wrong.
+    let request_id = require_request_id("new", &parsed)?;
     let prompt =
         prompt_from(&parsed, 0)?.context("missing initial prompt; use --stdin or -- PROMPT")?;
-    let request_id = require_request_id("new", &parsed)?;
     let cwd = launch_cwd(&parsed)?;
     let model = parsed.one("--model").or_else(|| {
         profile
@@ -223,8 +225,8 @@ fn command_send(args: &[String]) -> Result<()> {
         .positionals
         .first()
         .context("missing Session selector")?;
-    let prompt = prompt_from(&parsed, 1)?.context("missing prompt; use --stdin or -- PROMPT")?;
     let request_id = require_request_id("send", &parsed)?;
+    let prompt = prompt_from(&parsed, 1)?.context("missing prompt; use --stdin or -- PROMPT")?;
     if parsed.one("--harness").is_some() {
         bail!("--harness is derived from the provider-qualified resume selector");
     }
@@ -734,17 +736,30 @@ impl Args {
 /// Acceptance idempotency only works when the key exists before the first
 /// attempt, so it cannot be something a caller remembers to add afterwards.
 fn require_request_id<'a>(command: &str, parsed: &'a Args) -> Result<&'a str> {
-    parsed
-        .one("--request-id")
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| {
-            let reason = "missing required option --request-id; every acceptance needs an \
-idempotency key so a lost response can be retried without creating a second Session";
-            command_usage(command).map_or_else(
-                |_| anyhow::anyhow!("{reason}"),
-                |usage| anyhow::anyhow!("{reason}\n\n{usage}"),
-            )
-        })
+    let Some(request_id) = parsed.one("--request-id").filter(|id| !id.is_empty()) else {
+        return Err(request_id_error(
+            command,
+            "missing required option --request-id; every acceptance needs an idempotency key \
+so a lost response can be retried without creating a second Session",
+        ));
+    };
+    if request_id.len() > crate::protocol::MAX_ACCEPTANCE_REQUEST_ID_LEN {
+        return Err(request_id_error(
+            command,
+            &format!(
+                "invalid --request-id: must be at most {} bytes",
+                crate::protocol::MAX_ACCEPTANCE_REQUEST_ID_LEN
+            ),
+        ));
+    }
+    Ok(request_id)
+}
+
+fn request_id_error(command: &str, reason: &str) -> anyhow::Error {
+    command_usage(command).map_or_else(
+        |_| anyhow::anyhow!("{reason}"),
+        |usage| anyhow::anyhow!("{reason}\n\n{usage}"),
+    )
 }
 
 fn unknown_option(command: &str, name: &str) -> anyhow::Error {

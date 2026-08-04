@@ -77,11 +77,16 @@ baseline_cursor=$(printf '%s\n' "$baseline_json" \
   | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 test -n "$baseline_cursor"
 
-# An exhausted cursor is a successful empty observation, not an error.
+# An exhausted cursor is a successful empty observation, not an error, and it
+# keeps the caller's own position: nothing advanced, so there is nothing new to
+# name and no retained position is spent.
 empty_json=$("$binary" fetch "$session_id" --cursor "$baseline_cursor")
 printf '%s\n' "$empty_json" | grep -q '"reason":"timeout"'
 printf '%s\n' "$empty_json" | grep -q '"results":\[\]'
 printf '%s\n' "$empty_json" | grep -q '"has_more":false'
+printf '%s\n' "$empty_json" | grep -q "\"cursor\":\"$baseline_cursor\""
+"$binary" fetch "$session_id" --cursor "$baseline_cursor" \
+  | grep -q "\"cursor\":\"$baseline_cursor\""
 
 # A current client routes provider-qualified selectors to a live daemon on a
 # different versioned socket instead of launching a duplicate locally.
@@ -125,21 +130,28 @@ DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
 
-# Runtime state is memory-only, so no position may survive a daemon instance:
-# a restarted daemon has never minted it.
+# A position is meaningful only within one daemon lifetime. Nothing marks a
+# number as belonging to a previous daemon, and nothing needs to: the state it
+# described is gone, so there is nothing to be lost by reusing the number.
 DLGT_SOCKET="$old_socket" "$binary" server --foreground >"$state_dir/old-server-2.log" 2>&1 &
 old_server_pid=$!
 attempt=0
 while [ ! -S "$old_socket" ]; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
+# Before this daemon has minted that far, the position is simply not held.
 set +e
 expired_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all --cursor "$stale_cursor")
 expired_status=$?
 set -e
 test "$expired_status" -eq 1
 printf '%s\n' "$expired_json" | grep -q '"code":"CURSOR_EXPIRED"'
+# Once it has, the same number names this daemon's window of that position:
+# current data, never the previous daemon's world.
 DLGT_SOCKET="$old_socket" "$binary" fetch --all | grep -q '"reason":"snapshot"'
+reused_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all --cursor "$stale_cursor")
+printf '%s\n' "$reused_json" | grep -q '"ok":true'
+if printf '%s\n' "$reused_json" | grep -q 'provider-cross-version'; then exit 1; fi
 DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
@@ -233,6 +245,36 @@ test "$rpc_bytes" -le 2148 || {
   printf 'rpc fetch line was %s bytes, over 2048 plus its envelope\n' "$rpc_bytes" >&2
   exit 1
 }
+
+# A position is a number, so raw RPC accepts it spelled either way. Absent and
+# null mean "baseline"; anything that is not a position is a malformed request
+# rather than a silent baseline.
+rpc_fetch() {
+  printf '{"id":"c1","method":"session.fetch","params":{"session":"%s","screen":false,%s}}\n' \
+    "$session_id" "$1" | "$binary" rpc --stdio
+}
+rpc_fetch '"cursor":"1"' | grep -q '"cursor"'
+rpc_fetch '"cursor":1' | grep -q '"cursor"'
+rpc_fetch '"cursor":null' | grep -q '"reason":"snapshot"'
+rpc_fetch '"max_bytes":32768' | grep -q '"reason":"snapshot"'
+for shape in 'true' '{}' '[]' '"not-a-number"'; do
+  rpc_fetch "\"cursor\":$shape" | grep -q '"code":"CURSOR_INVALID"' || {
+    printf 'cursor shape %s was not rejected\n' "$shape" >&2
+    exit 1
+  }
+done
+
+# Acceptance over raw RPC needs the same idempotency key the CLI requires.
+rpc_accept() {
+  printf '{"id":"a1","method":"session.send","params":{"session":"%s","prompt":"x"%s}}\n' \
+    "$session_id" "$1" | "$binary" rpc --stdio
+}
+rpc_accept '' | grep -q '"code":"INVALID_ARGUMENT"'
+rpc_accept ',"request_id":""' | grep -q '"code":"INVALID_ARGUMENT"'
+long_key=$(awk 'BEGIN { for (i = 0; i < 129; i++) printf "k" }')
+rpc_accept ",\"request_id\":\"$long_key\"" | grep -q '"code":"INVALID_ARGUMENT"'
+printf '{"id":"a2","method":"session.create","params":{"title":"t","harness":"claude","prompt":"x","cwd":"%s","environment":{}}}\n' \
+  "$repo_root" | "$binary" rpc --stdio | grep -q '"code":"INVALID_ARGUMENT"'
 
 "$binary" models --harness claude | grep -q '"id":"default"'
 "$binary" harnesses | grep -q '"codex"'

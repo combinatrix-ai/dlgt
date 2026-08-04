@@ -96,6 +96,10 @@ impl std::fmt::Display for TurnState {
     }
 }
 
+/// Longest caller-supplied acceptance idempotency key. The key is retained
+/// for the daemon's lifetime, so it is bounded.
+pub const MAX_ACCEPTANCE_REQUEST_ID_LEN: usize = 128;
+
 /// Longest RPC request id accepted. The id is echoed in the response
 /// envelope, so an unbounded one would let a caller inflate a reply past any
 /// size the request itself agreed to.

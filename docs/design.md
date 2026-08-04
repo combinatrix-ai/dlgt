@@ -383,8 +383,12 @@ Session, 50,000 lifecycle events per daemon, and 128 results or 16 MiB of
 result bodies per Session. A cursor that predates an eviction returns a
 structured gap with a bounded baseline and a fresh cursor; a silent reset is
 never acceptable. A position the daemon never minted or no longer
-retains is a structured error whose recovery is one cursorless baseline
-fetch.
+retains is a structured error whose recovery is one cursorless baseline fetch.
+Positions are meaningful only within one daemon lifetime: resolution is
+`(scope, number)` alone, so a number kept across a restart names the new
+daemon's window rather than being detected as stale. That is sound because the
+old daemon's state does not survive either, but callers re-enter through an
+acceptance cursor or a baseline rather than a remembered number.
 
 Every observation is a success. Timeout, blocked input, a failed execution, and
 a canceled result all exit zero and are described by the response `reason` and
@@ -392,9 +396,12 @@ result status. Non-zero exits remain for malformed requests, unknown Sessions,
 unusable cursors, and transport failure.
 
 A response is assembled one unit at a time. Each watermark is recorded only
-when the unit it describes is committed and survives the final measurement,
-and the cursor is encoded last from the committed set, so a squeezed response
-cannot leave a watermark past data the caller never received.
+when the unit it describes is committed and survives the final measurement, and
+the published vector is derived last from the committed set, so a squeezed
+response cannot leave a watermark past data the caller never received. The
+position number itself is reserved before rendering, so the document carries
+its own number while it is being measured; a response that observed nothing
+keeps the caller's position instead of spending a new one.
 
 ### Known limitations
 

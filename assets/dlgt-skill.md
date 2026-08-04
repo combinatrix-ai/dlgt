@@ -59,8 +59,11 @@ Retain both before doing anything else:
   correlation, and later resume.
 - `cursor` is a small number: this Session's observation position, taken
   immediately before the work you just accepted, so reading from it cannot
-  miss output the provider produced in between. Every response mints the next
-  one, so they count up: 1, 2, 3. Carry the latest.
+  miss output the provider produced in between. Responses that advance mint
+  the next one, so they count up: 1, 2, 3. Carry the latest. A position is
+  only meaningful while that daemon lives: after `RPC_UNAVAILABLE`,
+  `SESSION_NOT_RUNNING`, or a restart, forget the number and re-enter with
+  `send --resume` or one cursorless `fetch`.
 - `--request-id` is required on every `new` and `send`, and makes the
   acceptance replayable. If you never see this response, re-run the identical
   command with the same ID: it returns the original receipt with
