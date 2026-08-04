@@ -31,6 +31,21 @@ Title     A human description. Alias is a short human address derived from it.
 Profile   A reusable client-side launch specification.
 ```
 
+## What is required, what is optional
+
+| Command | Required | Optional, with its default |
+| --- | --- | --- |
+| `new` | `--title`, `--request-id`, a Harness (`--harness` or a Profile), and the prompt (`--stdin` or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--no-auto-approve` (default is auto-approved), `--startup-timeout` (60s), env options |
+| `send` | the Session address, `--request-id`, and the prompt | `--resume`; launch options are accepted only with it |
+| `fetch` | the Session address, or `--all` | `--cursor` (omit = bounded baseline snapshot), `--wait <DURATION>` (omit = return immediately; explicit duration up to 24h), `--until any\|result` (default `any`), `--screen[=N]`/`--no-screen` (screen on for one Session; off and rejected for `--all`), `--max-bytes` (32 KiB) |
+| `stop`, `cancel`, `show`, `restart` | the Session address | `cancel --timeout` (30s), `stop --force` |
+
+What you must retain between commands is exactly two values: the
+provider-qualified `session.id` and the latest `cursor` number. The
+`--request-id` for each acceptance must be invented BEFORE the first attempt
+and reused verbatim on any retry — that is the entire mechanism that makes a
+lost response recoverable.
+
 ## Delegate and read the answer
 
 Delegation is two phases. `new` and `send` only accept work and return as soon
@@ -140,24 +155,51 @@ the Session ID and cursor you need, and the work is still running. A missing
 second line never means the acceptance failed, and it is never a reason to run
 `new` again.
 
-## Watch a long task
+## Standard workflow when running as Claude Code
 
-A long delegation outlives one foreground command, so run the long `fetch` the
-way your own harness supports and never fuse it with acceptance:
+```bash
+# 1. Accept in the foreground; it returns in seconds.
+receipt=$(dlgt new --title "long refactor" --harness codex --cwd . \
+  --request-id refactor-1 --stdin <<'PROMPT'
+...
+PROMPT
+)
+session_id=$(printf '%s\n' "$receipt" | jq -er '.session.id')
+cursor=$(printf '%s\n' "$receipt" | jq -er '.cursor')
 
-- Running as Claude: accept the work first, then run
-  `dlgt fetch <session.id> --cursor <cursor> --until result --wait 30m` through
-  the background mechanism your harness offers. The acceptance receipt is
-  already in hand, so a lost or backgrounded read costs nothing.
-  Never use the one-call optimization for a long task: it puts the receipt and
-  a 30-minute wait in the same killable command.
-- Running as Codex: run the same long `fetch` inside one exec cell and then
-  issue a single long cell wait. Output produced before the cell yields is
-  retained and delivered at that wait.
-- Either way, one long poll replaces a loop of short polls. Use `--wait 30m`
-  rather than fifteen `--wait 2m` calls.
+# 2. Observe with ONE long fetch, run through the Bash tool's
+#    background mechanism (run_in_background), not in the foreground:
+dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 30m
+```
 
-While waiting is impossible, poll forward instead of re-reading:
+The background task exits when the worker finishes, and the harness notifies
+you — zero polling calls. The acceptance receipt is already safe in your
+context, so nothing is lost even if the long read is killed. For a short task
+(a minute or less), a foreground `--wait 60s` fits inside the default tool
+budget and needs no background step. Never fuse acceptance into the long
+fetch: that puts the receipt and a 30-minute wait in the same killable
+command, which is exactly the failure the two-phase split removes.
+
+## Standard workflow when running as Codex
+
+```bash
+# 1. Accept — completes within the exec yield window; the receipt
+#    arrives inline in this same tool call.
+dlgt new --title "long refactor" --harness claude --cwd . \
+  --request-id refactor-1 --stdin < prompt.md
+
+# 2. Observe with ONE long fetch. Expect the exec cell to yield after
+#    ~10-30 seconds; that is normal, not a failure.
+dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 30m
+
+# 3. Issue a single LONG cell wait on that yielded cell rather than
+#    repeated short waits. Output printed before the yield is retained
+#    and delivered when the wait resolves.
+```
+
+One long poll replaces a loop of short polls on either harness: use
+`--wait 30m` once rather than fifteen `--wait 2m` calls. Where a long wait is
+impossible, poll forward instead of re-reading:
 
 ```bash
 dlgt fetch "$session_id" --cursor "$cursor" --wait 60s
