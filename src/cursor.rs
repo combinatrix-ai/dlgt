@@ -12,11 +12,12 @@
 //! two-digit number survives that.
 //!
 //! A position is meaningful only within one daemon lifetime. Nothing marks a
-//! number as belonging to a previous daemon, and nothing needs to: a restarted
-//! daemon retains none of the state the old numbers described, so there is
-//! nothing to be lost by confusing them. A number from a previous daemon
-//! resolves against the current table -- returning the current daemon's window
-//! of that position, or `CURSOR_EXPIRED` if it has not minted that far. Callers
+//! number as belonging to a previous daemon, so a stale number resolves
+//! against the current table -- returning the current daemon's window of that
+//! position, or `CURSOR_EXPIRED` if it has not minted that far. That behavior
+//! is defined but potentially lossy: used as a starting position, a stale
+//! number skips whatever the current daemon recorded before that window.
+//! Callers must therefore discard remembered numbers after a restart and
 //! re-enter through a resume acceptance cursor or a cursorless baseline.
 //!
 //! Scope binds to the immutable internal Session UID, never to the public
@@ -155,9 +156,10 @@ impl CursorTable {
     ///
     /// The lookup is `(scope, number)` and nothing else, so a number minted by
     /// a previous daemon is not detectable and resolves as this daemon's
-    /// position of the same number. That is safe rather than merely tolerated:
-    /// the old daemon's state is gone, so the window returned is current data,
-    /// never a stale world.
+    /// position of the same number. The window returned is always current
+    /// data, never a stale world -- but as a starting position a stale number
+    /// skips whatever this daemon recorded before it, so the documented rule
+    /// is to discard remembered numbers after a restart.
     ///
     /// Every failure is structured and non-zero, and the recovery for both is
     /// one cursorless baseline fetch.

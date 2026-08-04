@@ -1708,7 +1708,18 @@ impl Daemon {
             Some(Value::String(position)) => Some(position.clone()),
             Some(Value::Number(position)) => Some(position.to_string()),
             Some(_) => bail!("CURSOR_INVALID: cursor must be a position number"),
-        };
+        }
+        // Canonicalize the spelling: "0001" names position 1 and must be
+        // published back as "1", or the no-mint echo would replace the
+        // measured document's short reserved number with an arbitrarily long
+        // caller-chosen spelling and break the byte bound.
+        .map(|position| {
+            position
+                .parse::<u64>()
+                .map(|number| number.to_string())
+                .map_err(|_| anyhow!("CURSOR_INVALID: {position:?} is not a cursor position"))
+        })
+        .transpose()?;
         let cursor = incoming
             .as_deref()
             .map(|position| self.lock_store()?.resolve_cursor(&scope, position))

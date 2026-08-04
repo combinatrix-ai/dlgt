@@ -87,6 +87,11 @@ printf '%s\n' "$empty_json" | grep -q '"has_more":false'
 printf '%s\n' "$empty_json" | grep -q "\"cursor\":\"$baseline_cursor\""
 "$binary" fetch "$session_id" --cursor "$baseline_cursor" \
   | grep -q "\"cursor\":\"$baseline_cursor\""
+# A leading-zero spelling names the same position but is canonicalized before
+# publication, so the no-mint echo cannot smuggle an arbitrarily long
+# caller-chosen spelling past the measured byte bound.
+"$binary" fetch "$session_id" --cursor "000000000$baseline_cursor" \
+  | grep -q "\"cursor\":\"$baseline_cursor\""
 
 # A current client routes provider-qualified selectors to a live daemon on a
 # different versioned socket instead of launching a duplicate locally.

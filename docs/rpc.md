@@ -303,10 +303,14 @@ an earlier event behind a later one that keeps redelivering.
 A cursor is an ordinal position. Responses serialize it as a string of digits
 for field stability; requests accept either spelling, a JSON number or a string
 of digits. Absent or `null` requests a baseline. Any other type, and any string
-that is not a position, is `CURSOR_INVALID` rather than a silent baseline. Every acceptance and every fetch response mints the addressed
-scope's next position; `all` numbers independently of any Session. The daemon
-holds the watermarks behind each position and never mutates them, which is
-what makes replaying a position return an identical window.
+that is not a position, is `CURSOR_INVALID` rather than a silent baseline.
+Leading zeros are accepted and canonicalized: responses always spell the
+position without them. Every acceptance, and every fetch response that
+advances the observation, mints the addressed scope's next position; a fetch
+that observed nothing new returns the caller's own position unchanged. `all`
+numbers independently of any Session. The daemon holds the watermarks behind
+each position and never mutates them, which is what makes replaying a position
+return an identical window.
 
 The position is an ordinal within the scope addressed, not a capability
 token: using one Session's number against another resolves that other
@@ -320,9 +324,10 @@ A position is meaningful only within one daemon lifetime. Nothing in the value
 marks which daemon minted it, and resolution is `(scope, number)` alone, so a
 number from a previous daemon is not rejected: it names *this* daemon's window
 of that position, or fails `CURSOR_EXPIRED` if this daemon has not minted that
-far. That is safe rather than merely tolerated -- the previous daemon's state
-is gone, so what comes back is current data and never a stale world -- but it
-means a client must not carry positions across a restart. After
+far. What comes back is always current data, never a stale world, but the
+behavior is defined rather than safe: used as a starting position, a stale
+number skips whatever this daemon recorded before that window, so a client
+must not carry positions across a restart. After
 `RPC_UNAVAILABLE`, `SESSION_NOT_RUNNING`, or any daemon restart, discard
 remembered positions and re-enter through a resume acceptance cursor or a
 cursorless baseline.
@@ -466,8 +471,8 @@ terminal input, resize, and private execution operations are unavailable even
 if a caller names them directly.
 
 Provider turn IDs, internal Session UIDs, and internal execution row IDs never
-appear in public responses or normalized events; cursors carry the internal
-Session identity only in opaque form. Launch environment values travel in RPC memory
+appear in public responses or normalized events; a cursor is a bare position
+number and carries no identity data. Launch environment values travel in RPC memory
 but are not directly serialized into Session metadata, errors, Profiles, or
 events. Results and terminal output remain untrusted and potentially sensitive
 because a provider can echo its environment.

@@ -502,7 +502,7 @@ dlgt fetch (<SESSION_ID|@ALIAS> | --all)
 
 `fetch` is the one observation command. It returns, in a single JSON document,
 the current Session snapshot, every terminal result and lifecycle event after
-the cursor, the forward screen delta, and a new cursor.
+the cursor, the forward screen delta, and the response's cursor position.
 
 Every observation succeeds. A long poll that expires with nothing new is
 `{"ok":true,"reason":"timeout"}` with empty deltas and the same cursor
@@ -678,9 +678,12 @@ holding retained state for more than that rejects `--all` with
 
 ### Cursors
 
-A cursor is a position, not a token. Every acceptance and every `fetch`
-response mints the addressed scope's next position -- 1, 2, 3 -- and the daemon
-holds the watermarks behind it. `--all` numbers independently of any Session.
+A cursor is a position, not a token. Every acceptance, and every `fetch`
+response that advances the observation, mints the addressed scope's next
+position -- 1, 2, 3 -- and the daemon holds the watermarks behind it. A fetch
+that observed nothing new returns the caller's own position unchanged.
+Leading zeros in a supplied position are accepted and canonicalized away.
+`--all` numbers independently of any Session.
 
 ```json
 {"cursor":"4"}
