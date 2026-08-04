@@ -451,8 +451,12 @@ impl Daemon {
                     }
                     error.session_state = Some(session.state.public_name().to_owned());
                     if error.code == "SESSION_BLOCKED" && error.session_id.is_some() {
+                        // Worded for a human on a real terminal: agents have
+                        // executed this hint verbatim from non-TTY tool calls
+                        // and received raw ANSI. Agents observe the question
+                        // through fetch's blocked screen instead.
                         error.action = Some(format!(
-                            "dlgt attach {}",
+                            "have a human run in a terminal: dlgt attach {}",
                             error.session_id.as_deref().unwrap_or(selector)
                         ));
                     }

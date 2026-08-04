@@ -784,7 +784,7 @@ not an infinite wait.
   "error": {
     "code": "SESSION_BLOCKED",
     "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
-    "action": "dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345"
+    "action": "have a human run in a terminal: dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345"
   }
 }
 ```
