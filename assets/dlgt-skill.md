@@ -225,12 +225,22 @@ if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code + "\n"
 text(output);
 ```
 
-Then issue ONE long top-level wait on the DECIMAL cell ID from the
-"Script running with cell ID N" banner — `tools.wait({"cell_id":"N",
-"yield_time_ms":1860000})` gives a 30-minute fetch a safety margin. A
-`chunk_id` or a nested `session_id` is never a cell ID; waiting on one fails
-with "cell not found". If the outer wait yields early, wait again on the SAME
-cell — never start a replacement fetch because a cell yielded.
+The cell banner names a DECIMAL cell ID ("Script running with cell ID N").
+A `chunk_id` or a nested `session_id` is never a cell ID; waiting on one
+fails with "cell not found". Then choose by whether you can afford to block:
+
+- **Blocking until the answer is fine** (it is your next step anyway — a
+  review you will act on, a result you cannot proceed without): issue ONE
+  long top-level wait immediately — `tools.wait({"cell_id":"N",
+  "yield_time_ms":1860000})` gives a 30-minute fetch a safety margin. If it
+  yields early, wait again on the SAME cell; never start a replacement fetch
+  because a cell yielded.
+- **You have other work first**: keep the cell ID, do that work in the SAME
+  turn, and issue the same wait when ready — a cell that already finished
+  returns its buffered result instantly. Two hard limits: completion never
+  interrupts you, so you must eventually spend the wait to learn of it; and
+  the cell does not survive the turn — ending or interrupting the turn
+  destroys it and strands the fetch, so collect before the turn ends.
 
 Where Code Mode cells are unavailable, fall back to short forward polls that
 stay UNDER the 30-second nested clamp:
