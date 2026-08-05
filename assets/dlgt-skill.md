@@ -197,20 +197,49 @@ dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 30m
 #    and delivered when the wait resolves.
 ```
 
-Two Codex-specific traps:
+In Codex Code Mode, one nested `exec_command` is clamped to 30 seconds
+regardless of the `yield_time_ms` you pass, so a bare 30-minute `fetch` loses
+its process handle: the JavaScript finishes with the nested call's EMPTY
+still-running output, reports "Script completed", and the fetch keeps running
+orphaned. That empty completion never means the work finished. Hold the handle
+with an internal loop instead — empty `write_stdin` polls may wait up to five
+minutes each and cost no model round-trips:
 
-- Wait on the cell ID from the "Script running with cell ID N" line. A
-  `chunk_id` in a JSON-shaped yield is not a cell ID and the wait will fail
-  with "cell not found".
-- Some Codex environments kill a backgrounded cell after tens of seconds: the
-  cell reports "completed" with EMPTY output even though `fetch --wait 30m`
-  could not have exited silently. That empty completion means your harness
-  killed the process, not that the work finished. Do not run a cursorless
-  baseline to re-orient — your cursor is still valid, because an observation
-  that returned nothing advanced nothing. Re-issue the SAME
-  `fetch --cursor <same N> --until result` in the foreground with a `--wait`
-  short enough to survive, around 45s, and repeat. Positions replay safely,
-  so the same cursor can be retried any number of times.
+```js
+// @exec: {"yield_time_ms": 1000, "max_output_tokens": 30000}
+const chunks = [];
+let r = await tools.exec_command({
+  cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 30m",
+  workdir: "<WORKDIR>", yield_time_ms: 30000, max_output_tokens: 30000
+});
+for (;;) {
+  chunks.push(r.output ?? "");
+  if (r.session_id == null) break;
+  r = await tools.write_stdin({
+    session_id: r.session_id, chars: "",
+    yield_time_ms: 300000, max_output_tokens: 30000
+  });
+}
+const output = chunks.join("");
+if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code + "\n" + output);
+text(output);
+```
+
+Then issue ONE long top-level wait on the DECIMAL cell ID from the
+"Script running with cell ID N" banner — `tools.wait({"cell_id":"N",
+"yield_time_ms":1860000})` gives a 30-minute fetch a safety margin. A
+`chunk_id` or a nested `session_id` is never a cell ID; waiting on one fails
+with "cell not found". If the outer wait yields early, wait again on the SAME
+cell — never start a replacement fetch because a cell yielded.
+
+Where Code Mode cells are unavailable, fall back to short forward polls that
+stay UNDER the 30-second nested clamp:
+`dlgt fetch <id> --cursor <N> --until result --wait 20s`, repeated. After a
+lost or empty observation, retry the SAME cursor — an observation that
+returned nothing advanced nothing, and positions replay safely. Use a
+cursorless baseline only when the cursor itself is genuinely lost. Code Mode
+internals are version-sensitive (verified against 0.146.x); if the wrapper
+misbehaves after a Codex upgrade, drop to the short-poll fallback.
 
 One long poll replaces a loop of short polls on either harness: use
 `--wait 30m` once rather than fifteen `--wait 2m` calls. Where a long wait is
