@@ -241,6 +241,13 @@ cursorless baseline only when the cursor itself is genuinely lost. Code Mode
 internals are version-sensitive (verified against 0.146.x); if the wrapper
 misbehaves after a Codex upgrade, drop to the short-poll fallback.
 
+To pace periodic observations instead of holding one wait, delay with an
+awaited Code Mode timer — `await new Promise(r => setTimeout(r, 300000));`
+before the `fetch` in the same cell — never with a shell `sleep`, which burns
+a unified-exec process and hits the same 30-second clamp. On Codex Desktop,
+scheduled thread heartbeats can re-enter the chat on a timer across turns;
+the CLI has no out-of-turn scheduler.
+
 One long poll replaces a loop of short polls on either harness: use
 `--wait 30m` once rather than fifteen `--wait 2m` calls. Where a long wait is
 impossible, poll forward instead of re-reading:
