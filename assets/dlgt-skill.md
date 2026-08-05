@@ -78,9 +78,9 @@ useful work and delivers the completed fetch back into the SAME active turn.
 If the documentation is unclear, a one-line probe cell —
 `text(typeof yield_control + " " + typeof notify)` — settles whether both are
 functions without calling a missing helper. This capability has been verified
-in Codex Desktop and interactive Codex CLI 0.146.x; detect the helpers
-themselves rather than inferring support from a product name, feature flag, or
-TTY presence.
+in Codex Desktop Code Mode with the 0.146.x host; detect the helpers themselves
+rather than inferring support from a product name, feature flag, or TTY
+presence.
 
 If either helper is unavailable, use the explicit-collection path instead.
 Also prefer explicit collection when the delegation result is already the
@@ -102,11 +102,11 @@ await every continuation inside the same cell — substitute the three
 placeholders and run this as one `exec` call:
 
 ```js
-// @exec: {"yield_time_ms": 31000, "max_output_tokens": 30000}
+// @exec: {"yield_time_ms": 5000, "max_output_tokens": 30000}
 const chunks = [];
 let r = await tools.exec_command({
   cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 30m --max-bytes 24000",
-  workdir: "<WORKDIR>", yield_time_ms: 30000, max_output_tokens: 30000
+  workdir: "<WORKDIR>", yield_time_ms: 1000, max_output_tokens: 30000
 });
 
 if (r.session_id == null) {
@@ -115,7 +115,7 @@ if (r.session_id == null) {
   JSON.parse(output);
   text(output);
 } else {
-  text("dlgt listener armed; continuing in the parent turn.");
+  text("dlgt listener armed for <SESSION_ID> from cursor <CURSOR>; continuing in the parent turn.");
   yield_control();
   try {
     for (;;) {
@@ -131,7 +131,7 @@ if (r.session_id == null) {
     JSON.parse(output);
     notify("dlgt fetch returned:\n" + output);
   } catch (error) {
-    notify("dlgt listener failed: " + error + "\n" + chunks.join("").trim());
+    notify("dlgt listener failed for <SESSION_ID> from cursor <CURSOR>: " + error + "\n" + chunks.join("").trim());
   }
 }
 ```
@@ -254,11 +254,11 @@ stay UNDER the 30-second nested clamp, repeated:
 dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 20s
 ```
 
-Code Mode internals are version-sensitive (the delayed path is verified against
-interactive Codex CLI 0.146.x and the corresponding Desktop host); if either
-wrapper misbehaves after a Codex upgrade, drop to this fallback. Desktop
-scheduled thread heartbeats can re-enter a chat across turns, but that is a
-separate scheduler capability and is not part of this same-turn workflow.
+Code Mode internals are version-sensitive (the delayed path is verified in
+Codex Desktop Code Mode with the 0.146.x host); if either wrapper misbehaves
+after a Codex upgrade, drop to this fallback. Desktop scheduled thread
+heartbeats can re-enter a chat across turns, but that is a separate scheduler
+capability and is not part of this same-turn workflow.
 
 ## Standard workflow when running as Claude Code
 
