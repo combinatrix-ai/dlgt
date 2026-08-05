@@ -69,12 +69,96 @@ response is lost or killed, re-run the identical command with the identical
 `--request-id`; never issue a second bare `new` because you are unsure
 whether the first landed.
 
-### 2. Observe through one wrapped cell
+### 2. Choose how completion returns
+
+Read the `exec` tool's own documentation in this session before observing. If
+its JavaScript environment explicitly names both `yield_control()` and
+`notify()`, use the delayed-delivery path below. It lets the parent continue
+useful work and delivers the completed fetch back into the SAME active turn.
+If the documentation is unclear, a one-line probe cell —
+`text(typeof yield_control + " " + typeof notify)` — settles whether both are
+functions without calling a missing helper. This capability has been verified
+in Codex Desktop and interactive Codex CLI 0.146.x; detect the helpers
+themselves rather than inferring support from a product name, feature flag, or
+TTY presence.
+
+If either helper is unavailable, use the explicit-collection path instead.
+Also prefer explicit collection when the delegation result is already the
+parent's next dependency and there is no useful work to do concurrently.
+Without Code Mode cells at all, skip both paths and use the short forward polls
+under "Pacing and final fallback".
+
+Never send the parent's final response while a delayed listener is outstanding.
+`notify()` can re-enter an active turn; it does not resurrect a finalized turn.
+This JavaScript helper is also unrelated to Codex's `config.toml` `notify`
+command, which only sends an external turn-complete notification.
+
+### 3A. Delayed delivery when `yield_control` and `notify` exist
 
 A bare `dlgt fetch --wait 30m` under Code Mode's nested executor is clamped
 to 30 seconds and gets orphaned: the cell reports an empty completion while
-the fetch runs on unseen. Hold the process handle with this cell — substitute
-the three placeholders and run it verbatim:
+the fetch runs on, unseen. Hold the process handle, yield the parent turn, and
+await every continuation inside the same cell — substitute the three
+placeholders and run this as one `exec` call:
+
+```js
+// @exec: {"yield_time_ms": 31000, "max_output_tokens": 30000}
+const chunks = [];
+let r = await tools.exec_command({
+  cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 30m --max-bytes 24000",
+  workdir: "<WORKDIR>", yield_time_ms: 30000, max_output_tokens: 30000
+});
+
+if (r.session_id == null) {
+  const output = (r.output ?? "").trim();
+  if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code + "\n" + output);
+  JSON.parse(output);
+  text(output);
+} else {
+  text("dlgt listener armed; continuing in the parent turn.");
+  yield_control();
+  try {
+    for (;;) {
+      chunks.push(r.output ?? "");
+      if (r.session_id == null) break;
+      r = await tools.write_stdin({
+        session_id: r.session_id, chars: "",
+        yield_time_ms: 300000, max_output_tokens: 30000
+      });
+    }
+    const output = chunks.join("").trim();
+    if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code);
+    JSON.parse(output);
+    notify("dlgt fetch returned:\n" + output);
+  } catch (error) {
+    notify("dlgt listener failed: " + error + "\n" + chunks.join("").trim());
+  }
+}
+```
+
+The initial `text(...)` makes the armed listener visible before control
+returns. `yield_control()` does not end the cell: execution continues after it,
+and the awaited `write_stdin` calls keep the isolate alive until `notify(...)`
+injects the result. Never start the listener in an unawaited promise; unawaited
+work is discarded when the cell finishes. Keep the entire post-yield
+continuation inside the `try`: an uncaught error after `yield_control()` has no
+collector, and a listener that dies without calling `notify()` leaves the
+parent honoring a wait that can never end.
+
+The delayed tool result is still only a fetch response. Parse it using step 4.
+In particular, `timeout`, `blocked`, and `page_full` are wakeups that require
+another decision or observation; none means a completed delegation.
+
+If parent work runs out before the notification arrives, do not idle and do
+not finalize: issue the explicit top-level `wait` from 3B on the armed cell. It
+blocks until the listener ends. Never start a second `fetch` on the same
+Session while the listener holds it; a concurrent observer duplicates the
+window and forks the cursor you must adopt.
+
+### 3B. Explicit collection when delayed delivery is unavailable
+
+When the exec environment lacks either `yield_control()` or `notify()`, hold
+the process handle with this wrapped cell:
 
 ```js
 // @exec: {"yield_time_ms": 1000, "max_output_tokens": 30000}
@@ -100,8 +184,6 @@ text(output);
 `--max-bytes 24000` keeps the document comfortably inside the 30,000-token
 output limits; `has_more` pagination covers anything beyond it.
 
-### 3. Collect: inline result, or one top-level wait
-
 Two possible responses to that cell:
 
 - `Script completed` with the JSON already in the output: the fetch finished
@@ -125,10 +207,10 @@ Choose when to issue that wait by whether you can afford to block:
   immediately.
 - **You have other work first**: keep the cell ID, do that work in the SAME
   turn, and issue the same wait when ready — a cell that already finished
-  returns its buffered result instantly. Completion never interrupts you, so
-  you must eventually spend the wait to learn of it; and the cell does not
-  survive the turn. If you cannot guarantee this turn stays open, block now —
-  sending your final answer destroys the cell.
+  returns its buffered result instantly. In this fallback path completion does
+  not interrupt you, so you must eventually spend the wait to learn of it; and
+  the cell does not survive the turn. If you cannot guarantee this turn stays
+  open, block now — sending your final answer destroys the cell.
 
 ### 4. Parse reason first, then carry the cursor
 
@@ -158,14 +240,12 @@ When the Session is no longer needed: `dlgt stop '<SESSION_ID>'`. Stopping
 ends the process, not the provider conversation — the same `session.id`
 resumes later via `send --resume`.
 
-### Pacing and fallback
+### Pacing and final fallback
 
 To pace periodic observations instead of holding one wait, delay with an
 awaited Code Mode timer — `await new Promise(r => setTimeout(r, 300000));`
 before the `fetch` in the same cell — never with a shell `sleep`, which burns
-a unified-exec process and hits the same 30-second clamp. On Codex Desktop,
-scheduled thread heartbeats can re-enter the chat on a timer across turns;
-the CLI has no out-of-turn scheduler.
+a unified-exec process and hits the same 30-second clamp.
 
 Where Code Mode cells are unavailable, fall back to short forward polls that
 stay UNDER the 30-second nested clamp, repeated:
@@ -174,8 +254,11 @@ stay UNDER the 30-second nested clamp, repeated:
 dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 20s
 ```
 
-Code Mode internals are version-sensitive (verified against 0.146.x); if the
-wrapper misbehaves after a Codex upgrade, drop to this fallback.
+Code Mode internals are version-sensitive (the delayed path is verified against
+interactive Codex CLI 0.146.x and the corresponding Desktop host); if either
+wrapper misbehaves after a Codex upgrade, drop to this fallback. Desktop
+scheduled thread heartbeats can re-enter a chat across turns, but that is a
+separate scheduler capability and is not part of this same-turn workflow.
 
 ## Standard workflow when running as Claude Code
 
