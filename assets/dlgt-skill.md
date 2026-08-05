@@ -197,6 +197,21 @@ dlgt fetch "$session_id" --cursor "$cursor" --until result --wait 30m
 #    and delivered when the wait resolves.
 ```
 
+Two Codex-specific traps:
+
+- Wait on the cell ID from the "Script running with cell ID N" line. A
+  `chunk_id` in a JSON-shaped yield is not a cell ID and the wait will fail
+  with "cell not found".
+- Some Codex environments kill a backgrounded cell after tens of seconds: the
+  cell reports "completed" with EMPTY output even though `fetch --wait 30m`
+  could not have exited silently. That empty completion means your harness
+  killed the process, not that the work finished. Do not run a cursorless
+  baseline to re-orient — your cursor is still valid, because an observation
+  that returned nothing advanced nothing. Re-issue the SAME
+  `fetch --cursor <same N> --until result` in the foreground with a `--wait`
+  short enough to survive, around 45s, and repeat. Positions replay safely,
+  so the same cursor can be retried any number of times.
+
 One long poll replaces a loop of short polls on either harness: use
 `--wait 30m` once rather than fifteen `--wait 2m` calls. Where a long wait is
 impossible, poll forward instead of re-reading:
