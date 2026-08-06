@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -29,6 +29,9 @@ use crate::store::{NewSession, Store, now_ms};
 use crate::update;
 
 const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A short confirmation window covers the normal hook path without turning
+/// submission into observation. Expiry is a successful `pending` receipt.
+const SUBMISSION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Composite read bounds. Response size is part of the protocol: an LLM caller
 /// pays for every byte, so pagination is not optional implementation tuning.
 const FETCH_DEFAULT_MAX_BYTES: usize = 32 * 1024;
@@ -103,6 +106,7 @@ pub fn run() -> Result<()> {
         instance_id: Uuid::new_v4().simple().to_string(),
         receipts: ReceiptLedger::default(),
         store: Arc::new(Mutex::new(store)),
+        submission_changed: Condvar::new(),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         attach_leases: Mutex::new(HashMap::new()),
         pending_provider_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -190,6 +194,7 @@ struct Daemon {
     /// creating a duplicate Session or execution.
     receipts: ReceiptLedger,
     store: Arc<Mutex<Store>>,
+    submission_changed: Condvar,
     sessions: Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
     attach_leases: Mutex<HashMap<String, String>>,
     pending_provider_ids: Arc<Mutex<HashMap<String, Option<String>>>>,
@@ -1425,11 +1430,19 @@ impl Daemon {
             store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
             (turn, acceptance_cursor)
         };
+        // Build a receipt-safe snapshot before provider delivery. After the
+        // delivery boundary, internal observation failures must degrade to a
+        // pending receipt rather than erase idempotency and invite a retry.
+        let mut fallback_public_session = self.public_session(&session)?;
+        fallback_public_session["state"] = json!(SessionState::Busy.as_str());
+        let mut synchronously_confirmed = false;
         match agent {
             Agent::Codex => match runtime.start_codex_turn(prompt) {
                 Ok(provider_turn_id) => {
-                    let store = self.lock_store()?;
-                    if store.mark_turn_started(&turn_id, Some(&provider_turn_id)) {
+                    synchronously_confirmed = true;
+                    if let Ok(store) = self.lock_store()
+                        && store.mark_turn_started(&turn_id, Some(&provider_turn_id))
+                    {
                         store.set_session_state(&session.id, SessionState::Busy);
                         store.record_event(Some(&session.id), Some(&turn_id), "turn.started");
                     }
@@ -1467,22 +1480,74 @@ impl Daemon {
                     store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
                     return Err(error);
                 }
-                self.lock_store()?
-                    .set_session_state(&session.id, SessionState::Busy);
+                if let Ok(store) = self.lock_store() {
+                    store.set_session_state(&session.id, SessionState::Busy);
+                }
             }
         }
-        let current = self.resolve_session(&session.id)?;
+        let submission = if synchronously_confirmed
+            || self
+                .wait_for_submission_confirmation(&turn_id)
+                .unwrap_or(false)
+        {
+            "confirmed"
+        } else {
+            "pending"
+        };
+        let public_session = self
+            .resolve_session(&session.id)
+            .and_then(|current| self.public_session(&current))
+            .unwrap_or(fallback_public_session);
         let mut result = json!({
-            "session": self.public_session(&current)?,
+            "session": public_session,
             "execution_seq": turn.execution_seq,
             "cursor": acceptance_cursor,
+            "submission": submission,
         });
+        if submission == "pending" {
+            result["hint"] =
+                json!("provider confirmation has not arrived; do not resend with a new request_id");
+            result["action"] = json!(format!(
+                "dlgt fetch {} --until result --wait 25s",
+                session.id
+            ));
+        }
         if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
             && !correlation_id.is_empty()
         {
             result["correlation_id"] = json!(correlation_id);
         }
         Ok(result)
+    }
+
+    fn wait_for_submission_confirmation(&self, turn_id: &str) -> Result<bool> {
+        let deadline = Instant::now() + SUBMISSION_CONFIRM_TIMEOUT;
+        let mut store = self.lock_store()?;
+        loop {
+            let turn = store
+                .get_turn(turn_id)
+                .context("accepted turn disappeared before provider confirmation")?;
+            if turn.started_at_ms.is_some() {
+                return Ok(true);
+            }
+            if turn.state.is_terminal() {
+                return Ok(false);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let (next, timeout) = self
+                .submission_changed
+                .wait_timeout(store, deadline.saturating_duration_since(now))
+                .map_err(|_| anyhow!("session store lock poisoned"))?;
+            store = next;
+            if timeout.timed_out() {
+                return Ok(store
+                    .get_turn(turn_id)
+                    .is_some_and(|turn| turn.started_at_ms.is_some()));
+            }
+        }
     }
 
     fn read_session(&self, params: &Value) -> Result<Value> {
@@ -1596,8 +1661,19 @@ impl Daemon {
         let Some(request_id) = params.get("request_id").and_then(Value::as_str) else {
             return run(params);
         };
-        self.receipts
-            .accept_once(request_id, request_digest(params), || run(params))
+        let receipt = self
+            .receipts
+            .accept_once(request_id, request_digest(params), || run(params))?;
+        self.refresh_submission_receipt(receipt)
+    }
+
+    /// A replayed pending receipt follows the live turn and becomes confirmed
+    /// once the provider acknowledgement arrives. The execution itself is
+    /// never submitted twice.
+    fn refresh_submission_receipt(&self, mut receipt: Value) -> Result<Value> {
+        let store = self.lock_store()?;
+        refresh_submission_receipt_from_store(&store, &mut receipt);
+        Ok(receipt)
     }
 
     /// One composite forward-delta read: current state, newly terminalized
@@ -2031,12 +2107,15 @@ impl Daemon {
         let mut store = self.lock_store()?;
         let outcome = apply_hook_event(&mut store, &session, event_name, &payload, recovery)?;
         let seq = store.record_event(Some(&session.id), outcome.turn_id.as_deref(), outcome.kind);
-        Ok(json!({
+        let response = json!({
             "accepted": true,
             "seq": seq,
             "event": outcome.kind,
             "turn_id": outcome.turn_id,
-        }))
+        });
+        drop(store);
+        self.submission_changed.notify_all();
+        Ok(response)
     }
 
     /// Recover a missing Claude `final_text` from the Session transcript.
@@ -2530,6 +2609,12 @@ fn start_hook_turn(
     session: &SessionRecord,
     payload: &Value,
 ) -> Result<HookOutcome> {
+    if !claude_submission_matches_session(session, payload) {
+        return Ok(HookOutcome {
+            kind: "provider.prompt_unmatched",
+            turn_id: session.active_turn_id.clone(),
+        });
+    }
     let current = store
         .get_session(&session.id)
         .context("session disappeared while handling hook")?;
@@ -2571,13 +2656,32 @@ fn start_hook_turn(
     })
 }
 
+fn claude_submission_matches_session(session: &SessionRecord, payload: &Value) -> bool {
+    let Some(expected_provider_id) = session.id.strip_prefix("claude:") else {
+        return false;
+    };
+    if payload.get("session_id").and_then(Value::as_str) != Some(expected_provider_id) {
+        return false;
+    }
+    let Some(provider_cwd) = payload.get("cwd").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(expected_cwd) = PathBuf::from(&session.cwd).canonicalize() else {
+        return false;
+    };
+    let Ok(provider_cwd) = PathBuf::from(provider_cwd).canonicalize() else {
+        return false;
+    };
+    expected_cwd == provider_cwd
+}
+
 fn hook_prompt_matches_turn(store: &Store, turn_id: &str, payload: &Value) -> Result<bool> {
     let provider_prompt = payload
         .get("prompt")
         .or_else(|| payload.get("user_prompt"))
         .and_then(Value::as_str);
     let Some(provider_prompt) = provider_prompt else {
-        return Ok(true);
+        return Ok(false);
     };
     let turn = store.get_turn(turn_id).context("active turn not found")?;
     Ok(turn.prompt == provider_prompt)
@@ -3202,6 +3306,39 @@ fn generate_alias(title: &str) -> String {
         slug.chars().take(32).collect::<String>(),
         &suffix[..6]
     )
+}
+
+fn refresh_submission_receipt_from_store(store: &Store, receipt: &mut Value) {
+    // Confirmation is monotonic. A retained receipt can outlive its turn, so
+    // missing live evidence must never downgrade a previously confirmed one.
+    if receipt.get("submission").and_then(Value::as_str) != Some("pending") {
+        return;
+    }
+    let Some(session_id) = receipt
+        .get("session")
+        .and_then(|session| session.get("id"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Some(execution_seq) = receipt.get("execution_seq").and_then(Value::as_i64) else {
+        return;
+    };
+    let current_session_id = store
+        .session_uid(session_id)
+        .and_then(|uid| store.session_for_uid(&uid))
+        .map_or_else(|| session_id.to_owned(), |session| session.id);
+    if store
+        .turn_for_execution(&current_session_id, execution_seq)
+        .is_none_or(|turn| turn.started_at_ms.is_none())
+    {
+        return;
+    }
+    receipt["submission"] = json!("confirmed");
+    if let Some(object) = receipt.as_object_mut() {
+        object.remove("hint");
+        object.remove("action");
+    }
 }
 
 struct Receipt {
@@ -4400,8 +4537,9 @@ mod tests {
         TranscriptRecovery, all_sources, apply_codex_notification, apply_hook_event,
         canonical_session_id, clamp_busy_metrics, classify_error, cli_wrapper_overhead,
         generate_alias, generate_internal_id, provider_id_from_session, public_result,
-        public_session, public_session_with_metrics, retention_gap, signal_shutdown,
-        transcript_window, validate_alias, validate_continuation, wait_for_update_check,
+        public_session, public_session_with_metrics, refresh_submission_receipt_from_store,
+        retention_gap, signal_shutdown, start_hook_turn, transcript_window, validate_alias,
+        validate_continuation, wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -4640,6 +4778,94 @@ mod tests {
             turn.error
                 .is_some_and(|error| error.contains("invalid_request"))
         );
+    }
+
+    #[test]
+    fn claude_submission_requires_matching_session_cwd_and_prompt() {
+        let mut store = ready_store("claude");
+        store
+            .insert_turn("turn_1", "claude:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+
+        for payload in [
+            json!({"session_id":"other","cwd":"/tmp","user_prompt":"hello"}),
+            json!({"session_id":"thread-1","cwd":"/","user_prompt":"hello"}),
+            json!({"session_id":"thread-1","cwd":"/tmp"}),
+            json!({"session_id":"thread-1","cwd":"/tmp","user_prompt":"different"}),
+        ] {
+            let outcome = start_hook_turn(&mut store, &session, &payload)
+                .unwrap_or_else(|error| panic!("failed to inspect hook: {error}"));
+            assert_eq!(outcome.kind, "provider.prompt_unmatched");
+            assert_eq!(
+                store
+                    .get_turn("turn_1")
+                    .unwrap_or_else(|| panic!("turn missing"))
+                    .state,
+                TurnState::Submitted
+            );
+        }
+
+        let outcome = start_hook_turn(
+            &mut store,
+            &session,
+            &json!({
+                "session_id":"thread-1",
+                "cwd":"/tmp",
+                "turn_id":"provider-turn",
+                "user_prompt":"hello"
+            }),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply matching hook: {error}"));
+        assert_eq!(outcome.kind, "turn.started");
+        assert_eq!(
+            store
+                .get_turn("turn_1")
+                .unwrap_or_else(|| panic!("turn missing"))
+                .state,
+            TurnState::Running
+        );
+    }
+
+    #[test]
+    fn pending_submission_receipt_upgrades_across_session_rekey() {
+        let mut store = ready_store("claude");
+        store
+            .insert_turn("turn_1", "claude:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+        store
+            .rekey_session("claude:thread-1", "claude:thread-2")
+            .unwrap_or_else(|error| panic!("failed to rekey session: {error}"));
+        let mut receipt = json!({
+            "session": {"id": "claude:thread-1"},
+            "execution_seq": 1,
+            "submission": "pending",
+            "hint": "wait",
+            "action": "fetch"
+        });
+
+        refresh_submission_receipt_from_store(&store, &mut receipt);
+
+        assert_eq!(receipt["submission"], "confirmed");
+        assert!(receipt.get("hint").is_none());
+        assert!(receipt.get("action").is_none());
+    }
+
+    #[test]
+    fn confirmed_submission_receipt_never_downgrades_when_turn_is_gone() {
+        let store = ready_store("claude");
+        let mut receipt = json!({
+            "session": {"id": "claude:thread-1"},
+            "execution_seq": 99,
+            "submission": "confirmed"
+        });
+
+        refresh_submission_receipt_from_store(&store, &mut receipt);
+
+        assert_eq!(receipt["submission"], "confirmed");
     }
 
     fn started_claude_turn(store: &mut Store) -> (crate::protocol::SessionRecord, String) {

@@ -115,12 +115,15 @@ dlgt new \
   && dlgt fetch @review --until result --wait 15m
 ```
 
-`new` returns as soon as the prompt is accepted, and `fetch` is the one
-observation command: it returns current state, new results, lifecycle events,
-and the forward screen delta from a cursor position. Chaining them prints two
-JSON documents, one per line; the first is the acceptance receipt and carries
-the Session ID and cursor. For anything longer than a quick check, run the two
-commands separately so a lost read never costs you the receipt.
+`new` waits up to five seconds for provider confirmation, then returns a
+successful receipt with `submission: "confirmed" | "pending"`. `pending`
+means local delivery succeeded; follow its `action` and do not resend with a
+new request ID. `fetch` is the one observation command: it returns current
+state, new results, lifecycle events, and the forward screen delta from a
+cursor position. Chaining them prints two JSON documents, one per line; the
+first receipt carries the Session ID and cursor. For anything longer than a
+quick check, run the two commands separately so a lost read never costs you
+the receipt.
 
 Create a Codex Session:
 

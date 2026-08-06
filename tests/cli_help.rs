@@ -25,6 +25,7 @@ fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std
         "models",
         "profiles",
         "harnesses",
+        "doctor",
         "skill",
         "rpc",
         "version",

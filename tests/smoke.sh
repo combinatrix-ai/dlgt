@@ -51,15 +51,20 @@ while [ -z "$launch_id" ]; do
 done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"}' \
   | "$binary" hook emit "$launch_id" claude
-wait "$new_pid"
 session_id=claude:provider-session
+attempt=0
+until "$binary" show "$session_id" 2>/dev/null | grep -q '"execution_seq":1'; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
+done
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","cwd":"%s","turn_id":"provider-turn-1","user_prompt":"smoke-initial"}\n' "$repo_root" \
+  | "$binary" hook emit "$session_id" claude
+wait "$new_pid"
 grep -q '"id":"claude:provider-session"' "$state_dir/new.json"
 grep -q '"alias":"@smoke"' "$state_dir/new.json"
+grep -q '"submission":"confirmed"' "$state_dir/new.json"
 if grep -q '"provider_session_id"\|"resume_ref"\|"internal:' "$state_dir/new.json"; then exit 1; fi
 grep -q -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE"
 if grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"; then exit 1; fi
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-1","user_prompt":"smoke-initial"}' \
-  | "$binary" hook emit "$session_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-1","last_assistant_message":"initial-done"}' \
   | "$binary" hook emit "$session_id" claude
 "$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":1'
@@ -115,7 +120,7 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-cross-ve
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_launch_id" claude
 wait "$cross_version_new_pid"
 cross_version_id=claude:provider-cross-version
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","user_prompt":"cross-version-initial"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","cwd":"%s","turn_id":"provider-cross-version-1","user_prompt":"cross-version-initial"}\n' "$repo_root" \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","last_assistant_message":"cross-version-ready"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
@@ -123,7 +128,7 @@ DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --until result --w
 cross_version_send=$("$binary" send claude:provider-cross-version --request-id cross-2 \
   -- cross-version-follow-up)
 printf '%s\n' "$cross_version_send" | grep -q "\"id\":\"$cross_version_id\""
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","turn_id":"provider-cross-version-2","user_prompt":"cross-version-follow-up"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","cwd":"%s","turn_id":"provider-cross-version-2","user_prompt":"cross-version-follow-up"}\n' "$repo_root" \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-2","last_assistant_message":"cross-version-done"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
@@ -201,7 +206,7 @@ set -e
 test "$busy_status" -eq 5
 printf '%s\n' "$busy_json" | grep -q '"code":"SESSION_BUSY"'
 
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-2","user_prompt":"%s"}\n' "$long_message" \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","cwd":"%s","turn_id":"provider-turn-2","user_prompt":"%s"}\n' "$repo_root" "$long_message" \
   | "$binary" hook emit "$session_id" claude
 printf '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-2","last_assistant_message":"done"}\n' \
   | "$binary" hook emit "$session_id" claude
@@ -313,7 +318,7 @@ grep -q "\"id\":\"$session_id\"" "$state_dir/restart.json"
 "$binary" show "$session_id" | grep -q '"execution_seq":3'
 "$binary" show "$session_id" | grep -q '"status":"interrupted"'
 "$binary" send "$session_id" --request-id smoke-4 -- after-restart >/dev/null
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","turn_id":"provider-turn-4","user_prompt":"after-restart"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","cwd":"%s","turn_id":"provider-turn-4","user_prompt":"after-restart"}\n' "$repo_root" \
   | "$binary" hook emit "$session_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-4","last_assistant_message":"resumed"}' \
   | "$binary" hook emit "$session_id" claude
@@ -342,7 +347,7 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session-
   | "$binary" hook emit "$reused_launch_id" claude
 wait "$new_pid"
 reused_id=claude:provider-session-2
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","user_prompt":"reused-initial"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-1","user_prompt":"reused-initial"}\n' "$repo_root" \
   | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","last_assistant_message":"reused-ready"}' \
   | "$binary" hook emit "$reused_id" claude
@@ -357,7 +362,7 @@ test -n "$poll_cursor"
 "$binary" fetch "$reused_id" --cursor "$poll_cursor" --until result --wait 10s \
   >"$state_dir/poll.json" &
 poll_pid=$!
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-2","user_prompt":"long-poll"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-2","user_prompt":"long-poll"}\n' "$repo_root" \
   | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-2","last_assistant_message":"poll-done"}' \
   | "$binary" hook emit "$reused_id" claude
@@ -376,17 +381,20 @@ advanced_cursor=$(sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p' "$state_dir/poll.json
 # execution, and the same request ID with a different payload is rejected.
 retry_first=$("$binary" send "$reused_id" --request-id retry-1 -- retry-payload)
 printf '%s\n' "$retry_first" | grep -q '"execution_seq":3'
+printf '%s\n' "$retry_first" | grep -q '"submission":"pending"'
+printf '%s\n' "$retry_first" | grep -q '"action":"dlgt fetch '
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-3","user_prompt":"retry-payload"}\n' "$repo_root" \
+  | "$binary" hook emit "$reused_id" claude
 retry_replay=$("$binary" send "$reused_id" --request-id retry-1 -- retry-payload)
 printf '%s\n' "$retry_replay" | grep -q '"replayed":true'
 printf '%s\n' "$retry_replay" | grep -q '"execution_seq":3'
+printf '%s\n' "$retry_replay" | grep -q '"submission":"confirmed"'
 set +e
 retry_mismatch=$("$binary" send "$reused_id" --request-id retry-1 -- other-payload)
 retry_mismatch_status=$?
 set -e
 test "$retry_mismatch_status" -eq 1
 printf '%s\n' "$retry_mismatch" | grep -q '"code":"INVALID_ARGUMENT"'
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-3","user_prompt":"retry-payload"}' \
-  | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-3","last_assistant_message":"retry-done"}' \
   | "$binary" hook emit "$reused_id" claude
 "$binary" fetch "$reused_id" --until result --wait 4s | grep -q '"final_text":"retry-done"'
@@ -410,7 +418,7 @@ if "$binary" fetch "$reused_id" --cursor "$flood_cursor" --no-screen \
 "$binary" scrollback "$reused_id" --lines 5 | grep -q '"truncated":true'
 
 # A long final_text is chunked at a UTF-8 boundary and continued by cursor.
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","user_prompt":"flood-the-screen"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-4","user_prompt":"flood-the-screen"}\n' "$repo_root" \
   | "$binary" hook emit "$reused_id" claude
 printf '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-4","last_assistant_message":"%s"}\n' "$long_message" \
   | "$binary" hook emit "$reused_id" claude
@@ -527,7 +535,7 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-rekey-1"
   | "$binary" hook emit "$rekey_launch_id" claude
 wait "$new_pid"
 rekey_id=claude:provider-rekey-1
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"provider-rekey-1","turn_id":"rekey-turn-1","user_prompt":"rekey-initial"}' \
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-rekey-1","cwd":"%s","turn_id":"rekey-turn-1","user_prompt":"rekey-initial"}\n' "$repo_root" \
   | "$binary" hook emit "$rekey_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-rekey-1","turn_id":"rekey-turn-1","last_assistant_message":"rekey-ready"}' \
   | "$binary" hook emit "$rekey_id" claude

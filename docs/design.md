@@ -356,12 +356,18 @@ grid. Stable rows are immutable text and are never rewritten by a later epoch.
 
 ## Observation model
 
-Acceptance and observation are separate operations:
+Submission and observation are separate operations:
 
 ```text
-new / send   accept a prompt, return an acceptance cursor, exit
+new / send   deliver a prompt, briefly await confirmation, return a cursor
 fetch        one composite forward-delta read from a cursor
 ```
+
+The submission receipt reports `confirmed` when provider lifecycle evidence
+arrives during the short wait and `pending` otherwise. Both are successful:
+PTY/app-server delivery already occurred. Replaying the same idempotency key
+refreshes a pending receipt from live turn state; a new key would risk a
+duplicate execution.
 
 The acceptance cursor is captured under the store lock immediately before the
 acceptance is recorded, so a provider that emits output or finishes instantly
@@ -528,13 +534,14 @@ Claude provides lifecycle hooks and an interactive input surface. dlgt exposes
 one intent model but documents weaker, boundary-delayed Claude steering and
 weaker Claude interrupt quiescence instead of claiming identical guarantees.
 
-### Acceptance is never fused with a long wait
+### Submission is never fused with a long wait
 
 A command that accepts work and then blocks for minutes loses its acceptance
 receipt whenever the caller's harness kills, backgrounds, or swallows the
 response, which produces duplicate Sessions and Session-ID rediscovery. `new`
-and `send` therefore return immediately with a cursor, and waiting is a
-separate, replayable `fetch`.
+and `send` therefore wait only a short bounded confirmation window before
+returning a cursor. Waiting for progress or a result is a separate, replayable
+`fetch`.
 
 ### Timeouts express bounded observation
 

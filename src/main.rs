@@ -3,6 +3,7 @@ mod client;
 mod codex;
 mod cursor;
 mod daemon;
+mod doctor;
 mod paths;
 mod protocol;
 mod provider;
@@ -89,6 +90,7 @@ fn run() -> Result<()> {
         "models" => command_models(&args[1..]),
         "profiles" => command_profiles(&args[1..]),
         "harnesses" => command_harnesses(&args[1..]),
+        "doctor" => command_doctor(&args[1..]),
         "rpc" => command_rpc(&args[1..]),
         "hook" => command_hook(&args[1..]),
         "update" => command_update(&args[1..]),
@@ -584,6 +586,18 @@ fn command_harnesses(args: &[String]) -> Result<()> {
     print_success(json!({"harnesses":result}), parsed.flag("--pretty"))
 }
 
+fn command_doctor(args: &[String]) -> Result<()> {
+    let parsed = Args::parse("doctor", args, &["--json", "--probe"], &[])?;
+    parsed.no_positionals()?;
+    let report = doctor::run(parsed.flag("--probe"));
+    if parsed.flag("--json") {
+        print_success(report.as_json(), false)
+    } else {
+        print!("{}", doctor::human(&report));
+        Ok(())
+    }
+}
+
 fn command_rpc(args: &[String]) -> Result<()> {
     let parsed = Args::parse("rpc", args, &["--stdio"], &[])?;
     parsed.no_positionals()?;
@@ -972,7 +986,7 @@ fn exit_status(code: &str) -> i32 {
 
 fn print_usage() {
     println!(
-        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  fetch        Read new state, results, events, and screen from a cursor\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
+        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  fetch        Read new state, results, events, and screen from a cursor\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  doctor       Diagnose the local dlgt installation\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
     );
 }
 
@@ -1033,6 +1047,9 @@ fn command_usage(command: &str) -> Result<&'static str> {
         }
         "harnesses" => {
             "dlgt harnesses - list Harness capabilities\n\nUSAGE\n  dlgt harnesses [codex|claude] [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
+        }
+        "doctor" => {
+            "dlgt doctor - diagnose the local dlgt installation\n\nUSAGE\n  dlgt doctor [OPTIONS]\n\nOPTIONS\n  --json      Emit the same checks as compact JSON\n  --probe     Initialize Codex app-server and check the published release\n  -h, --help  Print this help\n\nThe default checks are read-only and offline. --probe starts no model turn."
         }
         "skill" => {
             "dlgt skill - print the embedded dlgt skill\n\nUSAGE\n  dlgt skill\n\nOPTIONS\n  -h, --help   Print this help"

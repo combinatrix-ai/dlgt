@@ -124,6 +124,16 @@ A different payload is rejected against an in-flight reservation as well as a
 stored receipt. A failed acceptance stores no receipt, so the same ID may be
 retried.
 
+Successful `session.create` and `session.send` receipts include
+`submission: "confirmed" | "pending"`. The daemon waits up to five seconds
+for the provider lifecycle acknowledgement. `pending` is still success: local
+delivery occurred, so the caller must observe or replay the identical request
+ID rather than submit with a new one. A replay refreshes this field from the
+live execution and can change `pending` to `confirmed` without executing the
+prompt twice.
+Pending receipts also include a human-readable `hint` and an `action` containing
+a bounded `fetch`; these are recovery guidance, not additional RPC state.
+
 `harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
 The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
 and retains the array so `session.restart` reuses the same launch behavior.

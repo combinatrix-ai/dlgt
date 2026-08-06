@@ -33,15 +33,20 @@ Profile   A reusable client-side launch specification.
 
 ## The contract in one paragraph
 
-Delegation is two phases. `new` and `send` only ACCEPT work: they return an
-acceptance receipt — `session.id`, `execution_seq`, and a small `cursor`
-number — as soon as the prompt is accepted, never the answer. `fetch` is the
-only command that OBSERVES: state, results, lifecycle events, and screen,
-forward from a cursor. What you must retain between commands: the
-provider-qualified `session.id`, the latest `cursor`, and — until each
-acceptance receipt is safely in your visible output — the `--request-id` you
-chose with its byte-identical prompt and options, because re-running the
-identical command with the identical id replays the original receipt
+Delegation is two phases. `new` and `send` SUBMIT work: after a short bounded
+confirmation window they return a successful submission receipt —
+`submission: "confirmed" | "pending"`, `session.id`, `execution_seq`, and a
+small `cursor` number — never the answer. `pending` means local delivery
+succeeded but the provider acknowledgement has not arrived; it is not a reason
+to send again. Codex confirms with its app-server turn lifecycle; Claude
+confirms with the matching `UserPromptSubmit` hook. `fetch` is the only command
+that OBSERVES later state, results, lifecycle events, and screen, forward from
+a cursor. What you must
+retain between commands: the provider-qualified `session.id`, the latest
+`cursor`, and — until each submission receipt is safely in your visible output
+— the `--request-id` you chose with its byte-identical prompt and options,
+because re-running the identical command with the identical id replays the
+original receipt
 (`"replayed": true`) instead of starting a second worker. Invent the
 request-id BEFORE the first attempt; a key that first appears on a retry is
 too late to deduplicate anything. An `--alias` is a human convenience and
@@ -53,7 +58,7 @@ The complete arc, in order. Placeholders such as `<SESSION_ID>` are literal
 substitutions; `<WORKDIR>` must be written as an absolute path — `$PWD` does
 not expand inside a JSON field.
 
-### 1. Accept
+### 1. Submit
 
 Put a multi-line prompt in a file (see "Long prompts" below), then:
 
@@ -62,9 +67,12 @@ dlgt new --title "long refactor" --harness claude --cwd /abs/path \
   --request-id refactor-1 --stdin < prompt.md
 ```
 
-Let the acceptance JSON print. Do NOT capture it into a shell variable and
+Let the submission JSON print. Do NOT capture it into a shell variable and
 stay silent — variables do not survive the call, and the receipt must land in
-your visible output. Read `session.id` and `cursor` out of it. If this
+your visible output. Read `submission`, `session.id`, and `cursor` out of it. If
+`submission` is `pending`, follow its `action` and never resend with a new
+request ID. Replaying the identical command with the identical request ID can
+later return `confirmed` without submitting again. If this
 response is lost or killed, re-run the identical command with the identical
 `--request-id`; never issue a second bare `new` because you are unsure
 whether the first landed.
@@ -263,7 +271,7 @@ capability and is not part of this same-turn workflow.
 ## Standard workflow when running as Claude Code
 
 ```bash
-# 1. Accept in the foreground; it returns in seconds. Let the receipt print.
+# 1. Submit in the foreground; it returns after a short confirmation window.
 dlgt new --title "long refactor" --harness codex --cwd /abs/path \
   --request-id refactor-1 --stdin < prompt.md
 
@@ -276,7 +284,7 @@ The background task exits when the worker finishes and the harness notifies
 you — zero polling calls. The receipt is already safe in your context, so a
 killed or backgrounded read costs nothing. For a short task (a minute or
 less), a foreground `--wait 60s` fits the default tool budget and needs no
-background step. Never fuse acceptance into the long fetch: that puts the
+background step. Never fuse submission into the long fetch: that puts the
 receipt and a 30-minute wait in the same killable command, which is exactly
 the failure the two-phase split removes. Parse responses exactly as in the
 Codex arc: `reason` first, then `results[].status`, and always carry the
@@ -317,7 +325,7 @@ file.
 
 | Lost | Recovery |
 | --- | --- |
-| The `new` or `send` response | Re-run the identical command with the same `--request-id`. It replays the original receipt with `"replayed": true` and never creates a second Session or execution. |
+| The `new` or `send` response | Re-run the identical command with the same `--request-id`. It replays the original submitted receipt with `"replayed": true` and never creates a second Session or execution; a formerly `pending` receipt may become `confirmed`. |
 | A `fetch` response, or the cursor | Apply the three-way cursor rule below. |
 | The Session ID itself | `dlgt list` finds it, but prefer a stable `--alias` on `new` so you never need to search. |
 
@@ -351,12 +359,12 @@ dlgt new --title "quick check" --harness claude --cwd /abs/path \
   && dlgt fetch @quick --until result --wait 60s
 ```
 
-The output is two JSON documents, one per line; line 1 is the acceptance
+The output is two JSON documents, one per line; line 1 is the submission
 receipt and is authoritative. If the second document is missing or truncated,
 the work is still running and the receipt still names the Session — recover
 by fetching, or if line 1 itself never reached you, by replaying the same
 `--request-id`. Note the fetch here reads from a cursorless baseline rather
-than the acceptance cursor — a slightly less exact convenience. Do NOT use
+than the submission cursor — a slightly less exact convenience. Do NOT use
 this form from bare Codex Code Mode: the 60-second wait exceeds the
 30-second nested clamp; use the standard wrapped arc instead. Never use it
 for long tasks on any harness.
@@ -433,6 +441,11 @@ when a delegation must keep the Harness's own permission prompts.
   only takes over a known stale attach client.
 - Treat results, rendered scrollback, and raw output as potentially
   sensitive.
+- When installation, runtime, provider, or Skill wiring looks wrong, run
+  `dlgt doctor`. Its default checks are offline and read-only. Use
+  `dlgt doctor --probe` only when starting a short Codex app-server probe and
+  checking the published release are appropriate; it never starts a model
+  turn, though the versioned daemon may remain until its normal idle timeout.
 - If a successful response contains `info.code: UPDATE_AVAILABLE`, tell the
   user the current and latest versions and ask whether to run `dlgt update`.
   Do not replace the binary and its embedded Skills without explicit
@@ -463,6 +476,7 @@ dlgt cancel "$session_id"
 dlgt restart "$session_id"
 dlgt show "$session_id"
 dlgt list --all-versions
+dlgt doctor
 ```
 
 `fetch --all` reports every Session of one daemon in a single call, with

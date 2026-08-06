@@ -135,6 +135,7 @@ CONFIGURATION
   models       Discover Harness models
   profiles     List or inspect Profiles
   harnesses    List Harness capabilities
+  doctor       Diagnose the local dlgt installation
   skill        Print the embedded dlgt skill
 
 RUNTIME
@@ -193,8 +194,11 @@ and their live Sessions continue on their versioned sockets.
 ## `new`
 
 `new` is the only Session creation command and always requires its first
-prompt. Launch and acceptance are one atomic operation, and the command always
-returns as soon as the prompt is accepted. Observation is a separate `fetch`.
+prompt. Launch and local reservation are one atomic operation. The command
+waits briefly for provider confirmation from Codex's app-server turn lifecycle
+or Claude's matching `UserPromptSubmit` hook, then returns success with
+`submission` set to `confirmed` or `pending`. Observation of later progress and
+the answer is a separate `fetch`.
 
 Its command-specific help is available through either equivalent spelling:
 
@@ -267,6 +271,12 @@ Rules:
   releases the Alias, and returns one structured launch failure. A failed audit
   record may remain addressable by its Session ID, but no live half-created
   Session is returned.
+- If local delivery succeeds but the provider does not confirm submission
+  within five seconds, the command still exits successfully with
+  `submission: "pending"`, the Session ID, and a bounded `fetch` action. The
+  prompt may still start. Do not resend it with a new request ID; replaying the
+  original request ID returns the same execution and can later report
+  `submission: "confirmed"`.
 
 Example:
 
@@ -312,14 +322,15 @@ dlgt new \
     "state": "busy"
   },
   "execution_seq": 1,
+  "submission": "confirmed",
   "cursor": "4"
 }
 ```
 
 `cursor` is this Session's observation position, taken immediately before the
-acceptance is recorded, so passing it to `fetch --cursor` cannot miss output a
+local reservation is recorded, so passing it to `fetch --cursor` cannot miss output a
 fast provider emitted in between. Positions are small counting numbers, so
-they survive an agent's conversation context. Follow the acceptance with:
+they survive an agent's conversation context. Follow the submission with:
 
 ```bash
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 \
@@ -432,7 +443,7 @@ dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-3 \
 ```
 
 ```json
-{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2,"cursor":"4"}
+{"ok":true,"session":{"id":"codex:019f6307-341e-7e81-8a33-7ab61e804345","state":"busy"},"execution_seq":2,"submission":"confirmed","cursor":"4"}
 ```
 
 Busy rejection:
@@ -950,6 +961,28 @@ Model aliases are resolved by the Harness when `new` launches the Session, not
 on each `send`. dlgt does not silently pin a drifting alias; `show` reports the
 provider-resolved model when the Harness makes it available.
 
+## `doctor`
+
+```text
+dlgt doctor [--json] [--probe]
+```
+
+The default command is offline and read-only. It reports the running binary,
+configuration parse status, every versioned daemon socket and its permissions,
+Codex and Claude CLI versions, and whether each installed Skill is byte-for-byte
+identical to the Skill embedded in this binary. Human-readable output is the
+default; `--json` emits the same check records with `ok`, `warn`, `fail`, or
+`skip` status.
+
+`--probe` additionally initializes Codex app-server and runs `model/list`, then
+checks the latest published dlgt release. It starts no model turn and performs
+no repair. If no current daemon exists, the probe may leave the versioned
+daemon running until its normal idle timeout. Every finding includes evidence
+and, when applicable, one explicit recovery hint; `doctor` never silently
+deletes sockets or overwrites Skills. The command exits successfully after
+producing a complete report; automation should gate on the report's `status`,
+not the top-level transport `ok` field.
+
 ## Profiles and launch environment
 
 ```text
@@ -1014,8 +1047,9 @@ They configure the provider CLI rather than the launch environment.
 The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
 5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ATTACH_REQUIRES_TTY`,
-`ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`, and
-`CURSOR_INVALID` use exit 1. `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
+`ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`,
+and `CURSOR_INVALID` use exit 1.
+`CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
 idempotent exit-0 no-op.
 
 `fetch` never uses a non-zero exit to describe an execution. A failed,
