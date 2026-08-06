@@ -27,7 +27,8 @@ Terms used below:
 Session   One Harness process and PTY, one controller, at most one active
           execution, no queue. The only public runtime object.
 Harness   The provider adapter, codex or claude.
-Title     A human description. Alias is a short human address derived from it.
+Title     A human description.
+Alias     A short human address derived from the title.
 Profile   A reusable client-side launch specification.
 ```
 
@@ -39,18 +40,17 @@ confirmation window they return a successful submission receipt —
 small `cursor` number — never the answer. `pending` means local delivery
 succeeded but the provider acknowledgement has not arrived; it is not a reason
 to send again. Codex confirms with its app-server turn lifecycle; Claude
-confirms with the matching `UserPromptSubmit` hook. `fetch` is the only command
-that OBSERVES later state, results, lifecycle events, and screen, forward from
-a cursor. What you must
+confirms with the matching `UserPromptSubmit` hook. `fetch` is the command for
+forward cursor-based observation of later state, results, lifecycle events,
+and screen. What you must
 retain between commands: the provider-qualified `session.id`, the latest
 `cursor`, and — until each submission receipt is safely in your visible output
-— the `--request-id` you chose with its byte-identical prompt and options,
-because re-running the identical command with the identical id replays the
-original receipt
-(`"replayed": true`) instead of starting a second worker. Invent the
-request-id BEFORE the first attempt; a key that first appears on a retry is
-too late to deduplicate anything. An `--alias` is a human convenience and
-does not deduplicate.
+— the `--request-id` you chose with its byte-identical prompt and options.
+Within the same daemon lifetime, re-running that identical command with the
+identical id replays the original receipt (`"replayed": true`) instead of
+starting a second worker. Invent the request-id BEFORE the first attempt; a
+key that first appears on a retry is too late to deduplicate anything. An
+`--alias` is a human convenience and does not deduplicate.
 
 ## Standard workflow when running as Codex
 
@@ -71,11 +71,13 @@ Let the submission JSON print. Do NOT capture it into a shell variable and
 stay silent — variables do not survive the call, and the receipt must land in
 your visible output. Read `submission`, `session.id`, and `cursor` out of it. If
 `submission` is `pending`, follow its `action` and never resend with a new
-request ID. Replaying the identical command with the identical request ID can
-later return `confirmed` without submitting again. If this
-response is lost or killed, re-run the identical command with the identical
-`--request-id`; never issue a second bare `new` because you are unsure
-whether the first landed.
+request ID. The `action` is the exact `fetch` command that observes whether
+the submitted execution appears. If this response is lost or killed, re-run
+the byte-identical command with the identical `--request-id`; within the same
+daemon lifetime it replays the original receipt and may upgrade `pending` to
+`confirmed` without submitting again. Never issue a second bare `new` because
+you are unsure whether the first landed. See "Recover a lost response" for the
+daemon-restart boundary.
 
 ### 2. Choose how completion returns
 
@@ -135,7 +137,7 @@ if (r.session_id == null) {
       });
     }
     const output = chunks.join("").trim();
-    if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code);
+    if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code + "\n" + chunks.join(""));
     JSON.parse(output);
     notify("dlgt fetch returned:\n" + output);
   } catch (error) {
@@ -155,13 +157,16 @@ parent honoring a wait that can never end.
 
 The delayed tool result is still only a fetch response. Parse it using step 4.
 In particular, `timeout`, `blocked`, and `page_full` are wakeups that require
-another decision or observation; none means a completed delegation.
+another decision or observation; none of them means completion.
 
-If parent work runs out before the notification arrives, do not idle and do
-not finalize: issue the explicit top-level `wait` from 3B on the armed cell. It
-blocks until the listener ends. Never start a second `fetch` on the same
-Session while the listener holds it; a concurrent observer duplicates the
-window and forks the cursor you must adopt.
+The outer `exec` tool may return `Script running with cell ID N` after the
+listener is armed. Retain that decimal cell ID. If parent work runs out before
+the notification arrives, do not idle and do not finalize: issue the explicit
+top-level `wait` from 3B on that cell ID. It blocks until the listener ends.
+Never start a second `fetch` on the same Session while the listener holds it;
+a concurrent observer duplicates the window and forks the cursor you must
+adopt. The top-level `wait` uses `max_tokens`; nested `exec_command` and
+`write_stdin` use `max_output_tokens`.
 
 ### 3B. Explicit collection when delayed delivery is unavailable
 
@@ -188,6 +193,12 @@ if (r.exit_code !== 0) throw new Error("dlgt fetch exited " + r.exit_code + "\n"
 JSON.parse(output); // throws on empty or truncated output instead of publishing it
 text(output);
 ```
+
+The yield values intentionally differ. The `@exec` value governs when the
+outer Code Mode cell yields; the nested `exec_command` value governs when it
+returns the child-process handle. In 3A the child returns quickly so the
+listener can arm before the outer cell yields. In 3B the child gets up to 30
+seconds to finish directly while the outer cell publishes its cell ID early.
 
 `--max-bytes 24000` keeps the document comfortably inside the 30,000-token
 output limits; `has_more` pagination covers anything beyond it.
@@ -222,20 +233,16 @@ Choose when to issue that wait by whether you can afford to block:
 
 ### 4. Parse reason first, then carry the cursor
 
-```bash
-printf '%s\n' "$json" | jq -r '.reason'
-printf '%s\n' "$json" | jq -r '.cursor'
-printf '%s\n' "$json" | jq -r '.sessions[0].results[0].status, .sessions[0].results[0].final_text'
-```
-
-Check `reason` before indexing `results`: on `timeout` the array is empty and
-the work is still running — that is never completion. `result` means the
-bound execution terminalized; only `results[].status == "completed"` makes
-`final_text` a finished answer. `page_full` means more is already waiting —
-call again immediately with the returned cursor. Every fetch exits 0;
-non-zero means the request itself was wrong. From EVERY valid response, adopt
-the returned `cursor` for the next call, even when the visible delta is
-empty.
+Parse the JSON document already printed by the wrapper. Read `reason` before
+indexing `sessions[0].results`: on `timeout` the array is empty and the work is
+still running — that is never completion. `result` means the bound execution
+terminalized; only `results[].status == "completed"` makes `final_text` a
+finished answer. `page_full` corresponds to `has_more: true`: more is already
+waiting, so call again immediately with the returned cursor. Every valid
+observation exits 0, including `timeout` and `blocked`; a non-zero exit returns
+an error document rather than an observation document. From EVERY valid
+response, adopt the returned `cursor` for the next call, even when the visible
+delta is empty.
 
 ### 5. Follow up, then release
 
@@ -262,11 +269,8 @@ stay UNDER the 30-second nested clamp, repeated:
 dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 20s
 ```
 
-Code Mode internals are version-sensitive (the delayed path is verified in
-Codex Desktop Code Mode with the 0.146.x host); if either wrapper misbehaves
-after a Codex upgrade, drop to this fallback. Desktop scheduled thread
-heartbeats can re-enter a chat across turns, but that is a separate scheduler
-capability and is not part of this same-turn workflow.
+Code Mode internals are version-sensitive; if either wrapper misbehaves after
+a Codex upgrade, drop to this fallback.
 
 ## Standard workflow when running as Claude Code
 
@@ -288,7 +292,8 @@ background step. Never fuse submission into the long fetch: that puts the
 receipt and a 30-minute wait in the same killable command, which is exactly
 the failure the two-phase split removes. Parse responses exactly as in the
 Codex arc: `reason` first, then `results[].status`, and always carry the
-returned cursor.
+returned cursor. If the background fetch returns `reason: "timeout"`, launch
+another fetch from that returned cursor; do not resend the prompt.
 
 ## Long prompts
 
@@ -316,7 +321,7 @@ file.
 
 | Command | Required | Optional, with its default |
 | --- | --- | --- |
-| `new` | `--title`, `--request-id`, a Harness (`--harness` or a Profile), and the prompt (`--stdin` or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--no-auto-approve` (default is auto-approved), `--startup-timeout` (60s), env options |
+| `new` | `--title`, `--request-id`, a Harness (`--harness` or `--profile <PROFILE>`), and the prompt (`--stdin` or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--no-auto-approve` (default is auto-approved), `--startup-timeout` (60s), env options |
 | `send` | the Session address, `--request-id`, and the prompt | `--resume`; launch options are accepted only with it |
 | `fetch` | the Session address, or `--all` | `--cursor` (omit = bounded baseline snapshot), `--wait <DURATION>` (omit = return immediately; explicit duration up to 24h), `--until any\|result` (default `any`), `--screen[=N]`/`--no-screen` (screen on for one Session; off and rejected for `--all`), `--max-bytes` (32 KiB) |
 | `stop`, `cancel`, `show`, `restart` | the Session address | `cancel --timeout` (30s), `stop --force` |
@@ -325,7 +330,7 @@ file.
 
 | Lost | Recovery |
 | --- | --- |
-| The `new` or `send` response | Re-run the identical command with the same `--request-id`. It replays the original submitted receipt with `"replayed": true` and never creates a second Session or execution; a formerly `pending` receipt may become `confirmed`. |
+| The `new` or `send` response, while the same daemon is alive | Re-run the byte-identical command with the same `--request-id`. It replays the original submitted receipt with `"replayed": true` and never creates a second Session or execution; a formerly `pending` receipt may become `confirmed`. |
 | A `fetch` response, or the cursor | Apply the three-way cursor rule below. |
 | The Session ID itself | `dlgt list` finds it, but prefer a stable `--alias` on `new` so you never need to search. |
 
@@ -343,10 +348,19 @@ applies:
   baseline — current state, the latest retained result, a screen tail, and a
   fresh cursor — and continue from there.
 
-Positions are meaningful only within one daemon lifetime: after
-`RPC_UNAVAILABLE`, `SESSION_NOT_RUNNING`, or a daemon restart, discard
-remembered numbers and re-enter through `send --resume` (new receipt, new
-cursor) or a cursorless baseline.
+Positions and the request-id replay ledger are memory-only and meaningful only
+within one daemon lifetime. Handle the boundaries separately:
+
+- On `RPC_UNAVAILABLE`, run `dlgt list --all-versions` to locate the owning
+  versioned daemon. Do not assume the daemon restarted.
+- After a confirmed daemon restart, its cursor positions and request-id ledger
+  are gone. Do not blindly replay an uncertain `new` or `send`: first inspect
+  provider history and possible external effects. Resume a known provider
+  conversation with `send --resume` only when a new follow-up is appropriate.
+- On `SESSION_NOT_RUNNING`, use `send --resume` for a new follow-up; a
+  cursorless baseline cannot recreate a missing live Session.
+- Use a cursorless baseline only when the Session still exists and only the
+  cursor was lost, expired, or invalid.
 
 ## Optimization: one call for a short task
 
@@ -405,7 +419,7 @@ when a delegation must keep the Harness's own permission prompts.
 | Start work with no existing provider conversation | `new` with its required first prompt |
 | Follow up on a live, idle Session | `send <session.id\|@alias>` |
 | Replace the provider process but keep history and conversation | `restart <session.id>` |
-| Continue after the owning daemon or Session is gone | `send <session.id> --resume --request-id <ID> -- "<prompt>"` |
+| Continue after the owning daemon or Session is gone | `send <session.id> --resume --request-id <ID> -- "<PROMPT>"` |
 
 - Plain `send` never launches, restarts, resumes, or queues. It submits work
   only to a live, idle Session; rejection is side-effect-free.
@@ -421,7 +435,7 @@ when a delegation must keep the Harness's own permission prompts.
 
 - `--cwd` accepts absolute and relative paths, resolved client-side; omitting
   it uses the client's current directory.
-- `fetch --wait` needs an explicit duration and accepts up to 24h. A timeout
+- `fetch --wait` requires a duration and accepts up to 24h. A timeout
   never cancels the work; it only ends that observation.
 - Use provider lifecycle state and the retained result, not PTY silence, as
   completion proof. `reason: "timeout"` is not completion.
@@ -434,7 +448,7 @@ when a delegation must keep the Harness's own permission prompts.
 - Use `fetch` for observation. `scrollback` is the human debugging view; raw
   PTY bytes require the explicit diagnostic command `logs --raw`.
 - If a Session stays `starting` or `busy` without the expected lifecycle
-  event, read `fetch <session.id>` and look at `screen.live`; a first-run,
+  event, run `fetch <session.id>` and look at `screen.live`; a first-run,
   authentication, trust, theme, or permission-mode prompt on it needs a human
   (`attach` from a real terminal), then retry the delegated work.
 - `attach` is exclusive and human-only. Detach with `Ctrl-b d`; `--steal`
@@ -457,24 +471,24 @@ when a delegation must keep the Harness's own permission prompts.
 | --- | --- |
 | `SESSION_BUSY` | Do not resend. `fetch <session.id> --until result --wait <duration>`, or explicitly `cancel`. |
 | `SESSION_BLOCKED` | `fetch` reports this as `reason: "blocked"` with the live screen. Read the question; answering needs a human on a real terminal (`attach`), then `fetch` again. |
-| `SESSION_NOT_RUNNING` | `send <session.id> --resume --request-id <ID> -- <prompt>`. |
+| `SESSION_NOT_RUNNING` | `send <session.id> --resume --request-id <ID> -- "<PROMPT>"`. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. `--steal` only for a known stale attach client. |
 | `ATTACH_REQUIRES_TTY` | You have no terminal. Use `fetch` and read `screen.live` instead. |
 | `CURSOR_EXPIRED` / `CURSOR_INVALID` | Third case of the cursor rule: one cursorless `fetch` to rebase. |
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address by ID. |
-| `LAUNCH_FAILED` | Read `fetch` and `show`, and only then the sensitive `logs --raw`. A failed execution is not an error: it is reported as `results[].status`. |
+| `LAUNCH_FAILED` | The provider process could not be launched. Read `fetch` and `show`, and only then the sensitive `logs --raw`. This differs from a process that launched and later failed: that execution failure appears in `results[].status`. |
 
 ## Observation and control reference
 
 ```bash
-dlgt fetch "$session_id" --until result --wait 30m
-dlgt fetch "$session_id" --cursor "$cursor"
-dlgt fetch "$session_id" --no-screen
+dlgt fetch '<SESSION_ID>' --until result --wait 30m
+dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>'
+dlgt fetch '<SESSION_ID>' --no-screen
 dlgt fetch --all
-dlgt cancel "$session_id"
-dlgt restart "$session_id"
-dlgt show "$session_id"
+dlgt cancel '<SESSION_ID>'
+dlgt restart '<SESSION_ID>'
+dlgt show '<SESSION_ID>'
 dlgt list --all-versions
 dlgt doctor
 ```
