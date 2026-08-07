@@ -195,9 +195,10 @@ dlgt new \
   --title "dlgt installation verification" \
   --harness claude \
   --cwd . \
-  --wait \
-  --timeout 5m \
-  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate."
+  --alias @dlgt-verify \
+  --request-id dlgt-verify-1 \
+  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
+  && dlgt fetch @dlgt-verify --until result --wait 5m
 ~~~
 
 From Claude:
@@ -207,13 +208,15 @@ dlgt new \
   --title "dlgt installation verification" \
   --harness codex \
   --cwd . \
-  --wait \
-  --timeout 5m \
-  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate."
+  --alias @dlgt-verify \
+  --request-id dlgt-verify-1 \
+  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
+  && dlgt fetch @dlgt-verify --until result --wait 5m
 ~~~
 
-The command must return `ok: true` with a completed result containing
-`DLGT_OK`. Retain the returned Session ID, stop that verification Session with
+Both commands print one JSON document each, on their own line. The `fetch`
+must return `ok: true` with `reason: "result"` and a completed result
+containing `DLGT_OK`. Retain the returned Session ID, stop that verification Session with
 `dlgt stop <SESSION_ID>`, and only then report that installation and end-to-end
 verification succeeded. A launch failure, timeout, blocked Session, or missing
 result means verification did not pass.

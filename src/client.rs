@@ -299,6 +299,20 @@ pub fn rpc_stdio() -> Result<()> {
             continue;
         }
         let request: Request = serde_json::from_str(&line).context("invalid RPC request")?;
+        if request.id_too_long() {
+            write_json_line(
+                &mut stdout,
+                &Response::error(
+                    request.short_id(),
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "request id must be at most {} bytes",
+                        crate::protocol::MAX_REQUEST_ID_LEN
+                    ),
+                ),
+            )?;
+            continue;
+        }
         if !public_rpc_method(&request.method) {
             write_json_line(
                 &mut stdout,
@@ -345,24 +359,47 @@ fn connect_or_start(socket: &Path) -> Result<UnixStream> {
     if let Ok(stream) = UnixStream::connect(socket) {
         return Ok(stream);
     }
-    start_daemon()?;
+    paths::check_socket_path(socket)?;
+    let log = start_daemon()?;
+    let mut last = None;
     for _ in 0..40 {
-        if let Ok(stream) = UnixStream::connect(socket) {
-            return Ok(stream);
+        match UnixStream::connect(socket) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(error),
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    bail!("dlgt server did not start at {}", socket.display())
+    // The child's own failure is the useful part; the connect error alone
+    // only ever says "no such file".
+    let reason = log
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .or_else(|| last.map(|error| error.to_string()))
+        .unwrap_or_else(|| "no diagnostic output".to_owned());
+    bail!(
+        "dlgt server did not start at {}: {reason}",
+        socket.display()
+    )
 }
 
-fn start_daemon() -> Result<()> {
+/// Spawn the daemon, returning the file its startup diagnostics go to.
+fn start_daemon() -> Result<Option<std::path::PathBuf>> {
     let executable = std::env::current_exe().context("failed to locate dlgt executable")?;
     let mut command = Command::new(executable);
+    let log_path = paths::socket_path()
+        .ok()
+        .and_then(|socket| socket.parent().map(|parent| parent.join("daemon.log")));
+    let log = log_path.as_ref().and_then(|path| {
+        path.parent().map(std::fs::create_dir_all);
+        std::fs::File::create(path).ok()
+    });
     command
         .args(["server", "--daemon-child"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(log.map_or_else(Stdio::null, Stdio::from));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -378,7 +415,7 @@ fn start_daemon() -> Result<()> {
         }
     }
     command.spawn().context("failed to start dlgt server")?;
-    Ok(())
+    Ok(log_path)
 }
 
 fn write_json_line(writer: &mut impl Write, value: &impl serde::Serialize) -> Result<()> {
@@ -422,7 +459,7 @@ fn public_rpc_method(method: &str) -> bool {
         "session.create"
             | "session.restart"
             | "session.send"
-            | "session.wait"
+            | "session.fetch"
             | "session.cancel"
             | "session.list"
             | "session.read"

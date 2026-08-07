@@ -12,7 +12,7 @@ fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std
         "new",
         "restart",
         "send",
-        "wait",
+        "fetch",
         "cancel",
         "list",
         "ls",
@@ -25,6 +25,7 @@ fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std
         "models",
         "profiles",
         "harnesses",
+        "doctor",
         "skill",
         "rpc",
         "version",
@@ -77,25 +78,143 @@ fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn send_rejects_timeout_before_starting_a_daemon() -> Result<(), Box<dyn std::error::Error>> {
+fn unknown_long_options_are_named_with_the_command_usage() -> Result<(), Box<dyn std::error::Error>>
+{
     let home = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
         .env("DLGT_HOME", home.path())
-        .args([
-            "send",
-            "codex:test-session",
-            "--timeout",
-            "1s",
-            "--",
-            "hello",
-        ])
+        .args(["show", "codex:test-session", "--json"])
         .output()?;
 
     assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
     assert!(
-        String::from_utf8(output.stdout)?.contains("--timeout requires --wait"),
-        "unexpected timeout error"
+        stdout.contains("unknown option") && stdout.contains("--json"),
+        "unexpected output: {stdout}"
     );
+    assert!(stdout.contains("USAGE"), "unexpected output: {stdout}");
+    assert!(
+        !stdout.contains("missing value"),
+        "unknown option consumed the next token: {stdout}"
+    );
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn acceptance_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    for command in [
+        vec!["new", "--title", "t", "--harness", "claude", "--", "hello"],
+        vec!["send", "codex:test-session", "--", "hello"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+            .env("DLGT_HOME", home.path())
+            .args(&command)
+            .output()?;
+
+        assert!(!output.status.success(), "{command:?} was accepted");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains("--request-id"),
+            "the error must name the flag: {stdout}"
+        );
+        assert!(stdout.contains("USAGE"), "unexpected output: {stdout}");
+    }
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn an_idempotency_key_is_validated_before_the_prompt_is_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let workdir = tempfile::tempdir()?;
+    let at_limit = "k".repeat(128);
+    let over_limit = "k".repeat(129);
+    let cases = [
+        ("", true),
+        (at_limit.as_str(), false),
+        (over_limit.as_str(), true),
+    ];
+    for (key, rejected) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+            .env("DLGT_HOME", home.path())
+            .current_dir(workdir.path())
+            // A missing --cwd fails after the key check, so it marks how far
+            // the invocation got without needing a daemon.
+            .args([
+                "new",
+                "--title",
+                "t",
+                "--harness",
+                "claude",
+                "--request-id",
+                key,
+                "--cwd",
+                "./missing",
+                "--",
+                "hello",
+            ])
+            .output()?;
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout)?;
+        if rejected {
+            assert!(
+                stdout.contains("--request-id"),
+                "key of {} bytes should be rejected: {stdout}",
+                key.len()
+            );
+        } else {
+            assert!(
+                stdout.contains("./missing"),
+                "key of {} bytes should be accepted: {stdout}",
+                key.len()
+            );
+        }
+    }
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn resuming_also_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .args(["send", "claude:some-session", "--resume", "--", "hello"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stdout)?.contains("--request-id"));
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn send_no_longer_accepts_the_removed_wait_flags() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    for flag in [["--wait", "--timeout"], ["--timeout", "1s"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+            .env("DLGT_HOME", home.path())
+            .args([
+                "send",
+                "codex:test-session",
+                flag[0],
+                flag[1],
+                "--",
+                "hello",
+            ])
+            .output()?;
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains("unknown option"),
+            "unexpected output: {stdout}"
+        );
+    }
     assert!(!home.path().join("run").exists());
     Ok(())
 }
@@ -114,6 +233,8 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
             "t",
             "--harness",
             "claude",
+            "--request-id",
+            "r1",
             "--cwd",
             "./missing",
             "--",

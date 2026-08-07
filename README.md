@@ -100,7 +100,7 @@ framework. It is the bridge between two competing harnesses.
 
 ## Direct CLI use
 
-After installing `dlgt`, create a Claude Session and wait for its review:
+After installing `dlgt`, create a Claude Session and read its review:
 
 ```bash
 dlgt new \
@@ -109,10 +109,21 @@ dlgt new \
   --model claude-fable-5 \
   --effort high \
   --cwd . \
-  --wait \
-  --timeout 15m \
-  -- "Review this repository. Return findings and trade-offs only."
+  --alias @review \
+  --request-id review-1 \
+  -- "Review this repository. Return findings and trade-offs only." \
+  && dlgt fetch @review --until result --wait 15m
 ```
+
+`new` waits up to five seconds for provider confirmation, then returns a
+successful receipt with `submission: "confirmed" | "pending"`. `pending`
+means local delivery succeeded; follow its `action` and do not resend with a
+new request ID. `fetch` is the one observation command: it returns current
+state, new results, lifecycle events, and the forward screen delta from a
+cursor position. Chaining them prints two JSON documents, one per line; the
+first receipt carries the Session ID and cursor. For anything longer than a
+quick check, run the two commands separately so a lost read never costs you
+the receipt.
 
 Create a Codex Session:
 
@@ -123,6 +134,7 @@ dlgt new \
   --model gpt-5.6-luna \
   --effort xhigh \
   --cwd . \
+  --request-id codex-review-1 \
   -- "Review the implementation and report correctness risks."
 ```
 
@@ -130,10 +142,11 @@ The command returns one provider-qualified Session ID, such as
 `codex:019f6307-341e-7e81-8a33-7ab61e804345`:
 
 ```bash
-dlgt wait codex:019f6307-341e-7e81-8a33-7ab61e804345 --timeout 15m
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait --timeout 15m -- "Review the revision"
+dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-2 -- "Review the revision"
+dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --cursor "$cursor"
 dlgt restart codex:019f6307-341e-7e81-8a33-7ab61e804345
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume -- "Continue the review"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume --request-id review-3 -- "Continue the review"
 dlgt show codex:019f6307-341e-7e81-8a33-7ab61e804345
 dlgt scrollback codex:019f6307-341e-7e81-8a33-7ab61e804345 --lines 100
 dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345

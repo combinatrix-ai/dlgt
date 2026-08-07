@@ -2,21 +2,41 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cursor::{Cursor, CursorTable};
 use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
+use crate::screen::{EpochReason, LIVE_ROW_LIMIT, ScreenStore, StablePage};
 use anyhow::{Context, Result, bail};
+use uuid::Uuid;
 
 pub struct Store {
     state: RefCell<MemoryState>,
 }
 
 const OUTPUT_CHUNK_LIMIT: usize = 8192;
+/// Lifecycle events retained per daemon before the oldest are evicted.
+const EVENT_RETENTION: usize = 50_000;
+/// Terminal results retained per Session.
+const RESULT_RETENTION: usize = 128;
+/// Retained result bodies per Session.
+const RESULT_BODY_RETENTION: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct MemoryState {
     sessions: HashMap<String, StoredSession>,
+    /// Every public Session ID this daemon has published, including
+    /// pre-rekey identities, mapped to the immutable internal Session UID.
+    uid_index: HashMap<String, String>,
     provider_reservations: HashMap<String, String>,
     turns: HashMap<String, TurnRecord>,
-    events: Vec<EventRecord>,
+    events: VecDeque<EventRecord>,
+    /// Highest lifecycle sequence already evicted by retention.
+    evicted_event_seq: i64,
+    /// Highest execution sequence whose result was evicted, per Session UID.
+    evicted_result_seq: HashMap<String, i64>,
+    screens: HashMap<String, ScreenStore>,
+    /// Observation positions and the watermarks behind them. Held here so
+    /// minting a position is atomic with the state capture it describes.
+    cursors: CursorTable,
     outputs: HashMap<String, VecDeque<OutputChunk>>,
     next_event_seq: i64,
     next_input_seq: i64,
@@ -25,8 +45,20 @@ struct MemoryState {
 
 struct StoredSession {
     record: SessionRecord,
+    /// Immutable internal identity. Public Session IDs rotate when Claude
+    /// reports a new provider session, so cursors bind to this instead.
+    uid: String,
     terminal_rows: u16,
     terminal_cols: u16,
+}
+
+/// Live screen projection: a replaceable snapshot, never cursor history.
+#[derive(Debug, Default)]
+pub struct LiveScreen {
+    pub epoch: u64,
+    pub reset_reason: Option<&'static str>,
+    pub rows: Vec<String>,
+    pub truncated: bool,
 }
 
 struct OutputChunk {
@@ -38,6 +70,15 @@ pub struct OutputPage {
     pub data: Vec<u8>,
     pub next_after: i64,
     pub has_more: bool,
+}
+
+struct FinishTurn<'a> {
+    id: &'a str,
+    provider_turn_id: Option<&'a str>,
+    state: TurnState,
+    final_message: Option<&'a str>,
+    recovered: bool,
+    error: Option<&'a str>,
 }
 
 pub struct NewSession<'a> {
@@ -70,6 +111,9 @@ impl Store {
             bail!("active session alias already exists");
         }
         let now = now_ms();
+        let uid = format!("su_{}", Uuid::new_v4().simple());
+        state.uid_index.insert(session.id.to_owned(), uid.clone());
+        state.screens.insert(uid.clone(), ScreenStore::new(24, 80));
         state.sessions.insert(
             session.id.to_owned(),
             StoredSession {
@@ -89,6 +133,7 @@ impl Store {
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
+                uid,
                 terminal_rows: 24,
                 terminal_cols: 80,
             },
@@ -213,6 +258,9 @@ impl Store {
         {
             bail!("active session id already exists: {to}");
         }
+        // Retained events are append-only. Pre-bind events recorded against an
+        // internal launch ID stay exactly as they were written and are never
+        // published; the canonical timeline is materialized at bind time.
         let replaced = state.sessions.remove(to);
         let mut session = state.sessions.remove(from).context("session not found")?;
         if let Some(replaced) = replaced {
@@ -220,19 +268,33 @@ impl Store {
                 .record
                 .created_at_ms
                 .min(replaced.record.created_at_ms);
+            // Resuming a retained provider conversation continues one logical
+            // Session. Adopt its immutable identity so cursors, screen
+            // history, and retention floors survive the replacement process,
+            // and retire the launch identity that was only ever a placeholder.
+            let launch_uid = std::mem::replace(&mut session.uid, replaced.uid.clone());
+            state.screens.remove(&launch_uid);
+            state.cursors.forget(&launch_uid);
+            state.evicted_result_seq.remove(&launch_uid);
+            state
+                .uid_index
+                .retain(|_, uid| uid.as_str() != launch_uid.as_str());
+            // A replacement PTY is still a new terminal generation.
+            if let Some(screen) = state.screens.get_mut(&session.uid) {
+                screen.restart();
+            }
         }
         to.clone_into(&mut session.record.id);
         session.record.updated_at_ms = now_ms();
+        // The pre-rekey ID stays resolvable for the daemon lifetime so a
+        // concurrent cursor keeps addressing the same logical Session.
+        state.uid_index.insert(to.to_owned(), session.uid.clone());
+        state.uid_index.insert(from.to_owned(), session.uid.clone());
         state.sessions.insert(to.to_owned(), session);
 
         for turn in state.turns.values_mut() {
             if turn.session_id == from {
                 to.clone_into(&mut turn.session_id);
-            }
-        }
-        for event in &mut state.events {
-            if event.session_id.as_deref() == Some(from) {
-                event.session_id = Some(to.to_owned());
             }
         }
         let mut merged = state.outputs.remove(to).unwrap_or_default();
@@ -280,20 +342,28 @@ impl Store {
     }
 
     pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) {
-        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
-            session.terminal_rows = rows;
-            session.terminal_cols = cols;
-            session.record.updated_at_ms = now_ms();
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return;
+        };
+        session.terminal_rows = rows;
+        session.terminal_cols = cols;
+        session.record.updated_at_ms = now_ms();
+        let uid = session.uid.clone();
+        if let Some(screen) = state.screens.get_mut(&uid) {
+            screen.resize(rows, cols);
         }
     }
 
-    pub fn terminal_size(&self, session_id: &str) -> Result<(u16, u16)> {
-        self.state
-            .borrow()
-            .sessions
-            .get(session_id)
-            .map(|session| (session.terminal_rows, session.terminal_cols))
-            .context("failed to read terminal size")
+    /// Start a new terminal generation for a replacement provider process.
+    pub fn restart_screen(&self, session_id: &str) {
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+            return;
+        };
+        if let Some(screen) = state.screens.get_mut(&uid) {
+            screen.restart();
+        }
     }
 
     pub fn get_session(&self, selector: &str) -> Option<SessionRecord> {
@@ -351,6 +421,9 @@ impl Store {
             state: TurnState::Submitted,
             provider_turn_id: None,
             final_message: None,
+            final_text_recovered: false,
+            transcript_path: None,
+            transcript_offset: None,
             error: None,
             created_at_ms: now,
             started_at_ms: None,
@@ -367,6 +440,27 @@ impl Store {
 
     pub fn get_turn(&self, id: &str) -> Option<TurnRecord> {
         self.state.borrow().turns.get(id).cloned()
+    }
+
+    pub fn turn_for_execution(&self, session_id: &str, execution_seq: i64) -> Option<TurnRecord> {
+        self.state
+            .borrow()
+            .turns
+            .values()
+            .find(|turn| turn.session_id == session_id && turn.execution_seq == execution_seq)
+            .cloned()
+    }
+
+    /// Newest retained *terminal* result. An execution that is still running
+    /// must not hide the answer the caller has not read yet.
+    pub fn latest_terminal_turn(&self, session_id: &str) -> Option<TurnRecord> {
+        self.state
+            .borrow()
+            .turns
+            .values()
+            .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+            .max_by_key(|turn| turn.execution_seq)
+            .cloned()
     }
 
     pub fn latest_turn(&self, session_id: &str) -> Option<TurnRecord> {
@@ -400,14 +494,16 @@ impl Store {
         id: &str,
         provider_turn_id: Option<&str>,
         final_message: Option<&str>,
+        recovered: bool,
     ) -> Result<bool> {
-        self.finish_turn_if_matching(
+        self.finish_turn(&FinishTurn {
             id,
             provider_turn_id,
-            TurnState::Completed,
+            state: TurnState::Completed,
             final_message,
-            None,
-        )
+            recovered,
+            error: None,
+        })
     }
 
     pub fn finish_turn_if_matching(
@@ -418,6 +514,34 @@ impl Store {
         final_message: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool> {
+        self.finish_turn(&FinishTurn {
+            id,
+            provider_turn_id,
+            state,
+            final_message,
+            recovered: false,
+            error,
+        })
+    }
+
+    /// Record the provider transcript boundary for an execution, so a later
+    /// fallback can never read a previous turn's assistant message.
+    pub fn set_turn_transcript(&self, id: &str, path: &str, offset: Option<u64>) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+            turn.transcript_path = Some(path.to_owned());
+            turn.transcript_offset = offset;
+        }
+    }
+
+    fn finish_turn(&self, finish: &FinishTurn<'_>) -> Result<bool> {
+        let FinishTurn {
+            id,
+            provider_turn_id,
+            state,
+            final_message,
+            recovered,
+            error,
+        } = *finish;
         if !state.is_provider_terminal() {
             bail!("invalid terminal turn state {:?}", state.as_str());
         }
@@ -436,6 +560,7 @@ impl Store {
             turn.provider_turn_id = provider_turn_id.map(str::to_owned);
         }
         turn.final_message = final_message.map(str::to_owned);
+        turn.final_text_recovered = recovered;
         turn.error = error.map(str::to_owned);
         turn.completed_at_ms = Some(now_ms());
         if let Some(session) = memory.sessions.get_mut(&session_id)
@@ -444,6 +569,7 @@ impl Store {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
+        enforce_result_retention(&mut memory, &session_id);
         Ok(true)
     }
 
@@ -462,6 +588,7 @@ impl Store {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
+        enforce_result_retention(&mut state, session_id);
         Some(turn_id)
     }
 
@@ -482,6 +609,7 @@ impl Store {
             session.record.state = SessionState::Quiescing;
             session.record.updated_at_ms = now_ms();
         }
+        enforce_result_retention(&mut state, &session_id);
         Ok(true)
     }
 
@@ -538,13 +666,33 @@ impl Store {
         let mut state = self.state.borrow_mut();
         state.next_event_seq += 1;
         let seq = state.next_event_seq;
-        state.events.push(EventRecord {
+        let scope = session_id.and_then(|id| {
+            state
+                .sessions
+                .get(id)
+                .map(|session| session.uid.clone())
+                .or_else(|| state.uid_index.get(id).cloned())
+        });
+        let turn = turn_id.and_then(|id| state.turns.get(id));
+        let execution_seq = turn.map(|turn| turn.execution_seq);
+        let result_status = turn
+            .map(|turn| turn.state)
+            .filter(|state| state.is_terminal());
+        state.events.push_back(EventRecord {
             seq,
+            session_uid: scope,
             session_id: session_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             kind: kind.to_owned(),
             retry_attempt,
+            execution_seq,
+            result_status,
         });
+        while state.events.len() > EVENT_RETENTION {
+            if let Some(evicted) = state.events.pop_front() {
+                state.evicted_event_seq = state.evicted_event_seq.max(evicted.seq);
+            }
+        }
         seq
     }
 
@@ -567,6 +715,10 @@ impl Store {
         });
         while chunks.len() > OUTPUT_CHUNK_LIMIT {
             chunks.pop_front();
+        }
+        let uid = state.sessions.get(session_id).map(|s| s.uid.clone());
+        if let Some(screen) = uid.and_then(|uid| state.screens.get_mut(&uid)) {
+            screen.feed(data);
         }
     }
 
@@ -598,17 +750,276 @@ impl Store {
         }
     }
 
-    pub fn read_events(&self, session_id: Option<&str>, after: i64) -> Vec<EventRecord> {
+    /// Events after `after`, optionally scoped to one immutable Session UID.
+    /// Scoping by UID keeps pre-rekey events readable through the Session's
+    /// current address without rewriting what was already published.
+    pub fn read_events(&self, uid: Option<&str>, after: i64) -> Vec<EventRecord> {
         self.state
             .borrow()
             .events
             .iter()
             .filter(|event| {
-                event.seq > after
-                    && session_id.is_none_or(|id| event.session_id.as_deref() == Some(id))
+                event.seq > after && uid.is_none_or(|uid| event.session_uid.as_deref() == Some(uid))
             })
             .cloned()
             .collect()
+    }
+
+    /// Take the next observation position for a scope.
+    pub fn reserve_cursor(&self, scope: &str) -> u64 {
+        self.state.borrow_mut().cursors.reserve(scope)
+    }
+
+    /// Bind a reserved position to the watermarks it stands for.
+    pub fn store_cursor(&self, scope: &str, number: u64, cursor: Cursor) -> Result<()> {
+        self.state.borrow_mut().cursors.store(scope, number, cursor)
+    }
+
+    pub fn resolve_cursor(&self, scope: &str, value: &str) -> Result<Cursor> {
+        self.state.borrow().cursors.resolve(scope, value)
+    }
+
+    /// Highest lifecycle sequence already dropped by event retention.
+    pub fn evicted_event_seq(&self) -> i64 {
+        self.state.borrow().evicted_event_seq
+    }
+
+    pub fn latest_event_seq(&self) -> i64 {
+        self.state.borrow().next_event_seq
+    }
+
+    /// Immutable internal identity for any public Session ID or alias,
+    /// including identities this daemon has already rekeyed away from.
+    pub fn session_uid(&self, selector: &str) -> Option<String> {
+        let state = self.state.borrow();
+        if let Some(session) = state.sessions.get(selector) {
+            return Some(session.uid.clone());
+        }
+        if let Some(uid) = state.uid_index.get(selector) {
+            return Some(uid.clone());
+        }
+        drop(state);
+        self.get_session(selector).and_then(|session| {
+            self.state
+                .borrow()
+                .sessions
+                .get(&session.id)
+                .map(|s| s.uid.clone())
+        })
+    }
+
+    pub fn session_for_uid(&self, uid: &str) -> Option<SessionRecord> {
+        self.state
+            .borrow()
+            .sessions
+            .values()
+            .find(|session| session.uid == uid)
+            .map(|session| session.record.clone())
+    }
+
+    pub fn session_uids(&self) -> Vec<String> {
+        let state = self.state.borrow();
+        let mut uids = state
+            .sessions
+            .values()
+            .map(|session| (session.record.created_at_ms, session.uid.clone()))
+            .collect::<Vec<_>>();
+        uids.sort_by_key(|(created, uid)| (std::cmp::Reverse(*created), uid.clone()));
+        uids.into_iter().map(|(_, uid)| uid).collect()
+    }
+
+    /// Drop one retained result, as result retention eventually does.
+    #[cfg(test)]
+    pub fn evict_turn_for_test(&self, id: &str) {
+        self.state.borrow_mut().turns.remove(id);
+    }
+
+    /// Highest execution sequence with a retained terminal result.
+    pub fn latest_result_seq(&self, uid: &str) -> i64 {
+        let state = self.state.borrow();
+        let Some(session_id) = state
+            .sessions
+            .values()
+            .find(|session| session.uid == uid)
+            .map(|session| session.record.id.clone())
+        else {
+            return 0;
+        };
+        state
+            .turns
+            .values()
+            .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+            .map(|turn| turn.execution_seq)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Terminal results after `after`, oldest first.
+    pub fn results_after(&self, uid: &str, after: i64, limit: usize) -> (Vec<TurnRecord>, bool) {
+        let state = self.state.borrow();
+        let Some(session_id) = state
+            .sessions
+            .values()
+            .find(|session| session.uid == uid)
+            .map(|session| session.record.id.clone())
+        else {
+            return (Vec::new(), false);
+        };
+        let mut results = state
+            .turns
+            .values()
+            .filter(|turn| {
+                turn.session_id == session_id
+                    && turn.state.is_terminal()
+                    && turn.execution_seq > after
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        results.sort_by_key(|turn| turn.execution_seq);
+        let has_more = results.len() > limit;
+        results.truncate(limit);
+        (results, has_more)
+    }
+
+    /// Highest execution sequence whose retained result was evicted.
+    pub fn evicted_result_seq(&self, uid: &str) -> i64 {
+        self.state
+            .borrow()
+            .evicted_result_seq
+            .get(uid)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn screen_epoch(&self, uid: &str) -> u64 {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or(0, ScreenStore::epoch)
+    }
+
+    pub fn stable_page(&self, uid: &str, after: u64, limit: usize) -> StablePage {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or_else(StablePage::default, |screen| {
+                screen.stable_page(after, limit)
+            })
+    }
+
+    pub fn stable_tail(&self, uid: &str, limit: usize) -> StablePage {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or_else(StablePage::default, |screen| screen.stable_tail(limit))
+    }
+
+    pub fn stable_head(&self, uid: &str) -> u64 {
+        self.state
+            .borrow()
+            .screens
+            .get(uid)
+            .map_or(0, ScreenStore::head_row_id)
+    }
+
+    pub fn live_screen(&self, uid: &str, limit: usize) -> LiveScreen {
+        let state = self.state.borrow();
+        let Some(screen) = state.screens.get(uid) else {
+            return LiveScreen::default();
+        };
+        let (rows, truncated) = screen.live_rows(limit.min(LIVE_ROW_LIMIT));
+        LiveScreen {
+            epoch: screen.epoch(),
+            reset_reason: screen.last_reset_reason().map(EpochReason::as_str),
+            rows,
+            truncated,
+        }
+    }
+
+    /// Rendered rows addressed by absolute row ID, live grid included.
+    pub fn rendered_rows(&self, uid: &str, before: Option<u64>, lines: usize) -> RenderedRows {
+        let state = self.state.borrow();
+        let Some(screen) = state.screens.get(uid) else {
+            return RenderedRows::default();
+        };
+        let head = screen.head_row_id();
+        let (live, _) = screen.live_rows(usize::MAX);
+        let live_len = u64::try_from(live.len()).unwrap_or(0);
+        let (rows, cols) = screen.size();
+        let end = before
+            .unwrap_or(head + live_len + 1)
+            .min(head + live_len + 1);
+        let floor = screen.floor_row_id();
+        let start = end
+            .saturating_sub(u64::try_from(lines).unwrap_or(0))
+            .max(floor);
+        let mut selected = Vec::new();
+        if start < end.min(head + 1) {
+            let page = screen.stable_page(
+                start - 1,
+                usize::try_from(end.min(head + 1) - start).unwrap_or(0),
+            );
+            selected.extend(page.lines);
+        }
+        for (index, row) in live.into_iter().enumerate() {
+            let id = head + u64::try_from(index).unwrap_or(0) + 1;
+            if id >= start && id < end {
+                selected.push(row);
+            }
+        }
+        RenderedRows {
+            rows,
+            cols,
+            lines: selected,
+            truncated: start > floor || floor > 1,
+            before: (start > floor).then_some(start),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RenderedRows {
+    pub rows: u16,
+    pub cols: u16,
+    pub lines: Vec<String>,
+    pub truncated: bool,
+    pub before: Option<u64>,
+}
+
+/// Evict the oldest retained results once a Session exceeds either bound.
+/// Eviction is recorded so a cursor that predates it reports a gap instead of
+/// silently skipping a result.
+fn enforce_result_retention(state: &mut MemoryState, session_id: &str) {
+    let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+        return;
+    };
+    let mut terminal = state
+        .turns
+        .values()
+        .filter(|turn| turn.session_id == session_id && turn.state.is_terminal())
+        .map(|turn| {
+            (
+                turn.execution_seq,
+                turn.id.clone(),
+                turn.final_message.as_ref().map_or(0, String::len),
+            )
+        })
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|(seq, _, _)| *seq);
+    let mut bytes = terminal.iter().map(|(_, _, len)| *len).sum::<usize>();
+    let mut index = 0;
+    while index + 1 < terminal.len()
+        && (terminal.len() - index > RESULT_RETENTION || bytes > RESULT_BODY_RETENTION)
+    {
+        let (seq, id, len) = &terminal[index];
+        state.turns.remove(id);
+        bytes = bytes.saturating_sub(*len);
+        let floor = state.evicted_result_seq.entry(uid.clone()).or_default();
+        *floor = (*floor).max(*seq);
+        index += 1;
     }
 }
 
@@ -632,6 +1043,26 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::{NewSession, Store};
     use crate::protocol::{SessionState, TurnState};
+
+    fn ready_store() -> Store {
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "codex:thread-1",
+                alias: "@worker",
+                title: "worker",
+                agent: "codex",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        assert!(store.set_session_running("codex:thread-1", Some(42)));
+        assert!(store.set_session_state("codex:thread-1", SessionState::Idle));
+        store
+    }
 
     fn mark_ready(store: &Store, session_id: &str) {
         assert!(store.set_session_running(session_id, Some(42)));
@@ -733,13 +1164,122 @@ mod tests {
 
     #[test]
     fn unscoped_event_reads_include_session_events() {
-        let store = Store::new();
+        let store = ready_store();
         store.record_event(Some("codex:thread-1"), None, "session.started");
         store.record_event(None, None, "runtime.started");
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
 
         let events = store.read_events(None, 0);
         assert_eq!(events.len(), 2);
-        assert_eq!(store.read_events(Some("codex:thread-1"), 0).len(), 1);
+        assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
+    }
+
+    #[test]
+    fn a_running_execution_never_hides_the_previous_result() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "first")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("p1")));
+        assert!(
+            store
+                .complete_turn_if_matching("turn_1", Some("p1"), Some("first-answer"), false)
+                .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
+        );
+        store
+            .insert_turn("turn_2", "codex:thread-1", "second")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_2", Some("p2")));
+
+        assert_eq!(
+            store
+                .latest_turn("codex:thread-1")
+                .map(|turn| turn.execution_seq),
+            Some(2)
+        );
+        let retained = store
+            .latest_terminal_turn("codex:thread-1")
+            .unwrap_or_else(|| panic!("the previous result was hidden by the active turn"));
+        assert_eq!(retained.execution_seq, 1);
+        assert_eq!(retained.final_message.as_deref(), Some("first-answer"));
+    }
+
+    #[test]
+    fn retained_events_are_never_rewritten_by_a_rekey() {
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "internal:LAUNCH01",
+                alias: "@worker",
+                title: "worker",
+                agent: "claude",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                auto_approve: true,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        store.record_event(Some("internal:LAUNCH01"), None, "session.created");
+        let launch_uid = store
+            .session_uid("internal:LAUNCH01")
+            .unwrap_or_else(|| panic!("launch uid missing"));
+        let before = store.read_events(None, 0);
+
+        store
+            .rekey_session("internal:LAUNCH01", "claude:provider-1")
+            .unwrap_or_else(|error| panic!("failed to promote: {error}"));
+        store.record_event(Some("claude:provider-1"), None, "session.created");
+
+        let after = store.read_events(None, 0);
+        assert_eq!(
+            after[0].session_id, before[0].session_id,
+            "a retained event was rewritten"
+        );
+        assert_eq!(after[0].session_uid.as_deref(), Some(launch_uid.as_str()));
+        assert_eq!(after[1].session_id.as_deref(), Some("claude:provider-1"));
+        assert_eq!(after.len(), 2);
+    }
+
+    #[test]
+    fn retained_events_survive_result_eviction_and_rekey_unchanged() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+        assert!(
+            store
+                .complete_turn_if_matching("turn_1", Some("provider-turn"), Some("done"), false)
+                .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
+        );
+        store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.completed");
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let before = store.read_events(Some(&uid), 0);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].execution_seq, Some(1));
+        assert_eq!(before[0].result_status, Some(TurnState::Completed));
+
+        // The turn the event described is gone, and the public ID rotated.
+        store.evict_turn_for_test("turn_1");
+        store
+            .rekey_session("codex:thread-1", "codex:thread-2")
+            .unwrap_or_else(|error| panic!("failed to rekey: {error}"));
+
+        let after = store.read_events(Some(&uid), 0);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].execution_seq, Some(1));
+        assert_eq!(after[0].result_status, Some(TurnState::Completed));
+        assert_eq!(after[0].session_id.as_deref(), Some("codex:thread-1"));
+        assert_eq!(
+            store.session_uid("codex:thread-1").as_deref(),
+            Some(uid.as_str()),
+            "the pre-rekey ID must keep addressing the same logical Session"
+        );
     }
 
     #[test]
@@ -1064,12 +1604,12 @@ mod tests {
         assert!(store.mark_turn_started("turn_1", Some("provider-1")));
         assert!(
             !store
-                .complete_turn_if_matching("turn_1", Some("provider-2"), Some("wrong"))
+                .complete_turn_if_matching("turn_1", Some("provider-2"), Some("wrong"), false)
                 .unwrap_or_else(|error| panic!("failed to reject stop: {error}"))
         );
         assert!(
             store
-                .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"))
+                .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"), false)
                 .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
         );
     }
@@ -1097,7 +1637,7 @@ mod tests {
         assert!(store.mark_turn_started("turn_1", None));
         assert!(
             store
-                .complete_turn_if_matching("turn_1", None, Some("done"))
+                .complete_turn_if_matching("turn_1", None, Some("done"), false)
                 .unwrap_or_else(|error| panic!("failed to complete first turn: {error}"))
         );
         store
@@ -1263,7 +1803,14 @@ mod tests {
                 .session_id,
             "codex:thread-1"
         );
-        assert_eq!(store.read_events(Some("codex:thread-1"), 0).len(), 1);
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        // The launch event keeps the identity it was written with; the
+        // canonical timeline is recorded after binding.
+        assert!(store.read_events(Some(&uid), 0).is_empty());
+        store.record_event(Some("codex:thread-1"), None, "session.created");
+        assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
         assert_eq!(
             store.read_output_page("codex:thread-1", 0, 64).data,
             b"oldnew"

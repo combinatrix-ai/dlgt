@@ -21,7 +21,7 @@ memory. When that daemon exits, its dlgt Session state disappears; the returned
 provider-qualified Session ID remains the durable lookup and resume key in
 Codex or Claude.
 
-Provider turns, steering messages, queued prompts, and delivery attempts are
+Provider turns, steering messages, and delivery attempts are
 internal correlation records. They do not have public selectors and do not
 change the Session-only public object model.
 
@@ -34,18 +34,20 @@ resources.
 1. `new` always creates a new Session; `send` never creates one.
 2. A Session has at most one active execution.
 3. Every accepted user turn receives a monotonically increasing
-   `execution_seq`. Steering does not create an execution sequence; an enqueued
-   prompt does when it is dispatched.
-4. State-changing commands, provider callbacks, queue dispatch, and attach
-   input are serialized per Session.
-5. The default send mode rejects busy work without side effects. Steering,
-   enqueueing, and replacement are explicit modes with distinct semantics.
+   `execution_seq`. Steering does not create an execution sequence.
+4. State-changing commands, provider callbacks, and attach input are
+   serialized per Session.
+5. There is no server-side queue. The default send mode rejects busy work
+   without side effects; steering and replacement are explicit modes with
+   distinct semantics.
 6. Provider lifecycle interfaces determine readiness, blocked state,
    quiescence, and completion. PTY silence and screen content never do.
 7. Stale, duplicate, mismatched, or late provider events are diagnostic only;
    they cannot mutate a newer execution or restart generation.
-8. Startup, wait, cancellation, and restart waits are bounded. A caller timeout
-   reports observation failure and does not silently cancel underlying work.
+8. Acceptance is separate from observation. `new` and `send` return as soon
+   as a prompt is accepted; every later observation is one bounded `fetch`.
+   Startup, cancellation, and restart waits are bounded, and a caller deadline
+   reports what was observed instead of cancelling underlying work.
 9. Replacement means cancel, prove provider quiescence, then start a new turn
    in the same provider conversation. It is not process restart.
 10. Attach is an exclusive input lease. Semantic operations cannot interleave
@@ -74,8 +76,7 @@ blocked --attach answer accepted-----------------------> busy
 busy|blocked --cancel or replace-----------------------> canceling
 canceling --matching provider quiescence---------------> idle
 
-busy --terminal result, no queued prompt---------------> idle
-busy --terminal result, queued prompt dispatched-------> busy
+busy --terminal result---------------------------------> idle
 
 starting|idle|busy|blocked|canceling --restart---------> restarting
 restarting --replacement provider ready---------------> idle or busy
@@ -126,8 +127,8 @@ notifications. Its remote TUI PTY exists for attach and presentation.
 | --- | --- |
 | `thread/started` | Bind and validate the Codex thread, then publish `codex:<thread-id>` as the Session ID; establish startup/resume readiness for the expected generation. |
 | `turn/started` | Match the bound thread and pending execution, bind `provider_turn_id`, and confirm `busy`. |
-| `turn/completed`, `completed` | Store the final assistant text, terminalize the execution successfully, then dispatch queued work or become `idle`. |
-| `turn/completed`, `failed` | Store the sanitized error, terminalize as failed, then dispatch queued work or become `idle`. |
+| `turn/completed`, `completed` | Store the final assistant text, terminalize the execution successfully, and become `idle`. |
+| `turn/completed`, `failed` | Store the sanitized error, terminalize as failed, and become `idle`. |
 | `turn/completed`, `interrupted` | Prove interruption and provider quiescence. Preserve canceled/replaced intent when dlgt initiated it. |
 | retryable `error` | Record `provider.retrying`; remain `busy`. |
 | terminal `error` | Fail only the matching active execution. |
@@ -204,7 +205,7 @@ is already empty, or `Ctrl+S`, which may restore a prior stash.
 The semantic send operation has an internally first-class mode:
 
 ```text
-reject  steer  enqueue  replace
+reject  steer  replace
 ```
 
 CLI flags and RPC fields may expose these names differently, but must preserve
@@ -214,20 +215,16 @@ the following behavior.
 | --- | --- | --- | --- | --- |
 | `reject` | Start a new execution. | `SESSION_BUSY`, no side effects. | Reject with the state-specific error. | No |
 | `steer` | `NO_ACTIVE_EXECUTION`. | Target the current execution. | Reject; steering cannot answer a human dialog or a turn already canceling. | Yes, until injected or target execution terminalizes |
-| `enqueue` | Dispatch immediately as a new execution. | Append a future user turn. | Append a future user turn, but do not resolve the current state. | Yes, FIFO |
 | `replace` | Start a new execution. | Atomically reserve replacement, cancel, await quiescence, then start it. | Replace blocked work; reject an already canceling/replacing Session. | Yes, until started or failed |
 
 All modes are decided under the per-Session controller lock. Concurrent
-operations cannot leapfrog an accepted enqueue or replacement. Enqueued prompts
-are dispatched FIFO, each with a fresh `execution_seq`. Failure of one queued
-execution does not discard later items unless an explicit queue-clearing
-operation says so.
+operations cannot leapfrog an accepted replacement. A busy Session rejects a
+new prompt; dlgt never holds one for later dispatch.
 
-Pending enqueue and replacement records live in the owning daemon. If that
-daemon exits, it stops its provider processes and discards the Session,
-execution, event, queue, and terminal-history state. The provider conversation
-ID returned to the caller remains available for provider-native lookup or
-resume.
+Pending replacement records live in the owning daemon. If that daemon exits, it
+stops its provider processes and discards the Session, execution, event, and
+terminal-history state. The provider conversation ID returned to the caller
+remains available for provider-native lookup or resume.
 
 ### Steering
 
@@ -268,18 +265,6 @@ expired   target execution ended before injection
 ```
 
 `injected` does not mean `acted_on`; provider compliance is not observable.
-
-### Enqueue
-
-Enqueue creates a future independent user turn. The daemon, not either
-provider, owns the queue. It does not use Codex `turn/steer` or Claude
-`additionalContext`.
-
-When the active execution terminalizes and the Session is otherwise usable,
-the daemon atomically claims the FIFO head, assigns the next `execution_seq`,
-and starts it through `turn/start` or Claude semantic PTY input. If dispatch
-fails, that queue item becomes a retained failed execution before later work is
-considered.
 
 ### Replace
 
@@ -324,7 +309,8 @@ interruption cannot reach quiescence, cancel/replace times out and the caller
 may request an explicit process restart.
 
 Restart replaces the provider process/control generation while retaining the
-alias, provider conversation, execution sequence, and queued work. The
+alias, provider conversation, execution sequence, and retained history. A
+replacement PTY always starts a new screen epoch. The
 provider-qualified Session ID remains the same unless Claude rotates its
 provider session ID, in which case dlgt atomically rekeys the retained Session.
 Active work receives a retained interrupted result before the replacement
@@ -346,15 +332,101 @@ dlgt retains two bounded representations:
 
 ```text
 PTY bytes
-  |-- raw ring -----------------> attach / logs --raw
-  `-- VT parser -> scrollback --> scrollback --lines N
+  |-- raw ring ------------------------------> attach / logs --raw
+  `-- live VT emulator -> stable rows -------> fetch / scrollback
 ```
 
 Terminal applications move cursors, erase lines, overwrite spinners, and
 repaint. A VT emulator must interpret those operations; stripping ANSI bytes
 would expose duplicate and false text. Raw bytes are an explicit diagnostic
-capability and may contain secrets. Normal observation uses rendered
-scrollback, lifecycle events, and retained results.
+capability and may contain secrets. Normal observation uses the rendered
+screen, lifecycle events, and retained results.
+
+One VT emulator per Session process generation is fed as PTY bytes arrive.
+Rows that scroll out of the live grid are appended to a per-Session vector with
+monotonically increasing absolute row IDs; the live grid is rendered on demand
+and is a replaceable snapshot, never history. The raw ring cannot back a
+forward cursor because eviction can cut mid escape sequence and change the
+interpretation and indexing of every remaining byte.
+
+A screen epoch identifies one continuous rendering. It advances on process
+restart, `RIS`, erase-scrollback (`CSI 3 J`), and a resize that changes the
+column count. Ordinary clears and alt-screen transitions mutate only the live
+grid. Stable rows are immutable text and are never rewritten by a later epoch.
+
+## Observation model
+
+Submission and observation are separate operations:
+
+```text
+new / send   deliver a prompt, briefly await confirmation, return a cursor
+fetch        one composite forward-delta read from a cursor
+```
+
+The submission receipt reports `confirmed` when provider lifecycle evidence
+arrives during the short wait and `pending` otherwise. Both are successful:
+PTY/app-server delivery already occurred. Replaying the same idempotency key
+refreshes a pending receipt from live turn state; a new key would risk a
+duplicate execution.
+
+The acceptance cursor is captured under the store lock immediately before the
+acceptance is recorded, so a provider that emits output or finishes instantly
+cannot move in front of the position the caller was handed.
+
+`fetch` joins the lifecycle event log to retained results, forward stable rows,
+and the live screen. A cursor is an ordinal position within one scope: the
+daemon mints the next number per Session, or per daemon for the aggregate
+scope, and holds the watermark vector behind it. Encoding that vector into the
+token bought no durability -- it addresses memory-only state either way -- while
+costing an LLM caller hundreds of characters of context per turn. Restart
+safety comes from the identities themselves: a new daemon mints new Session
+UIDs, so an old number resolves to nothing. Positions bind to the immutable
+Session UID rather than the public Session ID, so a Claude rekey does not
+invalidate them, and pre-rekey IDs stay resolvable for the daemon lifetime.
+
+Retention is bounded and eviction is observable: 10,000 stable rows per
+Session, 50,000 lifecycle events per daemon, and 128 results or 16 MiB of
+result bodies per Session. A cursor that predates an eviction returns a
+structured gap with a bounded baseline and a fresh cursor; a silent reset is
+never acceptable. A position the daemon never minted or no longer
+retains is a structured error whose recovery is one cursorless baseline fetch.
+Positions are meaningful only within one daemon lifetime: resolution is
+`(scope, number)` alone, so a number kept across a restart names the new
+daemon's window rather than being detected as stale. What comes back is
+current data, but as a starting position a stale number skips whatever the
+new daemon recorded before that window, so callers re-enter through an
+acceptance cursor or a baseline rather than a remembered number.
+
+Every observation is a success. Timeout, blocked input, a failed execution, and
+a canceled result all exit zero and are described by the response `reason` and
+result status. Non-zero exits remain for malformed requests, unknown Sessions,
+unusable cursors, and transport failure.
+
+A response is assembled one unit at a time. Each watermark is recorded only
+when the unit it describes is committed and survives the final measurement, and
+the published vector is derived last from the committed set, so a squeezed
+response cannot leave a watermark past data the caller never received. The
+position number itself is reserved before rendering, so the document carries
+its own number while it is being measured; a response whose watermark vector
+did not move keeps the caller's position instead of spending a new one.
+
+### Known limitations
+
+- Rebasing the VT emulator serializes only the visible grid. Scroll margins
+  (`DECSTBM`), origin mode, the saved cursor, and pending wrap are lost across
+  a main-screen rebase because the emulator exposes none of them. Already
+  promoted rows are unaffected, but applications do not re-issue margins on
+  every repaint, so a lost region can also change how the live grid scrolls
+  afterwards until the application happens to set it again.
+- The Claude transcript fallback canonicalizes a path, then opens it with
+  `O_NOFOLLOW` and verifies the descriptor by device and inode. Swapping an
+  *intermediate* directory between those two steps is not detected; closing it
+  needs an `openat2(RESOLVE_BENEATH)`-style walk. The acceptance boundary is
+  also taken by a separate, unconfined metadata lookup at hook time with no
+  binding to the file identity later opened, so a replaced file could pair a
+  stale offset with new content. The transcript is written by a same-user
+  provider that can already modify the target directly, so neither race grants
+  a privilege it does not already have.
 
 ## Launch environment and security
 
@@ -385,10 +457,10 @@ allowlist. Raw PTY bytes require explicit `logs --raw` access.
 
 ## Events and results
 
-Events normalize lifecycle, actionable blocked state, queue ownership, and
-steering delivery; they do not pretend both providers offer equivalent token
-or message streams. Humans inspect live output with attach, agents use bounded
-scrollback, and wait returns the retained terminal result.
+Events normalize lifecycle, actionable blocked state, and steering delivery;
+they do not pretend both providers offer equivalent token or message streams.
+Humans inspect live output with attach; agents use one `fetch`, which returns
+the retained terminal result together with the forward screen delta.
 
 At minimum, the event model distinguishes:
 
@@ -397,7 +469,6 @@ session.ready        session.busy        session.blocked
 session.canceling    session.idle        session.restarting
 session.stopping     session.stopped     session.failed
 input.steer.accepted input.steer.injected input.steer.expired
-input.enqueue.accepted input.enqueue.started
 turn.completed       turn.failed         turn.interrupted
 provider.retrying    provider.unmatched
 ```
@@ -408,20 +479,21 @@ Every public event is versioned and ordered by a daemon sequence number.
 
 1. Two concurrent default sends to one idle Session yield one accepted
    execution and one side-effect-free busy rejection.
-2. Two concurrent state-changing operations are serialized, and accepted queue
-   or replacement order is stable for the daemon lifetime.
+2. Two concurrent state-changing operations are serialized, and accepted
+   replacement order is stable for the daemon lifetime.
 3. `new` plus an initial prompt succeeds atomically or reports one failure
    without a live half-created alias.
 4. Every startup reaches ready or terminal failure within its deadline.
-5. Every accepted execution receives exactly one `execution_seq` and one
-   retained terminal result.
+5. Every accepted execution receives exactly one `execution_seq`, one
+   acceptance cursor, and one retained terminal result.
 6. Provider death during execution produces a retained result and terminal
    Session state in bounded time.
 7. Blocked input remains observable and is never inferred as completion.
 8. Cancel and replace never start new work before matching provider
    quiescence.
-9. Steering never leaks into a later execution; enqueue never mutates the
-   active execution.
+9. Steering never leaks into a later execution, and a retried acceptance
+   carrying the same request ID replays its original receipt instead of
+   creating a second Session or execution.
 10. Claude concurrent tool hooks cannot double-drain steering; Stop provides
     the final normal injection boundary.
 11. Daemon exit stops owned provider processes and discards all runtime-local
@@ -429,7 +501,7 @@ Every public event is versioned and ordered by a daemon sequence number.
 12. Attach excludes semantic sends and a second writer unless ownership is
     explicitly transferred.
 13. PTY silence, rendered text, and timeout are never accepted as lifecycle
-    proof.
+    proof, and a live-screen repaint alone never completes a long poll.
 14. All control success and error paths emit schema-valid JSON, and every
     public event carries `schema_version`.
 15. Raw PTY bytes are unavailable without explicit diagnostic access.
@@ -438,16 +510,15 @@ Every public event is versioned and ordered by a daemon sequence number.
 
 ### Session remains the public address
 
-Callers operate on one live Session identity. Internal execution, queue, and
+Callers operate on one live Session identity. Internal execution and
 delivery records exist for atomicity and observation, not as a second public
 API.
 
-### Steering and enqueue are different
+### Steering is not a queue
 
-Steering changes the current execution and expires with it. Enqueue creates a
-future execution within the same daemon lifetime. Combining them under one
-"queue" concept would make ordering, cancellation, and result ownership
-ambiguous.
+Steering changes the current execution and expires with it. dlgt does not hold
+a prompt for later dispatch: a busy Session rejects new work without side
+effects, so ordering, cancellation, and result ownership stay unambiguous.
 
 ### Replacement is not restart
 
@@ -463,16 +534,21 @@ Claude provides lifecycle hooks and an interactive input surface. dlgt exposes
 one intent model but documents weaker, boundary-delayed Claude steering and
 weaker Claude interrupt quiescence instead of claiming identical guarantees.
 
-### Queue ownership belongs to dlgt
+### Submission is never fused with a long wait
 
-Future turns are in-memory daemon state. Provider-native steering queues are not
-used for enqueue because they belong to the active turn and have different
-completion semantics.
+A command that accepts work and then blocks for minutes loses its acceptance
+receipt whenever the caller's harness kills, backgrounds, or swallows the
+response, which produces duplicate Sessions and Session-ID rediscovery. `new`
+and `send` therefore wait only a short bounded confirmation window before
+returning a cursor. Waiting for progress or a result is a separate, replayable
+`fetch`.
 
 ### Timeouts express bounded observation
 
-Startup, wait, cancellation, and restart waits are bounded. Timeout never
-manufactures completion, quiescence, or cancellation.
+Startup, cancellation, and restart waits are bounded, and a `fetch` deadline is
+an observation bound. Timeout never manufactures completion, quiescence, or
+cancellation, and it is reported as a successful observation rather than an
+error.
 
 ### Notifications are clients
 
@@ -487,8 +563,9 @@ work and results without creating a public Turn identity.
 
 ### Idle cancel is idempotent
 
-Canceling an idle Session succeeds with `canceled:false`. Waiting on a Session
-that has never accepted work remains `NO_RESULT`.
+Canceling an idle Session succeeds with `canceled:false`. Fetching a Session
+that has never accepted work returns a baseline snapshot with no result rather
+than an error.
 
 ### Model discovery reflects provider capability
 
@@ -511,10 +588,12 @@ remain provider-validated.
 
 The final design removes these earlier assumptions:
 
-- every busy send must fail and no server-side queue may exist;
+- a daemon-owned prompt queue can coexist with a one-execution Session;
 - one overloaded queue operation can mean both steering and a future turn;
 - replacement should kill and restart the provider process;
 - PTY quietness or prompt text can prove readiness or completion;
 - public Turn, Queue, Operation, or Delivery resources are required;
 - provider implementations must pretend to offer identical steering strength;
-- optional or unbounded lifecycle waits are acceptable.
+- optional or unbounded lifecycle waits are acceptable;
+- acceptance and a long wait can share one command;
+- a bounded observation timeout is an error rather than an observation.

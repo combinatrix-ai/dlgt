@@ -96,12 +96,36 @@ impl std::fmt::Display for TurnState {
     }
 }
 
+/// Longest caller-supplied acceptance idempotency key. The key is retained
+/// for the daemon's lifetime, so it is bounded.
+pub const MAX_ACCEPTANCE_REQUEST_ID_LEN: usize = 128;
+
+/// Longest RPC request id accepted. The id is echoed in the response
+/// envelope, so an unbounded one would let a caller inflate a reply past any
+/// size the request itself agreed to.
+pub const MAX_REQUEST_ID_LEN: usize = 200;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Request {
     pub id: String,
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+impl Request {
+    /// A bounded, safely truncated form of the id for use in an error reply.
+    pub fn short_id(&self) -> &str {
+        let mut end = self.id.len().min(64);
+        while end > 0 && !self.id.is_char_boundary(end) {
+            end -= 1;
+        }
+        &self.id[..end]
+    }
+
+    pub fn id_too_long(&self) -> bool {
+        self.id.len() > MAX_REQUEST_ID_LEN
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -224,6 +248,13 @@ pub struct TurnRecord {
     pub state: TurnState,
     pub provider_turn_id: Option<String>,
     pub final_message: Option<String>,
+    /// The hook did not report the final message and it was recovered from
+    /// the provider transcript instead.
+    pub final_text_recovered: bool,
+    /// Provider transcript path and the byte offset recorded when this
+    /// execution was accepted, used only for that bounded recovery.
+    pub transcript_path: Option<String>,
+    pub transcript_offset: Option<u64>,
     pub error: Option<String>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
@@ -231,15 +262,23 @@ pub struct TurnRecord {
     pub usage: Option<Value>,
 }
 
+/// A lifecycle event. Every field a reader can observe is materialized when
+/// the event is recorded: replay must never depend on an evictable turn or on
+/// a public Session ID that a later rekey rewrote.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EventRecord {
     pub seq: i64,
+    /// Immutable internal Session identity, used for scoping reads.
+    pub session_uid: Option<String>,
+    /// Public Session ID as published when the event happened.
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
     pub kind: String,
     /// The only event payload retained: retry attempts are exposed by the
     /// public event stream for provider retry notifications.
     pub retry_attempt: Option<u64>,
+    pub execution_seq: Option<i64>,
+    pub result_status: Option<TurnState>,
 }
 
 #[cfg(test)]

@@ -13,13 +13,13 @@ request produces exactly one response line.
 Request:
 
 ```json
-{"id":"req_1","method":"session.wait","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","timeout_ms":900000}}
+{"id":"req_1","method":"session.fetch","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","until":"result","wait_ms":900000}}
 ```
 
 Success:
 
 ```json
-{"id":"req_1","result":{"execution_seq":1,"result":{"status":"completed","final_text":"done"}}}
+{"id":"req_1","result":{"schema_version":1,"reason":"result","cursor":"4","sessions":[]}}
 ```
 
 A successful non-streaming response may also carry an informational notice
@@ -35,12 +35,16 @@ must obtain user confirmation before acting on `UPDATE_AVAILABLE`.
 Failure:
 
 ```json
-{"id":"req_1","error":{"code":"WAIT_TIMEOUT","message":"wait timed out; execution continues"}}
+{"id":"req_1","error":{"code":"CURSOR_EXPIRED","message":"this daemon no longer holds position 3"}}
 ```
 
 Raw RPC responses do not use the CLI's `ok:true` or `ok:false` wrapper. Blank
 input lines are ignored. Invalid JSON, framing failures, and a closed transport
 terminate the stdio proxy.
+
+A request `id` is echoed in the response envelope, so it is bounded: an id
+longer than 200 bytes is rejected with `INVALID_ARGUMENT`, and the rejection
+echoes only a truncated prefix of it.
 
 ## Public methods
 
@@ -48,7 +52,7 @@ terminate the stdio proxy.
 session.create        Create a Session with its required initial prompt
 session.restart       Replace a Session process and resume provider context
 session.send          Accept work on an existing idle Session
-session.wait          Wait for the bound current or latest execution
+session.fetch         Read everything new since a cursor, optionally long-polling
 session.cancel        Interrupt active work, bounded by timeout_ms
 session.list          List active or all Sessions
 session.read          Read live Session state and latest retained result
@@ -68,10 +72,10 @@ parameter shapes are stable for v1:
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
+| `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, required `request_id`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
-| `session.send` | `session`, `prompt`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
-| `session.wait` | `session`, positive `timeout_ms` |
+| `session.send` | `session`, `prompt`, required `request_id`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
+| `session.fetch` | exactly one of `session` or `all:true`; optional `cursor` (a position, as a number or a string of digits), `wait_ms` (max 86,400,000), `until` (`any` or `result`), `screen` (boolean or stable-line count), `max_bytes` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
 | `session.read` | `session` |
@@ -87,6 +91,48 @@ parameter shapes are stable for v1:
 Profiles are expanded by the client. `profile.list` is implemented by the
 stdio proxy rather than delegated to the daemon, so the daemon does not reread
 mutable client configuration.
+
+`request_id` is a required caller-chosen idempotency key: non-empty and at
+most 128 bytes. A missing, empty, or over-long key fails with
+`INVALID_ARGUMENT`. The daemon retains the last 1,024 acceptance receipts for
+its lifetime. Repeating an ID with the same payload returns the original
+receipt with `replayed: true`; repeating it with a different payload fails with
+`INVALID_ARGUMENT`.
+
+It is required rather than optional because a key that first appears on the
+retry cannot deduplicate anything: the original attempt has already created a
+Session. This is separate from the RPC envelope's `id`, which correlates one
+request and is capped at 200 bytes.
+
+Payload identity is the canonical form of the RPC parameters:
+
+- every parameter except `environment`, `rows`, `cols`, `correlation_id`, and
+  `request_id`, which legitimately differ between retries of the same
+  acceptance;
+- object keys in sorted order, so a client that emits parameters in a
+  different order still matches;
+- array values in the order given, so `harness_options` must be repeated in
+  the same order;
+- `prompt` compared byte for byte. A trailing newline is significant, so
+  `--stdin` from a heredoc and the same text passed after `--` are different
+  payloads.
+
+An acceptance reserves its `request_id` before it runs. A second call arriving
+while the first is still launching blocks until the winner settles and then
+replays its receipt, so two concurrent calls can never create two Sessions.
+A different payload is rejected against an in-flight reservation as well as a
+stored receipt. A failed acceptance stores no receipt, so the same ID may be
+retried.
+
+Successful `session.create` and `session.send` receipts include
+`submission: "confirmed" | "pending"`. The daemon waits up to five seconds
+for the provider lifecycle acknowledgement. `pending` is still success: local
+delivery occurred, so the caller must observe or replay the identical request
+ID rather than submit with a new one. A replay refreshes this field from the
+live execution and can change `pending` to `confirmed` without executing the
+prompt twice.
+Pending receipts also include a human-readable `hint` and an `action` containing
+a bounded `fetch`; these are recovery guidance, not additional RPC state.
 
 `harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
 The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
@@ -144,6 +190,7 @@ A retained result has this shape:
   "execution_seq": 2,
   "status": "completed",
   "final_text": "Review result...",
+  "final_text_source": "hook",
   "error": null,
   "started_at_ms": 1784024104395,
   "completed_at_ms": 1784024252019,
@@ -156,9 +203,170 @@ A retained result has this shape:
 empty. Other terminal states may include partial text and provide a structured
 error. Usage is nullable because provider support differs.
 
-`session.wait` binds to the active execution and sequence at request time. If
-the Session is idle, it returns the latest retained result; if no execution has
-ever been accepted, it fails with `NO_RESULT`. A timeout does not cancel work.
+`final_text_source` is `hook` when the Harness lifecycle event reported the
+text, `transcript` when the Harness reported nothing and dlgt recovered the
+text from that Session's own provider transcript within this execution's
+boundary, and `missing` when no text was recovered. A failed recovery never
+changes the execution status.
+
+`session.create` and `session.send` return `{session, execution_seq, cursor}`.
+The `cursor` is the Session's next observation position, taken under the
+runtime lock immediately before the acceptance is recorded, so the first
+`session.fetch` from it cannot miss output produced between acceptance and the
+caller's next request.
+
+## Composite reads
+
+`session.fetch` returns one document per request. There is no streaming
+variant and no partial output.
+
+```json
+{
+  "schema_version": 1,
+  "runtime": {"version":"0.4.0","instance_id":"1f2c…"},
+  "reason": "result",
+  "has_more": false,
+  "gaps": [],
+  "cursor": "4",
+  "sessions": [
+    {
+      "session": {"id":"claude:8bc7859c","state":"idle"},
+      "events": [
+        {"schema_version":1,"seq":104,"type":"session.idle","session_id":"claude:8bc7859c","execution_seq":7,"result_status":"completed"}
+      ],
+      "results": [
+        {"execution_seq":7,"status":"completed","final_text":"Review result...","final_text_source":"hook","final_text_offset":0,"final_text_complete":true,"error":null,"started_at_ms":1784024104395,"completed_at_ms":1784024252019,"usage":null}
+      ],
+      "screen": {"epoch":3,"reset":false,"reset_reason":null,"stable":["Checking tests..."],"live":["Writing final review..."],"live_truncated":false},
+      "gaps": []
+    }
+  ]
+}
+```
+
+`reason` is `snapshot`, `change`, `result`, `blocked`, `page_full`, `gap`, or
+`timeout`. Every one of them is a successful response; `results[].status`
+remains the authority on whether an execution succeeded.
+
+Rules:
+
+- Without `cursor`, the response is a bounded baseline: current state, the
+  latest retained result, a stable tail, the live screen, and a fresh cursor.
+- `until:"result"` binds to the execution active, or latest, at the first
+  evaluation. A later execution never extends the bind, and blocked input, a
+  page-full response, a gap, or the deadline returns early.
+- Replaying a cursor replays the same immutable events, results, and stable
+  rows. The Session snapshot and live screen are current snapshots and may be
+  newer on replay. Nothing is advanced or consumed server-side.
+- A live-screen repaint alone never completes a wait.
+- `all:true` covers only the addressed daemon, pages at 32 Sessions, and
+  rejects both screen aggregation and `until:"result"`. A cursorless call
+  enumerates every Session, carries its enumeration position in the cursor,
+  and stays in baseline mode with `has_more: true` until it finishes; later
+  calls return only changed Sessions.
+
+Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
+64 events, 4 results, 128 stable lines (512 on request), and 40 live rows per
+response. `has_more: true` means data already exists beyond the returned
+cursor, and the next request returns immediately even with `wait_ms`.
+
+`max_bytes` bounds two things: the `result` document itself, and the complete
+compact response line the CLI prints, whose `{"ok":true,...}` wrapper and
+newline the daemon reserves before committing content.
+
+It does not bound the raw JSONL envelope. That envelope carries a
+caller-supplied request `id`, so its size is the caller's to control; the id is
+capped at 200 bytes before JSON escaping; an id full of control characters can
+escape to about six times that, so the excess stays under roughly 1.3 KiB over the
+result document. An optional `info` notice and pretty-printing are also outside
+the bound. The cursor is derived from what the document actually carries, so it
+can never advance past omitted content. Progress under a tight budget comes from chunking: a long
+`final_text` is chunked at a UTF-8 boundary and continued with
+`final_text_offset` and `final_text_complete`, and a screen row wider than the
+remaining budget is chunked mid-line. Every `has_more` response advances at
+least one watermark. A `max_bytes` too small for the envelope plus one chunk
+fails with `INVALID_ARGUMENT` naming a verified workable value instead of
+emitting an oversized document. That value is verified by actually rendering a
+response at it, so retrying at exactly it succeeds; it is a verified
+candidate, not a guaranteed minimum, because progress is not monotonic in the
+budget.
+
+`screen.stable` contains complete rows only. A split row is carried in one of
+two ordered slots, each shaped
+`{"row_id":8412,"offset":4096,"text":"...","complete":false}`:
+
+- `screen.fragment_before` continues the row the previous response split. It
+  precedes `stable[0]` and is the only slot where `complete` can be true.
+- `screen.fragment_after` is the row this response split. It follows the last
+  entry of `stable` and is never complete.
+
+The screen delta reads in that order: `fragment_before`, `stable`,
+`fragment_after`. Clients must retain every piece and concatenate the pieces
+for a `row_id` in `offset` order until `complete` is true; a completing piece
+carries only its own tail, so discarding earlier pieces loses data. A row never
+appears in both `stable` and a fragment slot.
+
+Lifecycle events are committed as a strictly ascending prefix across every
+Session in the response, so a Session that did not fit the page can never park
+an earlier event behind a later one that keeps redelivering.
+
+A cursor is an ordinal position. Responses serialize it as a string of digits
+for field stability; requests accept either spelling, a JSON number or a string
+of digits. Absent or `null` requests a baseline. Any other type, and any string
+that is not a position, is `CURSOR_INVALID` rather than a silent baseline.
+Leading zeros are accepted and canonicalized: responses always spell the
+position without them. Every acceptance, and every fetch response whose
+watermark vector advanced, mints the addressed scope's next position; a fetch
+whose vector did not move returns the caller's own position, though an empty
+public delta can still mint a new position when internal bookkeeping advanced
+beneath it. `all`
+numbers independently of any Session. The daemon holds the watermarks behind
+each position and never mutates them, which is what makes replaying a position
+return an identical window.
+
+The position is an ordinal within the scope addressed, not a capability
+token: using one Session's number against another resolves that other
+Session's own position of the same number, which is a legitimate replay.
+Idempotency belongs to `request_id`.
+
+Positions bind to an internal Session identity, so a Claude provider-ID
+rotation keeps them valid.
+
+A position is meaningful only within one daemon lifetime. Nothing in the value
+marks which daemon minted it, and resolution is `(scope, number)` alone, so a
+number from a previous daemon is not rejected: it names *this* daemon's window
+of that position, or fails `CURSOR_EXPIRED` if this daemon has not minted that
+far. What comes back is always current data, never a stale world, but the
+behavior is defined rather than safe: used as a starting position, a stale
+number skips whatever this daemon recorded before that window, so a client
+must not carry positions across a restart. After
+`RPC_UNAVAILABLE`, `SESSION_NOT_RUNNING`, or any daemon restart, discard
+remembered positions and re-enter through a resume acceptance cursor or a
+cursorless baseline.
+
+The daemon retains the most recent 64 positions per Session and 256 for `all`,
+within a global cap of 4,096 across every scope; beyond either bound the oldest
+are dropped. A response whose watermark vector did not move keeps the caller's
+position rather than minting a new one, so an idle long poll normally spends
+none of them; internal bookkeeping can still advance the vector beneath an
+empty public delta and mint. One
+`all` position keeps entries only for Sessions that still exist and carry
+state, and addresses at most 256 of them; a daemon holding more rejects `all`
+with `INVALID_ARGUMENT` and must be read one Session at a time.
+
+Retention is bounded to 10,000 stable rows per Session, 50,000 lifecycle events
+per daemon, and 128 results or 16 MiB of result bodies per Session. A cursor
+that predates an eviction returns `reason:"gap"`, a `gaps` entry of
+`{"component":"screen"|"events"|"results","reason":"retention_overrun"}`, a
+bounded baseline, and a fresh cursor. Per-Session components (`screen`,
+`results`) are reported on the Session bucket and scope-wide components
+(`events`) in the top-level `gaps` array. dlgt never silently resets a cursor.
+
+Lifecycle events are materialized when they are recorded and are scoped by an
+internal Session identity, so replaying a cursor returns byte-identical events
+even after the execution they describe has been evicted or the public Session
+ID has rotated. `session_id` on an event is the ID that was published when the
+event happened.
 
 ## Lifecycle events
 
@@ -202,8 +410,8 @@ when applicable `session_id` and `execution_seq`. Type-specific fields include
 
 The stream contains lifecycle and actionable state, not token or terminal text
 deltas. `event.subscribe` is the extension point for notification adapters;
-generated output is observed through `scrollback.read`, `transcript.read_raw`,
-or interactive attach.
+`session.fetch` is the read path for agents, and raw output is observed through
+`scrollback.read`, `transcript.read_raw`, or interactive attach.
 
 ## Output readers
 
@@ -219,8 +427,11 @@ or interactive attach.
 }
 ```
 
-The default is the latest 100 rows. Reads are clamped to 1 through 10,000 rows,
-and `before` is an opaque cursor for older pages.
+The default is the latest 100 rows. Reads are clamped to 1 through 10,000
+rows, and `before` is an opaque cursor for older pages. Rows come from the
+persistent per-Session stable-row store that also backs `session.fetch`, so a
+read no longer re-renders the retained raw ring. `before` cursors are opaque
+and are not comparable across daemon instances.
 
 `transcript.read_raw` is an explicit diagnostic method. It returns a bounded
 base64 page and byte cursor:
@@ -253,10 +464,10 @@ SESSION_BLOCKED        Human input is required
 SESSION_ATTACHED       Exclusive attach lease prevents semantic send
 SESSION_UNAVAILABLE    Session state cannot accept the operation
 ALREADY_ATTACHED       Another client owns the attach lease
-WAIT_TIMEOUT           Wait expired; execution continues
+CURSOR_EXPIRED         Cursor position was never minted or is no longer held
+CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-PROVIDER_FAILED        Provider terminalized work as failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```
@@ -273,8 +484,9 @@ CLI exit-status mapping is defined in [CLI](cli.md#exit-statuses).
 terminal input, resize, and private execution operations are unavailable even
 if a caller names them directly.
 
-Provider turn IDs and internal execution row IDs never appear in public
-responses or normalized events. Launch environment values travel in RPC memory
+Provider turn IDs, internal Session UIDs, and internal execution row IDs never
+appear in public responses or normalized events; a cursor is a bare position
+number and carries no identity data. Launch environment values travel in RPC memory
 but are not directly serialized into Session metadata, errors, Profiles, or
 events. Results and terminal output remain untrusted and potentially sensitive
 because a provider can echo its environment.

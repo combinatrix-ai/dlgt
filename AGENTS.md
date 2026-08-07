@@ -97,13 +97,15 @@ Run at least three fresh containers for each Harness:
 1. Create a Claude Session with a prompt such as
    `Reply with exactly CLAUDE_E2E_<N>_OK. Do not use tools, edit files, or delegate.`
 2. Create a Codex Session with the equivalent `CODEX_E2E_<N>_OK` prompt.
-3. Give every `--wait` an explicit `--timeout 5m`.
+3. Read every result with `dlgt fetch <session.id> --until result --wait 5m`.
+   `new` and `send` return as soon as the prompt is accepted.
 
-`dlgt new` and `session.create` require a non-empty initial prompt. To verify
+`dlgt new` and `session.create` require a non-empty initial prompt and a
+`--request-id` idempotency key. To verify
 post-daemon continuity without creating duplicates, use the returned
 provider-qualified `session.id` with
-`dlgt send <session.id> --resume -- <PROMPT>`; plain `send` never launches a
-replacement and returns `SESSION_NOT_RUNNING` with that hint.
+`dlgt send <session.id> --resume --request-id <ID> -- <PROMPT>`; plain `send`
+never launches a replacement and returns `SESSION_NOT_RUNNING` with that hint.
 
 Every run passes only when all of the following are true:
 
@@ -117,8 +119,10 @@ Every run passes only when all of the following are true:
 - the Session is stopped, and the container and temporary authentication copy
   are removed.
 
-Also verify one same-Session follow-up with `dlgt send --wait`. Lifecycle
-completion must come from provider events and `wait`, never from PTY silence.
+Also verify one same-Session follow-up: `dlgt send <session.id> --request-id <ID> -- <PROMPT>`
+followed by `dlgt fetch <session.id> --until result --wait 5m`. Lifecycle
+completion must come from provider events and the retained result, never from
+PTY silence or a `fetch` timeout.
 
 ## Daemon ownership and memory lifetime
 
@@ -148,8 +152,8 @@ before cleanup:
 
 ```sh
 dlgt list --all --pretty
+dlgt fetch <SESSION_ID> --screen=200
 dlgt events <SESSION_ID>
-dlgt scrollback <SESSION_ID> --lines 100
 dlgt show <SESSION_ID>
 ```
 
