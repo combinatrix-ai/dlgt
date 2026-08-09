@@ -7,10 +7,7 @@
 //!
 //! The vector used to be encoded into the token itself, which bought nothing:
 //! it was bound to the daemon instance either way, because the state it points
-//! at is memory-only. What it cost was 200-300 characters per response, and up
-//! to tens of kilobytes for a daemon-wide scope -- context an LLM caller has to
-//! carry across every turn and reliably loses to compaction. A one- or
-//! two-digit number survives that.
+//! at is memory-only. A compact ordinal keeps the caller's context small.
 //!
 //! A position is meaningful only within one daemon lifetime. Nothing marks a
 //! number as belonging to a previous daemon, so a stale number resolves
@@ -24,36 +21,23 @@
 //! Scope binds to the immutable internal Session UID, never to the public
 //! Session ID, because Claude rotates that ID on rekey.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 
-/// Scope covering every Session owned by one daemon.
-pub const SCOPE_ALL: &str = "all";
-
 /// Vectors retained per single-Session scope.
 const MAX_SESSION_CURSORS: usize = 64;
-/// Vectors retained for the daemon-wide scope, which pages further.
-const MAX_ALL_CURSORS: usize = 256;
 /// Vectors retained across every scope.
 const MAX_TOTAL_CURSORS: usize = 4096;
-/// Most per-Session watermarks one cursor may carry.
-const MAX_SESSIONS: usize = 256;
 
 /// The watermarks one observation position stands for. Internal: a caller
 /// only ever sees the position number.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor {
-    /// One Session UID, or `all`.
-    pub s: String,
     /// Global lifecycle event watermark.
     pub e: i64,
-    /// Baseline enumeration position for `all` scope: the Session UID after
-    /// which the next baseline page resumes. Present only while a baseline is
-    /// still paging, so a caller cannot lose the Sessions it has not seen.
-    pub bl: Option<String>,
-    /// Per-Session watermarks keyed by Session UID.
-    pub p: BTreeMap<String, SessionCursor>,
+    /// Watermarks for the addressed Session.
+    pub p: SessionCursor,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,21 +58,26 @@ pub struct SessionCursor {
 }
 
 impl Cursor {
-    pub fn new(scope: &str) -> Self {
+    pub const fn new() -> Self {
         Self {
-            s: scope.to_owned(),
             e: 0,
-            bl: None,
-            p: BTreeMap::new(),
+            p: SessionCursor {
+                r: 0,
+                ro: 0,
+                ep: 0,
+                x: 0,
+                px: None,
+                po: 0,
+            },
         }
     }
 
-    pub fn session(&self, uid: &str) -> SessionCursor {
-        self.p.get(uid).copied().unwrap_or_default()
+    pub const fn session(&self) -> SessionCursor {
+        self.p
     }
 
-    pub fn set_session(&mut self, uid: &str, session: SessionCursor) {
-        self.p.insert(uid.to_owned(), session);
+    pub const fn set_session(&mut self, session: SessionCursor) {
+        self.p = session;
     }
 }
 
@@ -120,20 +109,10 @@ impl CursorTable {
     /// Bind a reserved position to the watermarks it stands for. The vector
     /// behind a position is never mutated, which is what makes replaying a
     /// number return an identical window.
-    pub fn store(&mut self, scope: &str, number: u64, cursor: Cursor) -> Result<()> {
-        if cursor.p.len() > MAX_SESSIONS {
-            bail!(
-                "invalid scope: {} Sessions carry retained state, more than the {MAX_SESSIONS} one cursor can address; fetch Sessions individually instead of --all",
-                cursor.p.len()
-            );
-        }
+    pub fn store(&mut self, scope: &str, number: u64, cursor: Cursor) {
         self.entries.insert((scope.to_owned(), number), cursor);
         self.issued.push_back((scope.to_owned(), number));
-        let limit = if scope == SCOPE_ALL {
-            MAX_ALL_CURSORS
-        } else {
-            MAX_SESSION_CURSORS
-        };
+        let limit = MAX_SESSION_CURSORS;
         let order = self.order.entry(scope.to_owned()).or_default();
         order.push_back(number);
         let mut retired = Vec::new();
@@ -150,7 +129,6 @@ impl CursorTable {
                 self.entries.remove(&expired);
             }
         }
-        Ok(())
     }
 
     /// Resolve a caller-supplied position within one scope.
@@ -182,41 +160,29 @@ impl CursorTable {
         self.order.remove(scope);
         self.next.remove(scope);
     }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Cursor, CursorTable, MAX_ALL_CURSORS, MAX_SESSION_CURSORS, SCOPE_ALL, SessionCursor,
-    };
+    use super::{Cursor, CursorTable, MAX_SESSION_CURSORS, SessionCursor};
 
-    fn sample(scope: &str, row: u64) -> Cursor {
-        let mut cursor = Cursor::new(scope);
+    fn sample(_scope: &str, row: u64) -> Cursor {
+        let mut cursor = Cursor::new();
         cursor.e = 104;
-        cursor.set_session(
-            "su_abc",
-            SessionCursor {
-                r: row,
-                ro: 0,
-                ep: 3,
-                x: 7,
-                px: Some(8),
-                po: 4_096,
-            },
-        );
+        cursor.set_session(SessionCursor {
+            r: row,
+            ro: 0,
+            ep: 3,
+            x: 7,
+            px: Some(8),
+            po: 4_096,
+        });
         cursor
     }
 
     fn mint(table: &mut CursorTable, scope: &str, row: u64) -> u64 {
         let number = table.reserve(scope);
-        table
-            .store(scope, number, sample(scope, row))
-            .unwrap_or_else(|error| panic!("failed to store: {error}"));
+        table.store(scope, number, sample(scope, row));
         number
     }
 
@@ -226,11 +192,8 @@ mod tests {
         assert_eq!(mint(&mut table, "su_abc", 1), 1);
         assert_eq!(mint(&mut table, "su_abc", 2), 2);
         assert_eq!(mint(&mut table, "su_abc", 3), 3);
-        // A second Session numbers independently, and so does the daemon-wide
-        // scope.
+        // A second Session numbers independently.
         assert_eq!(mint(&mut table, "su_other", 1), 1);
-        assert_eq!(mint(&mut table, SCOPE_ALL, 1), 1);
-        assert_eq!(mint(&mut table, SCOPE_ALL, 2), 2);
         assert_eq!(mint(&mut table, "su_abc", 4), 4);
     }
 
@@ -328,19 +291,6 @@ mod tests {
             mint(&mut table, "su_abc", u64::try_from(row).unwrap_or(0));
         }
         assert!(table.resolve("su_other", &other.to_string()).is_ok());
-
-        // The daemon-wide scope keeps more, because it pages further.
-        let mut table = CursorTable::default();
-        let first_all = mint(&mut table, SCOPE_ALL, 1);
-        for row in 0..MAX_SESSION_CURSORS {
-            mint(&mut table, SCOPE_ALL, u64::try_from(row).unwrap_or(0));
-        }
-        assert!(table.resolve(SCOPE_ALL, &first_all.to_string()).is_ok());
-        for row in 0..MAX_ALL_CURSORS {
-            mint(&mut table, SCOPE_ALL, u64::try_from(row).unwrap_or(0));
-        }
-        assert!(table.resolve(SCOPE_ALL, &first_all.to_string()).is_err());
-        assert!(table.len() <= MAX_ALL_CURSORS);
     }
 
     #[test]
@@ -381,29 +331,5 @@ mod tests {
                 .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
         );
         assert_eq!(table.reserve("su_abc"), 1, "numbering restarts");
-    }
-
-    #[test]
-    fn a_scope_wider_than_the_table_allows_is_rejected() {
-        let mut cursor = Cursor::new(SCOPE_ALL);
-        for index in 0..300 {
-            cursor.set_session(
-                &format!("su_{index}"),
-                SessionCursor {
-                    x: 1,
-                    ..SessionCursor::default()
-                },
-            );
-        }
-        let mut table = CursorTable::default();
-        let number = table.reserve(SCOPE_ALL);
-        let error = table
-            .store(SCOPE_ALL, number, cursor)
-            .err()
-            .unwrap_or_else(|| panic!("an unusable cursor was stored"));
-        assert!(
-            error.to_string().contains("invalid scope"),
-            "unexpected error: {error}"
-        );
     }
 }

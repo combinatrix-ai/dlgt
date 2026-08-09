@@ -334,7 +334,7 @@ they survive an agent's conversation context. Follow the submission with:
 
 ```bash
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 \
-  --cursor 4 --until result --wait 15m
+  --cursor 4 --wait 15m
 ```
 
 ## `restart`
@@ -457,7 +457,7 @@ Read the answer with one `fetch`:
 ```bash
 dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-4 \
   -- "Review the revised design" \
-  && dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
+  && dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait 15m
 ```
 
 ## Retained result
@@ -502,10 +502,9 @@ A failed recovery never turns a completed execution into a failure.
 ## `fetch`
 
 ```text
-dlgt fetch (<SESSION_ID|@ALIAS> | --all)
+dlgt fetch <SESSION_ID|@ALIAS>
   [--cursor <N>]
   [--wait <DURATION>]
-  [--until any|result]
   [--screen[=<MAX_STABLE_LINES>] | --no-screen]
   [--max-bytes <BYTES>]
   [--pretty]
@@ -539,9 +538,9 @@ Rules:
   position or a lost response.
 - `--wait` requires an explicit duration and accepts up to 24h. Omitted, the
   command returns immediately.
-- `--until result` binds to the execution that is active, or latest, at the
-  first evaluation and completes when that execution has a retained terminal
-  result. A later execution never extends the bind. Blocked input, a page-full
+- `--wait` binds to the execution that is active, or latest, at the first
+  evaluation and completes when that execution has a retained terminal result.
+  A later execution never extends the bind. Blocked input, a page-full
   response, a retention gap, and the deadline all return early.
 - A live-screen repaint alone never completes a `--wait`. Spinner redraws are
   included opportunistically when something else wakes the poll or the deadline
@@ -549,12 +548,6 @@ Rules:
 - Replaying the same cursor replays the same immutable events, results, and
   stable rows. Nothing is consumed or advanced server-side; the Session
   snapshot and live screen are always current.
-- `--all` covers every Session of the addressed daemon. It returns one bucket
-  per Session and pages at 32 Sessions. A cursorless `--all` enumerates every
-  Session, carrying its position in the cursor and staying in baseline mode
-  with `has_more: true` until enumeration completes; after that, only Sessions
-  with changes are returned. Screen aggregation and `--until result` are
-  rejected with `INVALID_ARGUMENT`.
 
 Response:
 
@@ -613,11 +606,10 @@ Response size is part of the contract:
 | Results per page | 4 | 4 |
 | Stable screen lines per page | 128 | 512 |
 | Live rows | current screen, cropped to 40 | 40 |
-| Changed Sessions in `--all` | 32 | 32 |
 
 `has_more: true` means requested data already exists beyond the returned
 cursor; that response uses `reason: "page_full"` and the next call returns
-immediately even with `--wait` or `--until result`.
+immediately even with `--wait`.
 
 `--max-bytes` is a hard bound on the **complete compact response line**: the
 `{"ok":true,...}` wrapper and its trailing newline are reserved before any
@@ -685,10 +677,6 @@ and the reported one may or may not work, and only the reported value carries
 the guarantee. The practical floor is roughly 1 KiB for a single Session; the
 default of 32 KiB is far above it.
 
-One `--all` position carries watermarks for at most 256 Sessions. A daemon
-holding retained state for more than that rejects `--all` with
-`INVALID_ARGUMENT` and must be read one Session at a time.
-
 ### Cursors
 
 A cursor is a position, not a token. Every acceptance, and every `fetch`
@@ -697,8 +685,6 @@ position -- 1, 2, 3 -- and the daemon holds the watermarks behind it. A fetch
 whose vector did not move returns the caller's own position; an empty public
 delta can still mint a new position when internal bookkeeping advanced.
 Leading zeros in a supplied position are accepted and canonicalized away.
-`--all` numbers independently of any Session.
-
 ```json
 {"cursor":"4"}
 ```
@@ -724,9 +710,9 @@ but the number no longer means what you think it means. After
 remembered positions and re-enter with `send --resume` (whose acceptance
 carries a fresh position) or one cursorless `fetch`.
 
-The daemon retains the most recent 64 positions per Session and 256 for
-`--all`, within a global cap of 4,096 across every scope; beyond either bound
-the oldest are dropped. A response whose watermark vector did not move keeps
+The daemon retains the most recent 64 positions per Session, within a global
+cap of 4,096 across every scope; beyond the bound the oldest are dropped. A
+response whose watermark vector did not move keeps
 the position you sent instead of minting a new one, so an idle long poll
 normally spends none of them; internal bookkeeping can still advance the
 vector beneath an empty public delta and mint.

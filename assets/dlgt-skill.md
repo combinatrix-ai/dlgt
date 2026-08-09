@@ -115,7 +115,7 @@ placeholders and run this as one `exec` call:
 // @exec: {"yield_time_ms": 5000, "max_output_tokens": 30000}
 const chunks = [];
 let r = await tools.exec_command({
-  cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 30m --max-bytes 24000",
+  cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --wait 30m --max-bytes 24000",
   workdir: "<WORKDIR>", yield_time_ms: 1000, max_output_tokens: 30000
 });
 
@@ -177,7 +177,7 @@ the process handle with this wrapped cell:
 // @exec: {"yield_time_ms": 1000, "max_output_tokens": 30000}
 const chunks = [];
 let r = await tools.exec_command({
-  cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 30m --max-bytes 24000",
+  cmd: "dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --wait 30m --max-bytes 24000",
   workdir: "<WORKDIR>", yield_time_ms: 30000, max_output_tokens: 30000
 });
 for (;;) {
@@ -266,7 +266,7 @@ Where Code Mode cells are unavailable, fall back to short forward polls that
 stay UNDER the 30-second nested clamp, repeated:
 
 ```bash
-dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 20s
+dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --wait 20s
 ```
 
 Code Mode internals are version-sensitive; if either wrapper misbehaves after
@@ -281,7 +281,7 @@ dlgt new --title "long refactor" --harness codex --cwd /abs/path \
 
 # 2. Observe with ONE long fetch, run through the Bash tool's background
 #    mechanism (run_in_background), substituting the printed values:
-dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --until result --wait 30m
+dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>' --wait 30m
 ```
 
 The background task exits when the worker finishes and the harness notifies
@@ -323,7 +323,7 @@ file.
 | --- | --- | --- |
 | `new` | `--title`, `--request-id`, a Harness (`--harness` or `--profile <PROFILE>`), and the prompt (`--stdin` or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--no-auto-approve` (default is auto-approved), `--startup-timeout` (60s), env options |
 | `send` | the Session address, `--request-id`, and the prompt | `--resume`; launch options are accepted only with it |
-| `fetch` | the Session address, or `--all` | `--cursor` (omit = bounded baseline snapshot), `--wait <DURATION>` (omit = return immediately; explicit duration up to 24h), `--until any\|result` (default `any`), `--screen[=N]`/`--no-screen` (screen on for one Session; off and rejected for `--all`), `--max-bytes` (32 KiB) |
+| `fetch` | the Session address | `--cursor` (omit = bounded baseline snapshot), `--wait <DURATION>` (omit = return immediately; binds to the active/latest execution and waits for its terminal result; up to 24h), `--screen[=N]`/`--no-screen`, `--max-bytes` (32 KiB) |
 | `stop`, `cancel`, `show`, `restart` | the Session address | `cancel --timeout` (30s), `stop --force` |
 
 ## Recover a lost response
@@ -370,7 +370,7 @@ fuse the two phases into one command:
 ```bash
 dlgt new --title "quick check" --harness claude --cwd /abs/path \
   --alias @quick --request-id quick-1 -- "..." \
-  && dlgt fetch @quick --until result --wait 60s
+  && dlgt fetch @quick --wait 60s
 ```
 
 The output is two JSON documents, one per line; line 1 is the submission
@@ -469,7 +469,7 @@ when a delegation must keep the Harness's own permission prompts.
 
 | Error | Required action |
 | --- | --- |
-| `SESSION_BUSY` | Do not resend. `fetch <session.id> --until result --wait <duration>`, or explicitly `cancel`. |
+| `SESSION_BUSY` | Do not resend. `fetch <session.id> --wait <duration>`, or explicitly `cancel`. |
 | `SESSION_BLOCKED` | `fetch` reports this as `reason: "blocked"` with the live screen. Read the question; answering needs a human on a real terminal (`attach`), then `fetch` again. |
 | `SESSION_NOT_RUNNING` | `send <session.id> --resume --request-id <ID> -- "<PROMPT>"`. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. `--steal` only for a known stale attach client. |
@@ -482,10 +482,10 @@ when a delegation must keep the Harness's own permission prompts.
 ## Observation and control reference
 
 ```bash
-dlgt fetch '<SESSION_ID>' --until result --wait 30m
+dlgt fetch '<SESSION_ID>' --wait 30m
 dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>'
 dlgt fetch '<SESSION_ID>' --no-screen
-dlgt fetch --all
+dlgt fetch '<SESSION_ID>'
 dlgt cancel '<SESSION_ID>'
 dlgt restart '<SESSION_ID>'
 dlgt show '<SESSION_ID>'
@@ -493,10 +493,9 @@ dlgt list --all-versions
 dlgt doctor
 ```
 
-`fetch --all` reports every Session of one daemon in a single call, with
-lifecycle events and results but no screens. A `fetch` response is bounded to
-about 32 KiB by default; `has_more: true` means more is already waiting —
-call again with the returned cursor and it returns immediately.
+`fetch` reports one Session's lifecycle events, results, and screen. A response
+is bounded to about 32 KiB by default; `has_more: true` means more is already
+waiting — call again with the returned cursor and it returns immediately.
 
 `dlgt help <command>` is authoritative for the installed binary. Use it
 whenever a flag is unclear, and use discovery (`dlgt harnesses`,

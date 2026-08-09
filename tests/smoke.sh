@@ -67,7 +67,7 @@ grep -q -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE"
 if grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"; then exit 1; fi
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-1","last_assistant_message":"initial-done"}' \
   | "$binary" hook emit "$session_id" claude
-"$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":1'
+"$binary" fetch "$session_id" --wait 2s | grep -q '"execution_seq":1'
 
 # Acceptance returns an observation position taken before the accepted work.
 grep -q '"cursor":"[0-9]*"' "$state_dir/new.json"
@@ -124,7 +124,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-versi
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","last_assistant_message":"cross-version-ready"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
-DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --until result --wait 2s >/dev/null
+DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --wait 2s >/dev/null
 cross_version_send=$("$binary" send claude:provider-cross-version --request-id cross-2 \
   -- cross-version-follow-up)
 printf '%s\n' "$cross_version_send" | grep -q "\"id\":\"$cross_version_id\""
@@ -132,7 +132,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-versi
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-2","last_assistant_message":"cross-version-done"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
-stale_cursor=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all \
+stale_cursor=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" \
   | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 test -n "$stale_cursor"
 DLGT_SOCKET="$old_socket" "$binary" stop "$cross_version_id" --force >/dev/null
@@ -152,15 +152,15 @@ while [ ! -S "$old_socket" ]; do
 done
 # Before this daemon has minted that far, the position is simply not held.
 set +e
-expired_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all --cursor "$stale_cursor")
+expired_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --cursor "$stale_cursor")
 expired_status=$?
 set -e
 test "$expired_status" -eq 1
 printf '%s\n' "$expired_json" | grep -q '"code":"CURSOR_EXPIRED"'
 # Once it has, the same number names this daemon's window of that position:
 # current data, never the previous daemon's world.
-DLGT_SOCKET="$old_socket" "$binary" fetch --all | grep -q '"reason":"snapshot"'
-reused_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch --all --cursor "$stale_cursor")
+DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" | grep -q '"reason":"snapshot"'
+reused_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --cursor "$stale_cursor")
 printf '%s\n' "$reused_json" | grep -q '"ok":true'
 if printf '%s\n' "$reused_json" | grep -q 'provider-cross-version'; then exit 1; fi
 DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
@@ -210,7 +210,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","c
   | "$binary" hook emit "$session_id" claude
 printf '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-2","last_assistant_message":"done"}\n' \
   | "$binary" hook emit "$session_id" claude
-wait_json=$("$binary" fetch "$session_id" --until result --wait 2s)
+wait_json=$("$binary" fetch "$session_id" --wait 2s)
 printf '%s\n' "$wait_json" | grep -q '"status":"completed"'
 printf '%s\n' "$wait_json" | grep -q '"final_text":"done"'
 printf '%s\n' "$wait_json" | grep -q '"execution_seq":2'
@@ -322,7 +322,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","c
   | "$binary" hook emit "$session_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-4","last_assistant_message":"resumed"}' \
   | "$binary" hook emit "$session_id" claude
-"$binary" fetch "$session_id" --until result --wait 2s | grep -q '"execution_seq":4'
+"$binary" fetch "$session_id" --wait 2s | grep -q '"execution_seq":4'
 "$binary" events "$session_id" | grep -q '"type":"session.restarting"'
 "$binary" stop "$session_id" --force >/dev/null
 attempt=0
@@ -351,7 +351,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2",
   | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","last_assistant_message":"reused-ready"}' \
   | "$binary" hook emit "$reused_id" claude
-"$binary" fetch "$reused_id" --until result --wait 2s | grep -q '"execution_seq":1'
+"$binary" fetch "$reused_id" --wait 2s | grep -q '"execution_seq":1'
 "$binary" show "$session_id" | grep -q '"state":"stopped"'
 
 # A long poll completes on the authoritative Stop hook, and the delta carries
@@ -359,7 +359,7 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn
 poll_send=$("$binary" send "$reused_id" --request-id reused-2 -- long-poll)
 poll_cursor=$(printf '%s\n' "$poll_send" | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 test -n "$poll_cursor"
-"$binary" fetch "$reused_id" --cursor "$poll_cursor" --until result --wait 10s \
+"$binary" fetch "$reused_id" --cursor "$poll_cursor" --wait 10s \
   >"$state_dir/poll.json" &
 poll_pid=$!
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-2","user_prompt":"long-poll"}\n' "$repo_root" \
@@ -397,7 +397,7 @@ test "$retry_mismatch_status" -eq 1
 printf '%s\n' "$retry_mismatch" | grep -q '"code":"INVALID_ARGUMENT"'
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-3","last_assistant_message":"retry-done"}' \
   | "$binary" hook emit "$reused_id" claude
-"$binary" fetch "$reused_id" --until result --wait 4s | grep -q '"final_text":"retry-done"'
+"$binary" fetch "$reused_id" --wait 4s | grep -q '"final_text":"retry-done"'
 
 # Retention overrun is a structured gap with a recoverable baseline, never a
 # silent reset.
@@ -473,16 +473,10 @@ set -e
 test "$bad_position_status" -eq 1
 printf '%s\n' "$bad_position" | grep -q '"code":"CURSOR_INVALID"'
 
-# fetch --all reports every Session of one daemon without a screen projection.
-all_json=$("$binary" fetch --all)
-printf '%s\n' "$all_json" | grep -q "\"id\":\"$reused_id\""
-if printf '%s\n' "$all_json" | grep -q '"screen"'; then exit 1; fi
-set +e
-all_screen=$("$binary" fetch --all --screen)
-all_screen_status=$?
-set -e
-test "$all_screen_status" -eq 1
-printf '%s\n' "$all_screen" | grep -q '"code":"INVALID_ARGUMENT"'
+# A single-session fetch includes its screen by default; --no-screen omits it.
+single_json=$("$binary" fetch "$reused_id")
+printf '%s\n' "$single_json" | grep -q "\"id\":\"$reused_id\""
+printf '%s\n' "$single_json" | grep -q '"screen"'
 
 # A default Session adds --permission-mode=auto beyond the one explicit
 # harness option, and never the dangerous bypass flag.
@@ -507,7 +501,7 @@ printf '%s\n' "$alias_json" | grep -q '"code":"ALIAS_IN_USE"' || {
 # Unexpected provider death creates a durable failed result in bounded time.
 "$binary" send "$reused_id" --request-id reused-5 -- crash >/dev/null
 set +e
-crash_json=$("$binary" fetch "$reused_id" --until result --wait 8s)
+crash_json=$("$binary" fetch "$reused_id" --wait 8s)
 crash_status=$?
 set -e
 test "$crash_status" -eq 0 || {
@@ -539,7 +533,7 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-rekey-1","c
   | "$binary" hook emit "$rekey_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-rekey-1","turn_id":"rekey-turn-1","last_assistant_message":"rekey-ready"}' \
   | "$binary" hook emit "$rekey_id" claude
-rekey_cursor=$("$binary" fetch "$rekey_id" --until result --wait 4s \
+rekey_cursor=$("$binary" fetch "$rekey_id" --wait 4s \
   | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 test -n "$rekey_cursor"
 

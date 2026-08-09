@@ -13,7 +13,7 @@ request produces exactly one response line.
 Request:
 
 ```json
-{"id":"req_1","method":"session.fetch","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","until":"result","wait_ms":900000}}
+{"id":"req_1","method":"session.fetch","params":{"session":"codex:019f6307-341e-7e81-8a33-7ab61e804345","wait_ms":900000}}
 ```
 
 Success:
@@ -52,7 +52,7 @@ echoes only a truncated prefix of it.
 session.create        Create a Session with its required initial prompt
 session.restart       Replace a Session process and resume provider context
 session.send          Accept work on an existing idle Session
-session.fetch         Read everything new since a cursor, optionally long-polling
+session.fetch         Read one Session since a cursor, optionally waiting
 session.cancel        Interrupt active work, bounded by timeout_ms
 session.list          List active or all Sessions
 session.read          Read live Session state and latest retained result
@@ -75,7 +75,7 @@ parameter shapes are stable for v1:
 | `session.create` | `title`, optional `alias`, `harness`, `cwd`, optional `model`, optional `effort`, optional `harness_options`, optional `auto_approve` (default `true`), required non-empty `prompt`, required `request_id`, `startup_timeout_ms`, launch `environment`, `rows`, `cols` |
 | `session.restart` | `session` ID, `startup_timeout_ms`, fresh launch `environment`, `rows`, `cols` |
 | `session.send` | `session`, `prompt`, required `request_id`; with `resume:true`, the same provider-qualified Session ID and launch options are accepted |
-| `session.fetch` | exactly one of `session` or `all:true`; optional `cursor` (a position, as a number or a string of digits), `wait_ms` (max 86,400,000), `until` (`any` or `result`), `screen` (boolean or stable-line count), `max_bytes` |
+| `session.fetch` | `session`, optional `cursor` (a position, as a number or a string of digits), `wait_ms` (max 86,400,000), `screen` (boolean or stable-line count), `max_bytes` |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
 | `session.read` | `session` |
@@ -252,18 +252,13 @@ Rules:
 
 - Without `cursor`, the response is a bounded baseline: current state, the
   latest retained result, a stable tail, the live screen, and a fresh cursor.
-- `until:"result"` binds to the execution active, or latest, at the first
+- A positive `wait_ms` binds to the execution active, or latest, at the first
   evaluation. A later execution never extends the bind, and blocked input, a
   page-full response, a gap, or the deadline returns early.
 - Replaying a cursor replays the same immutable events, results, and stable
   rows. The Session snapshot and live screen are current snapshots and may be
   newer on replay. Nothing is advanced or consumed server-side.
 - A live-screen repaint alone never completes a wait.
-- `all:true` covers only the addressed daemon, pages at 32 Sessions, and
-  rejects both screen aggregation and `until:"result"`. A cursorless call
-  enumerates every Session, carries its enumeration position in the cursor,
-  and stays in baseline mode with `has_more: true` until it finishes; later
-  calls return only changed Sessions.
 
 Bounds are part of the contract: 32 KiB serialized by default and 256 KiB hard,
 64 events, 4 results, 128 stable lines (512 on request), and 40 live rows per

@@ -41,7 +41,6 @@ const FETCH_RESULT_PAGE: usize = 4;
 const FETCH_STABLE_PAGE: usize = 128;
 const FETCH_STABLE_MAX: usize = 512;
 const FETCH_LIVE_ROWS: usize = 40;
-const FETCH_SESSION_PAGE: usize = 32;
 /// A long poll is bounded only to catch typos and leaked waiters.
 const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1507,10 +1506,7 @@ impl Daemon {
         if submission == "pending" {
             result["hint"] =
                 json!("provider confirmation has not arrived; do not resend with a new request_id");
-            result["action"] = json!(format!(
-                "dlgt fetch {} --until result --wait 25s",
-                session.id
-            ));
+            result["action"] = json!(format!("dlgt fetch {} --wait 25s", session.id));
         }
         if let Some(correlation_id) = params.get("correlation_id").and_then(Value::as_str)
             && !correlation_id.is_empty()
@@ -1634,21 +1630,18 @@ impl Daemon {
         let uid = store
             .session_uid(session_id)
             .with_context(|| format!("session not found: {session_id}"))?;
-        let mut cursor = cursor::Cursor::new(&uid);
+        let mut cursor = cursor::Cursor::new();
         cursor.e = store.latest_event_seq();
-        cursor.set_session(
-            &uid,
-            cursor::SessionCursor {
-                r: store.stable_head(&uid),
-                ro: 0,
-                ep: store.screen_epoch(&uid),
-                x: store.latest_result_seq(&uid),
-                px: None,
-                po: 0,
-            },
-        );
+        cursor.set_session(cursor::SessionCursor {
+            r: store.stable_head(&uid),
+            ro: 0,
+            ep: store.screen_epoch(&uid),
+            x: store.latest_result_seq(&uid),
+            px: None,
+            po: 0,
+        });
         let position = store.reserve_cursor(&uid);
-        store.store_cursor(&uid, position, cursor)?;
+        store.store_cursor(&uid, position, cursor);
         Ok(position.to_string())
     }
 
@@ -1685,11 +1678,7 @@ impl Daemon {
         let deadline = Instant::now() + options.wait;
         let mut bound: Option<i64> = None;
         loop {
-            let cut = if options.scope == cursor::SCOPE_ALL {
-                self.fetch_all_cut(&options)?
-            } else {
-                self.fetch_session_cut(&options, &mut bound)?
-            };
+            let cut = self.fetch_session_cut(&options, &mut bound)?;
             let rendered = cut.render(&options)?;
             if rendered.settled
                 || Instant::now() >= deadline
@@ -1719,21 +1708,21 @@ impl Daemon {
             return Ok(value);
         }
         self.lock_store()?
-            .store_cursor(&options.scope, options.position, rendered.cursor)?;
+            .store_cursor(&options.scope, options.position, rendered.cursor);
         Ok(value)
     }
 
     fn fetch_options(&self, params: &Value) -> Result<FetchOptions> {
-        let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
-        let selector = params.get("session").and_then(Value::as_str);
-        if all == selector.is_some() {
-            bail!("fetch requires exactly one of a Session selector or --all");
+        if params.get("all").is_some() {
+            bail!("invalid fetch parameters: all-session fetch is not supported");
         }
-        let until_result = match params.get("until").and_then(Value::as_str).unwrap_or("any") {
-            "any" => false,
-            "result" => true,
-            other => bail!("invalid until {other:?}; use any or result"),
-        };
+        if params.get("until").is_some() {
+            bail!(
+                "invalid fetch parameters: until is not supported; --wait binds to the active/latest execution"
+            );
+        }
+        let selector = params.get("session").and_then(Value::as_str);
+        let selector = selector.context("fetch requires a Session selector")?;
         let wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
         if wait_ms > FETCH_MAX_WAIT_MS {
             bail!("invalid wait duration; the maximum long poll is 24h");
@@ -1752,8 +1741,7 @@ impl Daemon {
         let screen = params.get("screen").unwrap_or(&Value::Null);
         let stable_limit = match screen {
             Value::Bool(false) => 0,
-            // Absent means the documented default: the screen delta is on for
-            // a single Session and unavailable for --all.
+            // Absent means the documented default: the screen delta is on.
             Value::Null | Value::Bool(true) => FETCH_STABLE_PAGE,
             Value::Number(lines) => usize::try_from(
                 lines
@@ -1764,23 +1752,13 @@ impl Daemon {
             .unwrap_or(FETCH_STABLE_PAGE),
             _ => bail!("invalid screen selection; use a boolean or a line count"),
         };
-        let scope = if all {
-            if !matches!(screen, Value::Null | Value::Bool(false)) {
-                bail!("invalid screen selection; fetch --all cannot aggregate screens");
-            }
-            if until_result {
-                bail!("invalid until selection; fetch --all cannot bind to one execution");
-            }
-            cursor::SCOPE_ALL.to_owned()
-        } else {
-            // Resolve through the UID index so a pre-rekey public ID, which a
-            // UID-bound cursor implies is still valid, keeps addressing the
-            // same logical Session.
-            let selector = selector.unwrap_or_default();
-            self.lock_store()?
-                .session_uid(selector)
-                .with_context(|| format!("session not found: {selector}"))?
-        };
+        // Resolve through the UID index so a pre-rekey public ID, which a
+        // UID-bound cursor implies is still valid, keeps addressing the same
+        // logical Session.
+        let scope = self
+            .lock_store()?
+            .session_uid(selector)
+            .with_context(|| format!("session not found: {selector}"))?;
         // A position is a number, so accept it spelled either way. Anything
         // that is not a position at all is a malformed request rather than a
         // silent baseline.
@@ -1815,8 +1793,7 @@ impl Daemon {
             incoming,
             cursor,
             wait: Duration::from_millis(wait_ms),
-            until_result,
-            stable_limit: if all { 0 } else { stable_limit },
+            stable_limit,
             max_bytes,
             instance_id: self.instance_id.clone(),
         })
@@ -1830,7 +1807,7 @@ impl Daemon {
             .session_for_uid(&uid)
             .context("session not found: cursor no longer addresses a live Session")?;
         let baseline = options.baseline();
-        let mut position = options.position(&uid);
+        let mut position = options.position();
         let mut scope_gaps = Vec::new();
         let mut gaps = Vec::new();
 
@@ -1918,7 +1895,6 @@ impl Daemon {
             dropped_event_seq: None,
             scope_gaps,
             sources: vec![BucketSource {
-                uid: uid.clone(),
                 session: public,
                 gaps,
                 events: events.into_iter().map(|(_, event)| event).collect(),
@@ -1936,18 +1912,7 @@ impl Daemon {
                 screen: options.stable_limit > 0,
                 incoming: position,
             }],
-            more_candidates: false,
-            live_uids: vec![uid],
         })
-    }
-
-    fn fetch_all_cut(&self, options: &FetchOptions) -> Result<Cut> {
-        let store = self.lock_store()?;
-        let cut = all_sources(&store, options, FETCH_SESSION_PAGE, &|store, session| {
-            self.public_session_locked(store, session)
-        })?;
-        drop(store);
-        Ok(cut)
     }
 
     fn read_transcript(&self, params: &Value) -> Result<Value> {
@@ -2325,156 +2290,6 @@ impl Daemon {
             .lock()
             .map_err(|_| anyhow!("session store lock poisoned"))
     }
-}
-
-/// Select the Sessions an `--all` observation covers.
-///
-/// Ordering matters: the Session holding the oldest pending event is served
-/// first, so the page cap can never park the earliest event behind a Session
-/// that never gets a turn. `page` is a parameter so the selection can be
-/// exercised at its boundary without a live daemon.
-#[allow(clippy::too_many_lines)]
-fn all_sources(
-    store: &Store,
-    options: &FetchOptions,
-    page: usize,
-    snapshot: &dyn Fn(&Store, &SessionRecord) -> Result<Value>,
-) -> Result<Cut> {
-    let baseline = options.baseline();
-    let after = options.event_position();
-    let mut scope_gaps = Vec::new();
-    if !baseline && after < store.evicted_event_seq() {
-        scope_gaps.push(retention_gap("events"));
-    }
-    let (events, events_more, event_watermark) = if baseline {
-        // Freeze the watermark at the first baseline page so events
-        // produced while the baseline is still paging are delivered as a
-        // delta once enumeration completes.
-        let watermark = if options.cursor.is_some() {
-            after
-        } else {
-            store.latest_event_seq()
-        };
-        (Vec::new(), false, watermark)
-    } else {
-        normalized_page(store, None, after, FETCH_EVENT_PAGE)
-    };
-
-    let mut by_uid: HashMap<String, Vec<Value>> = HashMap::new();
-    let mut dropped_event_seq: Option<i64> = None;
-    for (uid, event) in events {
-        let Some(uid) = uid else { continue };
-        by_uid.entry(uid).or_default().push(event);
-    }
-
-    let live_uids = store
-        .session_uids()
-        .into_iter()
-        .filter(|uid| {
-            store
-                .session_for_uid(uid)
-                .is_some_and(|session| !session.id.starts_with("internal:"))
-        })
-        .collect::<Vec<_>>();
-    let mut candidates = live_uids.clone();
-    if baseline && let Some(resume) = options.resume_after() {
-        let start = candidates
-            .iter()
-            .position(|uid| uid == resume)
-            .map_or(0, |index| index + 1);
-        candidates.drain(..start);
-    }
-
-    let mut ready = Vec::new();
-    for uid in candidates {
-        let Some(session) = store.session_for_uid(&uid) else {
-            continue;
-        };
-        let mut position = options.position(&uid);
-        let events = by_uid.remove(&uid).unwrap_or_default();
-        let mut gaps = Vec::new();
-        let (results, results_more) = if baseline {
-            let latest = store.latest_terminal_turn(&session.id);
-            if let Some(turn) = latest.as_ref() {
-                position.x = turn.execution_seq - 1;
-                position.px = None;
-                position.po = 0;
-            }
-            (latest.into_iter().collect::<Vec<_>>(), false)
-        } else {
-            if position.x < store.evicted_result_seq(&uid) {
-                gaps.push(retention_gap("results"));
-            }
-            store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
-        };
-        if !baseline && events.is_empty() && results.is_empty() {
-            continue;
-        }
-        validate_continuation(&position, &results, &[])?;
-        ready.push(BucketSource {
-            uid: uid.clone(),
-            session: snapshot(store, &session)?,
-            gaps,
-            events,
-            results,
-            results_more,
-            stable: Vec::new(),
-            stable_start: store.stable_head(&uid),
-            stable_offset: 0,
-            stable_more: false,
-            live: Vec::new(),
-            live_truncated: false,
-            epoch: store.screen_epoch(&uid),
-            epoch_reset: false,
-            reset_reason: None,
-            screen: false,
-            incoming: position,
-        });
-    }
-    // Serve the Sessions holding the oldest pending events first, so the
-    // page cap cannot park the earliest event behind a Session that never
-    // gets a turn. A baseline keeps enumeration order instead, because its
-    // resumption position depends on it.
-    if !baseline {
-        ready.sort_by(|left, right| {
-            let key = |source: &BucketSource| {
-                (
-                    source.events.first().map_or(i64::MAX, |event| {
-                        event.get("seq").and_then(Value::as_i64).unwrap_or(i64::MAX)
-                    }),
-                    source.uid.clone(),
-                )
-            };
-            key(left).cmp(&key(right))
-        });
-    }
-    let overflow = ready.split_off(ready.len().min(page));
-    let more_candidates = !overflow.is_empty();
-    let sources = ready;
-    // Events for Sessions this page never reached must not be counted as
-    // delivered by the shared watermark.
-    for event in overflow
-        .iter()
-        .flat_map(|source| source.events.iter())
-        .chain(by_uid.values().flatten())
-    {
-        let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
-        dropped_event_seq = Some(dropped_event_seq.map_or(seq, |current: i64| current.min(seq)));
-    }
-
-    Ok(Cut {
-        baseline,
-        state: None,
-        bound_seq: None,
-        bound_terminal: false,
-        full_event_watermark: event_watermark,
-        events_more,
-        dropped_event_seq,
-        scope_gaps,
-        sources,
-        more_candidates,
-        live_uids,
-    })
 }
 
 fn write_semantic_input(runtime: &AgentRuntime, input: &[u8]) -> Result<()> {
@@ -3495,7 +3310,7 @@ fn fnv1a128(bytes: &[u8]) -> u128 {
 
 #[derive(Clone)]
 struct FetchOptions {
-    /// One Session UID, or `all`.
+    /// One immutable Session UID.
     scope: String,
     /// Observation position this response publishes when it advances.
     position: u64,
@@ -3503,7 +3318,6 @@ struct FetchOptions {
     incoming: Option<String>,
     cursor: Option<cursor::Cursor>,
     wait: Duration,
-    until_result: bool,
     /// Zero disables the screen projection entirely.
     stable_limit: usize,
     max_bytes: usize,
@@ -3511,23 +3325,15 @@ struct FetchOptions {
 }
 
 impl FetchOptions {
-    /// A cursorless request, or an `--all` baseline that is still enumerating
-    /// Sessions. Baseline mode persists until enumeration completes so a
-    /// caller cannot lose the Sessions it has not been shown yet.
+    /// A cursorless request is the bounded baseline snapshot.
     fn baseline(&self) -> bool {
-        self.cursor
-            .as_ref()
-            .is_none_or(|cursor| cursor.bl.is_some())
+        self.cursor.is_none()
     }
 
-    fn resume_after(&self) -> Option<&str> {
-        self.cursor.as_ref().and_then(|cursor| cursor.bl.as_deref())
-    }
-
-    fn position(&self, uid: &str) -> cursor::SessionCursor {
+    fn position(&self) -> cursor::SessionCursor {
         self.cursor
             .as_ref()
-            .map(|cursor| cursor.session(uid))
+            .map(cursor::Cursor::session)
             .unwrap_or_default()
     }
 
@@ -3543,7 +3349,7 @@ impl FetchOptions {
 struct Cut {
     baseline: bool,
     state: Option<SessionState>,
-    /// Execution bound by `--until result`, and whether it has terminalized.
+    /// Execution bound by a waiting fetch, and whether it has terminalized.
     bound_seq: Option<i64>,
     bound_terminal: bool,
     /// Watermark the event scan reached. Publishable only when every
@@ -3557,17 +3363,12 @@ struct Cut {
     /// Scope-wide gaps. Per-Session gaps live on the bucket.
     scope_gaps: Vec<Value>,
     sources: Vec<BucketSource>,
-    /// Sessions this cut did not include at all.
-    more_candidates: bool,
-    /// Every live Session UID, used to prune an `--all` cursor.
-    live_uids: Vec<String>,
 }
 
 /// Everything one Session could contribute. The builder decides what actually
 /// ships; nothing here is a promise.
 #[allow(clippy::struct_excessive_bools)]
 struct BucketSource {
-    uid: String,
     session: Value,
     gaps: Vec<Value>,
     events: Vec<Value>,
@@ -3591,7 +3392,6 @@ struct BucketSource {
 /// One Session bucket as committed so far.
 #[allow(clippy::struct_excessive_bools)]
 struct Committed {
-    uid: String,
     session: Value,
     gaps: Vec<Value>,
     results: Vec<Value>,
@@ -3767,7 +3567,6 @@ impl<'a> Builder<'a> {
 
     fn empty_bucket(source: &BucketSource) -> Committed {
         let mut committed = Committed {
-            uid: source.uid.clone(),
             session: source.session.clone(),
             gaps: source.gaps.clone(),
             results: Vec::new(),
@@ -4050,7 +3849,7 @@ impl<'a> Builder<'a> {
     }
 
     fn pending(&self) -> bool {
-        if self.buckets.len() < self.cut.sources.len() || self.cut.more_candidates {
+        if self.buckets.len() < self.cut.sources.len() {
             return true;
         }
         if self.cut.events_more || self.cut.dropped_event_seq.is_some() {
@@ -4084,8 +3883,7 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// Whether this response moves the caller forward at all. A baseline
-    /// advances by enumerating Sessions even when none of them has content.
+    /// Whether this response moves the caller forward at all.
     fn progress(&self) -> bool {
         if self.cut.baseline {
             return !self.buckets.is_empty();
@@ -4095,26 +3893,13 @@ impl<'a> Builder<'a> {
 
     /// Derive the cursor from the committed set only.
     fn cursor(&self) -> cursor::Cursor {
-        let mut next = cursor::Cursor::new(&self.options.scope);
+        let mut next = cursor::Cursor::new();
         if let Some(previous) = self.options.cursor.as_ref() {
-            // Carry only watermarks that still mean something: a Session that
-            // no longer exists, or one whose entry is the default, adds bytes
-            // without adding information.
-            next.p = previous
-                .p
-                .iter()
-                .filter(|(uid, position)| {
-                    **position != cursor::SessionCursor::default()
-                        && self.cut.live_uids.iter().any(|live| live == *uid)
-                })
-                .map(|(uid, position)| (uid.clone(), *position))
-                .collect();
+            next.set_session(previous.p);
         }
         for bucket in &self.buckets {
-            next.set_session(&bucket.uid, bucket.position);
+            next.set_session(bucket.position);
         }
-        next.p
-            .retain(|_, position| *position != cursor::SessionCursor::default());
         // Events are committed as an ascending prefix, so the highest one
         // this document carries is a watermark with no holes behind it. The
         // scan watermark may be published only when nothing was left behind,
@@ -4141,11 +3926,6 @@ impl<'a> Builder<'a> {
         } else {
             self.cut.full_event_watermark
         };
-        if self.cut.baseline {
-            next.bl = (self.buckets.len() < self.cut.sources.len() || self.cut.more_candidates)
-                .then(|| self.buckets.last().map(|bucket| bucket.uid.clone()))
-                .flatten();
-        }
         next
     }
 
@@ -4170,7 +3950,7 @@ impl<'a> Builder<'a> {
             "gap"
         } else if self.cut.state == Some(SessionState::Blocked) {
             "blocked"
-        } else if self.options.until_result && self.result_ready() {
+        } else if self.options.wait > Duration::ZERO && self.result_ready() {
             "result"
         } else if self.pending() {
             "page_full"
@@ -4297,7 +4077,7 @@ impl<'a> Builder<'a> {
         let settled = self.gapped()
             || self.cut.state == Some(SessionState::Blocked)
             || self.pending()
-            || if self.options.until_result {
+            || if self.options.wait > Duration::ZERO {
                 self.result_ready()
             } else {
                 self.cut.baseline || self.delivered()
@@ -4534,12 +4314,12 @@ mod tests {
     use super::{
         BucketSource, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
         FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
-        TranscriptRecovery, all_sources, apply_codex_notification, apply_hook_event,
-        canonical_session_id, clamp_busy_metrics, classify_error, cli_wrapper_overhead,
-        generate_alias, generate_internal_id, provider_id_from_session, public_result,
-        public_session, public_session_with_metrics, refresh_submission_receipt_from_store,
-        retention_gap, signal_shutdown, start_hook_turn, transcript_window, validate_alias,
-        validate_continuation, wait_for_update_check,
+        TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
+        clamp_busy_metrics, classify_error, cli_wrapper_overhead, generate_alias,
+        generate_internal_id, provider_id_from_session, public_result, public_session,
+        public_session_with_metrics, refresh_submission_receipt_from_store, retention_gap,
+        signal_shutdown, start_hook_turn, transcript_window, validate_alias, validate_continuation,
+        wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -4975,7 +4755,6 @@ mod tests {
             incoming: None,
             cursor,
             wait: Duration::from_millis(0),
-            until_result: false,
             stable_limit: FETCH_STABLE_PAGE,
             max_bytes,
             instance_id: "boot".to_owned(),
@@ -5017,7 +4796,6 @@ mod tests {
     }
 
     struct SourceSpec {
-        uid: String,
         session: Value,
         events: Vec<Value>,
         results: Vec<crate::protocol::TurnRecord>,
@@ -5028,9 +4806,8 @@ mod tests {
     }
 
     impl SourceSpec {
-        fn new(uid: &str) -> Self {
+        fn new(_uid: &str) -> Self {
             Self {
-                uid: uid.to_owned(),
                 session: json!({"id": "claude:x", "state": "idle"}),
                 events: Vec::new(),
                 results: Vec::new(),
@@ -5043,7 +4820,6 @@ mod tests {
 
         fn build(self) -> BucketSource {
             BucketSource {
-                uid: self.uid,
                 session: self.session,
                 gaps: Vec::new(),
                 events: self.events,
@@ -5071,7 +4847,6 @@ mod tests {
             .filter_map(|event| event.get("seq").and_then(Value::as_i64))
             .max()
             .unwrap_or(0);
-        let live_uids = sources.iter().map(|source| source.uid.clone()).collect();
         Cut {
             baseline: false,
             state: Some(SessionState::Idle),
@@ -5082,8 +4857,6 @@ mod tests {
             dropped_event_seq: None,
             scope_gaps: Vec::new(),
             sources,
-            more_candidates: false,
-            live_uids,
         }
     }
 
@@ -5133,10 +4906,6 @@ mod tests {
         // a string for field stability.
         assert_eq!(rendered.value["cursor"], json!("42"));
         assert_eq!(position(&rendered.value), 42);
-        assert_eq!(
-            rendered.cursor.s, "su_test",
-            "the stored vector names the scope it positions"
-        );
     }
 
     #[test]
@@ -5193,85 +4962,6 @@ mod tests {
     }
 
     #[test]
-    fn events_across_capped_sessions_are_delivered_once_and_terminate() {
-        // Three Sessions interleave their events and only two buckets fit per
-        // response. Clamping to "the earliest hole" would park an event behind
-        // a Session that never gets a turn while later events redelivered
-        // forever; a global ascending prefix cannot. This drives the real
-        // Session-selection path, with only the page cap parameterized.
-        const CAP: usize = 2;
-        let store = Store::new();
-        let uids = ["a", "b", "c"]
-            .iter()
-            .map(|name| {
-                let id = format!("codex:thread-{name}");
-                store
-                    .insert_session(&NewSession {
-                        id: &id,
-                        alias: &format!("@{name}"),
-                        title: name,
-                        agent: "codex",
-                        cwd: "/tmp",
-                        model: None,
-                        effort: None,
-                        harness_options: &[],
-                        auto_approve: true,
-                    })
-                    .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
-                assert!(store.set_session_running(&id, Some(42)));
-                assert!(store.set_session_state(&id, SessionState::Idle));
-                (id.clone(), store.session_uid(&id).unwrap_or_default())
-            })
-            .collect::<Vec<_>>();
-        // Round robin, so sequences interleave across Sessions.
-        for _ in 0..3 {
-            for (id, _) in &uids {
-                store.record_event(Some(id), None, "session.ready");
-            }
-        }
-        let total = store.latest_event_seq();
-        assert_eq!(total, 9);
-
-        // Start from a delta cursor: a cursorless --all is a baseline, which
-        // deliberately subsumes prior events instead of replaying them.
-        let mut cursor = Some(crate::cursor::Cursor::new(crate::cursor::SCOPE_ALL));
-        let mut delivered: Vec<i64> = Vec::new();
-        for _ in 0..32 {
-            let options = FetchOptions {
-                scope: crate::cursor::SCOPE_ALL.to_owned(),
-                ..fetch_options(FETCH_DEFAULT_MAX_BYTES, cursor.clone())
-            };
-            let cut = all_sources(&store, &options, CAP, &|_, session| {
-                Ok(json!({"id": session.id, "state": "idle"}))
-            })
-            .unwrap_or_else(|error| panic!("failed to select Sessions: {error}"));
-            let rendered = cut
-                .render(&options)
-                .unwrap_or_else(|error| panic!("failed to render: {error}"));
-
-            let page = event_seqs(&rendered.value);
-            assert!(!page.is_empty(), "a page made no progress");
-            for seq in &page {
-                assert!(
-                    !delivered.contains(seq),
-                    "event {seq} was delivered twice: {delivered:?} then {page:?}"
-                );
-            }
-            delivered.extend(page);
-            cursor = Some(rendered.cursor.clone());
-            if rendered.value["has_more"] != json!(true) {
-                break;
-            }
-        }
-        delivered.sort_unstable();
-        assert_eq!(
-            delivered,
-            (1..=total).collect::<Vec<_>>(),
-            "events were lost or the exchange never terminated"
-        );
-    }
-
-    #[test]
     fn a_chunked_baseline_result_resumes_on_the_same_execution() {
         let text = "x".repeat(4_000);
         let incoming = crate::cursor::SessionCursor {
@@ -5295,7 +4985,7 @@ mod tests {
         assert_eq!(result["final_text_complete"], false);
         assert_eq!(result["final_text_offset"], 0);
         let cursor = first.cursor.clone();
-        let position = cursor.session("su_test");
+        let position = cursor.session();
         assert_eq!(position.px, Some(7));
         assert_eq!(position.x, 6, "an incomplete result must not advance x");
         assert!(position.po > 0);
@@ -5313,13 +5003,13 @@ mod tests {
         let result = &second.value["sessions"][0]["results"][0];
         assert_eq!(result["final_text_complete"], true);
         assert_eq!(result["final_text_offset"], json!(position.po));
-        let position = second.cursor.session("su_test");
+        let position = second.cursor.session();
         assert_eq!(position.x, 7);
         assert_eq!(position.px, None);
     }
 
     #[test]
-    fn until_result_reports_a_result_only_once_it_is_fully_delivered() {
+    fn wait_reports_a_result_only_once_it_is_fully_delivered() {
         let text = "y".repeat(4_000);
         let source = || {
             SourceSpec {
@@ -5332,7 +5022,7 @@ mod tests {
         cut.bound_seq = Some(7);
         cut.bound_terminal = true;
         let mut options = fetch_options(1_500, None);
-        options.until_result = true;
+        options.wait = Duration::from_secs(1);
         let partial = cut
             .render(&options)
             .unwrap_or_else(|error| panic!("failed to render: {error}"));
@@ -5343,7 +5033,7 @@ mod tests {
         cut.bound_seq = Some(7);
         cut.bound_terminal = true;
         let mut options = fetch_options(FETCH_HARD_MAX_BYTES, None);
-        options.until_result = true;
+        options.wait = Duration::from_secs(1);
         assert_eq!(
             cut.render(&options)
                 .unwrap_or_else(|error| panic!("failed to render: {error}"))
@@ -5404,7 +5094,7 @@ mod tests {
         let mut screen = String::new();
         for _ in 0..10_000 {
             let options = fetch_options(max_bytes, cursor.clone());
-            let position = options.position("su_test");
+            let position = options.position();
             let after = options.event_position();
             let pending_events = events
                 .iter()
@@ -5502,7 +5192,7 @@ mod tests {
         let mut completions = 0;
         for _ in 0..200 {
             let options = fetch_options(4 * 1024, cursor.clone());
-            let position = options.position("su_test");
+            let position = options.position();
             let delivered_rows = usize::try_from(position.r).unwrap_or(0);
             let rendered = test_cut(vec![
                 SourceSpec {
@@ -5569,7 +5259,7 @@ mod tests {
         let (replay_cursor, expected_text) =
             mid_fragment.unwrap_or_else(|| panic!("no mid-fragment cursor was captured"));
         let options = fetch_options(4 * 1024, Some(replay_cursor));
-        let position = options.position("su_test");
+        let position = options.position();
         let delivered_rows = usize::try_from(position.r).unwrap_or(0);
         let replay = test_cut(vec![
             SourceSpec {
@@ -5701,7 +5391,11 @@ mod tests {
         ];
         for (name, build) in variants {
             let mut options = fetch_options(FETCH_HARD_MAX_BYTES, None);
-            options.until_result = name == "result";
+            options.wait = if name == "result" {
+                Duration::from_secs(1)
+            } else {
+                Duration::default()
+            };
             let relaxed = build()
                 .render(&options)
                 .unwrap_or_else(|error| panic!("{name} failed to render: {error}"));
@@ -5712,7 +5406,11 @@ mod tests {
             // At exactly that budget the response must render unchanged.
             for budget in [exact, exact + 64] {
                 let mut options = fetch_options(budget, None);
-                options.until_result = name == "result";
+                options.wait = if name == "result" {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::default()
+                };
                 let rendered = build()
                     .render(&options)
                     .unwrap_or_else(|error| panic!("{name} failed at {budget}: {error}"));
@@ -5730,7 +5428,11 @@ mod tests {
             // One byte short may legitimately fail or shed content, but must
             // never overflow.
             let mut options = fetch_options(exact.saturating_sub(1), None);
-            options.until_result = name == "result";
+            options.wait = if name == "result" {
+                Duration::from_secs(1)
+            } else {
+                Duration::default()
+            };
             if let Ok(rendered) = build().render(&options) {
                 assert!(
                     line_length(&rendered.value) < exact,
@@ -5742,48 +5444,7 @@ mod tests {
     }
 
     #[test]
-    fn an_all_response_respects_an_exact_budget_including_the_wrapper() {
-        let build = || {
-            let mut cut = test_cut(vec![
-                SourceSpec {
-                    events: lifecycle_events(1..=4),
-                    ..SourceSpec::new("su_a")
-                }
-                .build(),
-                SourceSpec {
-                    results: vec![test_turn(2, "second session answer")],
-                    ..SourceSpec::new("su_b")
-                }
-                .build(),
-            ]);
-            cut.live_uids = vec!["su_a".to_owned(), "su_b".to_owned()];
-            cut
-        };
-        let scoped = |max_bytes: usize| FetchOptions {
-            scope: crate::cursor::SCOPE_ALL.to_owned(),
-            ..fetch_options(max_bytes, None)
-        };
-        let relaxed = build()
-            .render(&scoped(FETCH_HARD_MAX_BYTES))
-            .unwrap_or_else(|error| panic!("failed to render: {error}"));
-        let exact = line_length(&relaxed.value);
-
-        for budget in [exact, exact + 40] {
-            let rendered = build()
-                .render(&scoped(budget))
-                .unwrap_or_else(|error| panic!("--all failed at {budget}: {error}"));
-            assert!(
-                line_length(&rendered.value) <= budget,
-                "--all exceeded a {budget} byte budget"
-            );
-        }
-        if let Ok(rendered) = build().render(&scoped(exact.saturating_sub(40))) {
-            assert!(line_length(&rendered.value) <= exact - 40);
-        }
-    }
-
-    #[test]
-    fn the_reported_minimum_holds_for_a_screen_only_and_an_all_response() {
+    fn the_reported_minimum_holds_for_a_screen_only_response() {
         // A stable-only screen response: the floor must include the fixed
         // screen object as well as the fragment frame.
         let screen_cut = || {
@@ -5796,49 +5457,12 @@ mod tests {
                 .build(),
             ])
         };
-        // An --all response carrying watermarks for Sessions it does not
-        // return: the floor must include those cursor entries.
-        let mut carried = crate::cursor::Cursor::new(crate::cursor::SCOPE_ALL);
-        for index in 0..12 {
-            carried.set_session(
-                &format!("su_carried_{index}"),
-                crate::cursor::SessionCursor {
-                    x: 4,
-                    r: 900,
-                    ..crate::cursor::SessionCursor::default()
-                },
-            );
-        }
-        let all_cut = || {
-            let mut cut = test_cut(vec![
-                SourceSpec {
-                    results: vec![test_turn(5, &"body ".repeat(200))],
-                    ..SourceSpec::new("su_test")
-                }
-                .build(),
-            ]);
-            cut.live_uids = (0..12)
-                .map(|index| format!("su_carried_{index}"))
-                .chain(std::iter::once("su_test".to_owned()))
-                .collect();
-            cut
-        };
-
-        for (name, cut, options) in [
-            (
-                "screen",
-                Box::new(screen_cut) as Box<dyn Fn() -> Cut>,
-                fetch_options(32, None),
-            ),
-            (
-                "all",
-                Box::new(all_cut) as Box<dyn Fn() -> Cut>,
-                FetchOptions {
-                    scope: crate::cursor::SCOPE_ALL.to_owned(),
-                    ..fetch_options(32, Some(carried))
-                },
-            ),
-        ] {
+        let (name, cut, options) = (
+            "screen",
+            Box::new(screen_cut) as Box<dyn Fn() -> Cut>,
+            fetch_options(32, None),
+        );
+        {
             let error = cut()
                 .render(&options)
                 .err()
@@ -5870,21 +5494,7 @@ mod tests {
     fn a_reported_minimum_budget_always_renders() {
         // Each of these fails at a tiny budget for a different reason: an
         // oversized Session record, an oversized result body, an oversized
-        // screen row, and a wide --all cursor.
-        let mut carried = crate::cursor::Cursor::new(crate::cursor::SCOPE_ALL);
-        for index in 0..24 {
-            carried.set_session(
-                &format!("su_carried_{index}"),
-                crate::cursor::SessionCursor {
-                    x: 9,
-                    r: 4_096,
-                    ro: 12,
-                    px: Some(10),
-                    po: 64,
-                    ep: 3,
-                },
-            );
-        }
+        // screen row.
         type Case = (&'static str, Box<dyn Fn() -> Cut>, FetchOptions);
         let cases: Vec<Case> = vec![
             (
@@ -5925,27 +5535,6 @@ mod tests {
                     ])
                 }),
                 fetch_options(16, None),
-            ),
-            (
-                "wide carried cursor",
-                Box::new(|| {
-                    let mut cut = test_cut(vec![
-                        SourceSpec {
-                            results: vec![test_turn(11, &"answer ".repeat(500))],
-                            ..SourceSpec::new("su_test")
-                        }
-                        .build(),
-                    ]);
-                    cut.live_uids = (0..24)
-                        .map(|index| format!("su_carried_{index}"))
-                        .chain(std::iter::once("su_test".to_owned()))
-                        .collect();
-                    cut
-                }),
-                FetchOptions {
-                    scope: crate::cursor::SCOPE_ALL.to_owned(),
-                    ..fetch_options(16, Some(carried))
-                },
             ),
         ];
 
@@ -6013,56 +5602,6 @@ mod tests {
             );
             assert_eq!(screen, rows.concat(), "screen row loss at {max_bytes}");
         }
-    }
-
-    #[test]
-    fn a_baseline_pages_through_every_session_under_a_tight_budget() {
-        let all = (0..9)
-            .map(|index| format!("su_{index}"))
-            .collect::<Vec<_>>();
-        let mut cursor: Option<crate::cursor::Cursor> = None;
-        let mut seen = Vec::new();
-        for _ in 0..64 {
-            let options = FetchOptions {
-                scope: crate::cursor::SCOPE_ALL.to_owned(),
-                ..fetch_options(1_100, cursor.clone())
-            };
-            let mut remaining = all.clone();
-            if let Some(resume) = options.resume_after() {
-                let start = remaining
-                    .iter()
-                    .position(|uid| uid == resume)
-                    .map_or(0, |index| index + 1);
-                remaining.drain(..start);
-            }
-            let sources = remaining
-                .iter()
-                .map(|uid| SourceSpec::new(uid).build())
-                .collect::<Vec<_>>();
-            let mut cut = test_cut(sources);
-            cut.baseline = true;
-            cut.live_uids.clone_from(&all);
-            let rendered = cut
-                .render(&options)
-                .unwrap_or_else(|error| panic!("failed to render: {error}"));
-            for bucket in rendered.value["sessions"].as_array().into_iter().flatten() {
-                seen.push(bucket["session"]["id"].clone());
-            }
-            let next = rendered.cursor.clone();
-            let paging = next.bl.is_some();
-            cursor = Some(next);
-            if !paging {
-                assert_eq!(
-                    seen.len(),
-                    all.len(),
-                    "baseline finished without showing every Session"
-                );
-                assert_eq!(rendered.value["has_more"], json!(false));
-                return;
-            }
-            assert_eq!(rendered.value["has_more"], json!(true));
-        }
-        panic!("baseline enumeration never completed");
     }
 
     #[test]

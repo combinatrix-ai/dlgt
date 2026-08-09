@@ -771,8 +771,8 @@ impl Store {
     }
 
     /// Bind a reserved position to the watermarks it stands for.
-    pub fn store_cursor(&self, scope: &str, number: u64, cursor: Cursor) -> Result<()> {
-        self.state.borrow_mut().cursors.store(scope, number, cursor)
+    pub fn store_cursor(&self, scope: &str, number: u64, cursor: Cursor) {
+        self.state.borrow_mut().cursors.store(scope, number, cursor);
     }
 
     pub fn resolve_cursor(&self, scope: &str, value: &str) -> Result<Cursor> {
@@ -815,17 +815,6 @@ impl Store {
             .values()
             .find(|session| session.uid == uid)
             .map(|session| session.record.clone())
-    }
-
-    pub fn session_uids(&self) -> Vec<String> {
-        let state = self.state.borrow();
-        let mut uids = state
-            .sessions
-            .values()
-            .map(|session| (session.record.created_at_ms, session.uid.clone()))
-            .collect::<Vec<_>>();
-        uids.sort_by_key(|(created, uid)| (std::cmp::Reverse(*created), uid.clone()));
-        uids.into_iter().map(|(_, uid)| uid).collect()
     }
 
     /// Drop one retained result, as result retention eventually does.
