@@ -97,7 +97,7 @@ Run at least three fresh containers for each Harness:
 1. Create a Claude Session with a prompt such as
    `Reply with exactly CLAUDE_E2E_<N>_OK. Do not use tools, edit files, or delegate.`
 2. Create a Codex Session with the equivalent `CODEX_E2E_<N>_OK` prompt.
-3. Read every result with `dlgt fetch <session.id> --until result --wait 5m`.
+3. Read every result with `dlgt fetch <session.id> --wait 5m`.
    `new` and `send` return as soon as the prompt is accepted.
 
 `dlgt new` and `session.create` require a non-empty initial prompt and a
@@ -120,7 +120,7 @@ Every run passes only when all of the following are true:
   are removed.
 
 Also verify one same-Session follow-up: `dlgt send <session.id> --request-id <ID> -- <PROMPT>`
-followed by `dlgt fetch <session.id> --until result --wait 5m`. Lifecycle
+followed by `dlgt fetch <session.id> --wait 5m`. Lifecycle
 completion must come from provider events and the retained result, never from
 PTY silence or a `fetch` timeout.
 

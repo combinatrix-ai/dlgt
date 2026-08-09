@@ -312,16 +312,10 @@ fn command_fetch(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
         "fetch",
         args,
-        &["--all", "--screen", "--no-screen", "--pretty"],
-        &["--cursor", "--wait", "--until", "--screen", "--max-bytes"],
+        &["--screen", "--no-screen", "--pretty"],
+        &["--cursor", "--wait", "--screen", "--max-bytes"],
     )?;
-    let all = parsed.flag("--all");
-    let session = if all {
-        parsed.no_positionals()?;
-        None
-    } else {
-        Some(parsed.one_positional("Session selector")?)
-    };
+    let session = Some(parsed.one_positional("Session selector")?);
     if parsed.flag("--no-screen") && parsed.flag("--screen") {
         bail!("--screen and --no-screen are mutually exclusive");
     }
@@ -340,10 +334,8 @@ fn command_fetch(args: &[String]) -> Result<()> {
     };
     let params = json!({
         "session": session,
-        "all": all,
         "cursor": parsed.one("--cursor"),
         "wait_ms": parsed.one("--wait").map(parse_duration).transpose()?.map(duration_ms),
-        "until": parsed.one("--until").unwrap_or("any"),
         "screen": screen,
         "max_bytes": parsed.one("--max-bytes").map(str::parse::<u64>).transpose()
             .context("invalid --max-bytes")?,
@@ -1013,7 +1005,7 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Claude CLI option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "fetch" => {
-            "dlgt fetch - read everything new since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n  dlgt fetch --all [OPTIONS]\n\nOPTIONS\n  --cursor <N>            Observation position from a previous response\n  --wait <DURATION>       Long-poll until something new arrives (max 24h)\n  --until any|result      Wake on any change, or on the bound result (default: any)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --all                   Every Session of this daemon; screens are unavailable\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."
+            "dlgt fetch - read one Session since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --cursor <N>            Observation position from a previous response\n  --wait <DURATION>       Wait for the active/latest execution's terminal result (max 24h)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."
         }
         "cancel" => {
             "dlgt cancel - interrupt the active execution\n\nUSAGE\n  dlgt cancel <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --timeout <DURATION>   Cancellation timeout (default: 30s)\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"

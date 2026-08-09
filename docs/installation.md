@@ -198,7 +198,7 @@ dlgt new \
   --alias @dlgt-verify \
   --request-id dlgt-verify-1 \
   -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
-  && dlgt fetch @dlgt-verify --until result --wait 5m
+  && dlgt fetch @dlgt-verify --wait 5m
 ~~~
 
 From Claude:
@@ -211,7 +211,7 @@ dlgt new \
   --alias @dlgt-verify \
   --request-id dlgt-verify-1 \
   -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
-  && dlgt fetch @dlgt-verify --until result --wait 5m
+  && dlgt fetch @dlgt-verify --wait 5m
 ~~~
 
 Both commands print one JSON document each, on their own line. The `fetch`

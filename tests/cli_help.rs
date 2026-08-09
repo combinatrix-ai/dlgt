@@ -69,6 +69,29 @@ fn list_alias_uses_list_help() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn fetch_help_is_single_session_and_wait_binds_the_result() -> Result<(), Box<dyn std::error::Error>>
+{
+    let help = String::from_utf8(dlgt(&["fetch", "--help"])?.stdout)?;
+    assert!(help.contains("dlgt fetch <SESSION_ID|@ALIAS>"));
+    assert!(help.contains("--wait <DURATION>"));
+    assert!(!help.contains("--all"));
+    assert!(!help.contains("--until"));
+
+    let cases: &[&[&str]] = &[
+        &["fetch", "--all"],
+        &["fetch", "session", "--until", "result"],
+    ];
+    for args in cases {
+        let output = dlgt(args)?;
+        assert!(
+            !output.status.success(),
+            "removed fetch option was accepted: {args:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::error::Error>> {
     let output = dlgt(&["new", "--", "--help"])?;
 

@@ -112,7 +112,7 @@ dlgt new \
   --alias @review \
   --request-id review-1 \
   -- "Review this repository. Return findings and trade-offs only." \
-  && dlgt fetch @review --until result --wait 15m
+  && dlgt fetch @review --wait 15m
 ```
 
 `new` waits up to five seconds for provider confirmation, then returns a
@@ -142,7 +142,7 @@ The command returns one provider-qualified Session ID, such as
 `codex:019f6307-341e-7e81-8a33-7ab61e804345`:
 
 ```bash
-dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --until result --wait 15m
+dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait 15m
 dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-2 -- "Review the revision"
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --cursor "$cursor"
 dlgt restart codex:019f6307-341e-7e81-8a33-7ab61e804345
