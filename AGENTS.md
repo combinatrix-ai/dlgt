@@ -24,7 +24,8 @@ authentication. Treat it as sensitive and never commit it.
 ## Build the PR source
 
 Build the exact working-tree source into a temporary multi-stage image. Include
-`assets/`, because the Skill is embedded at compile time.
+`assets/` and `install.sh`, because the Skill and the installer are both
+embedded at compile time.
 
 ```dockerfile
 FROM rust:1-bookworm AS build
@@ -33,6 +34,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
+COPY install.sh ./install.sh
 RUN cargo build --release --locked --bin dlgt
 
 FROM dlgt-agent:latest
