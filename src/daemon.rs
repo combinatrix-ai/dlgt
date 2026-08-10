@@ -1713,14 +1713,6 @@ impl Daemon {
     }
 
     fn fetch_options(&self, params: &Value) -> Result<FetchOptions> {
-        if params.get("all").is_some() {
-            bail!("invalid fetch parameters: all-session fetch is not supported");
-        }
-        if params.get("until").is_some() {
-            bail!(
-                "invalid fetch parameters: until is not supported; --wait binds to the active/latest execution"
-            );
-        }
         let selector = params.get("session").and_then(Value::as_str);
         let selector = selector.context("fetch requires a Session selector")?;
         let wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
