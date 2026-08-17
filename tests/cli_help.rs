@@ -19,7 +19,6 @@ fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std
         "show",
         "attach",
         "stop",
-        "events",
         "scrollback",
         "logs",
         "models",

@@ -227,7 +227,7 @@ Session remains `starting` or `busy` without the expected lifecycle events,
 inspect it before retrying:
 
 ~~~sh
-dlgt events <SESSION_ID>
+dlgt fetch <SESSION_ID>
 dlgt scrollback <SESSION_ID> --lines 100
 dlgt attach <SESSION_ID>
 ~~~

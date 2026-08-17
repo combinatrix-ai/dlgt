@@ -155,7 +155,7 @@ before cleanup:
 ```sh
 dlgt list --all --pretty
 dlgt fetch <SESSION_ID> --screen=200
-dlgt events <SESSION_ID>
+dlgt scrollback <SESSION_ID> --lines 200
 dlgt show <SESSION_ID>
 ```
 

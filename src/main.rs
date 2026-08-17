@@ -84,7 +84,6 @@ fn run() -> Result<()> {
         "show" => command_show(&args[1..]),
         "attach" => command_attach(&args[1..]),
         "stop" => command_stop(&args[1..]),
-        "events" => command_events(&args[1..]),
         "scrollback" => command_scrollback(&args[1..]),
         "logs" => command_logs(&args[1..]),
         "models" => command_models(&args[1..]),
@@ -426,28 +425,6 @@ fn command_stop(args: &[String]) -> Result<()> {
         }),
     )?;
     print_success(result, parsed.flag("--pretty"))
-}
-
-fn command_events(args: &[String]) -> Result<()> {
-    let parsed = Args::parse("events", args, &["--follow", "--pretty"], &["--after"])?;
-    if parsed.positionals.len() > 1 {
-        bail!("events accepts at most one Session selector");
-    }
-    let after = parsed
-        .one("--after")
-        .map(str::parse::<i64>)
-        .transpose()
-        .context("invalid --after")?
-        .unwrap_or(0);
-    if parsed.flag("--follow") {
-        return client::follow_events(parsed.positionals.first().map(String::as_str), after);
-    }
-    let value = client::call(
-        "event.read",
-        json!({"session":parsed.positionals.first(),"after":after}),
-    )?;
-    let events = value.as_array().context("invalid event response")?;
-    print_success(json!({"events":events}), parsed.flag("--pretty"))
 }
 
 fn command_scrollback(args: &[String]) -> Result<()> {
@@ -978,7 +955,7 @@ fn exit_status(code: &str) -> i32 {
 
 fn print_usage() {
     println!(
-        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  fetch        Read new state, results, events, and screen from a cursor\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  events       Read or follow lifecycle events\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  doctor       Diagnose the local dlgt installation\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
+        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  fetch        Read new state, results, events, and screen from a cursor\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  doctor       Diagnose the local dlgt installation\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
     );
 }
 
@@ -1021,9 +998,6 @@ fn command_usage(command: &str) -> Result<&'static str> {
         }
         "stop" => {
             "dlgt stop - stop a Session and its process group\n\nUSAGE\n  dlgt stop <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --force      Force termination\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
-        }
-        "events" => {
-            "dlgt events - read or follow lifecycle events\n\nUSAGE\n  dlgt events [SESSION_ID|@ALIAS] [OPTIONS]\n\nOPTIONS\n  --after <SEQ>   Read events after a sequence number (default: 0)\n  --follow        Follow events as NDJSON\n  --pretty        Pretty-print JSON output when not following\n  -h, --help      Print this help"
         }
         "scrollback" => {
             "dlgt scrollback - read rendered terminal scrollback\n\nUSAGE\n  dlgt scrollback <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --lines <COUNT>     Number of rendered lines (default: 100)\n  --before <CURSOR>   Read an older page before a cursor\n  --pretty            Pretty-print JSON output\n  -h, --help          Print this help"
