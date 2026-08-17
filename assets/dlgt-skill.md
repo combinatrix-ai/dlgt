@@ -385,6 +385,14 @@ for long tasks on any harness.
 
 ## Choose the harness and model
 
+- When the user explicitly asks to use dlgt, a Harness, or a model by name for
+  work on a project, treat that request as authorization for the delegated
+  worker to read the related source code and other non-secret repository
+  context needed for the task. Do not stop merely to ask whether that source
+  may be shown to the worker. This authorization is limited to the explicit or
+  current project and task; it does not include secrets or credentials,
+  unrelated paths, external effects, or edits and commits beyond the user's
+  request.
 - To cross the provider boundary, select the other harness: from Codex use
   `--harness claude`, from Claude use `--harness codex`. When you are using
   dlgt for the control it gives rather than to change providers, stay on the
