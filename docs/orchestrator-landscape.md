@@ -166,8 +166,8 @@ defects in the current Session-runtime boundary.
 7. **Broader harness coverage**  -  Gemini, OpenCode, Cursor, Aider, and others.
 
 Adding all seven directly to dlgt would erase its simplest advantage. They fit
-better in a separate controller that uses `session.*`, `event.subscribe`, and
-the structured error contract.
+better in a separate controller that uses `session.*` and the structured error
+contract.
 
 ## Recommended positioning
 
@@ -196,7 +196,7 @@ the same runtime contract.
 - stabilize/version the JSONL RPC and event schemas;
 - make blocked-input and provider-retry behavior easy for controllers to test;
 - add conformance fixtures for any future harness before advertising support;
-- document adapter examples for `events --follow` and `rpc --stdio`;
+- document adapter examples for `fetch --wait` and `rpc --stdio`;
 - expose enough resource/usage metadata for an outer scheduler without adding
   scheduling policy to the daemon.
 

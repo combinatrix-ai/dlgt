@@ -96,7 +96,6 @@ The exceptions are deliberate:
 
 ```text
 attach             raw interactive terminal
-events --follow    NDJSON event stream
 logs --raw         raw PTY bytes
 help / skill       text
 rpc --stdio        JSONL request/response stream
@@ -127,7 +126,6 @@ SESSIONS
   stop         Stop the Session
 
 OBSERVABILITY
-  events       Read or follow lifecycle events
   scrollback   Read rendered terminal scrollback
   logs         Read raw retained PTY bytes (requires --raw)
 
@@ -825,15 +823,13 @@ control-pipe EOF makes the reaper terminate every remaining registered group.
 
 ## Lifecycle events
 
-```text
-dlgt events [<SESSION_ID|@ALIAS>] [--after <SEQ>] [--follow]
-```
+Lifecycle events are read through `fetch`, which returns them for one Session
+alongside state, results, and screen. There is no separate event command and no
+cross-Session event stream: `list` reports current state across Sessions, and
+`fetch` reports the ordered history of one.
 
-Without `--follow`, the command returns a JSON array. With `--follow`, it emits
-one normalized NDJSON event per line until interrupted or the connection ends.
-
-The versioned event schema, complete event set, and streaming boundary are
-defined in [RPC](rpc.md#lifecycle-events).
+The versioned event schema and the complete event set are defined in
+[RPC](rpc.md#lifecycle-events).
 
 ## Rendered scrollback and raw logs
 
@@ -873,7 +869,7 @@ dlgt logs <SESSION_ID|@ALIAS> --raw --json
 
 Plain `dlgt logs` without `--raw` is invalid. `--raw` writes bytes directly;
 `--raw --json` returns base64. There is no `logs --follow`. Live lifecycle
-observation uses `events --follow`, and live terminal observation uses
+observation uses `fetch --wait`, and live terminal observation uses
 `attach`.
 
 Requiring `--raw` is an intentional capability gate. See
@@ -1015,7 +1011,7 @@ They configure the provider CLI rather than the launch environment.
   Claude. They cannot be overridden per Session and do not change provider
   global configuration.
 - Launch environment values are passed in RPC memory, never argv, and are never
-  directly serialized into Session records, `list`, `show`, `events`, Profiles,
+  directly serialized into Session records, `list`, `show`, `fetch`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its
   environment, so results, scrollback, and especially `logs --raw` must be
   treated as potentially sensitive output rather than as a redaction boundary.

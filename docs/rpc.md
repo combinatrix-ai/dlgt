@@ -57,8 +57,6 @@ session.cancel        Interrupt active work, bounded by timeout_ms
 session.list          List active or all Sessions
 session.read          Read live Session state and latest retained result
 session.stop          Stop the Harness process group
-event.read            Read normalized versioned lifecycle events
-event.subscribe       Stream normalized lifecycle events
 scrollback.read       Read VT-rendered plain-text rows
 transcript.read_raw   Read explicitly requested raw PTY pages
 model.list            Discover Harness models
@@ -80,8 +78,6 @@ parameter shapes are stable for v1:
 | `session.list` | optional `all` boolean |
 | `session.read` | `session` |
 | `session.stop` | `session`, optional `force` boolean |
-| `event.read` | optional `session`, optional global `after` sequence |
-| `event.subscribe` | optional `session`, optional global `after` sequence |
 | `scrollback.read` | `session`, optional `lines`, optional opaque `before` cursor |
 | `transcript.read_raw` | `session`, optional byte offset `after`, optional `limit_bytes` |
 | `model.list` | `harness`, optional `include_hidden` |
@@ -365,9 +361,9 @@ event happened.
 
 ## Lifecycle events
 
-`event.read` returns a JSON array. `event.subscribe` returns an initial response
-and then one normalized NDJSON event per line until interrupted or the
-connection closes.
+`session.fetch` returns normalized lifecycle events for one Session in its
+`events` array. They are scoped to that Session; there is no cross-Session
+event read or stream.
 
 ```jsonl
 {"schema_version":1,"seq":101,"type":"session.created","session_id":"codex:019f6307-341e-7e81-8a33-7ab61e804345"}
@@ -403,9 +399,8 @@ Every event contains `schema_version`, a global monotonic `seq`, `type`, and
 when applicable `session_id` and `execution_seq`. Type-specific fields include
 `attempt`, `reason`, and `result_status`.
 
-The stream contains lifecycle and actionable state, not token or terminal text
-deltas. `event.subscribe` is the extension point for notification adapters;
-`session.fetch` is the read path for agents, and raw output is observed through
+Events carry lifecycle and actionable state, not token or terminal text deltas.
+`session.fetch` is the read path; raw output is observed through
 `scrollback.read`, `transcript.read_raw`, or interactive attach.
 
 ## Output readers

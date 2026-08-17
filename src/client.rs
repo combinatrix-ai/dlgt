@@ -324,9 +324,6 @@ pub fn rpc_stdio() -> Result<()> {
             )?;
             continue;
         }
-        if request.method == "event.subscribe" {
-            return proxy_subscription(&request, &mut stdout);
-        }
         let response = match if request.method == "profile.list" {
             read_profiles()
         } else {
@@ -464,48 +461,12 @@ fn public_rpc_method(method: &str) -> bool {
             | "session.list"
             | "session.read"
             | "session.stop"
-            | "event.read"
-            | "event.subscribe"
             | "scrollback.read"
             | "transcript.read_raw"
             | "model.list"
             | "profile.list"
             | "harness.list"
     )
-}
-
-pub fn follow_events(session: Option<&str>, after: i64) -> Result<()> {
-    let socket = paths::socket_path()?;
-    let mut stream = connect_or_start(&socket)?;
-    let request = Request {
-        id: format!("req_{}", Uuid::new_v4().simple()),
-        method: "event.subscribe".to_owned(),
-        params: json!({"session":session,"after":after}),
-    };
-    write_json_line(&mut stream, &request)?;
-    let mut reader = BufReader::new(stream);
-    let mut acknowledgement = String::new();
-    reader.read_line(&mut acknowledgement)?;
-    decode_response(&acknowledgement)?;
-    let mut stdout = io::stdout().lock();
-    for line in reader.lines() {
-        stdout.write_all(line?.as_bytes())?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-fn proxy_subscription(request: &Request, stdout: &mut impl Write) -> Result<()> {
-    let socket = paths::socket_path()?;
-    let mut stream = connect_or_start(&socket)?;
-    write_json_line(&mut stream, request)?;
-    for line in BufReader::new(stream).lines() {
-        stdout.write_all(line?.as_bytes())?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-    }
-    Ok(())
 }
 
 fn read_profiles() -> Result<Value> {

@@ -399,9 +399,6 @@ impl Daemon {
         if request.method == "view.subscribe" {
             return self.subscribe_view(&mut stream, &request);
         }
-        if request.method == "event.subscribe" {
-            return self.subscribe_events(&mut stream, &request);
-        }
         let response = match self.dispatch(&request.method, &request.params) {
             Ok(result) => Response::ok(request.id, result).with_info(
                 self.update_notice
@@ -523,7 +520,6 @@ impl Daemon {
             "session.fetch" => self.fetch(params),
             "session.cancel" => self.cancel_session(params),
             "transcript.read_raw" => self.read_transcript(params),
-            "event.read" => self.read_events(params),
             "scrollback.read" => self.read_scrollback(params),
             "model.list" => self.list_models(params),
             "harness.list" => Self::list_harnesses(params),
@@ -1810,7 +1806,7 @@ impl Daemon {
             if after < store.evicted_event_seq() {
                 scope_gaps.push(retention_gap("events"));
             }
-            normalized_page(&store, Some(&uid), after, FETCH_EVENT_PAGE)
+            normalized_page(&store, &uid, after, FETCH_EVENT_PAGE)
         };
 
         let (results, results_more) = if baseline {
@@ -1926,26 +1922,6 @@ impl Daemon {
             "next_after": page.next_after,
             "has_more": page.has_more,
         }))
-    }
-
-    fn read_events(&self, params: &Value) -> Result<Value> {
-        let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        let store = self.lock_store()?;
-        let uid = if let Some(selector) = params.get("session").and_then(Value::as_str) {
-            Some(
-                store
-                    .session_uid(selector)
-                    .with_context(|| format!("session not found: {selector}"))?,
-            )
-        } else {
-            None
-        };
-        let normalized = store
-            .read_events(uid.as_deref(), after)
-            .iter()
-            .filter_map(normalize_event)
-            .collect::<Vec<_>>();
-        Ok(Value::Array(normalized))
     }
 
     fn read_scrollback(&self, params: &Value) -> Result<Value> {
@@ -2179,35 +2155,6 @@ impl Daemon {
             && leases.get(&session.id) == Some(&lease_id)
         {
             leases.remove(&session.id);
-        }
-        Ok(())
-    }
-
-    fn subscribe_events(&self, stream: &mut UnixStream, request: &Request) -> Result<()> {
-        let mut after = request
-            .params
-            .get("after")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let session = request
-            .params
-            .get("session")
-            .and_then(Value::as_str)
-            .map(|selector| self.resolve_session(selector).map(|session| session.id))
-            .transpose()?;
-        write_response(
-            stream,
-            &Response::ok(&request.id, json!({"subscribed":true,"after":after})),
-        )?;
-        while !self.shutting_down.load(Ordering::SeqCst) {
-            let events = self.read_events(&json!({"session":session,"after":after}))?;
-            for event in events.as_array().into_iter().flatten() {
-                serde_json::to_writer(&mut *stream, event)?;
-                stream.write_all(b"\n")?;
-                stream.flush()?;
-                after = event.get("seq").and_then(Value::as_i64).unwrap_or(after);
-            }
-            std::thread::sleep(Duration::from_millis(200));
         }
         Ok(())
     }
@@ -4223,11 +4170,11 @@ fn validate_continuation(
 
 type EventPage = (Vec<(Option<String>, Value)>, bool, i64);
 
-fn normalized_page(store: &Store, uid: Option<&str>, after: i64, limit: usize) -> EventPage {
+fn normalized_page(store: &Store, uid: &str, after: i64, limit: usize) -> EventPage {
     let mut page = Vec::new();
     let mut watermark = after;
     let mut has_more = false;
-    for event in store.read_events(uid, after) {
+    for event in store.read_events(Some(uid), after) {
         if page.len() >= limit {
             has_more = true;
             break;
