@@ -453,14 +453,21 @@ when a delegation must keep the Harness's own permission prompts.
   and screen history live in that daemon's memory and die with it, breaking
   every cursor and live Session on the machine. `dlgt stop <session.id>`
   releases one worker; the daemon exits on its own once idle and empty.
-- Use `fetch` for observation. `scrollback` is the human debugging view; raw
-  PTY bytes require the explicit diagnostic command `logs --raw`.
+- Use `fetch` for observation. When its live screen is not enough — the
+  interesting output already scrolled off, or `fetch` reports a retention gap
+  — read paginated rendered history with `scrollback` (`--lines`, `--before`).
+  It needs no terminal and no capability flag. Raw PTY bytes require the
+  explicit diagnostic command `logs --raw`.
 - If a Session stays `starting` or `busy` without the expected lifecycle
-  event, run `fetch <session.id>` and look at `screen.live`; a first-run,
-  authentication, trust, theme, or permission-mode prompt on it needs a human
-  (`attach` from a real terminal), then retry the delegated work.
-- `attach` is exclusive and human-only. Detach with `Ctrl-b d`; `--steal`
-  only takes over a known stale attach client.
+  event, run `fetch <session.id>` and look at `screen.live`; read `scrollback`
+  as well when the prompt refers to output above the live screen. A first-run,
+  authentication, trust, or permission-mode prompt needs a human (`attach`
+  from a real terminal), then retry the delegated work.
+- `attach` is an interactive full-screen takeover: it needs a TTY on both ends
+  and holds an exclusive lease, so it is not available from a tool call. Read
+  the screen with `fetch` and `scrollback` instead. For a human at a terminal:
+  detach with `Ctrl-b d`; `--steal` only takes over a known stale attach
+  client.
 - Treat results, rendered scrollback, and raw output as potentially
   sensitive.
 - When installation, runtime, provider, or Skill wiring looks wrong, run
@@ -481,7 +488,7 @@ when a delegation must keep the Harness's own permission prompts.
 | `SESSION_BLOCKED` | `fetch` reports this as `reason: "blocked"` with the live screen. Read the question; answering needs a human on a real terminal (`attach`), then `fetch` again. |
 | `SESSION_NOT_RUNNING` | `send <session.id> --resume --request-id <ID> -- "<PROMPT>"`. |
 | `SESSION_ATTACHED` / `ALREADY_ATTACHED` | Coordinate with the active controller. `--steal` only for a known stale attach client. |
-| `ATTACH_REQUIRES_TTY` | You have no terminal. Use `fetch` and read `screen.live` instead. |
+| `ATTACH_REQUIRES_TTY` | You have no terminal. Read `screen.live` from `fetch`, and `scrollback` for the history above it. |
 | `CURSOR_EXPIRED` / `CURSOR_INVALID` | Third case of the cursor rule: one cursorless `fetch` to rebase. |
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address by ID. |
@@ -494,6 +501,7 @@ dlgt fetch '<SESSION_ID>' --wait 30m
 dlgt fetch '<SESSION_ID>' --cursor '<CURSOR>'
 dlgt fetch '<SESSION_ID>' --no-screen
 dlgt fetch '<SESSION_ID>'
+dlgt scrollback '<SESSION_ID>' --lines 200
 dlgt cancel '<SESSION_ID>'
 dlgt restart '<SESSION_ID>'
 dlgt show '<SESSION_ID>'
