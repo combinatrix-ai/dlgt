@@ -23,7 +23,8 @@ use crate::cursor;
 use crate::paths;
 use crate::protocol::{Request, Response, SessionRecord, SessionState, TurnRecord, TurnState};
 use crate::provider::{
-    Agent, CommandSpec, LaunchOptions, codex_remote_tui_command, command_spec, prepare_workspace,
+    Agent, CommandSpec, LaunchOptions, claude_marker_prompt, claude_session_marker,
+    codex_remote_tui_command, command_spec, is_slash_command, prepare_workspace,
     provider_display_name,
 };
 use crate::reaper::Reaper;
@@ -803,6 +804,8 @@ impl Daemon {
                 Err(error) => return Err(error),
             }
         }
+        self.lock_store()?
+            .set_marker_eligible(&id, agent == Agent::Claude && resume_provider_id.is_none());
         let _provider_reservation = if let Some(provider_ref) = provider_ref.as_deref() {
             let reserved = self
                 .lock_store()?
@@ -1597,9 +1600,31 @@ impl Daemon {
         let runtime = self.runtime(&session.id)?;
         let agent = Agent::parse(&session.agent)?;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+        let explicit_resume = params
+            .get("resume")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let marker_used = if agent == Agent::Claude
+            && !explicit_resume
+            && session.marker_eligible
+            && !is_slash_command(prompt)
+        {
+            provider_id_from_session(&session)
+                .map(claude_session_marker)
+                .map(|marker| -> Result<bool> {
+                    Ok(self.lock_store()?.session_marker_used(&session.id, &marker))
+                })
+                .transpose()?
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        let provider_prompt =
+            claude_provider_prompt(&session, prompt, explicit_resume, marker_used);
+        let submitted_prompt = provider_prompt.as_deref().unwrap_or(prompt);
         let input = match agent {
             Agent::Codex => prompt.as_bytes().to_vec(),
-            Agent::Claude => agent.semantic_input(prompt)?,
+            Agent::Claude => agent.semantic_input(submitted_prompt)?,
         };
         let (turn, acceptance_cursor) = {
             let mut store = self.lock_store()?;
@@ -1607,7 +1632,12 @@ impl Daemon {
             // before acceptance is recorded, so a fast provider cannot emit
             // output or finish in front of the position it names.
             let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
-            let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
+            let turn = store.insert_turn_with_provider_prompt(
+                &turn_id,
+                &session.id,
+                prompt,
+                provider_prompt.as_deref(),
+            )?;
             store.allocate_input_sequence();
             store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
             (turn, acceptance_cursor)
@@ -2625,7 +2655,7 @@ fn hook_prompt_matches_turn(store: &Store, turn_id: &str, payload: &Value) -> Re
         return Ok(false);
     };
     let turn = store.get_turn(turn_id).context("active turn not found")?;
-    Ok(turn.prompt == provider_prompt)
+    Ok(turn.provider_prompt.as_deref().unwrap_or(&turn.prompt) == provider_prompt)
 }
 
 fn complete_hook_turn(
@@ -3151,6 +3181,15 @@ fn public_session_with_metrics(
             json!(metrics.pty_quiet_for_ms),
         );
     }
+    if session.agent == Agent::Claude.as_str()
+        && let Some(provider_id) = provider_id_from_session(session)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "marker".to_owned(),
+            json!(claude_session_marker(provider_id)),
+        );
+    }
     value
 }
 
@@ -3220,6 +3259,27 @@ fn provider_id_from_session(session: &SessionRecord) -> Option<&str> {
         .split_once(':')
         .filter(|(agent, id)| *agent == session.agent && !id.is_empty())
         .map(|(_, id)| id)
+}
+
+fn claude_provider_prompt(
+    session: &SessionRecord,
+    prompt: &str,
+    explicit_resume: bool,
+    marker_used: bool,
+) -> Option<String> {
+    if session.agent != Agent::Claude.as_str()
+        || !session.marker_eligible
+        || explicit_resume
+        || marker_used
+        || is_slash_command(prompt)
+    {
+        return None;
+    }
+    let provider_id = provider_id_from_session(session)?;
+    Some(claude_marker_prompt(
+        &claude_session_marker(provider_id),
+        prompt,
+    ))
 }
 
 fn generate_alias(title: &str) -> String {
@@ -4443,12 +4503,12 @@ mod tests {
         BucketSource, BusyMetrics, Cut, DaemonLock, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
         FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
         TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
-        clamp_busy_metrics, classify_error, cli_wrapper_overhead, generate_alias,
-        generate_internal_id, is_stale_socket_error, ownership_lock_path, prepare_socket_path,
-        provider_id_from_session, public_result, public_session, public_session_with_metrics,
-        read_rpc_line, refresh_submission_receipt_from_store, remove_owned_socket, retention_gap,
-        signal_shutdown, socket_identity, start_hook_turn, transcript_window, validate_alias,
-        validate_continuation, wait_for_update_check,
+        clamp_busy_metrics, classify_error, claude_provider_prompt, cli_wrapper_overhead,
+        generate_alias, generate_internal_id, is_stale_socket_error, ownership_lock_path,
+        prepare_socket_path, provider_id_from_session, public_result, public_session,
+        public_session_with_metrics, read_rpc_line, refresh_submission_receipt_from_store,
+        remove_owned_socket, retention_gap, signal_shutdown, socket_identity, start_hook_turn,
+        transcript_window, validate_alias, validate_continuation, wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -4654,6 +4714,71 @@ mod tests {
         assert!(value.get("provider_session_id").is_none());
         assert!(value.get("resume_ref").is_none());
         assert_eq!(provider_id_from_session(&session), Some("thread-1"));
+    }
+
+    #[test]
+    fn every_claude_session_exposes_its_search_marker_but_codex_does_not() {
+        let store = ready_store("claude");
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let value = public_session(&session);
+        assert_eq!(value["marker"], "DLGTREF7468726561642D31");
+
+        let store = ready_store("codex");
+        let session = store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        assert!(public_session(&session).get("marker").is_none());
+    }
+
+    #[test]
+    fn claude_marker_is_only_added_to_the_first_ordinary_prompt() {
+        let store = ready_store("claude");
+        assert!(store.set_marker_eligible("claude:thread-1", true));
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let marker = "DLGTREF7468726561642D31";
+        let expected = "DLGT_SESSION_MARKER: DLGTREF7468726561642D31\n\nreview";
+        assert_eq!(
+            claude_provider_prompt(&session, "review", false, false).as_deref(),
+            Some(expected)
+        );
+        assert!(claude_provider_prompt(&session, "/compact", false, false).is_none());
+        assert!(claude_provider_prompt(&session, "review", true, false).is_none());
+        assert!(claude_provider_prompt(&session, "review", false, true).is_none());
+        assert_eq!(crate::provider::claude_session_marker("thread-1"), marker);
+    }
+
+    #[test]
+    fn claude_hook_matches_the_exact_marker_augmented_provider_prompt() {
+        let mut store = ready_store("claude");
+        let provider_prompt = "DLGT_SESSION_MARKER: DLGTREF7468726561642D31\n\nhello";
+        store
+            .insert_turn_with_provider_prompt(
+                "turn_marker",
+                "claude:thread-1",
+                "hello",
+                Some(provider_prompt),
+            )
+            .unwrap_or_else(|error| panic!("failed to insert marker turn: {error}"));
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let outcome = start_hook_turn(
+            &mut store,
+            &session,
+            &json!({
+                "session_id": "thread-1",
+                "cwd": "/tmp",
+                "user_prompt": provider_prompt,
+                "turn_id": "provider-turn",
+            }),
+        )
+        .unwrap_or_else(|error| panic!("failed to match marker hook: {error}"));
+        assert_eq!(outcome.kind, "turn.started");
+        assert!(store.session_marker_used("claude:thread-1", "DLGTREF7468726561642D31"));
     }
 
     #[test]
@@ -4980,6 +5105,7 @@ mod tests {
             session_id: "claude:x".to_owned(),
             execution_seq,
             prompt: "p".to_owned(),
+            provider_prompt: None,
             state: TurnState::Completed,
             provider_turn_id: None,
             final_message: Some(text.to_owned()),

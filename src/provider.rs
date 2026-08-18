@@ -16,6 +16,39 @@ static CLAUDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 const CODEX_UPDATE_SUPPRESSION: &str = "check_for_update_on_startup=false";
 const CLAUDE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
 
+/// Prefix used for the searchable beacon embedded in the first ordinary
+/// prompt of a newly-created Claude conversation.
+pub const CLAUDE_SESSION_MARKER_PREFIX: &str = "DLGTREF";
+
+fn hex_provider_id(provider_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(provider_id.len() * 2);
+    for byte in provider_id.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+    }
+    encoded
+}
+
+/// Return the stable, single-token marker for a Claude provider conversation.
+/// Claude reports UUIDs; the byte encoding is a collision-free fallback for
+/// synthetic IDs used by tests or any future provider ID shape.
+pub fn claude_session_marker(provider_id: &str) -> String {
+    let suffix = Uuid::parse_str(provider_id).map_or_else(
+        |_| hex_provider_id(provider_id),
+        |id| id.simple().to_string().to_ascii_uppercase(),
+    );
+    format!("{CLAUDE_SESSION_MARKER_PREFIX}{suffix}")
+}
+
+pub fn claude_marker_prompt(marker: &str, prompt: &str) -> String {
+    format!("DLGT_SESSION_MARKER: {marker}\n\n{prompt}")
+}
+
+pub fn is_slash_command(prompt: &str) -> bool {
+    prompt.trim_start().starts_with('/')
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
@@ -440,9 +473,33 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Agent, LaunchOptions, codex_app_server_args, codex_remote_tui_command, command_spec,
-        trust_claude_workspace, trust_codex_workspace,
+        Agent, LaunchOptions, claude_marker_prompt, claude_session_marker, codex_app_server_args,
+        codex_remote_tui_command, command_spec, is_slash_command, trust_claude_workspace,
+        trust_codex_workspace,
     };
+
+    #[test]
+    fn claude_marker_is_stable_and_searchable_as_one_token() {
+        let marker = claude_session_marker("9b634cb7-2e3e-437b-96cb-8199ce17afa6");
+        assert_eq!(marker, "DLGTREF9B634CB72E3E437B96CB8199CE17AFA6");
+        assert!(marker.starts_with("DLGTREF"));
+        assert!(
+            marker
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        );
+        assert_eq!(claude_session_marker("thread-1"), "DLGTREF7468726561642D31");
+    }
+
+    #[test]
+    fn claude_marker_prompt_is_one_metadata_line_then_original_prompt() {
+        assert_eq!(
+            claude_marker_prompt("DLGTREFabc", "Review the change"),
+            "DLGT_SESSION_MARKER: DLGTREFabc\n\nReview the change"
+        );
+        assert!(is_slash_command("  /compact"));
+        assert!(!is_slash_command("Review /compact handling"));
+    }
 
     #[test]
     fn claude_defaults_to_auto_approve() {

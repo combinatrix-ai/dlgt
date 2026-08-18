@@ -28,6 +28,11 @@ mkdir -p "$HOME"
 touch "$DLGT_FAKE_ARGS_FILE"
 old_socket="$state_dir/run/old/dlgt.sock"
 
+marker_for_provider() {
+  printf 'DLGTREF'
+  printf '%s' "$1" | od -An -tx1 | tr -d ' \n' | tr 'abcdef' 'ABCDEF'
+}
+
 version=$("$binary" --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
 test -n "$version" || exit 1
 
@@ -52,11 +57,14 @@ done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"}' \
   | "$binary" hook emit "$launch_id" claude
 session_id=claude:provider-session
+session_marker=$(marker_for_provider provider-session)
 attempt=0
 until "$binary" show "$session_id" 2>/dev/null | grep -q '"execution_seq":1'; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","cwd":"%s","turn_id":"provider-turn-1","user_prompt":"smoke-initial"}\n' "$repo_root" \
+"$binary" show "$session_id" | grep -q "\"marker\":\"$session_marker\""
+"$binary" fetch "$session_id" | grep -q "$session_marker"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","cwd":"%s","turn_id":"provider-turn-1","user_prompt":"DLGT_SESSION_MARKER: %s\\n\\nsmoke-initial"}\n' "$repo_root" "$session_marker" \
   | "$binary" hook emit "$session_id" claude
 wait "$new_pid"
 grep -q '"id":"claude:provider-session"' "$state_dir/new.json"
@@ -120,7 +128,8 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-cross-ve
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_launch_id" claude
 wait "$cross_version_new_pid"
 cross_version_id=claude:provider-cross-version
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","cwd":"%s","turn_id":"provider-cross-version-1","user_prompt":"cross-version-initial"}\n' "$repo_root" \
+cross_version_marker=$(marker_for_provider provider-cross-version)
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-cross-version","cwd":"%s","turn_id":"provider-cross-version-1","user_prompt":"DLGT_SESSION_MARKER: %s\\n\\ncross-version-initial"}\n' "$repo_root" "$cross_version_marker" \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-cross-version","turn_id":"provider-cross-version-1","last_assistant_message":"cross-version-ready"}' \
   | DLGT_SOCKET="$old_socket" "$binary" hook emit "$cross_version_id" claude
@@ -347,7 +356,8 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session-
   | "$binary" hook emit "$reused_launch_id" claude
 wait "$new_pid"
 reused_id=claude:provider-session-2
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-1","user_prompt":"reused-initial"}\n' "$repo_root" \
+reused_marker=$(marker_for_provider provider-session-2)
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session-2","cwd":"%s","turn_id":"provider-turn-reused-1","user_prompt":"DLGT_SESSION_MARKER: %s\\n\\nreused-initial"}\n' "$repo_root" "$reused_marker" \
   | "$binary" hook emit "$reused_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session-2","turn_id":"provider-turn-reused-1","last_assistant_message":"reused-ready"}' \
   | "$binary" hook emit "$reused_id" claude
@@ -529,7 +539,8 @@ printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-rekey-1"
   | "$binary" hook emit "$rekey_launch_id" claude
 wait "$new_pid"
 rekey_id=claude:provider-rekey-1
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-rekey-1","cwd":"%s","turn_id":"rekey-turn-1","user_prompt":"rekey-initial"}\n' "$repo_root" \
+rekey_marker=$(marker_for_provider provider-rekey-1)
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-rekey-1","cwd":"%s","turn_id":"rekey-turn-1","user_prompt":"DLGT_SESSION_MARKER: %s\\n\\nrekey-initial"}\n' "$repo_root" "$rekey_marker" \
   | "$binary" hook emit "$rekey_id" claude
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-rekey-1","turn_id":"rekey-turn-1","last_assistant_message":"rekey-ready"}' \
   | "$binary" hook emit "$rekey_id" claude
