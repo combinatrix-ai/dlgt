@@ -542,7 +542,12 @@ preserves that conversation for `send --resume`. Treat provider-history
 cleanup as a separate, explicit user action — never archive automatically
 when ordinary work finishes. For a Codex Session: `codex archive
 <thread-id>` (the `session.id` without its `codex:` prefix). For a Claude
-Session there is no public archive command; archiving means operating Claude
-Desktop's own UI, identifying the conversation unambiguously first — if it
-cannot be identified, or UI control is unavailable, report that instead of
-guessing, and never edit provider storage or transcript files directly.
+Session there is no public archive command. A new Claude conversation's first
+ordinary prompt contains `DLGT_SESSION_MARKER: <marker>`, and the same exact
+`DLGTREF...` value appears as `marker` in the dlgt Session JSON. In Claude
+Desktop search, use `DLGT_SESSION_MARKER` to find dlgt conversations or the
+exact marker to identify one Session unambiguously. The marker is not added
+to the provider title, follow-ups, slash commands, or resumed conversations.
+Archiving means operating Claude Desktop's own UI — if the conversation cannot
+be identified, or UI control is unavailable, report that instead of guessing,
+and never edit provider storage or transcript files directly.
