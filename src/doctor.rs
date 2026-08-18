@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -166,11 +167,58 @@ fn runtime_check(index: usize, socket: &Path) -> Check {
                 )
             }
         }
-        Err(error) => warn(
-            id,
-            format!("stale or unreachable socket {}: {error}", socket.display()),
-            Some("remove the stale socket only after confirming no dlgt daemon owns it"),
-        ),
+        Err(error) => match runtime_socket_failure(&error) {
+            RuntimeSocketFailure::Stale => warn(
+                id,
+                format!("stale socket {}: {error}", socket.display()),
+                Some("remove the stale socket only after confirming no dlgt daemon owns it"),
+            ),
+            RuntimeSocketFailure::AccessDenied => warn(
+                id,
+                format!(
+                    "socket access denied or sandbox-blocked at {}: {error}",
+                    socket.display()
+                ),
+                Some("retry `dlgt doctor` outside the sandbox after checking socket permissions"),
+            ),
+            RuntimeSocketFailure::Unreachable => warn(
+                id,
+                format!("unreachable socket {}: {error}", socket.display()),
+                Some("check the daemon owner and socket permissions before removing anything"),
+            ),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSocketFailure {
+    Stale,
+    AccessDenied,
+    Unreachable,
+}
+
+fn runtime_socket_failure(error: &anyhow::Error) -> RuntimeSocketFailure {
+    let has_kind = |kind| {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|io_error| io_error.kind() == kind)
+        })
+    };
+    if has_kind(io::ErrorKind::PermissionDenied) {
+        return RuntimeSocketFailure::AccessDenied;
+    }
+    if has_kind(io::ErrorKind::ConnectionRefused) || has_kind(io::ErrorKind::NotFound) {
+        return RuntimeSocketFailure::Stale;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("permission denied")
+        || message.contains("operation not permitted")
+        || message.contains("sandbox")
+    {
+        RuntimeSocketFailure::AccessDenied
+    } else {
+        RuntimeSocketFailure::Unreachable
     }
 }
 
@@ -333,7 +381,11 @@ fn skipped(id: &'static str, evidence: &str, hint: &str) -> Check {
 
 #[cfg(test)]
 mod tests {
-    use super::{Check, Report, human};
+    use std::io;
+
+    use anyhow::Error;
+
+    use super::{Check, Report, RuntimeSocketFailure, human, runtime_socket_failure};
 
     #[test]
     fn human_report_contains_status_evidence_and_hint() {
@@ -352,5 +404,23 @@ mod tests {
         assert!(text.contains("missing"));
         assert!(text.contains("hint: create it"));
         assert!(text.contains("Overall: WARN"));
+    }
+
+    #[test]
+    fn runtime_socket_failures_distinguish_stale_from_access_denied() {
+        let stale = Error::new(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(runtime_socket_failure(&stale), RuntimeSocketFailure::Stale);
+
+        let denied = Error::new(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            runtime_socket_failure(&denied),
+            RuntimeSocketFailure::AccessDenied
+        );
+
+        let sandbox = anyhow::anyhow!("sandbox blocked access to socket");
+        assert_eq!(
+            runtime_socket_failure(&sandbox),
+            RuntimeSocketFailure::AccessDenied
+        );
     }
 }

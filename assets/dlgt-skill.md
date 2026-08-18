@@ -21,6 +21,18 @@ call cannot express:
 Outside those, prefer the built-in subagent: dlgt costs a daemon, a process,
 and a PTY.
 
+## Codex sandbox socket failures
+
+When a normal `dlgt` command reports `RPC_UNAVAILABLE` because the daemon
+socket is inaccessible from a Codex sandbox, retry that exact same command
+once through `tools.exec_command` with
+`sandbox_permissions: "require_escalated"` and a concise approval
+justification. Preserve the command and prompt bytes, every option, and the
+same `--request-id`; this is the replay boundary and prevents duplicate work.
+Do not restart the server or change `DLGT_HOME` or `DLGT_SOCKET` as a
+workaround. Do not proactively ask for escalation when ordinary socket access
+succeeds.
+
 Terms used below:
 
 ```text
@@ -351,8 +363,10 @@ applies:
 Positions and the request-id replay ledger are memory-only and meaningful only
 within one daemon lifetime. Handle the boundaries separately:
 
-- On `RPC_UNAVAILABLE`, run `dlgt list --all-versions` to locate the owning
-  versioned daemon. Do not assume the daemon restarted.
+- On `RPC_UNAVAILABLE` with the Codex sandbox retry hint, follow "Codex
+  sandbox socket failures" above and retry the exact command once. For other
+  `RPC_UNAVAILABLE` failures, run `dlgt list --all-versions` to locate the
+  owning versioned daemon. Do not assume the daemon restarted.
 - After a confirmed daemon restart, its cursor positions and request-id ledger
   are gone. Do not blindly replay an uncertain `new` or `send`: first inspect
   provider history and possible external effects. Resume a known provider

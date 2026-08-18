@@ -72,8 +72,8 @@ fn call_socket_with_timeout(
     params: Value,
     timeout: Option<Duration>,
 ) -> Result<Value> {
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("dlgt server is not running at {}", socket.display()))?;
+    let mut stream =
+        UnixStream::connect(socket).map_err(|error| socket_unavailable(socket, error))?;
     stream
         .set_read_timeout(timeout)
         .context("failed to configure daemon socket read timeout")?;
@@ -165,14 +165,32 @@ pub fn list_all_versions(include_all: bool) -> Result<Vec<Value>> {
     let current_socket = paths::socket_path()?;
     let mut current_info = None;
     for socket in paths::runtime_sockets()? {
-        let Ok(ping) = call_socket(&socket, "server.ping", json!({})) else {
-            continue;
+        let ping = match call_socket(&socket, "server.ping", json!({})) {
+            Ok(ping) => ping,
+            Err(error) if socket_is_stale(&error) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect live dlgt runtime at {}",
+                        socket.display()
+                    )
+                });
+            }
         };
         let Some(version) = ping.get("version").and_then(Value::as_str) else {
             continue;
         };
-        let Ok(result) = call_socket(&socket, "session.list", json!({"all":include_all})) else {
-            continue;
+        let result = match call_socket(&socket, "session.list", json!({"all":include_all})) {
+            Ok(result) => result,
+            Err(error) if socket_is_stale(&error) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect live dlgt runtime at {}",
+                        socket.display()
+                    )
+                });
+            }
         };
         let runtime_info = take_info();
         if socket == current_socket {
@@ -353,16 +371,21 @@ pub fn rpc_stdio() -> Result<()> {
 }
 
 fn connect_or_start(socket: &Path) -> Result<UnixStream> {
-    if let Ok(stream) = UnixStream::connect(socket) {
-        return Ok(stream);
+    match UnixStream::connect(socket) {
+        Ok(stream) => return Ok(stream),
+        Err(error) if !is_auto_start_connect_error(&error) => {
+            return Err(socket_unavailable(socket, error));
+        }
+        Err(_) => {}
     }
     paths::check_socket_path(socket)?;
-    let log = start_daemon()?;
+    let log = start_daemon().map_err(|error| daemon_start_failed(socket, format!("{error:#}")))?;
     let mut last = None;
     for _ in 0..40 {
         match UnixStream::connect(socket) {
             Ok(stream) => return Ok(stream),
-            Err(error) => last = Some(error),
+            Err(error) if is_auto_start_connect_error(&error) => last = Some(error),
+            Err(error) => return Err(socket_unavailable(socket, error)),
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -375,10 +398,75 @@ fn connect_or_start(socket: &Path) -> Result<UnixStream> {
         .filter(|text| !text.is_empty())
         .or_else(|| last.map(|error| error.to_string()))
         .unwrap_or_else(|| "no diagnostic output".to_owned());
-    bail!(
-        "dlgt server did not start at {}: {reason}",
-        socket.display()
+    Err(daemon_start_failed(socket, reason))
+}
+
+fn is_auto_start_connect_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
     )
+}
+
+fn socket_unavailable(socket: &Path, error: io::Error) -> anyhow::Error {
+    let offer_sandbox_retry = is_permission_error(&error);
+    let failure = rpc_unavailable_failure(
+        format!(
+            "cannot access the dlgt server socket at {}: {}",
+            socket.display(),
+            error
+        ),
+        offer_sandbox_retry,
+    );
+    anyhow::Error::new(error).context(failure)
+}
+
+fn daemon_start_failed(socket: &Path, reason: impl Into<String>) -> anyhow::Error {
+    let reason = reason.into();
+    let offer_sandbox_retry = diagnostic_mentions_permission(&reason);
+    rpc_unavailable_failure(
+        format!(
+            "dlgt server did not start at {}: {reason}",
+            socket.display()
+        ),
+        offer_sandbox_retry,
+    )
+    .into()
+}
+
+const SANDBOX_RETRY_HINT: &str = concat!(
+    "retry the same dlgt command outside the Codex sandbox via ",
+    "tools.exec_command(... sandbox_permissions: \"require_escalated\"); ",
+    "DLGT_HOME and DLGT_SOCKET must not be changed",
+);
+
+fn rpc_unavailable_failure(message: String, offer_sandbox_retry: bool) -> RpcFailure {
+    let message = if offer_sandbox_retry {
+        format!("{message}; {SANDBOX_RETRY_HINT}")
+    } else {
+        message
+    };
+    RpcFailure {
+        code: "RPC_UNAVAILABLE".to_owned(),
+        message,
+        session_id: None,
+        launch_id: None,
+        correlation_id: None,
+        hint: offer_sandbox_retry.then(|| SANDBOX_RETRY_HINT.to_owned()),
+        session_state: None,
+        action: None,
+    }
+}
+
+fn is_permission_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+}
+
+fn diagnostic_mentions_permission(diagnostic: &str) -> bool {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    ["permission denied", "operation not permitted", "eperm"]
+        .iter()
+        .any(|marker| diagnostic.contains(marker))
 }
 
 /// Spawn the daemon, returning the file its startup diagnostics go to.
@@ -392,11 +480,14 @@ fn start_daemon() -> Result<Option<std::path::PathBuf>> {
         path.parent().map(std::fs::create_dir_all);
         std::fs::File::create(path).ok()
     });
+    // Only read a path back when this launch actually truncated and owns its
+    // diagnostic file. Otherwise a failed open could expose stale output from
+    // an unrelated daemon attempt.
+    let diagnostic_path = log.as_ref().and_then(|_| log_path.clone());
     command
         .args(["server", "--daemon-child"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log.map_or_else(Stdio::null, Stdio::from));
+        .stdin(Stdio::null());
+    configure_daemon_output(&mut command, log)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -412,7 +503,20 @@ fn start_daemon() -> Result<Option<std::path::PathBuf>> {
         }
     }
     command.spawn().context("failed to start dlgt server")?;
-    Ok(log_path)
+    Ok(diagnostic_path)
+}
+
+fn configure_daemon_output(command: &mut Command, log: Option<std::fs::File>) -> Result<()> {
+    let (stdout, stderr) = if let Some(log) = log {
+        let stdout = log
+            .try_clone()
+            .context("failed to duplicate daemon diagnostic log")?;
+        (Stdio::from(stdout), Stdio::from(log))
+    } else {
+        (Stdio::null(), Stdio::null())
+    };
+    command.stdout(stdout).stderr(stderr);
+    Ok(())
 }
 
 fn write_json_line(writer: &mut impl Write, value: &impl serde::Serialize) -> Result<()> {
@@ -524,7 +628,14 @@ fn filter_attach_input(input: &[u8], prefix: &mut bool) -> (Vec<u8>, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RpcFailure, decode_response, filter_attach_input};
+    use std::io;
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{
+        RpcFailure, configure_daemon_output, daemon_start_failed, decode_response,
+        filter_attach_input, is_auto_start_connect_error, socket_is_stale, socket_unavailable,
+    };
 
     #[test]
     fn detach_prefix_is_consumed_not_forwarded() {
@@ -567,5 +678,112 @@ mod tests {
             .unwrap_or_else(|| panic!("RPC failure missing"));
         assert_eq!(failure.launch_id.as_deref(), Some("internal:ABC12345"));
         assert!(failure.session_id.is_none());
+    }
+
+    #[test]
+    fn only_absent_or_refused_sockets_may_auto_start() {
+        assert!(is_auto_start_connect_error(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing",
+        )));
+        assert!(is_auto_start_connect_error(&io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "stale",
+        )));
+        assert!(!is_auto_start_connect_error(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "sandbox",
+        )));
+        assert!(!is_auto_start_connect_error(&io::Error::other(
+            "hard failure",
+        )));
+        assert!(!is_auto_start_connect_error(&io::Error::from_raw_os_error(
+            libc::EPERM,
+        )));
+    }
+
+    #[test]
+    fn permission_socket_failure_is_actionable_but_missing_socket_is_not() {
+        let permission = socket_unavailable(
+            Path::new("/tmp/dlgt.sock"),
+            io::Error::from_raw_os_error(libc::EPERM),
+        );
+        let failure = permission
+            .downcast_ref::<RpcFailure>()
+            .unwrap_or_else(|| panic!("RPC failure missing"));
+        assert_eq!(failure.code, "RPC_UNAVAILABLE");
+        assert!(failure.message.contains("tools.exec_command"));
+        assert!(
+            failure
+                .message
+                .contains("sandbox_permissions: \"require_escalated\"")
+        );
+        assert!(
+            failure
+                .message
+                .contains("DLGT_HOME and DLGT_SOCKET must not be changed")
+        );
+        assert!(failure.hint.is_some());
+
+        let missing = socket_unavailable(
+            Path::new("/tmp/dlgt.sock"),
+            io::Error::new(io::ErrorKind::NotFound, "missing"),
+        );
+        let failure = missing
+            .downcast_ref::<RpcFailure>()
+            .unwrap_or_else(|| panic!("RPC failure missing"));
+        assert_eq!(failure.code, "RPC_UNAVAILABLE");
+        assert!(failure.hint.is_none());
+        assert!(!failure.message.contains("sandbox_permissions"));
+        assert!(socket_is_stale(&missing));
+    }
+
+    #[test]
+    fn startup_failure_retains_diagnostic_and_structured_code() {
+        let failure = daemon_start_failed(
+            Path::new("/tmp/dlgt.sock"),
+            "{\"code\":\"EPERM\",\"message\":\"Operation not permitted\"}",
+        );
+        let failure = failure
+            .downcast_ref::<RpcFailure>()
+            .unwrap_or_else(|| panic!("RPC failure missing"));
+        assert_eq!(failure.code, "RPC_UNAVAILABLE");
+        assert!(failure.message.contains("Operation not permitted"));
+        assert!(failure.hint.is_some());
+    }
+
+    #[test]
+    fn daemon_child_stdout_and_stderr_share_diagnostic_log() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("daemon.log");
+        let file = std::fs::File::create(&path)?;
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf child-stdout; printf child-stderr >&2"]);
+        configure_daemon_output(&mut command, Some(file))?;
+        let status = command.status()?;
+        assert!(status.success(), "child exited with {status}");
+        let diagnostic = std::fs::read_to_string(path)?;
+        assert!(diagnostic.contains("child-stdout"));
+        assert!(diagnostic.contains("child-stderr"));
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_skill_documents_exact_sandbox_retry_contract() {
+        let skill = include_str!("../assets/dlgt-skill.md");
+        assert!(skill.contains("once through `tools.exec_command`"));
+        assert!(skill.contains("`sandbox_permissions: \"require_escalated\"`"));
+        assert!(skill.contains("concise approval\njustification"));
+        assert!(skill.contains("same `--request-id`"));
+        assert!(skill.contains("Do not restart the server or change"));
+        assert!(skill.contains("`DLGT_HOME` or `DLGT_SOCKET` as a\nworkaround"));
+        assert!(skill.contains("Do not proactively ask for escalation"));
+        assert!(
+            skill.contains(
+                "On `RPC_UNAVAILABLE` with the Codex sandbox retry hint, follow \"Codex\n"
+            )
+        );
+        assert!(skill.contains("sandbox socket failures\" above and retry the exact command once"));
+        assert!(!skill.contains("On `RPC_UNAVAILABLE`, run `dlgt list --all-versions`"));
     }
 }
