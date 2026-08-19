@@ -237,11 +237,6 @@ pub struct SessionRecord {
     pub pid: Option<u32>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    /// Eligible sessions are newly-created Claude conversations. This is
-    /// daemon-only state used to ensure the searchable marker is never added
-    /// to an explicit resume or an existing conversation.
-    #[serde(skip)]
-    pub marker_eligible: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -250,11 +245,6 @@ pub struct TurnRecord {
     pub session_id: String,
     pub execution_seq: i64,
     pub prompt: String,
-    /// Exact prompt delivered to the provider when it differs from the
-    /// caller's logical prompt (currently only the Claude session marker).
-    /// It is retained in memory solely for exact hook correlation.
-    #[serde(skip)]
-    pub provider_prompt: Option<String>,
     pub state: TurnState,
     pub provider_turn_id: Option<String>,
     pub final_message: Option<String>,

@@ -132,7 +132,6 @@ impl Store {
                     pid: None,
                     created_at_ms: now,
                     updated_at_ms: now,
-                    marker_eligible: false,
                 },
                 uid,
                 terminal_rows: 24,
@@ -140,26 +139,6 @@ impl Store {
             },
         );
         Ok(())
-    }
-
-    pub fn set_marker_eligible(&self, id: &str, eligible: bool) -> bool {
-        let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get_mut(id) else {
-            return false;
-        };
-        session.record.marker_eligible = eligible;
-        true
-    }
-
-    pub fn session_marker_used(&self, session_id: &str, marker: &str) -> bool {
-        let prefix = format!("DLGT_SESSION_MARKER: {marker}\n\n");
-        self.state.borrow().turns.values().any(|turn| {
-            turn.session_id == session_id
-                && turn
-                    .provider_prompt
-                    .as_deref()
-                    .is_some_and(|prompt| prompt.starts_with(&prefix))
-        })
     }
 
     pub fn set_session_running(&self, id: &str, pid: Option<u32>) -> bool {
@@ -415,16 +394,6 @@ impl Store {
     }
 
     pub fn insert_turn(&mut self, id: &str, session_id: &str, prompt: &str) -> Result<TurnRecord> {
-        self.insert_turn_with_provider_prompt(id, session_id, prompt, None)
-    }
-
-    pub fn insert_turn_with_provider_prompt(
-        &mut self,
-        id: &str,
-        session_id: &str,
-        prompt: &str,
-        provider_prompt: Option<&str>,
-    ) -> Result<TurnRecord> {
         let mut state = self.state.borrow_mut();
         if state.turns.contains_key(id) {
             bail!("turn id already exists");
@@ -449,7 +418,6 @@ impl Store {
             session_id: session_id.to_owned(),
             execution_seq,
             prompt: prompt.to_owned(),
-            provider_prompt: provider_prompt.map(str::to_owned),
             state: TurnState::Submitted,
             provider_turn_id: None,
             final_message: None,
