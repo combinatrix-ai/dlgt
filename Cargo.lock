@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "dlgt"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "attestation-verify",

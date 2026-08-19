@@ -28,6 +28,11 @@ mkdir -p "$HOME"
 touch "$DLGT_FAKE_ARGS_FILE"
 old_socket="$state_dir/run/old/dlgt.sock"
 
+marker_for_provider() {
+  printf 'dlgt:'
+  printf '%s' "$1" | od -An -tx1 | tr -d ' \n' | cut -c1-12
+}
+
 version=$("$binary" --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
 test -n "$version" || exit 1
 
@@ -52,10 +57,13 @@ done
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"provider-session"}' \
   | "$binary" hook emit "$launch_id" claude
 session_id=claude:provider-session
+session_marker=$(marker_for_provider provider-session)
 attempt=0
 until "$binary" show "$session_id" 2>/dev/null | grep -q '"execution_seq":1'; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
+"$binary" show "$session_id" | grep -q "\"marker\":\"$session_marker\""
+"$binary" fetch "$session_id" | grep -q "$session_marker"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","cwd":"%s","turn_id":"provider-turn-1","user_prompt":"smoke-initial"}\n' "$repo_root" \
   | "$binary" hook emit "$session_id" claude
 wait "$new_pid"

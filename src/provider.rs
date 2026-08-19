@@ -16,6 +16,28 @@ static CLAUDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 const CODEX_UPDATE_SUPPRESSION: &str = "check_for_update_on_startup=false";
 const CLAUDE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
 
+const CLAUDE_SESSION_MARKER_HEX_LEN: usize = 12;
+
+fn hex_provider_id(provider_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(provider_id.len() * 2);
+    for byte in provider_id.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+    }
+    encoded
+}
+
+/// Return the short, stable marker shown in a Claude provider title.
+pub fn claude_session_marker(provider_id: &str) -> String {
+    let mut suffix = Uuid::parse_str(provider_id).map_or_else(
+        |_| hex_provider_id(provider_id),
+        |id| id.simple().to_string(),
+    );
+    suffix.truncate(CLAUDE_SESSION_MARKER_HEX_LEN);
+    format!("dlgt:{suffix}")
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
@@ -74,6 +96,8 @@ pub struct LaunchOptions<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub harness_options: &'a [String],
+    /// Provider ID assigned to a newly-created Claude conversation.
+    pub new_provider_id: Option<&'a str>,
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
     pub auto_approve: bool,
@@ -81,6 +105,17 @@ pub struct LaunchOptions<'a> {
 
 pub(crate) fn provider_display_name(title: &str) -> String {
     format!("[dlgt] {title}")
+}
+
+fn claude_provider_display_name(options: &LaunchOptions<'_>) -> String {
+    let Some(provider_id) = options.resume_provider_id.or(options.new_provider_id) else {
+        return provider_display_name(options.title);
+    };
+    format!(
+        "{} [{}]",
+        provider_display_name(options.title),
+        claude_session_marker(provider_id)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -329,7 +364,7 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     let settings = claude_hook_settings(&hook_command);
     let mut args = vec![
         "--name".to_owned(),
-        provider_display_name(options.title),
+        claude_provider_display_name(options),
         "--settings".to_owned(),
         settings.to_string(),
     ];
@@ -345,6 +380,8 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     }
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["--resume".to_owned(), provider_id.to_owned()]);
+    } else if let Some(provider_id) = options.new_provider_id {
+        args.extend(["--session-id".to_owned(), provider_id.to_owned()]);
     }
     Ok(CommandSpec {
         program,
@@ -371,7 +408,10 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
             if value.is_empty() {
                 bail!("harness option {key:?} requires a non-empty value");
             }
-            if matches!(key, "name" | "settings" | "model" | "effort" | "resume") {
+            if matches!(
+                key,
+                "name" | "settings" | "model" | "effort" | "resume" | "session-id"
+            ) {
                 bail!("harness option {key:?} is managed by dlgt");
             }
             Ok(format!("--{key}={value}"))
@@ -440,9 +480,16 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Agent, LaunchOptions, codex_app_server_args, codex_remote_tui_command, command_spec,
-        trust_claude_workspace, trust_codex_workspace,
+        Agent, LaunchOptions, claude_session_marker, codex_app_server_args,
+        codex_remote_tui_command, command_spec, trust_claude_workspace, trust_codex_workspace,
     };
+
+    #[test]
+    fn claude_marker_is_stable_and_short() {
+        let marker = claude_session_marker("9b634cb7-2e3e-437b-96cb-8199ce17afa6");
+        assert_eq!(marker, "dlgt:9b634cb72e3e");
+        assert_eq!(claude_session_marker("thread-1"), "dlgt:746872656164");
+    }
 
     #[test]
     fn claude_defaults_to_auto_approve() {
@@ -453,9 +500,10 @@ mod tests {
             session_id: "internal:TESTID1",
             title: "Worker title",
             cwd: Path::new("/tmp"),
-            model: Some("claude-4-5-haiku-latest"),
-            effort: Some("high"),
+            model: Some("haiku"),
+            effort: None,
             harness_options: &[],
+            new_provider_id: None,
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
@@ -476,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_uses_the_dlgt_prefixed_session_title_as_provider_name() {
+    fn claude_uses_a_prefixed_title_with_an_exact_search_marker() {
         let spec = command_spec(&LaunchOptions {
             agent: Agent::Claude,
             session_id: "internal:TESTID1",
@@ -485,6 +533,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &[],
+            new_provider_id: Some("9b634cb7-2e3e-437b-96cb-8199ce17afa6"),
             resume_provider_id: None,
             environment: &std::collections::HashMap::new(),
             auto_approve: true,
@@ -493,7 +542,12 @@ mod tests {
         assert!(
             spec.args
                 .windows(2)
-                .any(|args| args == ["--name", "[dlgt] Review API boundaries"])
+                .any(|args| args == ["--name", "[dlgt] Review API boundaries [dlgt:9b634cb72e3e]"])
+        );
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| { args == ["--session-id", "9b634cb7-2e3e-437b-96cb-8199ce17afa6"] })
         );
     }
 
@@ -508,6 +562,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &[],
+            new_provider_id: None,
             resume_provider_id: None,
             environment: &environment,
             auto_approve: false,
@@ -539,6 +594,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &options,
+            new_provider_id: None,
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
@@ -569,6 +625,7 @@ mod tests {
                 model: None,
                 effort: Some("xhigh"),
                 harness_options: &[],
+                new_provider_id: None,
                 resume_provider_id: None,
                 environment: &environment,
                 auto_approve: true,
@@ -611,6 +668,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
+                new_provider_id: None,
                 resume_provider_id: None,
                 environment: &environment,
                 auto_approve: false,
@@ -650,6 +708,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &[],
+            new_provider_id: None,
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
@@ -683,6 +742,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &[],
+            new_provider_id: None,
             resume_provider_id: Some("claude-session"),
             environment: &environment,
             auto_approve: true,
@@ -704,6 +764,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
+                new_provider_id: None,
                 resume_provider_id: Some("codex-thread"),
                 environment: &environment,
                 auto_approve: true,
@@ -733,6 +794,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &options,
+            new_provider_id: None,
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
@@ -758,6 +820,7 @@ mod tests {
             model: None,
             effort: None,
             harness_options: &options,
+            new_provider_id: None,
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,

@@ -1,9 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::{
+    FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
@@ -20,8 +23,8 @@ use crate::cursor;
 use crate::paths;
 use crate::protocol::{Request, Response, SessionRecord, SessionState, TurnRecord, TurnState};
 use crate::provider::{
-    Agent, CommandSpec, LaunchOptions, codex_remote_tui_command, command_spec, prepare_workspace,
-    provider_display_name,
+    Agent, CommandSpec, LaunchOptions, claude_session_marker, codex_remote_tui_command,
+    command_spec, prepare_workspace, provider_display_name,
 };
 use crate::reaper::Reaper;
 use crate::session::SessionRuntime;
@@ -48,6 +51,172 @@ const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REQUEST_RECEIPT_LIMIT: usize = 1024;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+
+fn is_stale_socket_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
+}
+
+fn ownership_lock_path(socket_path: &Path) -> PathBuf {
+    let mut path = socket_path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+struct DaemonLock {
+    // Keeping this descriptor open holds the advisory flock for the daemon's
+    // entire lifetime. The lock file itself is intentionally retained so a
+    // concurrent starter always has one stable inode to lock.
+    _file: fs::File,
+}
+
+impl DaemonLock {
+    fn acquire(socket_path: &Path) -> Result<Self> {
+        let lock_path = ownership_lock_path(socket_path);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open dlgt ownership lock {}; check permissions and retry outside the sandbox",
+                    lock_path.display()
+                )
+            })?;
+        // SAFETY: flock only inspects and updates the kernel state attached to
+        // this valid open file descriptor; it does not access Rust memory.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bail!(
+                    "another dlgt server is starting or running (ownership lock {} is held); wait for it to exit or use a different DLGT_SOCKET",
+                    lock_path.display()
+                );
+            }
+            return Err(anyhow!(error)).with_context(|| {
+                format!(
+                    "failed to acquire dlgt ownership lock {}; check permissions and retry outside the sandbox",
+                    lock_path.display()
+                )
+            });
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
+fn socket_identity(socket_path: &Path) -> Result<SocketIdentity> {
+    fs::symlink_metadata(socket_path)
+        .map(|metadata| SocketIdentity::from_metadata(&metadata))
+        .with_context(|| format!("failed to inspect bound socket {}", socket_path.display()))
+}
+
+/// Remove the endpoint only when it still names the socket this daemon bound.
+/// A successor or any other replacement is left untouched.
+fn remove_owned_socket(socket_path: &Path, expected: SocketIdentity) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if SocketIdentity::from_metadata(&metadata) == expected => {
+            fs::remove_file(socket_path).with_context(|| {
+                format!(
+                    "failed to remove owned dlgt socket {} before listener release",
+                    socket_path.display()
+                )
+            })?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow!(error)).with_context(|| {
+                format!(
+                    "cannot verify ownership of dlgt socket {}; preserving the pathname",
+                    socket_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Inspect the configured endpoint before binding it. Only the two errors
+/// that mean "there is no listener behind this socket" authorize removing an
+/// existing Unix socket. Permission and other errors are deliberately
+/// returned without unlinking anything, since they may describe a live
+/// daemon or a sandbox boundary rather than stale state.
+fn prepare_socket_path(socket_path: &std::path::Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "; check socket-directory permissions and retry outside the sandbox"
+            } else {
+                "; inspect the path and choose another DLGT_SOCKET if needed"
+            };
+            return Err(anyhow!(error)).with_context(|| {
+                format!(
+                    "cannot inspect existing dlgt socket {}{hint}; refusing to remove it",
+                    socket_path.display()
+                )
+            });
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        bail!(
+            "dlgt socket path {} is occupied by a non-socket; refusing to remove it; choose another DLGT_SOCKET or remove the path manually",
+            socket_path.display()
+        );
+    }
+
+    match UnixStream::connect(socket_path) {
+        Ok(_) => bail!(
+            "dlgt server is already running at {}",
+            socket_path.display()
+        ),
+        Err(error) if is_stale_socket_error(&error) => match fs::remove_file(socket_path) {
+            Ok(()) => Ok(()),
+            Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(remove_error) => Err(anyhow!(remove_error)).with_context(|| {
+                format!(
+                    "stale dlgt socket {} could not be removed; refusing to bind over it; check ownership and permissions, then retry outside the sandbox if applicable",
+                    socket_path.display()
+                )
+            }),
+        },
+        Err(error) => {
+            let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "check socket-directory permissions and retry outside the sandbox"
+            } else {
+                "inspect the daemon owner and choose another DLGT_SOCKET if needed"
+            };
+            Err(anyhow!(error)).with_context(|| {
+                format!(
+                    "cannot connect to existing dlgt socket {}; refusing to remove it; {hint}",
+                    socket_path.display()
+                )
+            })
+        }
+    }
+}
 
 fn wait_for_update_check(shutdown: &Receiver<()>, interval: Duration) -> bool {
     match shutdown.recv_timeout(interval) {
@@ -87,16 +256,8 @@ pub fn run() -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    if socket_path.exists() {
-        if UnixStream::connect(&socket_path).is_ok() {
-            bail!(
-                "dlgt server is already running at {}",
-                socket_path.display()
-            );
-        }
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
-    }
+    let _ownership_lock = DaemonLock::acquire(&socket_path)?;
+    prepare_socket_path(&socket_path)?;
 
     let store = Store::new();
     let reaper = Reaper::spawn()?;
@@ -118,6 +279,7 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to secure {}", socket_path.display()))?;
+    let bound_socket_identity = socket_identity(&socket_path)?;
     listener
         .set_nonblocking(true)
         .context("failed to make server socket nonblocking")?;
@@ -126,8 +288,13 @@ pub fn run() -> Result<()> {
 
     let mut empty_since = Instant::now();
     while !daemon.shutting_down.load(Ordering::SeqCst) {
-        match listener.accept() {
+        let wait_for_accept = match listener.accept() {
             Ok((stream, _address)) => {
+                // A successful connect is activity from a client. Reset this
+                // synchronously before handing the stream to a worker so an
+                // empty-daemon timeout cannot race a request that has just
+                // been accepted (including a probe that closes immediately).
+                empty_since = Instant::now();
                 // Accepted sockets inherit O_NONBLOCK on macOS. RPC frames
                 // larger than the socket buffer otherwise fail at ~8 KiB.
                 stream
@@ -142,13 +309,12 @@ pub fn run() -> Result<()> {
                         }
                     })
                     .context("failed to start RPC thread")?;
+                false
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
             Err(error) => return Err(error).context("failed to accept RPC connection"),
-        }
+        };
         let empty = daemon
             .sessions
             .read()
@@ -159,6 +325,12 @@ pub fn run() -> Result<()> {
             }
         } else {
             empty_since = Instant::now();
+        }
+        // Decide the idle timeout before waiting. A client that connects
+        // during this sleep is accepted on the next iteration and can reset
+        // the timer instead of being discarded at the timeout boundary.
+        if wait_for_accept {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -173,11 +345,12 @@ pub fn run() -> Result<()> {
             let _ = runtime.force_stop();
         }
     }
+    // Unlink while this listener and the advisory ownership lock are still
+    // held. A successor cannot acquire the lock and bind in between this
+    // identity check and cleanup, and a replacement pathname is preserved.
+    let socket_cleanup = remove_owned_socket(&socket_path, bound_socket_identity);
     drop(listener);
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove {}", socket_path.display()))?;
-    }
+    socket_cleanup?;
     if let Some(directory) = socket_path.parent() {
         let _ = fs::remove_dir(directory);
     }
@@ -366,12 +539,26 @@ impl AgentRuntime {
     }
 }
 
+fn read_rpc_line(stream: &UnixStream) -> Result<Option<String>> {
+    let mut line = String::new();
+    let bytes_read = BufReader::new(stream.try_clone()?)
+        .read_line(&mut line)
+        .context("failed to read RPC request")?;
+    if bytes_read == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(line))
+    }
+}
+
 impl Daemon {
     fn handle_connection(&self, mut stream: UnixStream) -> Result<()> {
-        let mut line = String::new();
-        BufReader::new(stream.try_clone()?)
-            .read_line(&mut line)
-            .context("failed to read RPC request")?;
+        let Some(line) = read_rpc_line(&stream)? else {
+            // A probe may connect only to check whether the socket is live and
+            // close before sending a frame. This is normal EOF, not malformed
+            // JSON, and must not produce an INVALID_REQUEST/Broken pipe log.
+            return Ok(());
+        };
         let request = match serde_json::from_str::<Request>(&line) {
             Ok(request) => request,
             Err(error) => {
@@ -594,6 +781,8 @@ impl Daemon {
         let rows = params_u16(params, "rows", 24)?;
         let cols = params_u16(params, "cols", 80)?;
         let mut id = generate_internal_id();
+        let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
+            .then(|| Uuid::new_v4().to_string());
 
         prepare_workspace(agent, &cwd)?;
         for attempt in 0..16 {
@@ -653,6 +842,7 @@ impl Daemon {
             model,
             effort,
             harness_options: &harness_options,
+            new_provider_id: new_provider_id.as_deref(),
             resume_provider_id,
             environment: &environment,
             auto_approve,
@@ -997,6 +1187,7 @@ impl Daemon {
             model: session.model.as_deref(),
             effort: session.effort.as_deref(),
             harness_options: &session.harness_options,
+            new_provider_id: None,
             resume_provider_id: Some(&provider_id),
             environment: &environment,
             auto_approve: session.auto_approve,
@@ -2964,6 +3155,15 @@ fn public_session_with_metrics(
             json!(metrics.pty_quiet_for_ms),
         );
     }
+    if session.agent == Agent::Claude.as_str()
+        && let Some(provider_id) = provider_id_from_session(session)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "marker".to_owned(),
+            json!(claude_session_marker(provider_id)),
+        );
+    }
     value
 }
 
@@ -4244,6 +4444,8 @@ fn normalize_event_type(kind: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
@@ -4251,14 +4453,15 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        BucketSource, BusyMetrics, Cut, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
+        BucketSource, BusyMetrics, Cut, DaemonLock, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
         FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
         TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
         clamp_busy_metrics, classify_error, cli_wrapper_overhead, generate_alias,
-        generate_internal_id, provider_id_from_session, public_result, public_session,
-        public_session_with_metrics, refresh_submission_receipt_from_store, retention_gap,
-        signal_shutdown, start_hook_turn, transcript_window, validate_alias, validate_continuation,
-        wait_for_update_check,
+        generate_internal_id, is_stale_socket_error, ownership_lock_path, prepare_socket_path,
+        provider_id_from_session, public_result, public_session, public_session_with_metrics,
+        read_rpc_line, refresh_submission_receipt_from_store, remove_owned_socket, retention_gap,
+        signal_shutdown, socket_identity, start_hook_turn, transcript_window, validate_alias,
+        validate_continuation, wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
     use crate::store::{NewSession, Store};
@@ -4294,6 +4497,90 @@ mod tests {
             &shutdown_receiver,
             Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn startup_leaves_an_occupied_non_socket_path_untouched() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temp directory: {error}"));
+        let socket_path = directory.path().join("dlgt.sock");
+        fs::write(&socket_path, b"keep me")
+            .unwrap_or_else(|error| panic!("failed to create occupied path: {error}"));
+        let error = prepare_socket_path(&socket_path)
+            .err()
+            .unwrap_or_else(|| panic!("occupied non-socket path was accepted"));
+        assert!(socket_path.exists());
+        assert!(error.to_string().contains("non-socket"));
+    }
+
+    #[test]
+    fn only_connection_refused_and_not_found_authorize_stale_socket_cleanup() {
+        assert!(is_stale_socket_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(is_stale_socket_error(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_stale_socket_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_stale_socket_error(&std::io::Error::from(
+            std::io::ErrorKind::Other
+        )));
+    }
+
+    #[test]
+    fn a_peer_that_closes_before_an_rpc_is_quiet_eof() {
+        let (server, peer) = UnixStream::pair()
+            .unwrap_or_else(|error| panic!("failed to create test socket pair: {error}"));
+        drop(peer);
+        let request = read_rpc_line(&server)
+            .unwrap_or_else(|error| panic!("failed to read peer EOF: {error:#}"));
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn daemon_ownership_lock_serializes_starters() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temp directory: {error}"));
+        let socket_path = directory.path().join("dlgt.sock");
+        let first = DaemonLock::acquire(&socket_path)
+            .unwrap_or_else(|error| panic!("failed to acquire first lock: {error:#}"));
+        assert_eq!(
+            ownership_lock_path(&socket_path),
+            directory.path().join("dlgt.sock.lock")
+        );
+        let second = DaemonLock::acquire(&socket_path)
+            .err()
+            .unwrap_or_else(|| panic!("second starter acquired the ownership lock"));
+        assert!(second.to_string().contains("ownership lock"));
+        drop(first);
+        DaemonLock::acquire(&socket_path)
+            .unwrap_or_else(|error| panic!("lock was not released with the daemon: {error:#}"));
+    }
+
+    #[test]
+    fn cleanup_preserves_a_replacement_path_with_a_different_identity() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temp directory: {error}"));
+        let socket_path = directory.path().join("dlgt.sock");
+        let replacement_path = directory.path().join("replacement");
+        fs::write(&socket_path, b"owned")
+            .unwrap_or_else(|error| panic!("failed to create owned path: {error}"));
+        let owned = socket_identity(&socket_path)
+            .unwrap_or_else(|error| panic!("failed to record path identity: {error:#}"));
+        fs::write(&replacement_path, b"replacement")
+            .unwrap_or_else(|error| panic!("failed to create replacement: {error}"));
+        fs::rename(&replacement_path, &socket_path)
+            .unwrap_or_else(|error| panic!("failed to install replacement: {error}"));
+
+        remove_owned_socket(&socket_path, owned)
+            .unwrap_or_else(|error| panic!("replacement cleanup failed: {error:#}"));
+        assert_eq!(
+            fs::read(&socket_path)
+                .unwrap_or_else(|error| panic!("replacement disappeared: {error}")),
+            b"replacement"
+        );
     }
 
     #[test]
@@ -4380,6 +4667,45 @@ mod tests {
         assert!(value.get("provider_session_id").is_none());
         assert!(value.get("resume_ref").is_none());
         assert_eq!(provider_id_from_session(&session), Some("thread-1"));
+    }
+
+    #[test]
+    fn every_claude_session_exposes_its_search_marker_but_codex_does_not() {
+        let store = ready_store("claude");
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let value = public_session(&session);
+        assert_eq!(value["marker"], "dlgt:746872656164");
+
+        let store = ready_store("codex");
+        let session = store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        assert!(public_session(&session).get("marker").is_none());
+    }
+
+    #[test]
+    fn claude_hook_matches_the_unmodified_logical_prompt() {
+        let mut store = ready_store("claude");
+        store
+            .insert_turn("turn_prompt", "claude:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let outcome = start_hook_turn(
+            &mut store,
+            &session,
+            &json!({
+                "session_id": "thread-1",
+                "cwd": "/tmp",
+                "user_prompt": "hello",
+                "turn_id": "provider-turn",
+            }),
+        )
+        .unwrap_or_else(|error| panic!("failed to match prompt hook: {error}"));
+        assert_eq!(outcome.kind, "turn.started");
     }
 
     #[test]
