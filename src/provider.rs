@@ -137,10 +137,14 @@ pub fn codex_program() -> PathBuf {
     std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from)
 }
 
-pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path) -> CommandSpec {
+pub fn codex_remote_tui_command(
+    options: &LaunchOptions<'_>,
+    socket_path: &Path,
+) -> Result<CommandSpec> {
     let program =
         std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from);
     let mut args = vec!["--config".to_owned(), CODEX_UPDATE_SUPPRESSION.to_owned()];
+    args.extend(codex_harness_args(options.harness_options)?);
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["resume".to_owned(), provider_id.to_owned()]);
     }
@@ -149,7 +153,7 @@ pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path)
         format!("unix://{}", socket_path.display()),
         "--no-alt-screen".to_owned(),
     ]);
-    if options.auto_approve {
+    if options.auto_approve && !has_codex_execution_policy_option(options.harness_options) {
         args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
     }
     if let Some(model) = options.model {
@@ -161,22 +165,26 @@ pub fn codex_remote_tui_command(options: &LaunchOptions<'_>, socket_path: &Path)
             format!("model_reasoning_effort={}", toml_string(effort)),
         ]);
     }
-    CommandSpec {
+    Ok(CommandSpec {
         program,
         args,
         cwd: options.cwd.to_path_buf(),
         environment: options.environment.clone(),
-    }
+    })
 }
 
-pub(crate) fn codex_app_server_args(endpoint: &str) -> Vec<String> {
-    vec![
-        "--config".to_owned(),
-        CODEX_UPDATE_SUPPRESSION.to_owned(),
+pub(crate) fn codex_app_server_args(
+    endpoint: &str,
+    harness_options: &[String],
+) -> Result<Vec<String>> {
+    let mut args = vec!["--config".to_owned(), CODEX_UPDATE_SUPPRESSION.to_owned()];
+    args.extend(codex_harness_args(harness_options)?);
+    args.extend([
         "app-server".to_owned(),
         "--listen".to_owned(),
         endpoint.to_owned(),
-    ]
+    ]);
+    Ok(args)
 }
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
@@ -419,6 +427,41 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
         .collect()
 }
 
+fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
+    let mut args = Vec::with_capacity(options.len() * 2);
+    for option in options {
+        let (key, value) = option
+            .split_once('=')
+            .context("harness option requires KEY=VALUE")?;
+        if key.is_empty()
+            || !key.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+            })
+        {
+            bail!("invalid harness option key {key:?}");
+        }
+        if value.is_empty() {
+            bail!("harness option {key:?} requires a non-empty value");
+        }
+        if matches!(
+            key,
+            "check_for_update_on_startup" | "model" | "model_reasoning_effort"
+        ) {
+            bail!("harness option {key:?} is managed by dlgt");
+        }
+        args.extend(["--config".to_owned(), option.clone()]);
+    }
+    Ok(args)
+}
+
+fn has_codex_execution_policy_option(options: &[String]) -> bool {
+    options.iter().any(|option| {
+        option
+            .split_once('=')
+            .is_some_and(|(key, _)| matches!(key, "approval_policy" | "sandbox_mode"))
+    })
+}
+
 fn has_permission_mode_option(options: &[String]) -> bool {
     options.iter().any(|option| {
         option
@@ -631,7 +674,8 @@ mod tests {
                 auto_approve: true,
             },
             Path::new("/tmp/dlgt.sock"),
-        );
+        )
+        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
         assert_eq!(
             &spec.args[..2],
             ["--config", "check_for_update_on_startup=false"]
@@ -674,7 +718,8 @@ mod tests {
                 auto_approve: false,
             },
             Path::new("/tmp/dlgt.sock"),
-        );
+        )
+        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
         assert!(
             !spec
                 .args
@@ -686,7 +731,8 @@ mod tests {
     #[test]
     fn codex_app_server_suppresses_startup_update_prompts() {
         assert_eq!(
-            codex_app_server_args("unix:///tmp/dlgt.sock"),
+            codex_app_server_args("unix:///tmp/dlgt.sock", &[])
+                .unwrap_or_else(|error| panic!("failed to build app-server args: {error}")),
             [
                 "--config",
                 "check_for_update_on_startup=false",
@@ -695,6 +741,83 @@ mod tests {
                 "unix:///tmp/dlgt.sock",
             ]
         );
+    }
+
+    #[test]
+    fn codex_passes_explicit_harness_options_to_app_server_and_tui() {
+        let options = vec![
+            "web_search=\"live\"".to_owned(),
+            "features.experimental=true".to_owned(),
+        ];
+        let app_server = codex_app_server_args("unix:///tmp/dlgt.sock", &options)
+            .unwrap_or_else(|error| panic!("failed to build app-server args: {error}"));
+        let spec = codex_remote_tui_command(
+            &LaunchOptions {
+                agent: Agent::Codex,
+                session_id: "internal:TESTID1",
+                title: "Worker title",
+                cwd: Path::new("/tmp"),
+                model: None,
+                effort: None,
+                harness_options: &options,
+                new_provider_id: None,
+                resume_provider_id: None,
+                environment: &std::collections::HashMap::new(),
+                auto_approve: true,
+            },
+            Path::new("/tmp/dlgt.sock"),
+        )
+        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
+
+        for option in &options {
+            let expected = ["--config", option.as_str()];
+            assert!(app_server.windows(2).any(|args| args == expected));
+            assert!(spec.args.windows(2).any(|args| args == expected));
+        }
+    }
+
+    #[test]
+    fn codex_execution_policy_option_suppresses_implicit_auto_approve() {
+        let options = vec!["sandbox_mode=\"read-only\"".to_owned()];
+        let spec = codex_remote_tui_command(
+            &LaunchOptions {
+                agent: Agent::Codex,
+                session_id: "internal:TESTID1",
+                title: "Worker title",
+                cwd: Path::new("/tmp"),
+                model: None,
+                effort: None,
+                harness_options: &options,
+                new_provider_id: None,
+                resume_provider_id: None,
+                environment: &std::collections::HashMap::new(),
+                auto_approve: true,
+            },
+            Path::new("/tmp/dlgt.sock"),
+        )
+        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
+
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
+    }
+
+    #[test]
+    fn codex_rejects_harness_options_managed_by_dlgt() {
+        for option in [
+            "check_for_update_on_startup=true",
+            "model=\"gpt-5\"",
+            "model_reasoning_effort=\"high\"",
+        ] {
+            let result = codex_app_server_args("unix:///tmp/dlgt.sock", &[option.to_owned()]);
+            let Err(error) = result else {
+                panic!("managed harness option should fail: {option}");
+            };
+            assert!(error.to_string().contains("managed by dlgt"));
+        }
     }
 
     #[test]
@@ -770,7 +893,8 @@ mod tests {
                 auto_approve: true,
             },
             Path::new("/tmp/dlgt.sock"),
-        );
+        )
+        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
         assert!(
             codex
                 .args

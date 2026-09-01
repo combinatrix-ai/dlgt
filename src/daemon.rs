@@ -759,9 +759,6 @@ impl Daemon {
                 .context("invalid harness_options")?,
             Some(_) => bail!("harness_options must be an array"),
         };
-        if agent == Agent::Codex && !harness_options.is_empty() {
-            bail!("harness options are currently supported only for Claude");
-        }
         let auto_approve = params
             .get("auto_approve")
             .and_then(Value::as_bool)
@@ -1369,9 +1366,10 @@ impl Daemon {
             socket_path.clone(),
             handler,
             Some(options.environment),
+            options.harness_options,
             &self.reaper,
         )?;
-        let spec = codex_remote_tui_command(options, &socket_path);
+        let spec = codex_remote_tui_command(options, &socket_path)?;
         let output_store = Arc::clone(&self.store);
         let output_session_id = Arc::clone(runtime_session_id);
         let on_output = Arc::new(move |data: &[u8]| {

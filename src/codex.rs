@@ -56,16 +56,21 @@ impl CodexConnection {
         handler: NotificationHandler,
         reaper: &Arc<Reaper>,
     ) -> Result<Arc<Self>> {
-        Self::connect_with_environment(socket_path, handler, None, reaper)
+        Self::connect_with_environment(socket_path, handler, None, &[], reaper)
     }
 
     pub fn connect_with_environment(
         socket_path: PathBuf,
         handler: NotificationHandler,
         environment: Option<&HashMap<String, String>>,
+        harness_options: &[String],
         reaper: &Arc<Reaper>,
     ) -> Result<Arc<Self>> {
-        let mut child_guard = ChildGuard(Some(spawn_app_server(&socket_path, environment)?));
+        let mut child_guard = ChildGuard(Some(spawn_app_server(
+            &socket_path,
+            environment,
+            harness_options,
+        )?));
         let child = child_guard
             .0
             .as_ref()
@@ -538,6 +543,7 @@ fn transport_closed(message: &str) -> Value {
 fn spawn_app_server(
     socket_path: &Path,
     environment: Option<&HashMap<String, String>>,
+    harness_options: &[String],
 ) -> Result<Child> {
     let parent = socket_path.parent().context("Codex socket has no parent")?;
     std::fs::create_dir_all(parent)
@@ -550,7 +556,7 @@ fn spawn_app_server(
         command.env_clear().envs(environment);
     }
     let mut child = command
-        .args(codex_app_server_args(&endpoint))
+        .args(codex_app_server_args(&endpoint, harness_options)?)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
