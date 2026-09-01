@@ -130,12 +130,15 @@ prompt twice.
 Pending receipts also include a human-readable `hint` and an `action` containing
 a bounded `fetch`; these are recovery guidance, not additional RPC state.
 
-`harness_options` is an array of explicit `KEY=VALUE` Claude Code CLI options.
-The daemon converts each entry to `--KEY=VALUE`, rejects dlgt-managed arguments,
-and retains the array so `session.restart` reuses the same launch behavior.
-When the array carries no `permission-mode` entry and `auto_approve` is true,
-dlgt adds `--permission-mode=auto`; `auto_approve: false` keeps Claude Code's
-own permission default. Codex Harness options are not currently supported.
+`harness_options` is an array of explicit provider `KEY=VALUE` options. For
+Claude Code the daemon converts each entry to `--KEY=VALUE`. For Codex it
+converts each entry to `--config KEY=VALUE` on both the managed app-server and
+remote TUI processes. The daemon rejects dlgt-managed arguments and retains the
+array so `session.restart` reuses the same launch behavior. When the array
+carries no `permission-mode` entry and `auto_approve` is true, dlgt adds
+`--permission-mode=auto`; `auto_approve: false` keeps Claude Code's own
+permission default. For Codex, an explicit `approval_policy` or `sandbox_mode`
+entry suppresses dlgt's implicit bypass flag.
 
 ## Session and result schemas
 

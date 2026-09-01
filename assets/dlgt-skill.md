@@ -16,10 +16,17 @@ call cannot express:
 - a model or `--effort` pinned to that one worker
 - a Session that stays alive and keeps its context across later follow-ups
 - observation of the worker's screen, or a distinct `--cwd`, launch
-  environment, or approval posture
+  environment, approval posture, or provider option
 
 Outside those, prefer the built-in subagent: dlgt costs a daemon, a process,
 and a PTY.
+
+Use repeatable `--harness-option KEY=VALUE` entries for provider-specific
+launch configuration. Claude receives each entry as `--KEY=VALUE`. Codex
+receives each entry as `--config KEY=VALUE` on both its managed app-server and
+remote TUI processes; values use Codex's TOML syntax, for example
+`--harness-option 'web_search="live"'`. Do not use this to pass prompt text or
+secrets.
 
 ## Codex sandbox socket failures
 

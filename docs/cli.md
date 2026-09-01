@@ -235,15 +235,17 @@ Rules:
   `--permission-mode=auto` for Claude. `--no-auto-approve` (or Profile
   `auto_approve = false`) keeps the Harness's own approval prompts. An
   explicit `permission-mode=...` Harness option replaces the implicit Claude
-  mode.
+  mode. An explicit Codex `approval_policy=...` or `sandbox_mode=...` Harness
+  option likewise suppresses the implicit Codex bypass flag.
 - Before launching either Harness, dlgt records the Session working directory
   as trusted in that provider's local workspace state. For Claude this updates
   `~/.claude.json` and suppresses only the workspace trust dialog; tool
   permissions follow the auto-approve rule above.
-- `--harness-option KEY=VALUE` explicitly adds `--KEY=VALUE` to Claude Code.
-  It is repeatable, stored with the Session, and reused by `restart`. Options
-  whose arguments are managed by dlgt are rejected. Codex does not currently
-  accept Harness options.
+- `--harness-option KEY=VALUE` is repeatable, stored with the Session, and
+  reused by `restart`. Claude receives each entry as `--KEY=VALUE`. Codex
+  receives each entry as `--config KEY=VALUE` on both its managed app-server
+  and remote TUI processes. Options whose values are managed by dlgt are
+  rejected.
 - `--startup-timeout` is optional and defaults to 60 seconds, but startup is
   never unbounded.
 - Session creation and acceptance of the first prompt are one atomic daemon
@@ -298,6 +300,18 @@ dlgt new \
   --cwd . \
   --request-id review-2 \
   -- "Review the current design"
+```
+
+Codex configuration uses the same option with a TOML value:
+
+```bash
+dlgt new \
+  --title "Codex with live search" \
+  --harness codex \
+  --harness-option 'web_search="live"' \
+  --cwd . \
+  --request-id codex-search-1 \
+  -- "Research the current behavior"
 ```
 
 ```bash
@@ -987,6 +1001,10 @@ effort = "high"
 harness_options = ["permission-mode=auto"]
 clean_env = true
 pass_env = ["PATH", "HOME", "SSH_AUTH_SOCK"]
+
+[profiles.codex-live-search]
+harness = "codex"
+harness_options = ['web_search="live"']
 ```
 
 Environment precedence:
@@ -996,7 +1014,9 @@ client snapshot or clean base < Profile < explicit launch options
 ```
 
 Profile `harness_options` are followed by explicit `--harness-option` values.
-They configure the provider CLI rather than the launch environment.
+They configure the provider CLI rather than the launch environment. Claude
+entries become `--KEY=VALUE`; Codex entries become `--config KEY=VALUE` for
+both provider processes.
 
 - Default launch environment is a snapshot of the invoking client's
   environment, never the daemon's startup environment.

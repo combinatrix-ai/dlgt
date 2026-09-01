@@ -167,7 +167,15 @@ model = "claude-fable-5"
 effort = "high"
 harness_options = ["permission-mode=auto"]
 clean_env = true
+
+[profiles.codex-live-search]
+harness = "codex"
+harness_options = ['web_search="live"']
 ```
+
+Harness options map to the provider's native per-launch override: Claude
+receives `--KEY=VALUE`, while Codex receives `--config KEY=VALUE` on both the
+managed app-server and remote TUI processes.
 
 dlgt launches both Harnesses auto-approved by default so delegation never
 blocks on permission prompts. Opt out per Session with `--no-auto-approve` or
