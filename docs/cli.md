@@ -214,7 +214,7 @@ dlgt new
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
-  [--harness-option <KEY=VALUE>]...
+  [--harness-option <KEY[=VALUE]>]...
   [--no-auto-approve]
   [--startup-timeout <DURATION>]
   [--clean-env]
@@ -241,11 +241,11 @@ Rules:
   as trusted in that provider's local workspace state. For Claude this updates
   `~/.claude.json` and suppresses only the workspace trust dialog; tool
   permissions follow the auto-approve rule above.
-- `--harness-option KEY=VALUE` is repeatable, stored with the Session, and
-  reused by `restart`. Claude receives each entry as `--KEY=VALUE`. Codex
-  receives each entry as `--config KEY=VALUE` on both its managed app-server
-  and remote TUI processes. Options whose values are managed by dlgt are
-  rejected.
+- `--harness-option KEY[=VALUE]` is repeatable, stored with the Session, and
+  reused by `restart`. Claude receives a bare key as `--KEY` and a keyed value
+  as `--KEY=VALUE`. Codex requires `KEY=VALUE` and receives it as `--config
+  KEY=VALUE` on both its managed app-server and remote TUI processes. Options
+  whose values are managed by dlgt are rejected.
 - `--startup-timeout` is optional and defaults to 60 seconds, but startup is
   never unbounded.
 - Session creation and acceptance of the first prompt are one atomic daemon
@@ -403,7 +403,7 @@ dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
-  [--harness-option <KEY=VALUE>]...
+  [--harness-option <KEY[=VALUE]>]...
   [--no-auto-approve]
   [--startup-timeout <DURATION>]
   [--clean-env]
@@ -998,7 +998,7 @@ RPC so the daemon does not need to reread mutable configuration.
 harness = "claude"
 model = "best"
 effort = "high"
-harness_options = ["permission-mode=auto"]
+harness_options = ["chrome", "permission-mode=auto"]
 clean_env = true
 pass_env = ["PATH", "HOME", "SSH_AUTH_SOCK"]
 
@@ -1015,8 +1015,9 @@ client snapshot or clean base < Profile < explicit launch options
 
 Profile `harness_options` are followed by explicit `--harness-option` values.
 They configure the provider CLI rather than the launch environment. Claude
-entries become `--KEY=VALUE`; Codex entries become `--config KEY=VALUE` for
-both provider processes.
+bare entries become `--KEY` and keyed entries become `--KEY=VALUE`; Codex
+requires keyed entries and converts them to `--config KEY=VALUE` for both
+provider processes.
 
 - Default launch environment is a snapshot of the invoking client's
   environment, never the daemon's startup environment.

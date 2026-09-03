@@ -45,7 +45,8 @@ done
 
 # `new` is readiness-bounded. Start it while the fixture emits the authoritative hook.
 "$binary" new --title smoke --alias @smoke --harness claude --cwd "$repo_root" \
-  --request-id smoke-1 --harness-option permission-mode=auto -- smoke-initial >"$state_dir/new.json" &
+  --request-id smoke-1 --harness-option chrome \
+  --harness-option permission-mode=auto -- smoke-initial >"$state_dir/new.json" &
 new_pid=$!
 attempt=0
 launch_id=
@@ -71,6 +72,7 @@ grep -q '"id":"claude:provider-session"' "$state_dir/new.json"
 grep -q '"alias":"@smoke"' "$state_dir/new.json"
 grep -q '"submission":"confirmed"' "$state_dir/new.json"
 if grep -q '"provider_session_id"\|"resume_ref"\|"internal:' "$state_dir/new.json"; then exit 1; fi
+grep -q -- '^--chrome$' "$DLGT_FAKE_ARGS_FILE"
 grep -q -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE"
 if grep -q -- '^--dangerously-skip-permissions$' "$DLGT_FAKE_ARGS_FILE"; then exit 1; fi
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-1","last_assistant_message":"initial-done"}' \

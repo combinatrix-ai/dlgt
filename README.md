@@ -165,7 +165,7 @@ Store reusable launch profiles in `~/.config/dlgt/config.toml`, or point
 harness = "claude"
 model = "claude-fable-5"
 effort = "high"
-harness_options = ["permission-mode=auto"]
+harness_options = ["chrome", "permission-mode=auto"]
 clean_env = true
 
 [profiles.codex-live-search]
@@ -174,7 +174,8 @@ harness_options = ['web_search="live"']
 ```
 
 Harness options map to the provider's native per-launch override: Claude
-receives `--KEY=VALUE`, while Codex receives `--config KEY=VALUE` on both the
+receives a bare `KEY` as `--KEY` and `KEY=VALUE` as `--KEY=VALUE`. Codex
+requires `KEY=VALUE` and receives it as `--config KEY=VALUE` on both the
 managed app-server and remote TUI processes.
 
 dlgt launches both Harnesses auto-approved by default so delegation never

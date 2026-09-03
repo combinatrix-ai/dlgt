@@ -405,7 +405,7 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
         .map(|option| {
             let (key, value) = option
                 .split_once('=')
-                .context("harness option requires KEY=VALUE")?;
+                .map_or((option.as_str(), None), |(key, value)| (key, Some(value)));
             if key.is_empty()
                 || !key
                     .chars()
@@ -413,8 +413,8 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
             {
                 bail!("invalid harness option key {key:?}");
             }
-            if value.is_empty() {
-                bail!("harness option {key:?} requires a non-empty value");
+            if value.is_some_and(str::is_empty) {
+                bail!("harness option {key:?} requires a non-empty value after '='");
             }
             if matches!(
                 key,
@@ -422,7 +422,7 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
             ) {
                 bail!("harness option {key:?} is managed by dlgt");
             }
-            Ok(format!("--{key}={value}"))
+            Ok(value.map_or_else(|| format!("--{key}"), |value| format!("--{key}={value}")))
         })
         .collect()
 }
@@ -523,7 +523,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Agent, LaunchOptions, claude_session_marker, codex_app_server_args,
+        Agent, LaunchOptions, claude_harness_args, claude_session_marker, codex_app_server_args,
         codex_remote_tui_command, command_spec, trust_claude_workspace, trust_codex_workspace,
     };
 
@@ -777,6 +777,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_rejects_bare_harness_options() {
+        let result = codex_app_server_args("unix:///tmp/dlgt.sock", &["chrome".to_owned()]);
+        let Err(error) = result else {
+            panic!("bare Codex harness option should fail");
+        };
+        assert!(error.to_string().contains("requires KEY=VALUE"));
+    }
+
+    #[test]
+    fn claude_rejects_empty_and_managed_bare_harness_options() {
+        for option in ["chrome=", "model"] {
+            let result = claude_harness_args(&[option.to_owned()]);
+            let Err(error) = result else {
+                panic!("invalid Claude harness option {option:?} should fail");
+            };
+            assert!(
+                error.to_string().contains(if option == "model" {
+                    "managed by dlgt"
+                } else {
+                    "requires a non-empty value"
+                }),
+                "unexpected error for {option:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_execution_policy_option_suppresses_implicit_auto_approve() {
         let options = vec!["sandbox_mode=\"read-only\"".to_owned()];
         let spec = codex_remote_tui_command(
@@ -907,6 +934,7 @@ mod tests {
     fn claude_passes_explicit_harness_options() {
         let environment = std::collections::HashMap::new();
         let options = vec![
+            "chrome".to_owned(),
             "permission-mode=auto".to_owned(),
             "dangerously-skip-permissions=true".to_owned(),
         ];
@@ -924,6 +952,7 @@ mod tests {
             auto_approve: true,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
+        assert!(spec.args.iter().any(|arg| arg == "--chrome"));
         assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
         assert!(
             spec.args
