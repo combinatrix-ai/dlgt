@@ -101,6 +101,16 @@ fn harness_option_help_is_provider_neutral() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn acceptance_help_documents_prompt_files() -> Result<(), Box<dyn std::error::Error>> {
+    for command in ["new", "send"] {
+        let help = String::from_utf8(dlgt(&[command, "--help"])?.stdout)?;
+        assert!(help.contains("--prompt-file <PATH>"));
+        assert!(help.contains("Read the required prompt from a file"));
+    }
+    Ok(())
+}
+
+#[test]
 fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::error::Error>> {
     let output = dlgt(&["new", "--", "--help"])?;
 
@@ -206,6 +216,68 @@ fn an_idempotency_key_is_validated_before_the_prompt_is_read()
             );
         }
     }
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn prompt_file_errors_before_starting_a_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let workdir = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .current_dir(workdir.path())
+        .args([
+            "new",
+            "--title",
+            "t",
+            "--harness",
+            "claude",
+            "--request-id",
+            "r1",
+            "--prompt-file",
+            "missing-prompt.md",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("failed to read prompt file missing-prompt.md"),
+        "unexpected output: {stdout}"
+    );
+    assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+#[test]
+fn prompt_sources_are_mutually_exclusive() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let prompt = home.path().join("prompt.md");
+    std::fs::write(&prompt, "from file")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .args([
+            "new",
+            "--title",
+            "t",
+            "--harness",
+            "claude",
+            "--request-id",
+            "r1",
+            "--prompt-file",
+            prompt.to_str().ok_or("non-UTF-8 temporary path")?,
+            "--",
+            "inline",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("--prompt-file, --stdin, and positional prompt are mutually exclusive"),
+        "unexpected output: {stdout}"
+    );
     assert!(!home.path().join("run").exists());
     Ok(())
 }

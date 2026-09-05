@@ -44,8 +44,10 @@ while [ ! -S "$state_dir/run/$version/dlgt.sock" ]; do
 done
 
 # `new` is readiness-bounded. Start it while the fixture emits the authoritative hook.
+printf '%s' 'smoke-initial' >"$state_dir/initial-prompt.md"
 "$binary" new --title smoke --alias @smoke --harness claude --cwd "$repo_root" \
-  --request-id smoke-1 --harness-option permission-mode=auto -- smoke-initial >"$state_dir/new.json" &
+  --request-id smoke-1 --harness-option permission-mode=auto \
+  --prompt-file "$state_dir/initial-prompt.md" >"$state_dir/new.json" &
 new_pid=$!
 attempt=0
 launch_id=
@@ -198,7 +200,9 @@ launch_failure_id=$(printf '%s\n' "$launch_failure_json" \
   | sed -n 's/.*"launch_id":"\([^"]*\)".*/\1/p')
 
 long_message=$(awk 'BEGIN { for (i = 0; i < 12000; i++) printf "x" }')
-send_json=$("$binary" send "$session_id" --request-id smoke-2 -- "$long_message")
+printf '%s' "$long_message" >"$state_dir/follow-up-prompt.md"
+send_json=$("$binary" send "$session_id" --request-id smoke-2 \
+  --prompt-file "$state_dir/follow-up-prompt.md")
 printf '%s\n' "$send_json" | grep -q '"execution_seq":2'
 
 # A running execution must not hide the answer to the previous one.
