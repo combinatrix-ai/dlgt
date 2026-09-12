@@ -109,8 +109,9 @@ Payload identity is the canonical form of the RPC parameters:
   different order still matches;
 - array values in the order given, so `harness_options` must be repeated in
   the same order;
-- `prompt` compared byte for byte. A trailing newline is significant, so
-  `--stdin` from a heredoc and the same text passed after `--` are different
+- `prompt` compared byte for byte. `--prompt-file` and `--stdin` preserve file
+  and stream contents exactly; a trailing newline is significant, so a file
+  or heredoc containing one and the same text passed after `--` are different
   payloads.
 
 An acceptance reserves its `request_id` before it runs. A second call arriving

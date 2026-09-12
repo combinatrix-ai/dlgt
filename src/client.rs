@@ -786,4 +786,12 @@ mod tests {
         assert!(skill.contains("sandbox socket failures\" above and retry the exact command once"));
         assert!(!skill.contains("On `RPC_UNAVAILABLE`, run `dlgt list --all-versions`"));
     }
+
+    #[test]
+    fn embedded_skill_prefers_prompt_files_over_shell_redirection() {
+        let skill = include_str!("../assets/dlgt-skill.md");
+        assert!(skill.contains("--request-id refactor-1 --prompt-file prompt.md"));
+        assert!(skill.contains("Prefer a prompt\nfile with `--prompt-file`"));
+        assert!(skill.contains("needs no shell pipe, heredoc, or input redirection"));
+    }
 }

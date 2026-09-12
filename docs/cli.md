@@ -222,7 +222,7 @@ dlgt new
   [--env <KEY=VALUE>]...
   [--unset-env <KEY>]...
   --request-id <ID>         (required)
-  [--stdin | -- <PROMPT>]   (required)
+  [--prompt-file <PATH> | --stdin | -- <PROMPT>]   (required)
 ```
 
 Rules:
@@ -250,9 +250,13 @@ Rules:
   never unbounded.
 - Session creation and acceptance of the first prompt are one atomic daemon
   operation; omitting it returns `INVALID_ARGUMENT`.
-- `--stdin` reads the exact prompt from standard input and is mutually exclusive
-  with a prompt after `--`. It avoids argv disclosure and length limits.
-- Use `--stdin` when the required prompt should not appear in argv.
+- `--prompt-file` reads the exact UTF-8 prompt from a file. A relative path is
+  resolved from the directory where `dlgt` is invoked, independently of the
+  Session's `--cwd`.
+- `--prompt-file`, `--stdin`, and a prompt after `--` are mutually exclusive.
+  Both file and stdin input avoid putting the prompt text in argv.
+- Prefer `--prompt-file` for long prompts from an agent-controlled shell. It
+  needs no pipe, heredoc, or input redirection.
 - `--request-id` is required, and must be non-empty and at most 128 bytes.
   Retrying the same ID with a byte-identical payload returns the original
   acceptance receipt with `"replayed": true` instead of creating a second
@@ -392,7 +396,7 @@ Rules:
 dlgt send <SESSION_ID|@ALIAS>
   --request-id <ID>         (required)
   [--pretty]
-  [--stdin | -- <PROMPT>]   (required)
+  [--prompt-file <PATH> | --stdin | -- <PROMPT>]   (required)
 ```
 
 Resume a provider conversation after its owning daemon exits with the same
@@ -412,7 +416,7 @@ dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
   [--unset-env <KEY>]...
   --request-id <ID>         (required)
   [--pretty]
-  [--stdin | -- <PROMPT>]   (required)
+  [--prompt-file <PATH> | --stdin | -- <PROMPT>]   (required)
 ```
 
 The launch options above are accepted only with `--resume`, and `--harness`
@@ -432,7 +436,9 @@ Rules:
 - The prompt is required. `--` is recommended so prompt text beginning with an
   option-like token is never parsed as a CLI option; multiple remaining words
   are joined with spaces.
-- `--stdin` is the mutually exclusive safe path for long or sensitive prompts.
+- `--prompt-file`, `--stdin`, and a positional prompt are mutually exclusive.
+  Prefer `--prompt-file` for long prompts from an agent-controlled shell so
+  no shell pipe or redirection wraps the direct `dlgt send` invocation.
 - If the Session is idle, dlgt accepts the prompt and transitions it to busy.
 - If the Session is busy, canceling, blocked, stopping, stopped, or
   attached, the command fails immediately and has no side effects. Busy and

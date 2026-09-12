@@ -139,11 +139,12 @@ fn command_server(args: &[String]) -> Result<()> {
 }
 
 fn command_new(args: &[String]) -> Result<()> {
+    let options = acceptance_options();
     let parsed = Args::parse(
         "new",
         args,
         &["--stdin", "--pretty", "--clean-env", "--no-auto-approve"],
-        LAUNCH_OPTIONS,
+        &options,
     )?;
     let title = parsed.required("--title")?;
     let profile = parsed.one("--profile").map(load_profile).transpose()?;
@@ -159,8 +160,8 @@ fn command_new(args: &[String]) -> Result<()> {
     // Validated before the prompt so a caller is never asked for stdin only to
     // be told the invocation was wrong.
     let request_id = require_request_id("new", &parsed)?;
-    let prompt =
-        prompt_from(&parsed, 0)?.context("missing initial prompt; use --stdin or -- PROMPT")?;
+    let prompt = prompt_from(&parsed, 0)?
+        .context("missing initial prompt; use --prompt-file, --stdin, or -- PROMPT")?;
     let cwd = launch_cwd(&parsed)?;
     let model = parsed.one("--model").or_else(|| {
         profile
@@ -210,6 +211,7 @@ fn command_new(args: &[String]) -> Result<()> {
 }
 
 fn command_send(args: &[String]) -> Result<()> {
+    let options = acceptance_options();
     let parsed = Args::parse(
         "send",
         args,
@@ -220,14 +222,15 @@ fn command_send(args: &[String]) -> Result<()> {
             "--clean-env",
             "--no-auto-approve",
         ],
-        LAUNCH_OPTIONS,
+        &options,
     )?;
     let session = parsed
         .positionals
         .first()
         .context("missing Session selector")?;
     let request_id = require_request_id("send", &parsed)?;
-    let prompt = prompt_from(&parsed, 1)?.context("missing prompt; use --stdin or -- PROMPT")?;
+    let prompt = prompt_from(&parsed, 1)?
+        .context("missing prompt; use --prompt-file, --stdin, or -- PROMPT")?;
     if parsed.one("--harness").is_some() {
         bail!("--harness is derived from the provider-qualified resume selector");
     }
@@ -614,6 +617,14 @@ const LAUNCH_OPTIONS: &[&str] = &[
     "--unset-env",
 ];
 
+fn acceptance_options() -> Vec<&'static str> {
+    LAUNCH_OPTIONS
+        .iter()
+        .copied()
+        .chain(["--prompt-file"])
+        .collect()
+}
+
 #[derive(Default)]
 struct Args {
     positionals: Vec<String>,
@@ -753,15 +764,26 @@ fn unknown_option(command: &str, name: &str) -> anyhow::Error {
 }
 
 fn prompt_from(parsed: &Args, skip: usize) -> Result<Option<String>> {
+    let prompt_file = parsed.one("--prompt-file");
+    let has_positional_prompt = parsed.positionals.len() > skip;
+    let source_count = usize::from(parsed.flag("--stdin"))
+        + usize::from(prompt_file.is_some())
+        + usize::from(has_positional_prompt);
+    if source_count > 1 {
+        bail!("--prompt-file, --stdin, and positional prompt are mutually exclusive");
+    }
+    if let Some(path) = prompt_file {
+        let path = Path::new(path);
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read prompt file {}", path.display()))
+            .map(Some);
+    }
     if parsed.flag("--stdin") {
-        if parsed.positionals.len() > skip {
-            bail!("--stdin and positional prompt are mutually exclusive");
-        }
         let mut prompt = String::new();
         io::stdin().read_to_string(&mut prompt)?;
         return Ok(Some(prompt));
     }
-    Ok((parsed.positionals.len() > skip).then(|| parsed.positionals[skip..].join(" ")))
+    Ok(has_positional_prompt.then(|| parsed.positionals[skip..].join(" ")))
 }
 
 fn parse_duration(value: &str) -> Result<Duration> {
@@ -973,13 +995,13 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt update - install the latest release and embedded Skills\n\nUSAGE\n  dlgt update [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "new" => {
-            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Harness option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY=VALUE>   Harness option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "restart" => {
             "dlgt restart - replace a Session process and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "send" => {
-            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Harness option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY=VALUE>   Harness option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "fetch" => {
             "dlgt fetch - read one Session since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --cursor <N>            Observation position from a previous response\n  --wait <DURATION>       Wait for the active/latest execution's terminal result (max 24h)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."

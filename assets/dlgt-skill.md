@@ -83,7 +83,7 @@ Put a multi-line prompt in a file (see "Long prompts" below), then:
 
 ```bash
 dlgt new --title "long refactor" --harness claude --cwd /abs/path \
-  --request-id refactor-1 --stdin < prompt.md
+  --request-id refactor-1 --prompt-file prompt.md
 ```
 
 Let the submission JSON print. Do NOT capture it into a shell variable and
@@ -296,7 +296,7 @@ a Codex upgrade, drop to this fallback.
 ```bash
 # 1. Submit in the foreground; it returns after a short confirmation window.
 dlgt new --title "long refactor" --harness codex --cwd /abs/path \
-  --request-id refactor-1 --stdin < prompt.md
+  --request-id refactor-1 --prompt-file prompt.md
 
 # 2. Observe with ONE long fetch, run through the Bash tool's background
 #    mechanism (run_in_background), substituting the printed values:
@@ -317,9 +317,17 @@ another fetch from that returned cursor; do not resend the prompt.
 ## Long prompts
 
 A self-contained delegation prompt is usually multi-line. Prefer a prompt
-file with `--stdin` (as in both workflows above); it keeps the prompt out of
-argv and away from shell quoting entirely. A heredoc also works from a plain
-shell:
+file with `--prompt-file` (as in both workflows above). It keeps the prompt
+text out of argv and needs no shell pipe, heredoc, or input redirection.
+
+A relative prompt-file path is resolved from the directory where the `dlgt`
+client is invoked, not the Session's `--cwd`; use an absolute path when those
+may differ. Keep the file byte-identical until the submission receipt is
+safely visible, because request-id replay compares the resulting prompt bytes.
+
+`--stdin` remains available for a genuine pipeline or interactive terminal.
+A heredoc also works from a plain shell, but is not preferred from an agent
+tool:
 
 ```bash
 dlgt new --title "counterpart review" --harness claude --cwd /abs/path \
@@ -340,7 +348,7 @@ file.
 
 | Command | Required | Optional, with its default |
 | --- | --- | --- |
-| `new` | `--title`, `--request-id`, a Harness (`--harness` or `--profile <PROFILE>`), and the prompt (`--stdin` or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--no-auto-approve` (default is auto-approved), `--startup-timeout` (60s), env options |
+| `new` | `--title`, `--request-id`, a Harness (`--harness` or `--profile <PROFILE>`), and the prompt (`--prompt-file`, `--stdin`, or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--no-auto-approve` (default is auto-approved), `--startup-timeout` (60s), env options |
 | `send` | the Session address, `--request-id`, and the prompt | `--resume`; launch options are accepted only with it |
 | `fetch` | the Session address | `--cursor` (omit = bounded baseline snapshot), `--wait <DURATION>` (omit = return immediately; binds to the active/latest execution and waits for its terminal result; up to 24h), `--screen[=N]`/`--no-screen`, `--max-bytes` (32 KiB) |
 | `stop`, `cancel`, `show`, `restart` | the Session address | `cancel --timeout` (30s), `stop --force` |

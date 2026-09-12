@@ -191,27 +191,31 @@ the counterpart Harness and confirm that it completes a simple delegated task:
 From Codex:
 
 ~~~sh
+printf '%s\n' 'Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate.' \
+  > /tmp/dlgt-verify-prompt.md
 dlgt new \
   --title "dlgt installation verification" \
   --harness claude \
   --cwd . \
   --alias @dlgt-verify \
   --request-id dlgt-verify-1 \
-  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
-  && dlgt fetch @dlgt-verify --wait 5m
+  --prompt-file /tmp/dlgt-verify-prompt.md
+dlgt fetch @dlgt-verify --wait 5m
 ~~~
 
 From Claude:
 
 ~~~sh
+printf '%s\n' 'Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate.' \
+  > /tmp/dlgt-verify-prompt.md
 dlgt new \
   --title "dlgt installation verification" \
   --harness codex \
   --cwd . \
   --alias @dlgt-verify \
   --request-id dlgt-verify-1 \
-  -- "Reply with exactly DLGT_OK. Do not use tools, edit files, or delegate." \
-  && dlgt fetch @dlgt-verify --wait 5m
+  --prompt-file /tmp/dlgt-verify-prompt.md
+dlgt fetch @dlgt-verify --wait 5m
 ~~~
 
 Both commands print one JSON document each, on their own line. The `fetch`
