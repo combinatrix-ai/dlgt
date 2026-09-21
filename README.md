@@ -75,7 +75,7 @@ for supported targets and verification steps.
 
 ## What dlgt does
 
-`dlgt` runs Codex and Claude as live, addressable local Sessions. Each
+`dlgt` runs Codex, Claude, and Cursor CLI as live, addressable local Sessions. Each
 Session owns one harness process, one PTY, one terminal screen, and at most one
 active execution.
 
@@ -86,7 +86,7 @@ active execution.
 - The leader sees the counterpart's result and decides what to use.
 
 `dlgt` is not a planner, company simulator, workflow language, or multi-agent
-framework. It is the bridge between two competing harnesses.
+framework. It is the bridge between coding-agent harnesses.
 
 ## Why not the DIY routes
 
@@ -177,15 +177,14 @@ Harness options map to the provider's native per-launch override: Claude
 receives `--KEY=VALUE`, while Codex receives `--config KEY=VALUE` on both the
 managed app-server and remote TUI processes.
 
-dlgt launches both Harnesses auto-approved by default so delegation never
-blocks on permission prompts. Opt out per Session with `--no-auto-approve` or
+dlgt launches Harnesses with their supported auto-approval settings by default. Opt out per Session with `--no-auto-approve` or
 per Profile with `auto_approve = false`.
 
 Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
 override only the current version's socket. Session state is held in memory by
 the daemon that owns the Harness processes. The returned Session ID is also
 the provider conversation's durable resume selector: after that daemon exits,
-pass the same `codex:<id>` or `claude:<id>` to `send --resume`. Plain `send`
+pass the same `codex:<id>`, `claude:<id>`, or `cursor:<id>` to `send --resume`. Plain `send`
 scans live versioned sockets first, so a binary update routes that same ID back
 to its owning daemon instead of creating a duplicate.
 
@@ -193,6 +192,18 @@ The daemon owns every provider process group. A sibling reaper runs in a
 separate process group and ignores ordinary shutdown signals; when the daemon
 is killed abruptly, loss of its control pipe terminates any provider groups
 that were still registered.
+
+## Cursor CLI
+
+Use `--harness cursor` to run the official interactive Cursor CLI in a PTY.
+New sessions, follow-ups, result retrieval, attach, cancellation, stop, and
+`send --resume` use the same Session commands. Install/login first; set
+`DLGT_CURSOR_BIN` on the daemon to override the `cursor-agent` executable.
+The adapter registers an inert-outside-dlgt bridge in `~/.cursor/hooks.json`.
+See [Cursor CLI details and limitations](docs/cli.md#cursor-interactive-cli)
+before use, including current model-discovery, restart, and permission-prompt
+limitations. Authenticated macOS E2E covers new sessions, follow-ups, resume,
+and cancellation; see the CLI documentation for the tested version.
 
 ## Build and verify
 

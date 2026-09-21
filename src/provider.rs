@@ -43,6 +43,7 @@ pub fn claude_session_marker(provider_id: &str) -> String {
 pub enum Agent {
     Codex,
     Claude,
+    Cursor,
 }
 
 impl Agent {
@@ -50,7 +51,8 @@ impl Agent {
         match value {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
-            _ => bail!("unsupported agent {value:?}; expected codex or claude"),
+            "cursor" => Ok(Self::Cursor),
+            _ => bail!("unsupported agent {value:?}; expected codex, claude, or cursor"),
         }
     }
 
@@ -58,12 +60,13 @@ impl Agent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
         }
     }
 
     pub fn semantic_input(self, prompt: &str) -> Result<Vec<u8>> {
         match self {
-            Self::Claude => bracketed_paste_input(prompt),
+            Self::Claude | Self::Cursor => bracketed_paste_input(prompt),
             Self::Codex => bail!("Codex semantic input must use app-server turn/start"),
         }
     }
@@ -71,7 +74,7 @@ impl Agent {
     pub const fn cancel_input(self) -> &'static [u8] {
         match self {
             Self::Codex => &[0x03],
-            Self::Claude => &[0x1b],
+            Self::Claude | Self::Cursor => &[0x1b],
         }
     }
 }
@@ -101,6 +104,7 @@ pub struct LaunchOptions<'a> {
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
     pub auto_approve: bool,
+    pub initial_prompt: Option<&'a str>,
 }
 
 pub(crate) fn provider_display_name(title: &str) -> String {
@@ -130,6 +134,7 @@ pub fn command_spec(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     match options.agent {
         Agent::Codex => bail!("Codex requires the app-server runtime"),
         Agent::Claude => claude_command(options),
+        Agent::Cursor => crate::cursor_agent::command(options),
     }
 }
 
@@ -189,6 +194,7 @@ pub(crate) fn codex_app_server_args(
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
     match agent {
+        Agent::Cursor => {}
         Agent::Codex => {
             let home = std::env::var_os("CODEX_HOME").map_or_else(
                 || {
@@ -326,7 +332,7 @@ fn project_is_trusted(document: &DocumentMut, cwd: &str) -> bool {
         == Some("trusted")
 }
 
-fn write_config_atomic(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_config_atomic(path: &Path, contents: &str) -> Result<()> {
     let parent = path.parent().context("config path has no parent")?;
     let name = path
         .file_name()
@@ -550,6 +556,7 @@ mod tests {
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
@@ -580,6 +587,7 @@ mod tests {
             resume_provider_id: None,
             environment: &std::collections::HashMap::new(),
             auto_approve: true,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(
@@ -609,6 +617,7 @@ mod tests {
             resume_provider_id: None,
             environment: &environment,
             auto_approve: false,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(
@@ -641,6 +650,7 @@ mod tests {
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(spec.args.iter().any(|arg| arg == "--permission-mode=plan"));
@@ -672,6 +682,7 @@ mod tests {
                 resume_provider_id: None,
                 environment: &environment,
                 auto_approve: true,
+                initial_prompt: None,
             },
             Path::new("/tmp/dlgt.sock"),
         )
@@ -716,6 +727,7 @@ mod tests {
                 resume_provider_id: None,
                 environment: &environment,
                 auto_approve: false,
+                initial_prompt: None,
             },
             Path::new("/tmp/dlgt.sock"),
         )
@@ -764,6 +776,7 @@ mod tests {
                 resume_provider_id: None,
                 environment: &std::collections::HashMap::new(),
                 auto_approve: true,
+                initial_prompt: None,
             },
             Path::new("/tmp/dlgt.sock"),
         )
@@ -792,6 +805,7 @@ mod tests {
                 resume_provider_id: None,
                 environment: &std::collections::HashMap::new(),
                 auto_approve: true,
+                initial_prompt: None,
             },
             Path::new("/tmp/dlgt.sock"),
         )
@@ -835,6 +849,7 @@ mod tests {
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         let settings = spec
@@ -869,6 +884,7 @@ mod tests {
             resume_provider_id: Some("claude-session"),
             environment: &environment,
             auto_approve: true,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build Claude command: {error}"));
         assert!(
@@ -891,6 +907,7 @@ mod tests {
                 resume_provider_id: Some("codex-thread"),
                 environment: &environment,
                 auto_approve: true,
+                initial_prompt: None,
             },
             Path::new("/tmp/dlgt.sock"),
         )
@@ -922,6 +939,7 @@ mod tests {
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
+            initial_prompt: None,
         })
         .unwrap_or_else(|error| panic!("failed to build command: {error}"));
         assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
@@ -948,6 +966,7 @@ mod tests {
             resume_provider_id: None,
             environment: &environment,
             auto_approve: true,
+            initial_prompt: None,
         });
         let Err(error) = result else {
             panic!("managed harness option should fail");

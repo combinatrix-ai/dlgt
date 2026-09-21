@@ -10,7 +10,7 @@ Backward compatibility with earlier drafts is not required.
 ## Product boundary
 
 `dlgt` is a local, single-binary runtime for live, addressable, and
-attachable Codex and Claude subagents. `Session` is its only public runtime
+attachable Codex, Claude, and Cursor CLI subagents. `Session` is its only public runtime
 object.
 
 Each Session owns one provider conversation, one harness process set and its
@@ -19,7 +19,7 @@ controller. The owning version's daemon keeps Session state, executions,
 lifecycle events, results, bounded raw PTY bytes, and rendered scrollback in
 memory. When that daemon exits, its dlgt Session state disappears; the returned
 provider-qualified Session ID remains the durable lookup and resume key in
-Codex or Claude.
+the provider.
 
 Provider turns, steering messages, and delivery attempts are
 internal correlation records. They do not have public selectors and do not
@@ -142,6 +142,30 @@ event and otherwise ignored.
 
 The result returned by `turn/start` is dispatch acknowledgement. The matching
 notifications remain authoritative for continuing and terminal state.
+
+## Cursor lifecycle observation
+
+Cursor uses the official interactive CLI in an owned PTY. The first prompt
+is passed on launch, including on resume; `beforeSubmitPrompt` binds the
+conversation ID and generation ID to the reserved initial execution. Startup
+therefore confirms the first prompt's hook rather than relying on a
+`sessionStart` event that is absent on resume. Later prompts use bracketed
+paste. The unique launch selector, conversation ID, canonical workspace, and
+generation ID guard callbacks across concurrent sessions and resume.
+
+`afterAgentResponse` retains response text; `stop(completed)` finalizes only
+once that generation's response is also available. Their arrival order does
+not matter. `stop(error)` fails and `stop(aborted)` interrupts; a matching
+stop after cancellation proves quiescence. Missing notifications do not imply
+completion. Callback bodies and screenshots are not retained as event data.
+
+Current Cursor limitations are explicit: no prompt-free `restart`, no
+structured permission-prompt observation, and no model catalog through dlgt.
+The user-level hook bridge is scoped by child environment variables and
+preserves existing hooks. See [CLI](cli.md#cursor-interactive-cli) for the
+configuration footprint, interaction with user hooks, and authenticated
+validation results. Automated fixtures separately cover callback ordering,
+routing, and rejection of stale events.
 
 ## Claude lifecycle observation
 

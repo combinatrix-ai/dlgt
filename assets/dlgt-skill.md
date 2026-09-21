@@ -5,7 +5,7 @@ description: Delegate work to the competing harness - run Claude from Codex, or 
 
 # dlgt
 
-`dlgt` runs a Codex or Claude subagent in a dlgt-owned PTY that stays alive
+`dlgt` runs a Codex, Claude, or Cursor CLI subagent in a dlgt-owned PTY that stays alive
 between commands. Reach for it whenever the work should cross the provider
 boundary.
 
@@ -45,7 +45,7 @@ Terms used below:
 ```text
 Session   One Harness process and PTY, one controller, at most one active
           execution, no queue. The only public runtime object.
-Harness   The provider adapter, codex or claude.
+Harness   The provider adapter, codex, claude, or cursor.
 Title     A human description.
 Alias     A short human address derived from the title.
 Profile   A reusable client-side launch specification.
@@ -566,3 +566,20 @@ stable across restart and resume; dlgt does not add marker text to prompts.
 Archiving means operating Claude Desktop's own UI — if the conversation cannot
 be identified, or UI control is unavailable, report that instead of guessing,
 and never edit provider storage or transcript files directly.
+
+## Cursor CLI sessions
+
+When the user selects Cursor, use `--harness cursor`. This starts the official
+interactive CLI in a PTY, not ACP or the desktop application. Use the returned
+`cursor:<conversation-id>` with send/fetch/attach/stop and `send --resume`.
+Cursor CLI must be installed and logged in; `DLGT_CURSOR_BIN` selects the
+executable when the daemon starts. Launch registers a bridge in
+`~/.cursor/hooks.json` that preserves existing handlers and only runs inside
+dlgt children. Defaults pass `--trust --force`; `--no-auto-approve` omits both.
+
+Use `--model` but not `--effort`; model discovery is currently unavailable in
+dlgt, so consult `cursor-agent --list-models`. Supported harness options are
+`mode=plan|ask` and `sandbox=enabled|disabled`. Cursor `restart` is unsupported;
+use stop then send --resume. Permission prompts may leave the session busy,
+so inspect the screen and use human attach. Do not infer completion from
+quiet output: the response and stop hooks must agree on the generation.

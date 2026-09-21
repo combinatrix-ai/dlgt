@@ -488,3 +488,12 @@ because a provider can echo its environment.
 Raw transcript pages are deliberately separate from rendered scrollback. They
 may contain control bytes, redraw noise, and provider-emitted secrets; clients
 should request and retain them only for explicit diagnosis.
+
+## Cursor Harness
+
+`harness: "cursor"` selects the interactive Cursor CLI adapter and returns
+`cursor:<conversation-id>` Session IDs. It supports the same create, send,
+fetch, cancel, attach, stop, and explicit-resume RPC paths. `harness.list`
+advertises `effort: false`, `restart: false`, and unavailable model discovery.
+See [Cursor CLI](cli.md#cursor-interactive-cli) for hook registration and the
+current limitations; this path does not use ACP or a desktop app.

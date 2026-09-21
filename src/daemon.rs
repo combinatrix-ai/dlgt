@@ -437,7 +437,7 @@ impl Drop for ProviderReservation {
 }
 
 enum AgentRuntime {
-    Claude(Arc<SessionRuntime>),
+    Pty(Arc<SessionRuntime>),
     Codex {
         control: Arc<CodexConnection>,
         provider_thread_id: String,
@@ -448,7 +448,7 @@ enum AgentRuntime {
 impl AgentRuntime {
     fn provider_id(&self) -> Option<&str> {
         match self {
-            Self::Claude(_) => None,
+            Self::Pty(_) => None,
             Self::Codex {
                 provider_thread_id, ..
             } => Some(provider_thread_id),
@@ -457,56 +457,56 @@ impl AgentRuntime {
 
     fn pid(&self) -> Option<u32> {
         match self {
-            Self::Claude(runtime) => runtime.pid(),
+            Self::Pty(runtime) => runtime.pid(),
             Self::Codex { view, .. } => view.pid(),
         }
     }
 
     fn write(&self, data: &[u8]) -> Result<()> {
         match self {
-            Self::Claude(runtime) => runtime.write(data),
+            Self::Pty(runtime) => runtime.write(data),
             Self::Codex { view, .. } => view.write(data),
         }
     }
 
     fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         match self {
-            Self::Claude(runtime) => runtime.resize(rows, cols),
+            Self::Pty(runtime) => runtime.resize(rows, cols),
             Self::Codex { view, .. } => view.resize(rows, cols),
         }
     }
 
     fn subscribe(&self) -> Result<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
         match self {
-            Self::Claude(runtime) => runtime.subscribe(),
+            Self::Pty(runtime) => runtime.subscribe(),
             Self::Codex { view, .. } => view.subscribe(),
         }
     }
 
     fn last_output_age(&self) -> Result<Option<Duration>> {
         match self {
-            Self::Claude(runtime) => runtime.last_output_age(),
+            Self::Pty(runtime) => runtime.last_output_age(),
             Self::Codex { view, .. } => view.last_output_age(),
         }
     }
 
     fn stop(&self) -> Result<()> {
         match self {
-            Self::Claude(runtime) => runtime.stop(),
+            Self::Pty(runtime) => runtime.stop(),
             Self::Codex { view, .. } => view.stop(),
         }
     }
 
     fn force_stop(&self) -> Result<()> {
         match self {
-            Self::Claude(runtime) => runtime.force_stop(),
+            Self::Pty(runtime) => runtime.force_stop(),
             Self::Codex { view, .. } => view.force_stop(),
         }
     }
 
     fn wait_for_input_ready(&self, timeout: Duration) -> Result<()> {
         match self {
-            Self::Claude(runtime) => runtime.wait_for_input_ready(timeout),
+            Self::Pty(runtime) => runtime.wait_for_input_ready(timeout),
             Self::Codex { view, .. } => view.wait_for_input_ready(timeout),
         }
     }
@@ -523,7 +523,7 @@ impl AgentRuntime {
                 control.watch_turn(provider_thread_id, &turn_id)?;
                 Ok(turn_id)
             }
-            Self::Claude(_) => bail!("Claude turns use semantic PTY input"),
+            Self::Pty(_) => bail!("PTY turns use semantic PTY input"),
         }
     }
 
@@ -534,7 +534,7 @@ impl AgentRuntime {
                 provider_thread_id,
                 ..
             } => control.interrupt_turn(provider_thread_id, provider_turn_id),
-            Self::Claude(_) => bail!("Claude turns use semantic PTY input"),
+            Self::Pty(_) => bail!("PTY turns use semantic PTY input"),
         }
     }
 }
@@ -649,7 +649,7 @@ impl Daemon {
                         ));
                     }
                 } else if selector.split_once(':').is_some_and(|(agent, id)| {
-                    matches!(agent, "codex" | "claude") && !id.is_empty()
+                    matches!(agent, "codex" | "claude" | "cursor") && !id.is_empty()
                 }) {
                     error.session_id = Some(selector.to_owned());
                 }
@@ -759,11 +759,15 @@ impl Daemon {
                 .context("invalid harness_options")?,
             Some(_) => bail!("harness_options must be an array"),
         };
+        if agent == Agent::Cursor {
+            crate::cursor_agent::validate(effort, &harness_options)?;
+            agent.semantic_input(initial_prompt)?;
+        }
         let auto_approve = params
             .get("auto_approve")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let environment = params
+        let mut environment = params
             .get("environment")
             .and_then(Value::as_object)
             .context("missing launch environment snapshot")?
@@ -823,11 +827,36 @@ impl Daemon {
             .record_event(Some(&id), None, "session.created");
         self.lock_store()?.set_terminal_size(&id, rows, cols);
         let runtime_session_id = Arc::new(RwLock::new(id.clone()));
-        let mut pending_provider_id = if agent == Agent::Claude {
+        let mut pending_provider_id = if agent == Agent::Codex {
+            None
+        } else {
             Some(PendingProviderId::register(
                 &self.pending_provider_ids,
                 &id,
             )?)
+        };
+        let cursor_initial = if agent == Agent::Cursor {
+            let mut store = self.lock_store()?;
+            if let Err(error) = crate::cursor_agent::configure(&mut environment, &id) {
+                store.set_session_failed(&id);
+                return Err(error);
+            }
+            let prior = provider_ref
+                .as_deref()
+                .filter(|id| store.get_session(id).is_some());
+            let cursor = Self::acceptance_cursor(&store, prior.unwrap_or(&id))?;
+            let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+            let turn = store.insert_cursor_initial_turn(&turn_id, &id, initial_prompt, prior)?;
+            store.record_event(Some(&id), Some(&turn_id), "turn.submitted");
+            if let Some(provider_id) = resume_provider_id {
+                *self
+                    .pending_provider_ids
+                    .lock()
+                    .map_err(|_| anyhow!("pending provider ID map lock poisoned"))?
+                    .get_mut(&id)
+                    .context("missing Cursor binding")? = Some(provider_id.to_owned());
+            }
+            Some((turn, cursor))
         } else {
             None
         };
@@ -843,6 +872,7 @@ impl Daemon {
             resume_provider_id,
             environment: &environment,
             auto_approve,
+            initial_prompt: (agent == Agent::Cursor).then_some(initial_prompt),
         };
 
         let startup_timeout = Duration::from_millis(
@@ -854,8 +884,8 @@ impl Daemon {
         );
         let startup_deadline = Instant::now() + startup_timeout;
         let runtime = match agent {
-            Agent::Claude => command_spec(&options)
-                .and_then(|spec| self.spawn_claude_runtime(&runtime_session_id, &spec, rows, cols)),
+            Agent::Claude | Agent::Cursor => command_spec(&options)
+                .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
             Agent::Codex => {
                 self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, startup_timeout)
             }
@@ -919,7 +949,15 @@ impl Daemon {
         }
         loop {
             let current = self.resolve_session(&id)?;
-            if current.state == SessionState::Idle {
+            if let Some((turn, _)) = &cursor_initial {
+                if self
+                    .lock_store()?
+                    .get_turn(&turn.id)
+                    .is_some_and(|turn| turn.started_at_ms.is_some())
+                {
+                    break;
+                }
+            } else if current.state == SessionState::Idle {
                 break;
             }
             if current.state.is_terminal() {
@@ -939,9 +977,9 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(25));
         }
         let provider_id = match agent {
-            Agent::Claude => pending_provider_id
+            Agent::Claude | Agent::Cursor => pending_provider_id
                 .as_mut()
-                .context("missing Claude provider ID binding")?
+                .context("missing hook provider ID binding")?
                 .take()?,
             Agent::Codex => runtime
                 .provider_id()
@@ -965,24 +1003,44 @@ impl Daemon {
             let store = self.lock_store()?;
             store.record_event(Some(&id), None, "session.created");
             store.record_event(Some(&id), None, "session.ready");
+            if let Some((turn, _)) = &cursor_initial {
+                store.record_event(Some(&id), Some(&turn.id), "turn.submitted");
+                store.record_event(Some(&id), Some(&turn.id), "turn.started");
+                if let Some(current) = store.get_turn(&turn.id) {
+                    let terminal = match current.state {
+                        TurnState::Completed => Some("turn.completed"),
+                        TurnState::Failed => Some("turn.failed"),
+                        TurnState::Interrupted => Some("turn.interrupted"),
+                        _ => None,
+                    };
+                    if let Some(kind) = terminal {
+                        store.record_event(Some(&id), Some(&turn.id), kind);
+                    }
+                }
+            }
         }
         let correlation_id = params
             .get("correlation_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let mut response = match self.submit_turn(&json!({
-            "session": id,
-            "prompt": initial_prompt,
-            "correlation_id": correlation_id,
-        })) {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = runtime.force_stop();
-                self.lock_store()?.set_session_failed(&id);
-                return Err(Self::session_launch_failure(
-                    &id,
-                    &error.context("initial prompt acceptance failed"),
-                ));
+        let mut response = if let Some((turn, cursor)) = cursor_initial {
+            json!({"session": self.public_session(&self.resolve_session(&id)?)?,
+                "execution_seq": turn.execution_seq, "cursor": cursor, "submission": "confirmed"})
+        } else {
+            match self.submit_turn(&json!({
+                "session": id,
+                "prompt": initial_prompt,
+                "correlation_id": correlation_id,
+            })) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = runtime.force_stop();
+                    self.lock_store()?.set_session_failed(&id);
+                    return Err(Self::session_launch_failure(
+                        &id,
+                        &error.context("initial prompt acceptance failed"),
+                    ));
+                }
             }
         };
         if !correlation_id.is_empty() {
@@ -1045,9 +1103,9 @@ impl Daemon {
 
         let (agent, provider_id) = selector
             .split_once(':')
-            .filter(|(agent, id)| matches!(*agent, "codex" | "claude") && !id.is_empty())
+            .filter(|(agent, id)| matches!(*agent, "codex" | "claude" | "cursor") && !id.is_empty())
             .context(
-                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id> or claude:<id> with --resume",
+                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id>, claude:<id>, or cursor:<id> with --resume",
             )?;
         self.launch_resumed_session(params, agent, provider_id, None, None)
     }
@@ -1098,6 +1156,9 @@ impl Daemon {
             .context("session is unavailable because it has no provider conversation to resume")?
             .to_owned();
         let agent = Agent::parse(&session.agent)?;
+        if agent == Agent::Cursor {
+            bail!("Cursor restart is unsupported; use stop then send --resume with a prompt");
+        }
         let cwd = PathBuf::from(&session.cwd)
             .canonicalize()
             .context("session cwd does not exist")?;
@@ -1188,19 +1249,20 @@ impl Daemon {
             resume_provider_id: Some(&provider_id),
             environment: &environment,
             auto_approve: session.auto_approve,
+            initial_prompt: None,
         };
         let runtime_session_id = Arc::new(RwLock::new(session.id.clone()));
-        let mut pending_provider_id = if agent == Agent::Claude {
+        let mut pending_provider_id = if agent == Agent::Codex {
+            None
+        } else {
             Some(PendingProviderId::register(
                 &self.pending_provider_ids,
                 &session.id,
             )?)
-        } else {
-            None
         };
         let runtime = match agent {
-            Agent::Claude => command_spec(&options)
-                .and_then(|spec| self.spawn_claude_runtime(&runtime_session_id, &spec, rows, cols)),
+            Agent::Claude | Agent::Cursor => command_spec(&options)
+                .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
             Agent::Codex => {
                 self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, remaining)
             }
@@ -1264,9 +1326,9 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(25));
         }
         let rebound_provider_id = match agent {
-            Agent::Claude => pending_provider_id
+            Agent::Claude | Agent::Cursor => pending_provider_id
                 .as_mut()
-                .context("missing Claude provider ID binding")?
+                .context("missing hook provider ID binding")?
                 .take()?,
             Agent::Codex => runtime
                 .provider_id()
@@ -1279,7 +1341,7 @@ impl Daemon {
         Ok(json!({"session": self.public_session(&current)?}))
     }
 
-    fn spawn_claude_runtime(
+    fn spawn_hook_runtime(
         &self,
         runtime_session_id: &Arc<RwLock<String>>,
         spec: &CommandSpec,
@@ -1316,9 +1378,9 @@ impl Daemon {
         )?;
         runtime.track_with(
             self.reaper
-                .watch(runtime.pid().context("Claude runtime had no pid")?)?,
+                .watch(runtime.pid().context("PTY runtime had no pid")?)?,
         )?;
-        Ok(Arc::new(AgentRuntime::Claude(runtime)))
+        Ok(Arc::new(AgentRuntime::Pty(runtime)))
     }
 
     fn spawn_codex_runtime(
@@ -1601,7 +1663,7 @@ impl Daemon {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let input = match agent {
             Agent::Codex => prompt.as_bytes().to_vec(),
-            Agent::Claude => agent.semantic_input(prompt)?,
+            Agent::Claude | Agent::Cursor => agent.semantic_input(prompt)?,
         };
         let (turn, acceptance_cursor) = {
             let mut store = self.lock_store()?;
@@ -1649,7 +1711,7 @@ impl Daemon {
                     return Err(error);
                 }
             },
-            Agent::Claude => {
+            Agent::Claude | Agent::Cursor => {
                 if let Err(error) = write_semantic_input(&runtime, &input) {
                     let store = self.lock_store()?;
                     let message = sanitize_message(&error.to_string());
@@ -1664,7 +1726,11 @@ impl Daemon {
                     store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
                     return Err(error);
                 }
-                if let Ok(store) = self.lock_store() {
+                if let Ok(store) = self.lock_store()
+                    && store
+                        .get_session(&session.id)
+                        .is_some_and(|current| current.active_turn_id.as_deref() == Some(&turn_id))
+                {
                     store.set_session_state(&session.id, SessionState::Busy);
                 }
             }
@@ -1799,12 +1865,12 @@ impl Daemon {
             if !store.cancel_turn(&turn.id)? {
                 bail!("turn is already terminal or no longer active");
             }
-            if agent == Agent::Claude {
+            if agent != Agent::Codex {
                 store.allocate_input_sequence();
             }
             store.record_event(Some(&turn.session_id), Some(&turn.id), "turn.canceled");
         }
-        if agent == Agent::Claude {
+        if agent != Agent::Codex {
             runtime.write(cancel_input)?;
         }
         Ok(json!({"canceled": true, "turn_id": turn.id}))
@@ -2145,6 +2211,10 @@ impl Daemon {
 
     fn list_models(&self, params: &Value) -> Result<Value> {
         match params_string(params, "harness")? {
+            "cursor" => Ok(
+                json!({"harness":"cursor","source":"cli","discovery":"unavailable",
+                "models":[],"hint":"Use cursor-agent --list-models; pass the chosen ID with --model"}),
+            ),
             "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
                 let socket = paths::home_dir()?
@@ -2174,7 +2244,8 @@ impl Daemon {
     fn list_harnesses(params: &Value) -> Result<Value> {
         let all = json!([
             {"id":"codex","model_discovery":"complete","effort":true},
-            {"id":"claude","model_discovery":"snapshot","effort":true}
+            {"id":"claude","model_discovery":"snapshot","effort":true},
+            {"id":"cursor","model_discovery":"unavailable","effort":false,"restart":false}
         ]);
         if let Some(name) = params.get("harness").and_then(Value::as_str) {
             return all
@@ -2186,9 +2257,61 @@ impl Daemon {
         Ok(all)
     }
 
+    fn handle_cursor_hook(&self, params: &Value) -> Result<Value> {
+        let launch = params_string(params, "session")?;
+        let payload = params
+            .get("payload")
+            .context("missing Cursor hook payload")?;
+        let mut store = self.lock_store()?;
+        let uid = store.session_uid(launch).context("unknown Cursor launch")?;
+        let session = store
+            .session_for_uid(&uid)
+            .context("unknown Cursor launch")?;
+        if session.agent != "cursor"
+            || session.cursor_launch_id.as_deref() != Some(launch)
+            || session.state.is_terminal()
+        {
+            return Ok(json!({"accepted":false,"event":"provider.hook_unmatched"}));
+        }
+        let provider_id = payload
+            .get("conversation_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("Cursor hook has no conversation_id")?;
+        let mut pending = self
+            .pending_provider_ids
+            .lock()
+            .map_err(|_| anyhow!("pending provider ID map lock poisoned"))?;
+        let expected = session
+            .id
+            .strip_prefix("cursor:")
+            .or_else(|| pending.get(&session.id).and_then(Option::as_deref));
+        if expected.is_some_and(|expected| expected != provider_id) {
+            return Ok(json!({"accepted":false,"event":"provider.hook_unmatched"}));
+        }
+        let event_name = payload
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .context("missing Cursor hook name")?;
+        let outcome = apply_cursor_hook(&mut store, &session, event_name, payload)?;
+        if outcome.kind == "turn.started"
+            && let Some(binding) = pending.get_mut(&session.id)
+        {
+            *binding = Some(provider_id.to_owned());
+        }
+        drop(pending);
+        let seq = store.record_event(Some(&session.id), outcome.turn_id.as_deref(), outcome.kind);
+        drop(store);
+        self.submission_changed.notify_all();
+        Ok(json!({"accepted":true,"seq":seq,"event":outcome.kind}))
+    }
+
     fn handle_hook(&self, params: &Value) -> Result<Value> {
         let selector = params_string(params, "session")?;
         let agent = params_string(params, "agent")?;
+        if agent == "cursor" {
+            return self.handle_cursor_hook(params);
+        }
         let payload = params.get("payload").cloned().unwrap_or(Value::Null);
         let session = self.resolve_session(selector).or_else(|_| {
             let provider_id = payload
@@ -2468,6 +2591,149 @@ struct TranscriptRecovery {
     boundary: u64,
     path: String,
     text: String,
+}
+
+/// Cursor reports final text and stop separately, potentially out of order.
+/// Both must belong to the exact generation accepted for this execution.
+fn start_cursor_hook(
+    store: &mut Store,
+    session: &SessionRecord,
+    payload: &Value,
+    generation: &str,
+) -> Result<HookOutcome> {
+    let unmatched = || HookOutcome {
+        kind: "provider.hook_unmatched",
+        turn_id: session.active_turn_id.clone(),
+    };
+    if store.provider_turn_seen(&session.id, generation) {
+        return Ok(unmatched());
+    }
+    let Some(prompt) = payload.get("prompt").and_then(Value::as_str) else {
+        return Ok(unmatched());
+    };
+    let turn_id = if let Some(id) = &session.active_turn_id {
+        let turn = store.get_turn(id).context("missing Cursor execution")?;
+        if turn.state != TurnState::Submitted || turn.prompt != prompt {
+            return Ok(unmatched());
+        }
+        id.clone()
+    } else if session.state == SessionState::Idle {
+        let id = format!("turn_{}", Uuid::new_v4().simple());
+        store.insert_turn(&id, &session.id, prompt)?;
+        id
+    } else {
+        return Ok(unmatched());
+    };
+    store.mark_turn_started(&turn_id, Some(generation));
+    store.set_session_state(&session.id, SessionState::Busy);
+    Ok(HookOutcome {
+        kind: "turn.started",
+        turn_id: Some(turn_id),
+    })
+}
+
+fn apply_cursor_hook(
+    store: &mut Store,
+    session: &SessionRecord,
+    event: &str,
+    payload: &Value,
+) -> Result<HookOutcome> {
+    let unmatched = || HookOutcome {
+        kind: "provider.hook_unmatched",
+        turn_id: session.active_turn_id.clone(),
+    };
+    let Some(generation) = payload
+        .get("generation_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(unmatched());
+    };
+    let workspace_matches = payload
+        .get("workspace_roots")
+        .and_then(Value::as_array)
+        .is_some_and(|roots| {
+            roots.iter().filter_map(Value::as_str).any(|root| {
+                PathBuf::from(root)
+                    .canonicalize()
+                    .ok()
+                    .zip(PathBuf::from(&session.cwd).canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b)
+            })
+        });
+    if !workspace_matches {
+        return Ok(unmatched());
+    }
+    if event == "beforeSubmitPrompt" {
+        return start_cursor_hook(store, session, payload, generation);
+    }
+    let Some(id) = &session.active_turn_id else {
+        return Ok(unmatched());
+    };
+    let turn = store.get_turn(id).context("missing Cursor execution")?;
+    if turn.provider_turn_id.as_deref() != Some(generation) {
+        return Ok(unmatched());
+    }
+    match event {
+        "afterAgentResponse" => {
+            let Some(text) = payload.get("text").and_then(Value::as_str) else {
+                return Ok(unmatched());
+            };
+            store.record_cursor_response(id, text);
+        }
+        "stop" => {
+            let Some(status @ ("completed" | "aborted" | "error")) =
+                payload.get("status").and_then(Value::as_str)
+            else {
+                return Ok(unmatched());
+            };
+            store.record_cursor_stop(id, status);
+        }
+        _ => return Ok(unmatched()),
+    }
+    let turn = store.get_turn(id).context("missing Cursor execution")?;
+    let Some(status) = turn.cursor_stop_status.as_deref() else {
+        return Ok(HookOutcome {
+            kind: "provider.response",
+            turn_id: Some(id.clone()),
+        });
+    };
+    if status == "completed" && turn.final_message.is_none() {
+        return Ok(HookOutcome {
+            kind: "provider.awaiting_response",
+            turn_id: Some(id.clone()),
+        });
+    }
+    let state = match status {
+        "completed" => TurnState::Completed,
+        "aborted" => TurnState::Interrupted,
+        _ => TurnState::Failed,
+    };
+    let finished = store.finish_turn_if_matching(
+        id,
+        Some(generation),
+        state,
+        turn.final_message.as_deref(),
+        (status == "error").then_some("Cursor reported an agent error"),
+    )?;
+    let quiesced = !finished && store.settle_canceled_turn(id, Some(generation))?;
+    if finished {
+        store.set_session_state(&session.id, SessionState::Idle);
+    }
+    Ok(HookOutcome {
+        kind: if quiesced {
+            "provider.quiesced"
+        } else if !finished {
+            "provider.hook_unmatched"
+        } else {
+            match state {
+                TurnState::Completed => "turn.completed",
+                TurnState::Interrupted => "turn.interrupted",
+                _ => "turn.failed",
+            }
+        },
+        turn_id: Some(id.clone()),
+    })
 }
 
 fn apply_hook_event(
@@ -4486,6 +4752,137 @@ mod tests {
     }
 
     #[test]
+    fn cursor_requires_matching_generation_and_both_response_and_stop() -> anyhow::Result<()> {
+        for stop_first in [false, true] {
+            let mut store = ready_store("cursor");
+            store.insert_turn("cursor-turn", "cursor:thread-1", "hello")?;
+            let mut session = store
+                .get_session("cursor:thread-1")
+                .ok_or_else(|| anyhow::anyhow!("session"))?;
+            let event = |name: &str, generation: &str| {
+                serde_json::json!({
+                "hook_event_name":name,"conversation_id":"thread-1","generation_id":generation,
+                "workspace_roots":["/tmp"],"prompt":"hello","text":"answer","status":"completed"})
+            };
+            super::apply_cursor_hook(
+                &mut store,
+                &session,
+                "beforeSubmitPrompt",
+                &event("beforeSubmitPrompt", "g1"),
+            )?;
+            session = store
+                .get_session(&session.id)
+                .ok_or_else(|| anyhow::anyhow!("session"))?;
+            super::apply_cursor_hook(&mut store, &session, "stop", &event("stop", "old"))?;
+            assert_eq!(
+                store.get_turn("cursor-turn").map(|t| t.state),
+                Some(TurnState::Running)
+            );
+            let order = if stop_first {
+                ["stop", "afterAgentResponse"]
+            } else {
+                ["afterAgentResponse", "stop"]
+            };
+            super::apply_cursor_hook(&mut store, &session, order[0], &event(order[0], "g1"))?;
+            assert_eq!(
+                store.get_turn("cursor-turn").map(|t| t.state),
+                Some(TurnState::Running)
+            );
+            super::apply_cursor_hook(&mut store, &session, order[1], &event(order[1], "g1"))?;
+            let turn = store
+                .get_turn("cursor-turn")
+                .ok_or_else(|| anyhow::anyhow!("turn"))?;
+            assert_eq!(turn.state, TurnState::Completed);
+            assert_eq!(turn.final_message.as_deref(), Some("answer"));
+            store.insert_turn("next", &session.id, "hello")?;
+            session = store
+                .get_session(&session.id)
+                .ok_or_else(|| anyhow::anyhow!("session"))?;
+            super::apply_cursor_hook(&mut store, &session, "stop", &event("stop", "g1"))?;
+            assert_eq!(
+                store.get_turn("next").map(|t| t.state),
+                Some(TurnState::Submitted)
+            );
+            super::apply_cursor_hook(
+                &mut store,
+                &session,
+                "beforeSubmitPrompt",
+                &event("beforeSubmitPrompt", "g1"),
+            )?;
+            assert_eq!(
+                store.get_turn("next").map(|t| t.state),
+                Some(TurnState::Submitted)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_cancel_waits_for_matching_quiescence() -> anyhow::Result<()> {
+        let mut store = ready_store("cursor");
+        store.insert_turn("cursor-turn", "cursor:thread-1", "hello")?;
+        store.mark_turn_started("cursor-turn", Some("g1"));
+        store.set_session_state("cursor:thread-1", SessionState::Busy);
+        store.cancel_turn("cursor-turn")?;
+        let session = store
+            .get_session("cursor:thread-1")
+            .ok_or_else(|| anyhow::anyhow!("session"))?;
+        let mut event = serde_json::json!({"generation_id":"old","workspace_roots":["/tmp"],"status":"aborted"});
+        super::apply_cursor_hook(&mut store, &session, "stop", &event)?;
+        assert_ne!(
+            store.get_session(&session.id).map(|s| s.state),
+            Some(SessionState::Idle)
+        );
+        event["generation_id"] = serde_json::json!("g1");
+        let outcome = super::apply_cursor_hook(&mut store, &session, "stop", &event)?;
+        assert_eq!(outcome.kind, "provider.quiesced");
+        assert_eq!(
+            store.get_session(&session.id).map(|s| s.state),
+            Some(SessionState::Idle)
+        );
+        assert_eq!(
+            store.get_turn("cursor-turn").map(|t| t.state),
+            Some(TurnState::Canceled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_rejects_wrong_prompt_or_workspace_and_records_errors() -> anyhow::Result<()> {
+        let mut store = ready_store("cursor");
+        store.insert_turn("cursor-turn", "cursor:thread-1", "hello")?;
+        let session = store
+            .get_session("cursor:thread-1")
+            .ok_or_else(|| anyhow::anyhow!("session"))?;
+        let mut event =
+            serde_json::json!({"generation_id":"g1","workspace_roots":["/tmp"],"prompt":"wrong"});
+        super::apply_cursor_hook(&mut store, &session, "beforeSubmitPrompt", &event)?;
+        assert_eq!(
+            store.get_turn("cursor-turn").map(|t| t.state),
+            Some(TurnState::Submitted)
+        );
+        event["prompt"] = serde_json::json!("hello");
+        event["workspace_roots"] = serde_json::json!(["/missing-dlgt-test"]);
+        super::apply_cursor_hook(&mut store, &session, "beforeSubmitPrompt", &event)?;
+        assert_eq!(
+            store.get_turn("cursor-turn").map(|t| t.state),
+            Some(TurnState::Submitted)
+        );
+        event["workspace_roots"] = serde_json::json!(["/tmp"]);
+        super::apply_cursor_hook(&mut store, &session, "beforeSubmitPrompt", &event)?;
+        let session = store
+            .get_session(&session.id)
+            .ok_or_else(|| anyhow::anyhow!("session"))?;
+        event["status"] = serde_json::json!("error");
+        super::apply_cursor_hook(&mut store, &session, "stop", &event)?;
+        assert_eq!(
+            store.get_turn("cursor-turn").map(|t| t.state),
+            Some(TurnState::Failed)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn queued_shutdown_signal_cannot_be_lost_before_wait() {
         let shutting_down = AtomicBool::new(false);
         let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
@@ -5034,6 +5431,7 @@ mod tests {
             provider_turn_id: None,
             final_message: Some(text.to_owned()),
             final_text_recovered: false,
+            cursor_stop_status: None,
             transcript_path: None,
             transcript_offset: None,
             error: None,
