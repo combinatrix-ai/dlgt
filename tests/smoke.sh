@@ -150,29 +150,27 @@ DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
 
-# A position is meaningful only within one daemon lifetime. Nothing marks a
-# number as belonging to a previous daemon: it resolves against the new
-# daemon's table (or expires), returning current data -- though as a starting
-# position it may skip earlier new-daemon records, hence the discard rule.
+# Restarting drops every Session as well as its cursor table. Selector lookup
+# happens before cursor lookup, so the old Session must return NOT_FOUND even
+# with a formerly valid cursor. Numeric reuse within a new cursor table is
+# covered by cursor::tests::a_position_from_another_table_resolves_against_this_one.
 DLGT_SOCKET="$old_socket" "$binary" server --foreground >"$state_dir/old-server-2.log" 2>&1 &
 old_server_pid=$!
 attempt=0
 while [ ! -S "$old_socket" ]; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
 done
-# Before this daemon has minted that far, the position is simply not held.
 set +e
-expired_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --cursor "$stale_cursor")
-expired_status=$?
+missing_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --cursor "$stale_cursor")
+missing_status=$?
+missing_baseline=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id")
+missing_baseline_status=$?
 set -e
-test "$expired_status" -eq 1
-printf '%s\n' "$expired_json" | grep -q '"code":"CURSOR_EXPIRED"'
-# Once it has, the same number names this daemon's window of that position:
-# current data, never the previous daemon's world.
-DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" | grep -q '"reason":"snapshot"'
-reused_json=$(DLGT_SOCKET="$old_socket" "$binary" fetch "$cross_version_id" --cursor "$stale_cursor")
-printf '%s\n' "$reused_json" | grep -q '"ok":true'
-if printf '%s\n' "$reused_json" | grep -q 'provider-cross-version'; then exit 1; fi
+test "$missing_status" -eq 1
+test "$missing_baseline_status" -eq 1
+printf '%s\n' "$missing_json" | grep -q '"code":"NOT_FOUND"'
+printf '%s\n' "$missing_baseline" | grep -q '"code":"NOT_FOUND"'
+DLGT_SOCKET="$old_socket" "$binary" list --all | grep -q '"sessions":\[\]'
 DLGT_SOCKET="$old_socket" "$binary" server stop >/dev/null
 wait "$old_server_pid"
 old_server_pid=
@@ -236,21 +234,15 @@ test "$plain_status" -eq 1
 printf '%s\n' "$plain_logs" | grep -q '"code":"INVALID_ARGUMENT"'
 "$binary" logs "$session_id" --raw --json | grep -q '"data_base64"'
 "$binary" scrollback "$session_id" --lines 10 | grep -q '"lines"'
-"$binary" events "$session_id" | grep -q '"schema_version":1'
-# The public timeline is materialized against the provider-qualified ID; the
-# pre-bind launch events are plumbing and are never published.
-"$binary" events "$session_id" | grep -q '"type":"session.created"'
-if "$binary" events "$session_id" | grep -q 'internal:'; then exit 1; fi
-if "$binary" events | grep -q 'internal:'; then exit 1; fi
-"$binary" events "$session_id" --follow >"$state_dir/follow.jsonl" &
-follow_pid=$!
-attempt=0
-while [ ! -s "$state_dir/follow.jsonl" ]; do
-  attempt=$((attempt + 1)); test "$attempt" -lt 100 || exit 1; sleep 0.02
-done
-kill "$follow_pid"
-wait "$follow_pid" 2>/dev/null || true
-grep -q '"schema_version":1' "$state_dir/follow.jsonl"
+# Public lifecycle events arrive through fetch deltas. The acceptance cursor
+# precedes the first execution; pre-bind internal launch IDs must not leak.
+initial_cursor=$(sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p' "$state_dir/new.json")
+events_json=$("$binary" fetch "$session_id" --cursor "$initial_cursor" --no-screen)
+printf '%s\n' "$events_json" | grep -q '"schema_version":1'
+printf '%s\n' "$events_json" | grep -q '"type":"session.busy"'
+printf '%s\n' "$events_json" | grep -q '"type":"session.idle"'
+if printf '%s\n' "$events_json" | grep -q 'internal:'; then exit 1; fi
+# Long-poll delivery is checked below with a new execution and its Stop hook.
 # The response envelope echoes the request id, so the id is bounded.
 long_rpc_id=$(awk 'BEGIN { for (i = 0; i < 300; i++) printf "i" }')
 printf '{"id":"%s","method":"session.list","params":{}}\n' "$long_rpc_id" \
@@ -314,6 +306,8 @@ printf '%s\n' "$attach_json" | grep -q '"code":"ATTACH_REQUIRES_TTY"'
 
 # Restart interrupts active work while preserving identity, provider binding, and history.
 "$binary" send "$session_id" --request-id smoke-3 -- interrupted-by-restart >/dev/null
+restart_cursor=$("$binary" fetch "$session_id" --no-screen \
+  | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
 option_count_before=$(grep -c -- '^--permission-mode=auto$' "$DLGT_FAKE_ARGS_FILE")
 "$binary" restart "$session_id" >"$state_dir/restart.json" &
 restart_pid=$!
@@ -335,7 +329,8 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"provider-session","c
 printf '%s\n' '{"hook_event_name":"Stop","session_id":"provider-session","turn_id":"provider-turn-4","last_assistant_message":"resumed"}' \
   | "$binary" hook emit "$session_id" claude
 "$binary" fetch "$session_id" --wait 2s | grep -q '"execution_seq":4'
-"$binary" events "$session_id" | grep -q '"type":"session.restarting"'
+"$binary" fetch "$session_id" --cursor "$restart_cursor" --no-screen \
+  | grep -q '"type":"session.restarting"'
 "$binary" stop "$session_id" --force >/dev/null
 attempt=0
 while "$binary" show @smoke >/dev/null 2>&1; do
