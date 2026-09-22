@@ -4,3 +4,5 @@
 /docs/.vitepress/dist/
 /target/
 /.dlgt-e2e-home/
+__pycache__/
+*.pyc

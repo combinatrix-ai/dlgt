@@ -437,6 +437,7 @@ impl Drop for ProviderReservation {
 }
 
 enum AgentRuntime {
+    Desktop(Arc<crate::desktop::Runtime>),
     Claude(Arc<SessionRuntime>),
     Codex {
         control: Arc<CodexConnection>,
@@ -448,7 +449,7 @@ enum AgentRuntime {
 impl AgentRuntime {
     fn provider_id(&self) -> Option<&str> {
         match self {
-            Self::Claude(_) => None,
+            Self::Desktop(_) | Self::Claude(_) => None,
             Self::Codex {
                 provider_thread_id, ..
             } => Some(provider_thread_id),
@@ -457,6 +458,7 @@ impl AgentRuntime {
 
     fn pid(&self) -> Option<u32> {
         match self {
+            Self::Desktop(runtime) => runtime.pid(),
             Self::Claude(runtime) => runtime.pid(),
             Self::Codex { view, .. } => view.pid(),
         }
@@ -464,6 +466,7 @@ impl AgentRuntime {
 
     fn write(&self, data: &[u8]) -> Result<()> {
         match self {
+            Self::Desktop(_) => bail!("UNSUPPORTED: desktop has no raw terminal input"),
             Self::Claude(runtime) => runtime.write(data),
             Self::Codex { view, .. } => view.write(data),
         }
@@ -471,6 +474,7 @@ impl AgentRuntime {
 
     fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         match self {
+            Self::Desktop(_) => bail!("UNSUPPORTED: desktop has no PTY"),
             Self::Claude(runtime) => runtime.resize(rows, cols),
             Self::Codex { view, .. } => view.resize(rows, cols),
         }
@@ -478,6 +482,7 @@ impl AgentRuntime {
 
     fn subscribe(&self) -> Result<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
         match self {
+            Self::Desktop(_) => bail!("UNSUPPORTED: desktop has no PTY; inspect Claude directly"),
             Self::Claude(runtime) => runtime.subscribe(),
             Self::Codex { view, .. } => view.subscribe(),
         }
@@ -485,6 +490,7 @@ impl AgentRuntime {
 
     fn last_output_age(&self) -> Result<Option<Duration>> {
         match self {
+            Self::Desktop(_) => Ok(None),
             Self::Claude(runtime) => runtime.last_output_age(),
             Self::Codex { view, .. } => view.last_output_age(),
         }
@@ -492,6 +498,7 @@ impl AgentRuntime {
 
     fn stop(&self) -> Result<()> {
         match self {
+            Self::Desktop(runtime) => runtime.stop(),
             Self::Claude(runtime) => runtime.stop(),
             Self::Codex { view, .. } => view.stop(),
         }
@@ -499,6 +506,7 @@ impl AgentRuntime {
 
     fn force_stop(&self) -> Result<()> {
         match self {
+            Self::Desktop(runtime) => runtime.stop(),
             Self::Claude(runtime) => runtime.force_stop(),
             Self::Codex { view, .. } => view.force_stop(),
         }
@@ -506,6 +514,7 @@ impl AgentRuntime {
 
     fn wait_for_input_ready(&self, timeout: Duration) -> Result<()> {
         match self {
+            Self::Desktop(_) => Ok(()),
             Self::Claude(runtime) => runtime.wait_for_input_ready(timeout),
             Self::Codex { view, .. } => view.wait_for_input_ready(timeout),
         }
@@ -523,7 +532,9 @@ impl AgentRuntime {
                 control.watch_turn(provider_thread_id, &turn_id)?;
                 Ok(turn_id)
             }
-            Self::Claude(_) => bail!("Claude turns use semantic PTY input"),
+            Self::Desktop(_) | Self::Claude(_) => {
+                bail!("runtime does not support Codex app-server turns")
+            }
         }
     }
 
@@ -534,7 +545,9 @@ impl AgentRuntime {
                 provider_thread_id,
                 ..
             } => control.interrupt_turn(provider_thread_id, provider_turn_id),
-            Self::Claude(_) => bail!("Claude turns use semantic PTY input"),
+            Self::Desktop(_) | Self::Claude(_) => {
+                bail!("runtime does not support Codex app-server turns")
+            }
         }
     }
 }
@@ -649,7 +662,7 @@ impl Daemon {
                         ));
                     }
                 } else if selector.split_once(':').is_some_and(|(agent, id)| {
-                    matches!(agent, "codex" | "claude") && !id.is_empty()
+                    matches!(agent, "codex" | "claude" | "claude-desktop") && !id.is_empty()
                 }) {
                     error.session_id = Some(selector.to_owned());
                 }
@@ -716,7 +729,198 @@ impl Daemon {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn create_desktop_session(&self, params: &Value) -> Result<Value> {
+        if params
+            .get("resume_provider_id")
+            .is_some_and(|v| !v.is_null())
+        {
+            bail!("UNSUPPORTED: desktop resume requires a live adapter Session");
+        }
+        if params.get("effort").is_some_and(|v| !v.is_null())
+            || params
+                .get("harness_options")
+                .and_then(Value::as_array)
+                .is_some_and(|v| !v.is_empty())
+        {
+            bail!("UNSUPPORTED: desktop effort and harness options are not supported");
+        }
+        let title = params_string(params, "title")?;
+        let generated_alias = generate_alias(title);
+        let alias = params
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or(&generated_alias);
+        validate_alias(alias)?;
+        let prompt = params_string(params, "prompt")?;
+        if prompt.is_empty() {
+            bail!("initial prompt must not be empty");
+        }
+        let environment = params
+            .get("environment")
+            .and_then(Value::as_object)
+            .context("missing launch environment snapshot")?;
+        let model = params_string(params, "model")?;
+        if model.trim().is_empty() {
+            bail!("desktop model must be the visible model label");
+        }
+        let cwd = PathBuf::from(params_string(params, "cwd")?).canonicalize()?;
+        if !cwd.is_dir() {
+            bail!("cwd must be a directory");
+        }
+        let id = format!("claude-desktop:{}", Uuid::new_v4());
+        self.lock_store()?.insert_session(&NewSession {
+            id: &id,
+            alias,
+            title,
+            agent: "claude-desktop",
+            cwd: cwd.to_str().context("non-UTF8 cwd")?,
+            model: Some(model),
+            effort: None,
+            harness_options: &[],
+            auto_approve: false,
+        })?;
+        let store = Arc::clone(&self.store);
+        let callback_id = id.clone();
+        let sessions = Arc::clone(&self.sessions);
+        // Do not let an immediate helper exit race with runtime registration.
+        let registered = Arc::new(Mutex::new(()));
+        let registration_guard = registered
+            .lock()
+            .map_err(|_| anyhow!("desktop registration poisoned"))?;
+        let event_registered = Arc::clone(&registered);
+        let event = Arc::new(move |value: Value| {
+            let Ok(_registered) = event_registered.lock() else {
+                return;
+            };
+            let Ok(store) = store.lock() else { return };
+            let Some(session) = store.get_session(&callback_id) else {
+                return;
+            };
+            let turn = session.active_turn_id.as_deref();
+            match value["event"].as_str() {
+                Some("started") => {
+                    if let Some(turn) = turn {
+                        store.mark_turn_started(turn, None);
+                        store.record_event(Some(&callback_id), Some(turn), "turn.started");
+                    }
+                }
+                Some("completed") => {
+                    if let Some(turn) = turn {
+                        let _ = store.finish_turn_if_matching(
+                            turn,
+                            None,
+                            TurnState::Completed,
+                            value["text"].as_str(),
+                            None,
+                        );
+                        store.set_session_state(&callback_id, SessionState::Idle);
+                        store.record_event(Some(&callback_id), Some(turn), "turn.completed");
+                    }
+                }
+                Some("error" | "exit") => {
+                    if let Some(turn) = turn {
+                        let message = value["message"].as_str().unwrap_or("desktop controller disconnected; Claude may still be running; inspect before retrying");
+                        let _ = store.finish_turn_if_matching(
+                            turn,
+                            None,
+                            TurnState::Failed,
+                            None,
+                            Some(message),
+                        );
+                        store.record_event(Some(&callback_id), Some(turn), "turn.failed");
+                    }
+                    store.set_session_stopped(&callback_id);
+                    store.record_event(Some(&callback_id), None, "session.stopped");
+                }
+                _ => {}
+            }
+            drop(store);
+            if matches!(value["event"].as_str(), Some("error" | "exit"))
+                && let Ok(mut sessions) = sessions.write()
+            {
+                sessions.remove(&callback_id);
+            }
+        });
+        let timeout = Duration::from_millis(
+            params
+                .get("startup_timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(60_000)
+                .min(300_000),
+        );
+        let desktop = match crate::desktop::Runtime::spawn(
+            &json!({"path":cwd,"model":model}),
+            environment,
+            timeout,
+            &self.reaper,
+            event,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.lock_store()?.set_session_failed(&id);
+                return Err(Self::session_launch_failure(&id, &error));
+            }
+        };
+        let runtime = Arc::new(AgentRuntime::Desktop(desktop));
+        self.sessions
+            .write()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .insert(id.clone(), Arc::clone(&runtime));
+        {
+            let store = self.lock_store()?;
+            store.set_session_running(&id, runtime.pid());
+            store.set_session_state(&id, SessionState::Idle);
+            store.record_event(Some(&id), None, "session.ready");
+        }
+        drop(registration_guard);
+        self.submit_turn(&json!({"session":id,"prompt":prompt}))
+    }
+
+    fn submit_desktop_turn(
+        &self,
+        session: &SessionRecord,
+        runtime: &AgentRuntime,
+        prompt: &str,
+    ) -> Result<Value> {
+        let AgentRuntime::Desktop(desktop) = runtime else {
+            bail!("desktop runtime missing");
+        };
+        let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+        let (turn, cursor) = {
+            let mut store = self.lock_store()?;
+            let cursor = Self::acceptance_cursor(&store, &session.id)?;
+            let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
+            store.set_session_state(&session.id, SessionState::Busy);
+            store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
+            (turn, cursor)
+        };
+        // Once queued, the adapter owns exactly one attempt. A pending receipt
+        // is cached even when the UI acknowledgement or helper is lost.
+        if let Err(error) = desktop.send(&json!({"op":"send","prompt":prompt})) {
+            let store = self.lock_store()?;
+            let _ = store.finish_turn_if_matching(
+                &turn_id,
+                None,
+                TurnState::Failed,
+                None,
+                Some(&error.to_string()),
+            );
+            store.set_session_failed(&session.id);
+        }
+        let current = self.resolve_session(&session.id)?;
+        Ok(
+            json!({"session":self.public_session(&current)?,"execution_seq":turn.execution_seq,
+            "cursor":cursor,"submission":"pending","observation":"accessibility",
+            "hint":"UI delivery is asynchronous; do not resend with a new request_id",
+            "action":format!("dlgt fetch {} --wait 25s",session.id)}),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn create_session(&self, params: &Value) -> Result<Value> {
+        if params["harness"] == "claude-desktop" {
+            return self.create_desktop_session(params);
+        }
         let title = params_string(params, "title")?;
         let generated_alias = generate_alias(title);
         let alias = params
@@ -1045,7 +1249,7 @@ impl Daemon {
 
         let (agent, provider_id) = selector
             .split_once(':')
-            .filter(|(agent, id)| matches!(*agent, "codex" | "claude") && !id.is_empty())
+            .filter(|(agent, id)| matches!(*agent, "codex" | "claude" | "claude-desktop") && !id.is_empty())
             .context(
                 "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id> or claude:<id> with --resume",
             )?;
@@ -1097,6 +1301,11 @@ impl Daemon {
         let provider_id = provider_id_from_session(&session)
             .context("session is unavailable because it has no provider conversation to resume")?
             .to_owned();
+        if session.agent == "claude-desktop" {
+            bail!(
+                "UNSUPPORTED: desktop restart/cancel is not supported; stop detaches the controller without killing Claude"
+            );
+        }
         let agent = Agent::parse(&session.agent)?;
         let cwd = PathBuf::from(&session.cwd)
             .canonicalize()
@@ -1597,6 +1806,9 @@ impl Daemon {
             bail!("prompt must not be empty");
         }
         let runtime = self.runtime(&session.id)?;
+        if session.agent == "claude-desktop" {
+            return self.submit_desktop_turn(&session, &runtime, prompt);
+        }
         let agent = Agent::parse(&session.agent)?;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let input = match agent {
@@ -1784,6 +1996,11 @@ impl Daemon {
     fn cancel_turn(&self, params: &Value) -> Result<Value> {
         let turn = self.resolve_turn(params_string(params, "turn")?)?;
         let session = self.resolve_session(&turn.session_id)?;
+        if session.agent == "claude-desktop" {
+            bail!(
+                "UNSUPPORTED: desktop restart/cancel is not supported; stop detaches the controller without killing Claude"
+            );
+        }
         let agent = Agent::parse(&session.agent)?;
         let cancel_input = agent.cancel_input();
         let runtime = self.runtime(&turn.session_id)?;
@@ -2146,6 +2363,9 @@ impl Daemon {
     fn list_models(&self, params: &Value) -> Result<Value> {
         match params_string(params, "harness")? {
             "claude" => Ok(crate::claude_models::list_models()),
+            "claude-desktop" => Ok(
+                json!({"harness":"claude-desktop","discovery":"unavailable","models":[],"hint":"Use the exact visible model label, e.g. Haiku 4.5"}),
+            ),
             "codex" => {
                 let socket = paths::home_dir()?
                     .join("run")
@@ -2174,7 +2394,8 @@ impl Daemon {
     fn list_harnesses(params: &Value) -> Result<Value> {
         let all = json!([
             {"id":"codex","model_discovery":"complete","effort":true},
-            {"id":"claude","model_discovery":"snapshot","effort":true}
+            {"id":"claude","model_discovery":"snapshot","effort":true},
+            {"id":"claude-desktop","model_discovery":"unavailable","effort":false,"restart":false,"resume":false,"cancel":false,"attach":false,"experimental":true,"platform":"macos","observation":"accessibility"}
         ]);
         if let Some(name) = params.get("harness").and_then(Value::as_str) {
             return all
@@ -3143,6 +3364,11 @@ fn public_session_with_metrics(
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
     });
+    if session.agent == "claude-desktop" {
+        value["observation"] = json!("accessibility");
+        value["identity_scope"] = json!("adapter_session");
+        value["auto_approve"] = json!(false);
+    }
     if let Some(metrics) = busy_metrics
         && session.state == SessionState::Busy
         && let Some(object) = value.as_object_mut()
@@ -3196,6 +3422,17 @@ fn public_result(turn: &TurnRecord) -> Value {
 /// Where a retained `final_text` came from. `missing` is an explicit
 /// diagnostic: the execution still completed, but no answer was recovered.
 fn final_text_source(turn: &TurnRecord) -> &'static str {
+    if turn.session_id.starts_with("claude-desktop:") {
+        return if turn
+            .final_message
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            "visible_ax_tree"
+        } else {
+            "missing"
+        };
+    }
     if turn.final_text_recovered {
         "transcript"
     } else if turn
