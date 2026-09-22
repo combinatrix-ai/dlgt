@@ -89,7 +89,7 @@ class Adapter:
             raise RuntimeError('TARGET_CHANGED: Claude restarted')
         nodes = state['nodes']
         if any(label(n) in ('デバイスを確認するために再度サインインしてください', 'Sign in again to verify your device') for n in nodes):
-            raise RuntimeError('AUTHENTICATION_REQUIRED: sign in again in Claude; inspect submission before retrying')
+            raise RuntimeError('AUTHENTICATION_REQUIRED: Ask the user to reauthenticate in Claude. Submission may be unconfirmed; inspect Claude before retrying.')
         if not allow_confirmation and any(label(n) in TRUST_LABELS for n in nodes):
             raise RuntimeError('WORKSPACE_CONFIRMATION_REQUIRED: confirm the requested folder in Claude, then retry')
         if self.url is not None and self.document_url(state) != self.url:

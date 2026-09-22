@@ -3277,7 +3277,9 @@ fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
-    if message.contains("SESSION_NOT_RUNNING") {
+    if message.starts_with("AUTHENTICATION_REQUIRED:") {
+        "AUTHENTICATION_REQUIRED"
+    } else if message.contains("SESSION_NOT_RUNNING") {
         "SESSION_NOT_RUNNING"
     } else if message.contains("CURSOR_EXPIRED") {
         "CURSOR_EXPIRED"
@@ -3407,7 +3409,7 @@ impl std::error::Error for SessionLaunchFailure {}
 
 fn public_result(turn: &TurnRecord) -> Value {
     let status = turn.state.as_str();
-    json!({
+    let mut value = json!({
         "execution_seq": turn.execution_seq,
         "status": status,
         "final_text": turn.final_message.clone().unwrap_or_default(),
@@ -3416,7 +3418,15 @@ fn public_result(turn: &TurnRecord) -> Value {
         "started_at_ms": turn.started_at_ms.unwrap_or(turn.created_at_ms),
         "completed_at_ms": turn.completed_at_ms,
         "usage": turn.usage,
-    })
+    });
+    if turn
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("AUTHENTICATION_REQUIRED:"))
+    {
+        value["error_code"] = json!("AUTHENTICATION_REQUIRED");
+    }
+    value
 }
 
 /// Where a retained `final_text` came from. `missing` is an explicit
@@ -4996,6 +5006,34 @@ mod tests {
                 pty_quiet_for_ms: 500,
             }
         );
+    }
+
+    #[test]
+    fn desktop_reauthentication_is_actionable_during_launch_and_fetch() {
+        let message = "AUTHENTICATION_REQUIRED: Ask the user to reauthenticate in Claude. Submission may be unconfirmed; inspect Claude before retrying.";
+        let error =
+            super::Daemon::session_launch_failure("claude-desktop:test", &anyhow::anyhow!(message));
+        assert_eq!(classify_error(&error), "AUTHENTICATION_REQUIRED");
+        let mut store = ready_store("claude");
+        store
+            .insert_turn("auth_turn", "claude:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("turn update failed: {error}"));
+        store
+            .finish_turn_if_matching("auth_turn", None, TurnState::Failed, None, Some(message))
+            .unwrap_or_else(|error| panic!("turn update failed: {error}"));
+        let result = public_result(
+            &store
+                .get_turn("auth_turn")
+                .unwrap_or_else(|| panic!("turn missing")),
+        );
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["error_code"], "AUTHENTICATION_REQUIRED");
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("Ask the user to reauthenticate"))
+        );
+        assert_eq!(result["final_text_source"], "missing");
     }
 
     #[test]

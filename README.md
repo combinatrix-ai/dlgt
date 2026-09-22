@@ -281,3 +281,9 @@ Claude or cancel work already submitted. Resume, restart, cancel, PTY attach,
 effort selection and arbitrary harness options are unsupported. Authentication
 and tool approvals remain in Claude's UI. Desktop AX state is not written to
 disk by the adapter.
+
+When Claude requests sign-in again, startup returns error code
+`AUTHENTICATION_REQUIRED`; an already queued turn becomes `failed` and exposes
+`error_code: "AUTHENTICATION_REQUIRED"` in its fetched result. The error message
+instructs the caller to ask the user to reauthenticate in Claude. Submission
+may be unconfirmed, so the caller must inspect Claude before retrying.
