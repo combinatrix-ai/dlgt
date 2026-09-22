@@ -230,3 +230,60 @@ sh install.sh --register-skills-from target/release/dlgt --skill both
 ```
 
 The PTY and attach architecture is derived from the private `umux` project.
+
+## Experimental Claude Desktop harness (macOS)
+
+`claude-desktop` opens Claude Code in the signed-in Claude desktop app. It uses
+local Laya inference to choose the model and approve the requested workspace,
+then reads the AX state to verify those choices. The regular CLI harnesses do
+not need its optional dependencies.
+
+```sh
+# Requires uv (or Python 3.11) and Xcode Command Line Tools.
+# Downloads pinned Laya/PyTorch dependencies and the model; builds the AX helper.
+dlgt desktop-setup
+
+dlgt new --harness claude-desktop --model 'Haiku 4.5' \
+  --cwd /absolute/path/to/project --title 'Desktop task' \
+  --startup-timeout 90s --request-id desktop-task-1 \
+  -- 'Describe the project.'
+```
+
+Open Claude first, sign in, and grant macOS Accessibility access to the invoking
+terminal. Use the exact visible model label. Setup keeps the helper, Python
+environment and model cache under `$DLGT_HOME/desktop/<version>` (default
+`~/.dlgt/desktop/<version>`); allow roughly 1.5 GB. Inference then runs locally
+with network model downloads disabled. The sources are embedded in dlgt; run
+setup again after installing a build with changed adapter assets. Python and
+Swift are an initial implementation behind a JSONL boundary for a later Rust
+port.
+
+**Specifying `--cwd` authorizes trusting that workspace in Claude.** This grants
+Claude access to that folder according to its own permission settings. Both the
+controller and native click helper require the confirmation's absolute path to
+match the requested directory; Laya chooses between trust and cancel. It cannot
+approve another folder. Existing nonempty drafts and ambiguous controls stop
+the operation. Keep one Claude window open and leave the active conversation in
+place while dlgt controls it. Only one adapter can own Claude at a time.
+
+`new` and `send` return a pending receipt; use `fetch` for observation. A
+`claude-desktop:<uuid>` identifies the live adapter, not a provider conversation
+ID. This harness has no lifecycle hooks: results use `visible_ax_tree` evidence,
+and recognition depends on the desktop app version and language. The initial
+model/trust flow has been exercised on the Japanese UI; response completion and
+same-session follow-ups are not yet verified end to end (the live test reached
+a reauthentication screen). Treat this harness as experimental.
+
+Do not retry with a new request ID after an uncertain submission; inspect
+Claude first. An observation failure does not prove that Claude stopped or that
+the prompt was never sent. `stop` detaches the controller; it does not terminate
+Claude or cancel work already submitted. Resume, restart, cancel, PTY attach,
+effort selection and arbitrary harness options are unsupported. Authentication
+and tool approvals remain in Claude's UI. Desktop AX state is not written to
+disk by the adapter.
+
+When Claude requests sign-in again, startup returns error code
+`AUTHENTICATION_REQUIRED`; an already queued turn becomes `failed` and exposes
+`error_code: "AUTHENTICATION_REQUIRED"` in its fetched result. The error message
+instructs the caller to ask the user to reauthenticate in Claude. Submission
+may be unconfirmed, so the caller must inspect Claude before retrying.
