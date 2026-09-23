@@ -81,11 +81,10 @@ body { background: var(--dlgt-paper); }
 .harnesses { max-width: 1240px; margin: 0 auto; padding: clamp(88px, 11vw, 150px) 24px; }
 .harnesses-intro h2 { margin-top: 20px; font-size: clamp(3rem, 6.2vw, 6rem); line-height: 0.98; letter-spacing: -0.07em; }
 .harnesses-intro > p:last-child { max-width: 70ch; margin-top: 22px; font-size: clamp(1.06rem, 1.6vw, 1.3rem); line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 72%, transparent); }
-.harness-logos { display: flex; margin: 48px 0 0; padding: 18px 0; list-style: none; overflow-x: auto; border-top: 2px solid var(--dlgt-ink); border-bottom: 1px solid var(--dlgt-line); scrollbar-width: thin; }
+.dlgt-home .harness-logos { display: flex; margin: 16px 0 0; padding: 18px 0; list-style: none; overflow-x: auto; border-top: 2px solid var(--dlgt-ink); border-bottom: 1px solid var(--dlgt-line); scrollbar-width: thin; }
 .harness-logos:focus-visible { outline: 2px solid var(--dlgt-accent); outline-offset: 4px; }
-.harness-logos li { display: flex; flex: 1 0 auto; align-items: center; gap: 11px; min-width: 150px; padding: 6px 18px; border-right: 1px solid var(--dlgt-line); font-size: clamp(1rem, 1.4vw, 1.2rem); font-weight: 750; white-space: nowrap; }
-.harness-logos li:first-child { padding-left: 4px; }
-.harness-logos li:last-child { border-right: 0; }
+.dlgt-home .harness-logos li { display: flex; flex: 1 0 auto; align-items: center; gap: 11px; min-width: 150px; margin: 0; padding: 6px 18px; border-right: 1px solid var(--dlgt-line); font-size: clamp(1rem, 1.4vw, 1.2rem); font-weight: 750; white-space: nowrap; }
+.dlgt-home .harness-logos li:last-child { border-right: 0; }
 .harness-logos img { display: block; flex: 0 0 28px; width: 28px; height: 28px; object-fit: contain; }
 .dark .harness-logos img { filter: invert(1); }
 .harness-release { margin-top: 15px !important; font-size: 0.82rem; line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 68%, transparent); }
@@ -172,8 +171,8 @@ body { background: var(--dlgt-paper); }
   .agent-picker { width: 128px; }
   .copy-command { margin-top: 4px; }
   .harnesses, .statement, .quick-start { padding-left: 20px; padding-right: 20px; }
-  .harness-logos { margin-right: -20px; }
-  .harness-logos li { min-width: 142px; }
+  .dlgt-home .harness-logos { margin-right: -20px; }
+  .dlgt-home .harness-logos li { min-width: 142px; }
   .statement .diy-routes > li { grid-template-columns: 1fr; gap: 6px; }
 }
 
