@@ -577,8 +577,8 @@ executable when the daemon starts. Launch registers a bridge in
 `~/.cursor/hooks.json` that preserves existing handlers and only runs inside
 dlgt children. Defaults pass `--trust --force`; `--no-auto-approve` omits both.
 
-Use `--model` but not `--effort`; model discovery is currently unavailable in
-dlgt, so consult `cursor-agent --list-models`. Supported harness options are
+Use `--model` but not `--effort`. Discover IDs with `dlgt models --harness cursor`
+(CLI: `cursor-agent --list-models`). Supported harness options are
 `mode=plan|ask` and `sandbox=enabled|disabled`. Cursor `restart` is unsupported;
 use stop then send --resume. Permission prompts may leave the session busy,
 so inspect the screen and use human attach. Do not infer completion from
@@ -594,7 +594,7 @@ send/fetch/attach/stop and `send --resume`. Grok must be installed and
 authenticated; `DLGT_GROK_BIN` selects the executable. Defaults pass
 `--always-approve --trust`; `--no-auto-approve` omits both.
 
-`--model` and `--effort` are supported. Model discovery is currently
-unavailable in dlgt, so pick an ID from Grok itself. Do not infer completion
+`--model` and `--effort` are supported. Discover IDs with `dlgt models --harness grok`
+(CLI: `grok models`). Do not infer completion
 from PTY silence: `Stop` / `StopFailure` hooks are the authority. ACP is not
 used by this harness.
