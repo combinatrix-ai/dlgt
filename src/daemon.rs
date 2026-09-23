@@ -2225,14 +2225,8 @@ impl Daemon {
 
     fn list_models(&self, params: &Value) -> Result<Value> {
         match params_string(params, "harness")? {
-            "cursor" => Ok(
-                json!({"harness":"cursor","source":"cli","discovery":"unavailable",
-                "models":[],"hint":"Use cursor-agent --list-models; pass the chosen ID with --model"}),
-            ),
-            "grok" => Ok(
-                json!({"harness":"grok","source":"cli","discovery":"unavailable",
-                "models":[],"hint":"Use grok inspect or pass --model with a Grok model ID"}),
-            ),
+            "cursor" => Ok(crate::cursor_models::list_models()),
+            "grok" => Ok(crate::grok_models::list_models()),
             "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
                 let socket = paths::home_dir()?
@@ -2263,8 +2257,8 @@ impl Daemon {
         let all = json!([
             {"id":"codex","model_discovery":"complete","effort":true},
             {"id":"claude","model_discovery":"snapshot","effort":true},
-            {"id":"cursor","model_discovery":"unavailable","effort":false,"restart":false},
-            {"id":"grok","model_discovery":"unavailable","effort":true}
+            {"id":"cursor","model_discovery":"cli","effort":false,"restart":false},
+            {"id":"grok","model_discovery":"cli","effort":true}
         ]);
         if let Some(name) = params.get("harness").and_then(Value::as_str) {
             return all

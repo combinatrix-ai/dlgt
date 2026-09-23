@@ -1136,8 +1136,8 @@ automatic follow-ups can affect the conversation.
 The adapter supports `--model`, `--harness-option mode=plan|ask`, and
 `--harness-option sandbox=enabled|disabled`. Default auto-approval passes
 `--trust --force`; `--no-auto-approve` omits both. Other launch options and
-`--effort` are rejected. Use `cursor-agent --list-models` to discover available
-models: dlgt currently reports model discovery as unavailable.
+`--effort` are rejected. Model IDs come from CLI discovery (`dlgt models --harness cursor`
+runs `cursor-agent --list-models`).
 
 Current limitations: `restart` is rejected before changing the session; use
 `stop` followed by `send --resume`. Permission prompts do not yet have a
