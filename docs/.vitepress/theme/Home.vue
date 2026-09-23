@@ -146,6 +146,27 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
       </figure>
     </section>
 
+    <section id="harnesses" class="harnesses">
+      <div class="harnesses-intro">
+        <p class="eyebrow">Supported on main</p>
+        <h2>One bridge.<br />Six harnesses.</h2>
+        <p>Run another coding agent in a live, addressable terminal Session. Follow up in the same conversation and read its provider-reported result.</p>
+      </div>
+      <div class="harnesses-status" role="note">
+        <strong>Release status</strong>
+        <span>The published v0.4.3 installer supports Codex and Claude. Cursor CLI, Grok Build, OpenCode, and Pi are available in main source builds; they have not shipped in a release yet.</span>
+      </div>
+      <div class="harness-grid">
+        <article><span>Released</span><strong>Codex</strong><code>--harness codex</code></article>
+        <article><span>Released</span><strong>Claude</strong><code>--harness claude</code></article>
+        <article><span>Main source</span><strong>Cursor CLI</strong><code>--harness cursor</code></article>
+        <article><span>Main source</span><strong>Grok Build</strong><code>--harness grok</code></article>
+        <article><span>Main source</span><strong>OpenCode</strong><code>--harness opencode</code></article>
+        <article><span>Main source</span><strong>Pi</strong><code>--harness pi</code></article>
+      </div>
+      <a class="harness-doc-link" :href="withBase('/cli')">Explore CLI usage <span aria-hidden="true">↗</span></a>
+    </section>
+
     <section class="statement">
       <p>Every major harness already has subagents.</p>
       <h2>The missing piece is <span class="statement-strike">the bridge</span> <span class="statement-brand">dlgt</span>.</h2>
