@@ -72,23 +72,27 @@ body { background: var(--dlgt-paper); }
 .hero-lede { margin-top: 30px !important; max-width: 46rem; font-size: clamp(1.05rem, 1.4vw, 1.32rem); line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 72%, transparent); }
 .hero-lede-line { display: block; }
 .hero-lede-keep { white-space: nowrap; }
-.pair-ticker { display: flex; align-items: baseline; gap: 12px; margin-top: 26px !important; font: 700 0.92rem/1.2 var(--vp-font-family-mono); letter-spacing: 0.02em; line-height: 1.2 !important; /* .vp-doc p sets line-height: 28px, which would overflow the 1.2em ticker rows */ }
+.pair-ticker { display: flex; align-items: center; gap: 12px; margin-top: 26px !important; font: 700 0.92rem/1.35 var(--vp-font-family-mono); letter-spacing: 0.02em; line-height: 1.35 !important; /* .vp-doc p sets line-height: 28px, which would overflow the ticker rows */ }
 .pair-ticker-mark { color: var(--dlgt-accent); }
-.pair-ticker-window { display: block; height: 1.2em; overflow: hidden; }
+.pair-ticker-window { display: block; min-width: 0; height: 1.35em; overflow: hidden; }
 .pair-ticker-strip { display: block; animation: pair-roll 27.2s ease infinite; }
-.pair-ticker-item { display: block; height: 1.2em; white-space: nowrap; }
+.pair-ticker-item { display: flex; align-items: center; gap: 0.4em; height: 1.35em; white-space: nowrap; }
+.pair-ticker-agent { display: inline-flex; align-items: center; gap: 0.28em; }
+.pair-ticker-agent img { display: block; flex: 0 0 1em; width: 1em; height: 1em; object-fit: contain; }
+.dark .pair-ticker-agent img { filter: invert(1); }
+.pair-ticker-detail { margin-left: -0.18em; }
 .pair-ticker-arrow { color: var(--dlgt-accent); }
 .pair-ticker-effort { color: color-mix(in srgb, var(--dlgt-ink) 55%, transparent); }
 @keyframes pair-roll {
   0%, 10.5% { transform: translateY(0); }
-  12.5%, 23% { transform: translateY(-1.2em); }
-  25%, 35.5% { transform: translateY(-2.4em); }
-  37.5%, 48% { transform: translateY(-3.6em); }
-  50%, 60.5% { transform: translateY(-4.8em); }
-  62.5%, 73% { transform: translateY(-6em); }
-  75%, 85.5% { transform: translateY(-7.2em); }
-  87.5%, 98% { transform: translateY(-8.4em); }
-  100% { transform: translateY(-9.6em); }
+  12.5%, 23% { transform: translateY(-1.35em); }
+  25%, 35.5% { transform: translateY(-2.7em); }
+  37.5%, 48% { transform: translateY(-4.05em); }
+  50%, 60.5% { transform: translateY(-5.4em); }
+  62.5%, 73% { transform: translateY(-6.75em); }
+  75%, 85.5% { transform: translateY(-8.1em); }
+  87.5%, 98% { transform: translateY(-9.45em); }
+  100% { transform: translateY(-10.8em); }
 }
 
 .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 36px; }
@@ -183,7 +187,7 @@ body { background: var(--dlgt-paper); }
   .hero h1 { font-size: clamp(3rem, 16vw, 4.4rem); }
   .hero h1 span { white-space: normal; }
   .hero-lede { font-size: 1rem; }
-  .pair-ticker { font-size: 0.78rem; } /* longest pair+task row must clear the ~280px clip window */
+  .pair-ticker { gap: 7px; font-size: 0.68rem; } /* keep both logos and the longest task on one row */
   .hero-actions a { width: 100%; }
   .command-line { grid-template-columns: 1fr; gap: 8px; justify-items: start; }
   .agent-picker { width: 128px; }

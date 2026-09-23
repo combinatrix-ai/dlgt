@@ -83,8 +83,14 @@ onBeforeUnmount(() => {
 
 // Keep the examples short enough for the single-line ticker on mobile. Cursor
 // and OpenCode reject effort, so only show it for targets that support it.
-type Delegation = { from: string; to: string; task: string; efforts?: string[] };
-type TickerPair = { from: string; to: string; task: string; effort: string | null };
+type TickerAgent = "sol" | "fable" | "luna" | "sonnet" | "grok" | "cursor" | "opencode" | "pi";
+type Delegation = { from: TickerAgent; to: TickerAgent; task: string; efforts?: string[] };
+type TickerPair = { from: TickerAgent; to: TickerAgent; task: string; effort: string | null };
+const tickerHarness: Record<TickerAgent, string> = {
+  sol: "codex", luna: "codex", fable: "claude", sonnet: "claude",
+  grok: "grok", cursor: "cursor", opencode: "opencode", pi: "pi",
+};
+const tickerLogo = (agent: TickerAgent) => withBase(`/harness-logos/${tickerHarness[agent]}.svg`);
 const delegations: Delegation[] = [
   { from: "sol", to: "fable", task: "review the UX copy", efforts: ["max", "xhigh"] },
   { from: "fable", to: "sol", task: "design the API", efforts: ["ultra", "max", "xhigh"] },
@@ -149,7 +155,12 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
           <span class="pair-ticker-mark">▸</span>
           <span class="pair-ticker-window">
             <span class="pair-ticker-strip">
-              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">{{ pair.from }} <span class="pair-ticker-arrow">──▶</span> {{ pair.to }}<span v-if="pair.effort" class="pair-ticker-effort"> · {{ pair.effort }}</span>: {{ pair.task }}</span>
+              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">
+                <span class="pair-ticker-agent"><img :src="tickerLogo(pair.from)" alt="" width="14" height="14" />{{ pair.from }}</span>
+                <span class="pair-ticker-arrow">──▶</span>
+                <span class="pair-ticker-agent"><img :src="tickerLogo(pair.to)" alt="" width="14" height="14" />{{ pair.to }}</span>
+                <span class="pair-ticker-detail"><span v-if="pair.effort" class="pair-ticker-effort"> · {{ pair.effort }}</span>: {{ pair.task }}</span>
+              </span>
             </span>
           </span>
         </p>
