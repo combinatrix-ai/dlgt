@@ -81,24 +81,47 @@ onBeforeUnmount(() => {
   copyTimers.clear();
 });
 
-// Every pair crosses providers, and each target only shows effort levels its
-// harness actually accepts (sol supports ultra; the others top out at max).
-// Tasks are fixed per pair so each target is asked for what it's best at;
-// keep them under ~20 chars so the nowrap ticker row fits a mobile viewport.
-const delegations = [
+// Keep the examples short enough for the single-line ticker on mobile. Cursor
+// and OpenCode reject effort, so only show it for targets that support it.
+type TickerAgent = "sol" | "fable" | "luna" | "sonnet" | "grok" | "cursor" | "opencode" | "pi";
+type Delegation = { from: TickerAgent; to: TickerAgent; task: string; efforts?: string[] };
+type TickerPair = { from: TickerAgent; to: TickerAgent; task: string; effort: string | null };
+const tickerHarness: Record<TickerAgent, string> = {
+  sol: "codex", luna: "codex", fable: "claude", sonnet: "claude",
+  grok: "grok", cursor: "cursor", opencode: "opencode", pi: "pi",
+};
+const tickerLogo = (agent: TickerAgent) => withBase(`/harness-logos/${tickerHarness[agent]}.svg`);
+const delegations: Delegation[] = [
   { from: "sol", to: "fable", task: "review the UX copy", efforts: ["max", "xhigh"] },
   { from: "fable", to: "sol", task: "design the API", efforts: ["ultra", "max", "xhigh"] },
   { from: "fable", to: "luna", task: "rewrite the parser", efforts: ["max", "xhigh"] },
   { from: "sol", to: "sonnet", task: "build the sidebar", efforts: ["max", "xhigh"] },
+  { from: "sol", to: "grok", task: "audit the tests" },
+  { from: "fable", to: "cursor", task: "map the UX" },
+  { from: "sol", to: "opencode", task: "trace the bug" },
+  { from: "fable", to: "pi", task: "check the docs" },
 ];
 
-// Static list for SSR; reshuffled with random efforts after mount.
-const pairs = ref([
+// Static list for SSR; reshuffled with supported random efforts after mount.
+const pairs = ref<TickerPair[]>([
   { from: "fable", to: "sol", effort: "ultra", task: "design the API" },
   { from: "sol", to: "fable", effort: "max", task: "review the UX copy" },
   { from: "fable", to: "luna", effort: "xhigh", task: "rewrite the parser" },
   { from: "sol", to: "sonnet", effort: "max", task: "build the sidebar" },
+  { from: "sol", to: "grok", effort: null, task: "audit the tests" },
+  { from: "fable", to: "cursor", effort: null, task: "map the UX" },
+  { from: "sol", to: "opencode", effort: null, task: "trace the bug" },
+  { from: "fable", to: "pi", effort: null, task: "check the docs" },
 ]);
+
+const harnesses = [
+  { slug: "codex", label: "Codex" },
+  { slug: "claude", label: "Claude" },
+  { slug: "cursor", label: "Cursor" },
+  { slug: "grok", label: "Grok" },
+  { slug: "opencode", label: "OpenCode" },
+  { slug: "pi", label: "Pi" },
+];
 
 onMounted(() => {
   const shuffled = [...delegations];
@@ -109,7 +132,7 @@ onMounted(() => {
   pairs.value = shuffled.map(d => ({
     from: d.from,
     to: d.to,
-    effort: d.efforts[Math.floor(Math.random() * d.efforts.length)],
+    effort: d.efforts?.length ? d.efforts[Math.floor(Math.random() * d.efforts.length)] : null,
     task: d.task,
   }));
 });
@@ -132,7 +155,12 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
           <span class="pair-ticker-mark">▸</span>
           <span class="pair-ticker-window">
             <span class="pair-ticker-strip">
-              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">{{ pair.from }} <span class="pair-ticker-arrow">──▶</span> {{ pair.to }} <span class="pair-ticker-effort">· {{ pair.effort }}:</span> {{ pair.task }}</span>
+              <span v-for="(pair, i) in tickerPairs" :key="i" class="pair-ticker-item">
+                <span class="pair-ticker-agent"><img :src="tickerLogo(pair.from)" alt="" width="14" height="14" />{{ pair.from }}</span>
+                <span class="pair-ticker-arrow">──▶</span>
+                <span class="pair-ticker-agent"><img :src="tickerLogo(pair.to)" alt="" width="14" height="14" />{{ pair.to }}</span>
+                <span class="pair-ticker-detail"><span v-if="pair.effort" class="pair-ticker-effort"> · {{ pair.effort }}</span>: {{ pair.task }}</span>
+              </span>
             </span>
           </span>
         </p>
@@ -144,6 +172,21 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
       <figure class="hero-visual">
         <img :src="heroImage" width="604" height="459" alt="I built an entire company with 47 AI agents. Hey Sol, ask Fable to review this." />
       </figure>
+    </section>
+
+    <section id="harnesses" class="harnesses">
+      <div class="harnesses-intro">
+        <p class="eyebrow">Supported harnesses</p>
+        <h2>One bridge. Six harnesses.</h2>
+        <p>Run another coding agent in a live, addressable terminal Session. Follow up in the same conversation and read its provider-reported result.</p>
+      </div>
+      <ul class="harness-logos" aria-label="Supported harnesses" tabindex="0">
+        <li v-for="harness in harnesses" :key="harness.slug">
+          <img :src="withBase(`/harness-logos/${harness.slug}.svg`)" alt="" width="28" height="28" />
+          <span>{{ harness.label }}</span>
+        </li>
+      </ul>
+      <a class="harness-doc-link" :href="withBase('/cli')">Explore CLI usage <span aria-hidden="true">↗</span></a>
     </section>
 
     <section class="statement">

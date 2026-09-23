@@ -13,6 +13,9 @@ directory, and registers the embedded skill when a user-level Codex or Claude
 Harness is installed. Fresh Harness homes are created at the correct skill
 roots when needed.
 
+For Cursor CLI, Grok Build, OpenCode, and Pi prerequisites and commands, see
+the [CLI reference](cli.md).
+
 Normal users do not need Rust, Cargo, a compiler, or a source checkout. The
 published targets cover macOS and Linux on x86_64 and arm64, with both glibc
 and musl Linux packages.

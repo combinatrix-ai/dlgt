@@ -1,7 +1,5 @@
 # dlgt CLI v1 reference
 
-Status: implemented public contract for the repository binary.
-
 This reference is also published as raw Markdown at
 https://combinatrix.ai/dlgt/cli.md for agents to fetch with curl.
 

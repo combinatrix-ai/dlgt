@@ -41,6 +41,7 @@ export default defineConfig({
     siteTitle: "dlgt",
     nav: [
       { text: "Quick Start", link: "/#quick-start" },
+      { text: "Harnesses", link: "/#harnesses" },
       { text: "Installation", link: "/installation" },
       { text: "CLI", link: "/cli" },
       { text: "Design", link: "/design" },
@@ -60,6 +61,6 @@ export default defineConfig({
     ],
     socialLinks: [{ icon: "github", link: "https://github.com/combinatrix-ai/dlgt" }],
     search: { provider: "local" },
-    footer: { message: "One bridge. Two harnesses.", copyright: "Released under the MIT License." },
+    footer: { message: "One bridge. Six harnesses.", copyright: "Released under the MIT License." },
   },
 });

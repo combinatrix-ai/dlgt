@@ -75,7 +75,8 @@ for supported targets and verification steps.
 
 ## What dlgt does
 
-`dlgt` runs Codex, Claude, and Cursor CLI as live, addressable local Sessions. Each
+`dlgt` runs Codex, Claude, Cursor CLI, Grok Build, OpenCode, and Pi as live,
+addressable local Sessions. Each
 Session owns one harness process, one PTY, one terminal screen, and at most one
 active execution.
 
