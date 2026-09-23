@@ -195,8 +195,11 @@ body { background: var(--dlgt-paper); }
   .agent-picker { width: 128px; }
   .copy-command { margin-top: 4px; }
   .harnesses, .statement, .quick-start { padding-left: 20px; padding-right: 20px; }
-  .dlgt-home .harness-logos { margin-right: -20px; }
-  .dlgt-home .harness-logos li { min-width: 142px; }
+  .dlgt-home .harness-logos { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-right: 0; padding: 0; overflow: visible; }
+  .dlgt-home .harness-logos li { min-width: 0; gap: 8px; padding: 15px 8px; border-right: 0; border-bottom: 1px solid var(--dlgt-line); font-size: 0.94rem; }
+  .dlgt-home .harness-logos li:nth-child(odd) { border-right: 1px solid var(--dlgt-line); }
+  .dlgt-home .harness-logos li:nth-child(n+5) { border-bottom: 0; }
+  .harness-logos img { flex-basis: 24px; width: 24px; height: 24px; }
   .statement .diy-routes > li { grid-template-columns: 1fr; gap: 6px; }
 }
 
