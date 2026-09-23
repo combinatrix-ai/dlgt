@@ -5,7 +5,7 @@ description: Delegate work to the competing harness - run Claude from Codex, or 
 
 # dlgt
 
-`dlgt` runs a Codex, Claude, or Cursor CLI subagent in a dlgt-owned PTY that stays alive
+`dlgt` runs a Codex, Claude, Cursor, or Grok Build subagent in a dlgt-owned PTY that stays alive
 between commands. Reach for it whenever the work should cross the provider
 boundary.
 
@@ -45,7 +45,7 @@ Terms used below:
 ```text
 Session   One Harness process and PTY, one controller, at most one active
           execution, no queue. The only public runtime object.
-Harness   The provider adapter, codex, claude, or cursor.
+Harness   The provider adapter, codex, claude, cursor, or grok.
 Title     A human description.
 Alias     A short human address derived from the title.
 Profile   A reusable client-side launch specification.
@@ -583,3 +583,18 @@ dlgt, so consult `cursor-agent --list-models`. Supported harness options are
 use stop then send --resume. Permission prompts may leave the session busy,
 so inspect the screen and use human attach. Do not infer completion from
 quiet output: the response and stop hooks must agree on the generation.
+
+## Grok Build sessions
+
+When the user selects Grok, use `--harness grok`. This starts the interactive
+Grok Build TUI in a PTY and observes Claude-shaped lifecycle hooks installed
+under `~/.grok/hooks/dlgt.json`. The bridge only runs inside dlgt children
+(`DLGT_GROK_LAUNCH`). Use the returned `grok:<session-id>` with
+send/fetch/attach/stop and `send --resume`. Grok must be installed and
+authenticated; `DLGT_GROK_BIN` selects the executable. Defaults pass
+`--always-approve --trust`; `--no-auto-approve` omits both.
+
+`--model` and `--effort` are supported. Model discovery is currently
+unavailable in dlgt, so pick an ID from Grok itself. Do not infer completion
+from PTY silence: `Stop` / `StopFailure` hooks are the authority. ACP is not
+used by this harness.

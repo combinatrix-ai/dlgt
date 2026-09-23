@@ -31,7 +31,7 @@ have public IDs.
 Other terms:
 
 ```text
-Harness   The provider adapter, codex, claude, or cursor
+Harness   The provider adapter, codex, claude, cursor, or grok
 Profile   A reusable client-side launch specification
 Alias     A human-readable address for an active Session
 Title     A non-unique human description used to generate an Alias
@@ -210,7 +210,7 @@ dlgt new
   --title <TITLE>
   [--alias <@ALIAS>]
   [--profile <PROFILE>]
-  [--harness codex|claude|cursor]
+  [--harness codex|claude|cursor|grok]
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
@@ -1158,3 +1158,29 @@ References: [Cursor CLI](https://cursor.com/docs/cli/overview),
 [parameters](https://cursor.com/docs/cli/reference/parameters), and
 [hooks](https://cursor.com/docs/hooks). The adapter was developed against
 CLI `2026.09.18-9a7762b`.
+
+## Grok Build
+
+Grok support uses the interactive `grok` TUI in a live PTY. It does not start
+ACP agent mode or headless `-p` runs. Install and authenticate Grok Build
+first. `DLGT_GROK_BIN` can select another executable when starting the dlgt
+daemon.
+
+```sh
+dlgt new --harness grok --title "Grok review" --cwd . \
+  --request-id grok-review-1 -- "Review this change"
+dlgt fetch grok:<session-id> --wait 5m
+dlgt send grok:<session-id> --request-id grok-review-2 -- "Review the revision"
+dlgt stop grok:<session-id>
+dlgt send grok:<session-id> --resume --request-id grok-review-3 -- "Continue"
+```
+
+On launch, dlgt installs an idempotent Claude-shaped hook bridge in
+`$HOME/.grok/hooks/dlgt.json` for `SessionStart`, `UserPromptSubmit`, `Stop`,
+`StopFailure`, `Notification`, and `SessionEnd`. The bridge is inert outside
+dlgt children (`DLGT_GROK_LAUNCH` / `DLGT_GROK_HOOK_BIN`). CamelCase Grok hook
+payloads are normalized to the snake_case fields Claude handlers expect.
+Default auto-approval passes `--always-approve --trust`; `--no-auto-approve`
+omits both. `--model` and `--effort` are supported; model discovery is
+currently unavailable in dlgt. Completion comes from lifecycle hooks, not PTY
+silence.

@@ -184,7 +184,7 @@ Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
 override only the current version's socket. Session state is held in memory by
 the daemon that owns the Harness processes. The returned Session ID is also
 the provider conversation's durable resume selector: after that daemon exits,
-pass the same `codex:<id>`, `claude:<id>`, or `cursor:<id>` to `send --resume`. Plain `send`
+pass the same `codex:<id>`, `claude:<id>`, `cursor:<id>`, or `grok:<id>` to `send --resume`. Plain `send`
 scans live versioned sockets first, so a binary update routes that same ID back
 to its owning daemon instead of creating a duplicate.
 
@@ -204,6 +204,14 @@ See [Cursor CLI details and limitations](docs/cli.md#cursor-interactive-cli)
 before use, including current model-discovery, restart, and permission-prompt
 limitations. Authenticated macOS E2E covers new sessions, follow-ups, resume,
 and cancellation; see the CLI documentation for the tested version.
+
+## Grok Build
+
+Use `--harness grok` to run the interactive Grok Build TUI in a PTY. Lifecycle
+completion comes from Claude-shaped hooks under `~/.grok/hooks/dlgt.json`
+(gated by `DLGT_GROK_LAUNCH`). Set `DLGT_GROK_BIN` to override the `grok`
+executable. Defaults pass `--always-approve --trust`; use `--no-auto-approve`
+to keep Grok's own prompts. ACP is not used by this harness.
 
 ## Build and verify
 

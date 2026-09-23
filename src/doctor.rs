@@ -45,6 +45,7 @@ pub fn run(probe: bool) -> Report {
         &provider_program("DLGT_CLAUDE_BIN", "claude"),
     ));
     checks.push(provider_check("cursor", &crate::cursor_agent::program()));
+    checks.push(provider_check("grok", &crate::grok_agent::program()));
     checks.push(skill_check("codex-skill", &codex_skill_path()));
     checks.push(skill_check("claude-skill", &claude_skill_path()));
     if probe {
