@@ -61,6 +61,6 @@ export default defineConfig({
     ],
     socialLinks: [{ icon: "github", link: "https://github.com/combinatrix-ai/dlgt" }],
     search: { provider: "local" },
-    footer: { message: "One bridge. Six harnesses on main.", copyright: "Released under the MIT License." },
+    footer: { message: "One bridge. Six harnesses.", copyright: "Released under the MIT License." },
   },
 });

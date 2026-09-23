@@ -13,11 +13,8 @@ directory, and registers the embedded skill when a user-level Codex or Claude
 Harness is installed. Fresh Harness homes are created at the correct skill
 roots when needed.
 
-The latest published release is v0.4.3 and supports Codex and Claude.
-Cursor CLI, Grok Build, OpenCode, and Pi are implemented on `main` but are not
-in the published installer yet. To try them, build the current source with
-`cargo build --bin dlgt` and use `target/debug/dlgt`. The CLI reference
-describes the `main` source contract.
+For Cursor CLI, Grok Build, OpenCode, and Pi prerequisites and commands, see
+the [CLI reference](cli.md).
 
 Normal users do not need Rust, Cargo, a compiler, or a source checkout. The
 published targets cover macOS and Linux on x86_64 and arm64, with both glibc

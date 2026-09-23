@@ -165,7 +165,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
 
     <section id="harnesses" class="harnesses">
       <div class="harnesses-intro">
-        <p class="eyebrow">Supported on main</p>
+        <p class="eyebrow">Supported harnesses</p>
         <h2>One bridge. Six harnesses.</h2>
         <p>Run another coding agent in a live, addressable terminal Session. Follow up in the same conversation and read its provider-reported result.</p>
       </div>
@@ -175,7 +175,6 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
           <span>{{ harness.label }}</span>
         </li>
       </ul>
-      <p class="harness-release"><strong>Published v0.4.3:</strong> Codex, Claude <span aria-hidden="true">·</span> <strong>Main source:</strong> Cursor CLI, Grok Build, OpenCode, Pi</p>
       <a class="harness-doc-link" :href="withBase('/cli')">Explore CLI usage <span aria-hidden="true">↗</span></a>
     </section>
 

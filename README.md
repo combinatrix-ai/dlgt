@@ -75,11 +75,6 @@ for supported targets and verification steps.
 
 ## What dlgt does
 
-The latest published release, v0.4.3, supports Codex and Claude. The other
-four harnesses are implemented on `main` and require a source build until a
-new release ships. The [CLI reference](docs/cli.md) describes the source-build
-features and their requirements.
-
 `dlgt` runs Codex, Claude, Cursor CLI, Grok Build, OpenCode, and Pi as live,
 addressable local Sessions. Each
 Session owns one harness process, one PTY, one terminal screen, and at most one

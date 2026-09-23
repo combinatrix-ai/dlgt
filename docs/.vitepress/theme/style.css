@@ -87,9 +87,6 @@ body { background: var(--dlgt-paper); }
 .dlgt-home .harness-logos li:last-child { border-right: 0; }
 .harness-logos img { display: block; flex: 0 0 28px; width: 28px; height: 28px; object-fit: contain; }
 .dark .harness-logos img { filter: invert(1); }
-.harness-release { margin-top: 15px !important; font-size: 0.82rem; line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 68%, transparent); }
-.harness-release strong { color: var(--dlgt-ink); }
-.harness-release span { margin: 0 0.4em; }
 .harness-doc-link { display: inline-block; margin-top: 25px; color: var(--dlgt-ink) !important; font-weight: 700; text-decoration-thickness: 1px; text-underline-offset: 4px; }
 .harness-doc-link span { color: var(--dlgt-accent); }
 
