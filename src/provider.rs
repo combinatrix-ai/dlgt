@@ -45,6 +45,8 @@ pub enum Agent {
     Claude,
     Cursor,
     Grok,
+    OpenCode,
+    Pi,
 }
 
 impl Agent {
@@ -54,7 +56,11 @@ impl Agent {
             "claude" => Ok(Self::Claude),
             "cursor" => Ok(Self::Cursor),
             "grok" => Ok(Self::Grok),
-            _ => bail!("unsupported agent {value:?}; expected codex, claude, cursor, or grok"),
+            "opencode" => Ok(Self::OpenCode),
+            "pi" => Ok(Self::Pi),
+            _ => bail!(
+                "unsupported agent {value:?}; expected codex, claude, cursor, grok, opencode, or pi"
+            ),
         }
     }
 
@@ -64,12 +70,16 @@ impl Agent {
             Self::Claude => "claude",
             Self::Cursor => "cursor",
             Self::Grok => "grok",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
         }
     }
 
     pub fn semantic_input(self, prompt: &str) -> Result<Vec<u8>> {
         match self {
-            Self::Claude | Self::Cursor | Self::Grok => bracketed_paste_input(prompt),
+            Self::Claude | Self::Cursor | Self::Grok | Self::OpenCode | Self::Pi => {
+                bracketed_paste_input(prompt)
+            }
             Self::Codex => bail!("Codex semantic input must use app-server turn/start"),
         }
     }
@@ -77,7 +87,7 @@ impl Agent {
     pub const fn cancel_input(self) -> &'static [u8] {
         match self {
             Self::Codex => &[0x03],
-            Self::Claude | Self::Cursor | Self::Grok => &[0x1b],
+            Self::Claude | Self::Cursor | Self::Grok | Self::OpenCode | Self::Pi => &[0x1b],
         }
     }
 }
@@ -139,6 +149,8 @@ pub fn command_spec(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         Agent::Claude => claude_command(options),
         Agent::Cursor => crate::cursor_agent::command(options),
         Agent::Grok => crate::grok_agent::command(options),
+        Agent::OpenCode => crate::opencode_agent::command(options),
+        Agent::Pi => crate::pi_agent::command(options),
     }
 }
 
@@ -198,7 +210,7 @@ pub(crate) fn codex_app_server_args(
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
     match agent {
-        Agent::Cursor | Agent::Grok => {}
+        Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {}
         Agent::Codex => {
             let home = std::env::var_os("CODEX_HOME").map_or_else(
                 || {

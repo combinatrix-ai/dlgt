@@ -167,6 +167,32 @@ configuration footprint, interaction with user hooks, and authenticated
 validation results. Automated fixtures separately cover callback ordering,
 routing, and rejection of stale events.
 
+## OpenCode and Pi lifecycle observation
+
+OpenCode and Pi use the interactive PTY and the Claude-shaped hook events
+(`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd`).
+Screen silence is not a completion signal.
+
+OpenCode's one-shot `run` command exits, so it cannot hold a Session. The
+adapter launches the TUI with `--auto` and installs an inert plugin at
+`$XDG_CONFIG_HOME/opencode/plugins/dlgt.js` (or `~/.config/opencode/plugins/`).
+The plugin reports session creation, the submitted prompt, idle completion,
+and session errors.
+
+Pi's RPC mode can report `agent_settled` on stdout. That event is also
+delivered to extensions inside the interactive TUI, and RPC would replace the
+PTY used for attach and follow-up input. The adapter therefore launches the
+TUI, passes a dlgt-owned extension with `--extension`, and treats
+`agent_settled` as `Stop`. `agent_end` is ignored because Pi may still retry
+or compact. `--approve` skips the project-trust prompt; Pi does not ask before
+ordinary tool calls.
+
+Both CLIs can replace the process and reopen the saved conversation without a
+new prompt (`opencode --session`, `pi --session`), so `restart` is supported.
+xAI requests use `XAI_API_KEY`. The working value is the OIDC access JWT in
+`~/.grok/auth.json` under `key`. It expires. Refresh Grok CLI auth and export
+the new `key`. dlgt does not read or store that token.
+
 ## Claude lifecycle observation
 
 Claude uses semantic PTY input for ordinary turns and Session-scoped lifecycle

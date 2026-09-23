@@ -12,7 +12,7 @@ invariants, lifecycle rationale, security model, and acceptance criteria.
 ## Product definition
 
 `dlgt` is a local, single-binary runtime for live, addressable, and
-attachable Codex, Claude, and Cursor CLI subagents.
+attachable Codex, Claude, Cursor, Grok, OpenCode, and Pi subagents.
 
 The only public runtime object is a **Session**:
 
@@ -31,7 +31,7 @@ have public IDs.
 Other terms:
 
 ```text
-Harness   The provider adapter, codex, claude, cursor, or grok
+Harness   The provider adapter, codex, claude, cursor, grok, opencode, or pi
 Profile   A reusable client-side launch specification
 Alias     A human-readable address for an active Session
 Title     A non-unique human description used to generate an Alias
@@ -210,7 +210,7 @@ dlgt new
   --title <TITLE>
   [--alias <@ALIAS>]
   [--profile <PROFILE>]
-  [--harness codex|claude|cursor|grok]
+  [--harness codex|claude|cursor|grok|opencode|pi]
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
@@ -1184,3 +1184,80 @@ Default auto-approval passes `--always-approve --trust`; `--no-auto-approve`
 omits both. `--model` and `--effort` are supported; model discovery is
 currently unavailable in dlgt. Completion comes from lifecycle hooks, not PTY
 silence.
+
+## OpenCode
+
+OpenCode support runs the interactive `opencode` TUI in a live PTY. It does
+not use `opencode run`, which exits after one prompt. Install OpenCode first.
+`DLGT_OPENCODE_BIN` can select another executable when starting the dlgt
+daemon.
+
+```sh
+# Export the Grok CLI OIDC access token. It is the `key` field of
+# ~/.grok/auth.json and it expires. Sign in with the Grok CLI again to refresh
+# it, then export the new value. Do not print, log, or commit the token.
+export XAI_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.grok/auth.json")))["key"])')"
+
+dlgt new --harness opencode --model xai/grok-4.7 --title "OpenCode review" --cwd . \
+  --request-id opencode-review-1 -- "Review this change"
+dlgt fetch opencode:<session-id> --wait 5m
+dlgt send opencode:<session-id> --request-id opencode-review-2 -- "Review the revision"
+dlgt stop opencode:<session-id>
+dlgt send opencode:<session-id> --resume --request-id opencode-review-3 -- "Continue"
+```
+
+On launch, dlgt installs `dlgt.js` in `$XDG_CONFIG_HOME/opencode/plugins/` or
+`~/.config/opencode/plugins/`. The plugin is inert unless `DLGT_OPENCODE_LAUNCH`
+is set, which only dlgt children receive. It emits Claude-shaped `SessionStart`,
+`UserPromptSubmit`, `Stop`, and `StopFailure` hooks. A foreign `dlgt.js` that
+lacks that marker is left unchanged.
+
+Default auto-approval passes `--auto`. `--no-auto-approve` omits it. `--model`
+takes `provider/model`. `--effort` is rejected. The only harness option is
+`agent=<name>`. `opencode` can reopen a session with `--session` and no prompt,
+so `restart` is supported. Discover model IDs with `dlgt models --harness opencode`
+(`opencode models`). Completion comes from the hooks, not PTY silence.
+
+## Pi
+
+Pi support runs the interactive `pi` TUI in a live PTY. Install
+`@earendil-works/pi-coding-agent` first. `DLGT_PI_BIN` can select another
+executable when starting the dlgt daemon.
+
+Pi's `--mode rpc` protocol reports `agent_settled` on stdout, which is the
+right completion signal. That same event is available to an extension inside
+the interactive TUI. RPC would replace the PTY session `attach` and follow-up
+pastes use, so dlgt stays on the TUI and the extension waits for
+`agent_settled` rather than `agent_end` (a retry or compaction can still follow
+`agent_end`).
+
+```sh
+# Same Grok CLI JWT as OpenCode. Refresh ~/.grok/auth.json `key` when it
+# expires. Do not print the token.
+export XAI_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.grok/auth.json")))["key"])')"
+
+dlgt new --harness pi --model grok-4.7 --harness-option provider=xai \
+  --title "Pi review" --cwd . --request-id pi-review-1 -- "Review this change"
+dlgt fetch pi:<session-id> --wait 5m
+dlgt send pi:<session-id> --request-id pi-review-2 -- "Review the revision"
+dlgt stop pi:<session-id>
+dlgt send pi:<session-id> --resume --request-id pi-review-3 -- "Continue"
+```
+
+`--model xai/grok-4.7` also selects the provider. `--effort` maps to Pi's
+`--thinking` level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+The only harness option is `provider=<name>`.
+
+On launch, dlgt writes `~/.pi/agent/dlgt/bridge.js` and passes it with
+`--extension`. That directory is outside Pi's extension autoload path. The
+extension is inert unless `DLGT_PI_LAUNCH` is set. A foreign `bridge.js` that
+lacks that marker is left unchanged.
+
+Pi does not prompt before each tool call. Default auto-approval passes
+`--approve`, which skips the project-trust dialog so the TUI can become idle.
+`--no-auto-approve` omits it and Pi may wait on that dialog. `pi --session`
+reopens a conversation without a prompt, so `restart` is supported. Discover
+model IDs with `dlgt models --harness pi` (`pi --list-models`). IDs are
+`provider/model`. Completion comes from `agent_settled`, not PTY silence.
+These CLIs can stall when stdout is a pipe; dlgt already runs the harness in
+a PTY.

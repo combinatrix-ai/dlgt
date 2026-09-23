@@ -497,3 +497,14 @@ fetch, cancel, attach, stop, and explicit-resume RPC paths. `harness.list`
 advertises `effort: false`, `restart: false`, and unavailable model discovery.
 See [Cursor CLI](cli.md#cursor-interactive-cli) for hook registration and the
 current limitations; this path does not use ACP or a desktop app.
+
+## OpenCode and Pi harnesses
+
+`harness: "opencode"` and `harness: "pi"` select the interactive OpenCode and
+Pi TUIs. Session IDs are `opencode:<session-id>` and `pi:<session-id>`.
+`harness.list` advertises `model_discovery: "cli"` and `restart: true`.
+OpenCode has `effort: false`. Pi has `effort: true` and maps it to `--thinking`.
+Both use the Claude-shaped hook lifecycle inside the PTY. Pi does not use
+`--mode rpc`; the extension observes `agent_settled` in the TUI instead.
+See [OpenCode](cli.md#opencode) and [Pi](cli.md#pi) for `XAI_API_KEY` and the
+Grok CLI JWT refresh path.

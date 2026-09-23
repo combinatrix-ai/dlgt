@@ -648,9 +648,10 @@ impl Daemon {
                             error.session_id.as_deref().unwrap_or(selector)
                         ));
                     }
-                } else if selector.split_once(':').is_some_and(|(agent, id)| {
-                    matches!(agent, "codex" | "claude" | "cursor" | "grok") && !id.is_empty()
-                }) {
+                } else if selector
+                    .split_once(':')
+                    .is_some_and(|(agent, id)| provider_qualified(agent, id))
+                {
                     error.session_id = Some(selector.to_owned());
                 }
             }
@@ -766,6 +767,12 @@ impl Daemon {
         if agent == Agent::Grok {
             crate::grok_agent::validate(&harness_options)?;
         }
+        if agent == Agent::OpenCode {
+            crate::opencode_agent::validate(effort, &harness_options)?;
+        }
+        if agent == Agent::Pi {
+            crate::pi_agent::validate(effort, &harness_options)?;
+        }
         let auto_approve = params
             .get("auto_approve")
             .and_then(Value::as_bool)
@@ -839,9 +846,7 @@ impl Daemon {
                 &id,
             )?)
         };
-        if agent == Agent::Grok
-            && let Err(error) = crate::grok_agent::configure(&mut environment, &id)
-        {
+        if let Err(error) = configure_pty_hooks(agent, &mut environment, &id) {
             self.lock_store()?.set_session_failed(&id);
             return Err(error);
         }
@@ -894,8 +899,11 @@ impl Daemon {
         );
         let startup_deadline = Instant::now() + startup_timeout;
         let runtime = match agent {
-            Agent::Claude | Agent::Cursor | Agent::Grok => command_spec(&options)
-                .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
+            Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {
+                command_spec(&options).and_then(|spec| {
+                    self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)
+                })
+            }
             Agent::Codex => {
                 self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, startup_timeout)
             }
@@ -987,10 +995,12 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(25));
         }
         let provider_id = match agent {
-            Agent::Claude | Agent::Cursor | Agent::Grok => pending_provider_id
-                .as_mut()
-                .context("missing hook provider ID binding")?
-                .take()?,
+            Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {
+                pending_provider_id
+                    .as_mut()
+                    .context("missing hook provider ID binding")?
+                    .take()?
+            }
             Agent::Codex => runtime
                 .provider_id()
                 .context("Codex runtime did not report a provider thread ID")?
@@ -1113,9 +1123,9 @@ impl Daemon {
 
         let (agent, provider_id) = selector
             .split_once(':')
-            .filter(|(agent, id)| matches!(*agent, "codex" | "claude" | "cursor" | "grok") && !id.is_empty())
+            .filter(|(agent, id)| provider_qualified(agent, id))
             .context(
-                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id>, claude:<id>, cursor:<id>, or grok:<id> with --resume",
+                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id>, claude:<id>, cursor:<id>, grok:<id>, opencode:<id>, or pi:<id> with --resume",
             )?;
         self.launch_resumed_session(params, agent, provider_id, None, None)
     }
@@ -1247,10 +1257,8 @@ impl Daemon {
             self.lock_store()?.set_session_failed(&session.id);
             bail!("restart launch timed out before starting the replacement process");
         }
-        if agent == Agent::Grok {
-            crate::grok_agent::configure(&mut environment, &session.id)
-                .context("failed to configure Grok hooks for restart")?;
-        }
+        configure_pty_hooks(agent, &mut environment, &session.id)
+            .context("failed to configure harness hooks for restart")?;
         let options = LaunchOptions {
             agent,
             session_id: &session.id,
@@ -1275,8 +1283,11 @@ impl Daemon {
             )?)
         };
         let runtime = match agent {
-            Agent::Claude | Agent::Cursor | Agent::Grok => command_spec(&options)
-                .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
+            Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {
+                command_spec(&options).and_then(|spec| {
+                    self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)
+                })
+            }
             Agent::Codex => {
                 self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, remaining)
             }
@@ -1340,10 +1351,12 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(25));
         }
         let rebound_provider_id = match agent {
-            Agent::Claude | Agent::Cursor | Agent::Grok => pending_provider_id
-                .as_mut()
-                .context("missing hook provider ID binding")?
-                .take()?,
+            Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {
+                pending_provider_id
+                    .as_mut()
+                    .context("missing hook provider ID binding")?
+                    .take()?
+            }
             Agent::Codex => runtime
                 .provider_id()
                 .context("Codex runtime did not report a provider thread ID")?
@@ -1677,7 +1690,9 @@ impl Daemon {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let input = match agent {
             Agent::Codex => prompt.as_bytes().to_vec(),
-            Agent::Claude | Agent::Cursor | Agent::Grok => agent.semantic_input(prompt)?,
+            Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {
+                agent.semantic_input(prompt)?
+            }
         };
         let (turn, acceptance_cursor) = {
             let mut store = self.lock_store()?;
@@ -1725,7 +1740,7 @@ impl Daemon {
                     return Err(error);
                 }
             },
-            Agent::Claude | Agent::Cursor | Agent::Grok => {
+            Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {
                 if let Err(error) = write_semantic_input(&runtime, &input) {
                     let store = self.lock_store()?;
                     let message = sanitize_message(&error.to_string());
@@ -2227,6 +2242,8 @@ impl Daemon {
         match params_string(params, "harness")? {
             "cursor" => Ok(crate::cursor_models::list_models()),
             "grok" => Ok(crate::grok_models::list_models()),
+            "opencode" => Ok(crate::opencode_models::list_models()),
+            "pi" => Ok(crate::pi_models::list_models()),
             "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
                 let socket = paths::home_dir()?
@@ -2258,7 +2275,9 @@ impl Daemon {
             {"id":"codex","model_discovery":"complete","effort":true},
             {"id":"claude","model_discovery":"snapshot","effort":true},
             {"id":"cursor","model_discovery":"cli","effort":false,"restart":false},
-            {"id":"grok","model_discovery":"cli","effort":true}
+            {"id":"grok","model_discovery":"cli","effort":true},
+            {"id":"opencode","model_discovery":"cli","effort":false,"restart":true},
+            {"id":"pi","model_discovery":"cli","effort":true,"restart":true}
         ]);
         if let Some(name) = params.get("harness").and_then(Value::as_str) {
             return all
@@ -2884,13 +2903,15 @@ fn start_hook_turn(
 }
 
 fn claude_submission_matches_session(session: &SessionRecord, payload: &Value) -> bool {
-    let Some(expected_provider_id) = session
-        .id
-        .strip_prefix("claude:")
-        .or_else(|| session.id.strip_prefix("grok:"))
-    else {
+    let Some((agent, expected_provider_id)) = session.id.split_once(':') else {
         return false;
     };
+    if agent != session.agent
+        || !matches!(agent, "claude" | "grok" | "opencode" | "pi")
+        || expected_provider_id.is_empty()
+    {
+        return false;
+    }
     if payload.get("session_id").and_then(Value::as_str) != Some(expected_provider_id) {
         return false;
     }
@@ -3507,6 +3528,26 @@ fn generate_internal_id() -> String {
         value >>= 5;
     }
     format!("internal:{}", String::from_utf8_lossy(&suffix))
+}
+
+fn provider_qualified(agent: &str, id: &str) -> bool {
+    matches!(
+        agent,
+        "codex" | "claude" | "cursor" | "grok" | "opencode" | "pi"
+    ) && !id.is_empty()
+}
+
+fn configure_pty_hooks(
+    agent: Agent,
+    environment: &mut HashMap<String, String>,
+    launch: &str,
+) -> Result<()> {
+    match agent {
+        Agent::Grok => crate::grok_agent::configure(environment, launch),
+        Agent::OpenCode => crate::opencode_agent::configure(environment, launch),
+        Agent::Pi => crate::pi_agent::configure(environment, launch),
+        Agent::Codex | Agent::Claude | Agent::Cursor => Ok(()),
+    }
 }
 
 fn canonical_session_id(agent: &str, provider_id: &str) -> String {
