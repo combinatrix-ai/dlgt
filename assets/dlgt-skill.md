@@ -5,7 +5,7 @@ description: Delegate work to the competing harness - run Claude from Codex, or 
 
 # dlgt
 
-`dlgt` runs a Codex, Claude, Cursor, or Grok Build subagent in a dlgt-owned PTY that stays alive
+`dlgt` runs a Codex, Claude, Cursor, Grok, OpenCode, or Pi subagent in a dlgt-owned PTY that stays alive
 between commands. Reach for it whenever the work should cross the provider
 boundary.
 
@@ -45,7 +45,7 @@ Terms used below:
 ```text
 Session   One Harness process and PTY, one controller, at most one active
           execution, no queue. The only public runtime object.
-Harness   The provider adapter, codex, claude, cursor, or grok.
+Harness   The provider adapter, codex, claude, cursor, grok, opencode, or pi.
 Title     A human description.
 Alias     A short human address derived from the title.
 Profile   A reusable client-side launch specification.
@@ -598,3 +598,27 @@ authenticated; `DLGT_GROK_BIN` selects the executable. Defaults pass
 (CLI: `grok models`). Do not infer completion
 from PTY silence: `Stop` / `StopFailure` hooks are the authority. ACP is not
 used by this harness.
+
+## OpenCode and Pi sessions
+
+When the user selects OpenCode, use `--harness opencode`. This starts the
+interactive OpenCode TUI in a PTY, not `opencode run`. Use the returned
+`opencode:<session-id>` with send/fetch/attach/stop, `send --resume`, and
+`restart`. Pass models as `provider/model` (`--model xai/grok-4.7`). Do not
+pass `--effort`. The only harness option is `agent=<name>`. Defaults pass
+`--auto`; `--no-auto-approve` omits it. Discover IDs with
+`dlgt models --harness opencode`.
+
+When the user selects Pi, use `--harness pi`. This starts the interactive Pi
+TUI in a PTY. Use the returned `pi:<session-id>` the same way, including
+`restart`. Pass `--model grok-4.7` with `--harness-option provider=xai`, or
+`--model xai/grok-4.7`. `--effort` maps to Pi's thinking level. Defaults pass
+`--approve` so the project-trust dialog does not block startup. Discover IDs
+with `dlgt models --harness pi`.
+
+For xAI on either harness, set `XAI_API_KEY` to the OIDC access token in
+`~/.grok/auth.json` under `key`. That JWT expires. Refresh it by signing in
+with the Grok CLI again and export the new `key`. Never print, log, or commit
+the token. Do not infer completion from a quiet screen. OpenCode completion is
+the `session.idle` hook. Pi completion is the extension's `agent_settled`
+event, not `--mode rpc` and not `agent_end`.

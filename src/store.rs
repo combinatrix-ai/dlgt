@@ -150,7 +150,8 @@ impl Store {
         if !(matches!(
             session.record.state,
             SessionState::Starting | SessionState::Idle
-        ) || session.record.agent == "cursor" && session.record.state == SessionState::Busy)
+        ) || matches!(session.record.agent.as_str(), "cursor" | "opencode")
+            && session.record.state == SessionState::Busy)
         {
             return false;
         }
@@ -405,8 +406,10 @@ impl Store {
         let session = self
             .get_session(session_id)
             .context("Cursor launch missing")?;
-        if session.agent != "cursor" || session.state != SessionState::Starting {
-            bail!("invalid Cursor launch state");
+        if !matches!(session.agent.as_str(), "cursor" | "opencode")
+            || session.state != SessionState::Starting
+        {
+            bail!("invalid prepared launch state");
         }
         let next = previous
             .and_then(|id| self.latest_turn(id))

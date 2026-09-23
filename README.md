@@ -184,7 +184,7 @@ Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
 override only the current version's socket. Session state is held in memory by
 the daemon that owns the Harness processes. The returned Session ID is also
 the provider conversation's durable resume selector: after that daemon exits,
-pass the same `codex:<id>`, `claude:<id>`, `cursor:<id>`, or `grok:<id>` to `send --resume`. Plain `send`
+pass the same `codex:<id>`, `claude:<id>`, `cursor:<id>`, `grok:<id>`, `opencode:<id>`, or `pi:<id>` to `send --resume`. Plain `send`
 scans live versioned sockets first, so a binary update routes that same ID back
 to its owning daemon instead of creating a duplicate.
 
@@ -212,6 +212,23 @@ completion comes from Claude-shaped hooks under `~/.grok/hooks/dlgt.json`
 (gated by `DLGT_GROK_LAUNCH`). Set `DLGT_GROK_BIN` to override the `grok`
 executable. Defaults pass `--always-approve --trust`; use `--no-auto-approve`
 to keep Grok's own prompts. ACP is not used by this harness.
+
+## OpenCode and Pi
+
+`--harness opencode` runs the OpenCode TUI (`opencode --auto`) in a PTY.
+`--harness pi` runs the Pi TUI (`pi --approve`) in a PTY. Both keep the
+conversation across `stop` and `send --resume`, and both support `restart`.
+Set `DLGT_OPENCODE_BIN` or `DLGT_PI_BIN` to override the executable.
+
+OpenCode models are `provider/model` (`--model xai/grok-4.7`). Pi takes
+`--model grok-4.7` with `--harness-option provider=xai`, or `--model xai/grok-4.7`.
+`--effort` maps to Pi's thinking level and is rejected for OpenCode.
+
+Both CLIs call xAI when `XAI_API_KEY` is the OIDC access JWT stored at
+`~/.grok/auth.json` under `key`. The JWT expires. Sign in with the Grok CLI
+again and export the new `key`. Do not print or commit the token. Pi stays on
+the interactive TUI: its extension waits for `agent_settled`, the same
+completion signal as `--mode rpc`, without replacing the PTY session.
 
 ## Build and verify
 

@@ -101,7 +101,10 @@ pub struct LiveSessionRoute {
 
 pub fn find_live_session(selector: &str) -> Result<Option<LiveSessionRoute>> {
     let canonical = selector.split_once(':').filter(|(harness, id)| {
-        matches!(*harness, "codex" | "claude" | "cursor") && !id.is_empty()
+        matches!(
+            *harness,
+            "codex" | "claude" | "cursor" | "grok" | "opencode" | "pi"
+        ) && !id.is_empty()
     });
     if canonical.is_none() {
         return Ok(None);
