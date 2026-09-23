@@ -53,7 +53,6 @@ def interactive(agent):
             "cwd": os.getcwd(),
         },
     )
-
     def turn(prompt):
         emit(
             agent,
@@ -75,6 +74,11 @@ def interactive(agent):
                 "last_assistant_message": "result:" + prompt,
             },
         )
+
+    # OpenCode launches pass the first prompt on argv. The TUI does not emit
+    # a session until that prompt exists, and dlgt does not paste it again.
+    if "--prompt" in args:
+        turn(args[args.index("--prompt") + 1])
 
     buffer = b""
     while True:

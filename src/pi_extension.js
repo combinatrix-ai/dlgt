@@ -5,6 +5,10 @@ import { spawnSync } from "node:child_process";
 
 const launch = process.env.DLGT_PI_LAUNCH || "";
 const bin = process.env.DLGT_PI_HOOK_BIN || "";
+// Pi's session context uses the saved project directory. A resume launched
+// from another directory would then fail dlgt's cwd check. Freeze the
+// directory dlgt spawned, before Pi can change it.
+const launchCwd = process.cwd();
 
 function emit(payload) {
   if (!launch || !bin) return;
@@ -48,7 +52,6 @@ function assistantText(message) {
 export default function (pi) {
   if (!launch || !bin || !pi || typeof pi.on !== "function") return;
   let id = "";
-  let cwd = "";
   let prompt = "";
   let assistant = "";
   let awaiting = false;
@@ -65,12 +68,10 @@ export default function (pi) {
     const found = currentId(ctx);
     if (!found || started) return;
     started = true;
-    cwd = (ctx && ctx.cwd) || cwd;
-    emit({ hook_event_name: "SessionStart", session_id: found, cwd });
+    emit({ hook_event_name: "SessionStart", session_id: found, cwd: launchCwd });
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    cwd = (ctx && ctx.cwd) || cwd;
     for (let attempt = 0; attempt < 50 && !currentId(ctx); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
@@ -78,7 +79,6 @@ export default function (pi) {
   });
 
   pi.on("input", (event, ctx) => {
-    cwd = (ctx && ctx.cwd) || cwd;
     emitStart(ctx);
     const text = clean(event && event.text);
     const found = currentId(ctx);
@@ -88,14 +88,14 @@ export default function (pi) {
       awaiting = true;
       failed = false;
       assistant = "";
-      emit({ hook_event_name: "UserPromptSubmit", session_id: found, cwd, prompt: text });
+      emit({ hook_event_name: "UserPromptSubmit", session_id: found, cwd: launchCwd, prompt: text });
       return { action: "transform", text };
     }
     prompt = text;
     awaiting = true;
     failed = false;
     assistant = "";
-    emit({ hook_event_name: "UserPromptSubmit", session_id: found, cwd, prompt: text });
+    emit({ hook_event_name: "UserPromptSubmit", session_id: found, cwd: launchCwd, prompt: text });
   });
 
   pi.on("message_end", (event) => {
@@ -110,13 +110,12 @@ export default function (pi) {
   pi.on("agent_settled", (_event, ctx) => {
     if (!awaiting) return;
     awaiting = false;
-    cwd = (ctx && ctx.cwd) || cwd;
     const found = currentId(ctx);
     if (failed) {
       emit({
         hook_event_name: "StopFailure",
         session_id: found,
-        cwd,
+        cwd: launchCwd,
         prompt,
         last_assistant_message: assistant,
         error: "pi_error",
@@ -127,7 +126,7 @@ export default function (pi) {
     emit({
       hook_event_name: "Stop",
       session_id: found,
-      cwd,
+      cwd: launchCwd,
       prompt,
       last_assistant_message: assistant,
     });
@@ -139,7 +138,7 @@ export default function (pi) {
     emit({
       hook_event_name: "SessionEnd",
       session_id: found,
-      cwd: (ctx && ctx.cwd) || cwd,
+      cwd: launchCwd,
     });
   });
 }

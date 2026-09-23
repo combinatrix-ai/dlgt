@@ -4,6 +4,9 @@ import { spawnSync } from "node:child_process";
 
 const launch = process.env.DLGT_OPENCODE_LAUNCH || "";
 const bin = process.env.DLGT_OPENCODE_HOOK_BIN || "";
+// The TUI worker does not see CLI argv. dlgt passes the provider id here
+// because a resumed session publishes no session.* event until the next prompt.
+const resumeId = (process.env.DLGT_OPENCODE_RESUME || "").trim();
 
 function emit(payload) {
   if (!launch || !bin) return;
@@ -44,12 +47,20 @@ export const DlgtPlugin = async ({ client, directory }) => {
   let awaiting = false;
   let prompt = "";
   let assistant = "";
-  const cwd = directory || process.cwd();
+  // Report the process cwd dlgt launched, not OpenCode's project directory.
+  // A resumed session can belong to another directory than the launch cwd.
+  const cwd = process.cwd() || directory || "";
 
   function bind(id) {
     if (!id || bound) return;
     bound = id;
     emit({ hook_event_name: "SessionStart", session_id: id, cwd });
+  }
+
+  if (resumeId) {
+    // Defer until this factory returns so plugin startup is not blocked on
+    // the daemon round-trip. Readiness still arrives before the TUI is idle.
+    setTimeout(() => bind(resumeId), 0);
   }
 
   function notePrompt(sessionID, text) {

@@ -8,7 +8,9 @@
 //! The extension therefore emits Claude-shaped hooks and waits for
 //! `agent_settled`. It is loaded with `--extension` from a dlgt-owned path
 //! outside Pi's autoload directory, and it no-ops unless `DLGT_PI_LAUNCH` is
-//! set.
+//! set. Resume passes the session file path when it can be found: `pi
+//! --session <id>` from another directory stops to ask whether to fork, and
+//! that prompt never reaches `session_start`.
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -126,7 +128,10 @@ pub fn command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     }
     if let Some(id) = options.resume_provider_id {
         reject_flag_like("session", id)?;
-        args.extend(["--session".to_owned(), id.to_owned()]);
+        args.extend([
+            "--session".to_owned(),
+            resume_session_argument(options.environment, id),
+        ]);
     }
     Ok(CommandSpec {
         program: program(),
@@ -134,6 +139,70 @@ pub fn command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         cwd: options.cwd.to_path_buf(),
         environment: options.environment.clone(),
     })
+}
+
+/// Prefer the on-disk session file. An id-only `--session` from another
+/// directory is a global match, and Pi then blocks on an interactive fork
+/// prompt before `session_start`.
+fn resume_session_argument(environment: &HashMap<String, String>, id: &str) -> String {
+    session_file(environment, id)
+        .map_or_else(|| id.to_owned(), |path| path.to_string_lossy().into_owned())
+}
+
+fn session_file(environment: &HashMap<String, String>, id: &str) -> Option<PathBuf> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') {
+        return None;
+    }
+    let mut roots = Vec::new();
+    if let Some(dir) = environment
+        .get("PI_CODING_AGENT_SESSION_DIR")
+        .filter(|value| !value.is_empty())
+    {
+        roots.push(PathBuf::from(dir));
+    }
+    if let Some(home) = environment.get("HOME").filter(|value| !value.is_empty()) {
+        let agent = Path::new(home).join(".pi/agent");
+        if let Some(dir) = settings_session_dir(&agent.join("settings.json")) {
+            roots.push(dir);
+        }
+        roots.push(agent.join("sessions"));
+    }
+    let suffix = format!("_{id}.jsonl");
+    roots
+        .into_iter()
+        .find_map(|root| find_session_file(&root, &suffix))
+}
+
+fn settings_session_dir(path: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let dir = value
+        .get("sessionDir")
+        .and_then(serde_json::Value::as_str)
+        .filter(|dir| !dir.is_empty())?;
+    Some(PathBuf::from(dir))
+}
+
+fn find_session_file(root: &Path, suffix: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().ends_with(suffix) {
+            return Some(path);
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(nested) = fs::read_dir(&path) else {
+            continue;
+        };
+        for child in nested.flatten() {
+            if child.file_name().to_string_lossy().ends_with(suffix) {
+                return Some(child.path());
+            }
+        }
+    }
+    None
 }
 
 fn valid_token(value: &str) -> bool {
@@ -206,6 +275,50 @@ mod tests {
         assert!(validate(None, &["mode=rpc".to_owned()]).is_err());
         assert!(validate(None, &["api-key=secret".to_owned()]).is_err());
         assert!(validate(Some("max"), &["provider=xai".to_owned()]).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn resume_opens_the_session_file_so_a_different_cwd_does_not_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let id = "11111111-1111-1111-1111-111111111111";
+        let file = temp
+            .path()
+            .join(".pi/agent/sessions/--tmp-proj--")
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        fs::create_dir_all(file.parent().context("session parent")?)?;
+        fs::write(&file, "{}\n")?;
+        let environment = HashMap::from([
+            (
+                "HOME".to_owned(),
+                temp.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "DLGT_PI_EXTENSION".to_owned(),
+                "/tmp/pi-bridge.js".to_owned(),
+            ),
+        ]);
+        let options = LaunchOptions {
+            agent: crate::provider::Agent::Pi,
+            session_id: "internal:TEST",
+            title: "review",
+            cwd: Path::new("/workspace"),
+            model: Some("grok-4.7"),
+            effort: None,
+            harness_options: &["provider=xai".to_owned()],
+            new_provider_id: None,
+            resume_provider_id: Some(id),
+            environment: &environment,
+            auto_approve: true,
+            initial_prompt: None,
+        };
+        let spec = command(&options)?;
+        let session = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--session")
+            .and_then(|index| spec.args.get(index + 1));
+        assert_eq!(session.map(String::as_str), file.to_str());
         Ok(())
     }
 

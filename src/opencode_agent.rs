@@ -22,7 +22,11 @@ pub fn program() -> PathBuf {
     std::env::var_os("DLGT_OPENCODE_BIN").map_or_else(|| PathBuf::from("opencode"), PathBuf::from)
 }
 
-pub fn configure(environment: &mut HashMap<String, String>, launch: &str) -> Result<()> {
+pub fn configure(
+    environment: &mut HashMap<String, String>,
+    launch: &str,
+    resume_provider_id: Option<&str>,
+) -> Result<()> {
     let home = environment
         .get("HOME")
         .context("OpenCode launch requires HOME")?;
@@ -40,6 +44,14 @@ pub fn configure(environment: &mut HashMap<String, String>, launch: &str) -> Res
         "DLGT_SOCKET".to_owned(),
         crate::paths::socket_path()?.to_string_lossy().into_owned(),
     );
+    // The plugin worker does not receive CLI arguments, and a resumed TUI
+    // emits no session event until the next prompt. The id has to travel in
+    // the environment or readiness waits until the startup timeout.
+    if let Some(id) = resume_provider_id.filter(|id| !id.is_empty()) {
+        environment.insert("DLGT_OPENCODE_RESUME".to_owned(), id.to_owned());
+    } else {
+        environment.remove("DLGT_OPENCODE_RESUME");
+    }
     Ok(())
 }
 
@@ -111,6 +123,13 @@ pub fn command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         reject_flag_like("session", id)?;
         args.extend(["--session".to_owned(), id.to_owned()]);
     }
+    // A new TUI does not create a session until this prompt exists. Resume
+    // leaves it unset: `opencode --session` ignores `--prompt`, and dlgt
+    // pastes after SessionStart instead.
+    if let Some(prompt) = options.initial_prompt {
+        options.agent.semantic_input(prompt)?;
+        args.extend(["--prompt".to_owned(), prompt.to_owned()]);
+    }
     Ok(CommandSpec {
         program: program(),
         args,
@@ -131,7 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_auto_approves_and_resumes_without_a_prompt() -> Result<()> {
+    fn command_passes_the_launch_prompt_and_resumes_a_session() -> Result<()> {
         let environment = HashMap::new();
         let mut options = LaunchOptions {
             agent: crate::provider::Agent::OpenCode,
@@ -145,7 +164,7 @@ mod tests {
             resume_provider_id: Some("ses_abc"),
             environment: &environment,
             auto_approve: true,
-            initial_prompt: Some("ignored by argv"),
+            initial_prompt: Some("Review the change"),
         };
         let spec = command(&options)?;
         assert_eq!(
@@ -157,13 +176,15 @@ mod tests {
                 "--agent",
                 "build",
                 "--session",
-                "ses_abc"
+                "ses_abc",
+                "--prompt",
+                "Review the change"
             ]
         );
-        assert!(!spec.args.iter().any(|arg| arg == "ignored by argv"));
         options.auto_approve = false;
         options.harness_options = &[];
         options.resume_provider_id = None;
+        options.initial_prompt = None;
         let plain = command(&options)?;
         assert_eq!(plain.args, ["--model", "xai/grok-4.7"]);
         assert!(validate(Some("high"), &[]).is_err());
@@ -179,18 +200,23 @@ mod tests {
             "HOME".to_owned(),
             temp.path().to_string_lossy().into_owned(),
         )]);
-        configure(&mut environment, "internal:ONE")?;
+        configure(&mut environment, "internal:ONE", None)?;
         let path = temp.path().join(".config/opencode/plugins/dlgt.js");
         let first = fs::read_to_string(&path)?;
         assert!(first.contains(MARKER));
         assert!(first.contains("session.idle"));
-        configure(&mut environment, "internal:TWO")?;
+        configure(&mut environment, "internal:TWO", None)?;
         assert_eq!(fs::read_to_string(&path)?, first);
         assert_eq!(environment["DLGT_OPENCODE_LAUNCH"], "internal:TWO");
+        assert!(!environment.contains_key("DLGT_OPENCODE_RESUME"));
+        environment.insert("DLGT_OPENCODE_RESUME".to_owned(), "stale".to_owned());
+        configure(&mut environment, "internal:TWO", Some("ses_abc"))?;
+        assert_eq!(environment["DLGT_OPENCODE_RESUME"], "ses_abc");
+        assert!(first.contains("DLGT_OPENCODE_RESUME"));
 
         fs::write(&path, "export const DlgtPlugin = async () => ({});\n")?;
         let foreign = fs::read_to_string(&path)?;
-        assert!(configure(&mut environment, "internal:THREE").is_err());
+        assert!(configure(&mut environment, "internal:THREE", None).is_err());
         assert_eq!(fs::read_to_string(&path)?, foreign);
         Ok(())
     }
