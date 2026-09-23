@@ -7,6 +7,7 @@
   --vp-c-brand-soft: rgb(216 59 23 / 0.12);
   --dlgt-ink: #16130f;
   --dlgt-paper: #f4f1eb;
+  --dlgt-harness-bg: #e8dfd2;
   --dlgt-line: rgb(22 19 15 / 0.16);
   --dlgt-accent: #f04b23;
   --vp-c-bg: var(--dlgt-paper);
@@ -32,6 +33,7 @@
   --vp-c-brand-soft: rgb(255 106 71 / 0.14);
   --dlgt-ink: #f3efe8;
   --dlgt-paper: #151310;
+  --dlgt-harness-bg: #27211c;
   --dlgt-line: rgb(243 239 232 / 0.16);
   --dlgt-accent: #ff6a47;
   --vp-c-bg-alt: #211d19;
@@ -103,7 +105,7 @@ body { background: var(--dlgt-paper); }
 .hero-visual { margin: 0; transform: rotate(1.1deg); box-shadow: 18px 18px 0 var(--dlgt-ink); }
 .hero-visual img { display: block; width: 100%; height: auto; border: 2px solid var(--dlgt-ink); }
 
-.harnesses { max-width: 1240px; margin: 0 auto; padding: clamp(88px, 11vw, 150px) 24px; }
+.harnesses { padding: clamp(88px, 11vw, 150px) max(24px, calc((100vw - 1192px) / 2)); background: var(--dlgt-harness-bg); border-top: 1px solid var(--dlgt-line); }
 .harnesses-intro h2 { margin-top: 20px; font-size: clamp(3rem, 6.2vw, 6rem); line-height: 0.98; letter-spacing: -0.07em; }
 .harnesses-intro > p:last-child { max-width: 70ch; margin-top: 22px; font-size: clamp(1.06rem, 1.6vw, 1.3rem); line-height: 1.5; color: color-mix(in srgb, var(--dlgt-ink) 72%, transparent); }
 .dlgt-home .harness-logos { display: flex; margin: 16px 0 0; padding: 18px 0; list-style: none; overflow-x: auto; border-top: 2px solid var(--dlgt-ink); border-bottom: 1px solid var(--dlgt-line); scrollbar-width: thin; }
