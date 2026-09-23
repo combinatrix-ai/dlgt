@@ -649,7 +649,7 @@ impl Daemon {
                         ));
                     }
                 } else if selector.split_once(':').is_some_and(|(agent, id)| {
-                    matches!(agent, "codex" | "claude" | "cursor") && !id.is_empty()
+                    matches!(agent, "codex" | "claude" | "cursor" | "grok") && !id.is_empty()
                 }) {
                     error.session_id = Some(selector.to_owned());
                 }
@@ -763,6 +763,9 @@ impl Daemon {
             crate::cursor_agent::validate(effort, &harness_options)?;
             agent.semantic_input(initial_prompt)?;
         }
+        if agent == Agent::Grok {
+            crate::grok_agent::validate(&harness_options)?;
+        }
         let auto_approve = params
             .get("auto_approve")
             .and_then(Value::as_bool)
@@ -782,8 +785,9 @@ impl Daemon {
         let rows = params_u16(params, "rows", 24)?;
         let cols = params_u16(params, "cols", 80)?;
         let mut id = generate_internal_id();
-        let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
-            .then(|| Uuid::new_v4().to_string());
+        let new_provider_id = (matches!(agent, Agent::Claude | Agent::Grok)
+            && resume_provider_id.is_none())
+        .then(|| Uuid::new_v4().to_string());
 
         prepare_workspace(agent, &cwd)?;
         for attempt in 0..16 {
@@ -835,6 +839,12 @@ impl Daemon {
                 &id,
             )?)
         };
+        if agent == Agent::Grok
+            && let Err(error) = crate::grok_agent::configure(&mut environment, &id)
+        {
+            self.lock_store()?.set_session_failed(&id);
+            return Err(error);
+        }
         let cursor_initial = if agent == Agent::Cursor {
             let mut store = self.lock_store()?;
             if let Err(error) = crate::cursor_agent::configure(&mut environment, &id) {
@@ -884,7 +894,7 @@ impl Daemon {
         );
         let startup_deadline = Instant::now() + startup_timeout;
         let runtime = match agent {
-            Agent::Claude | Agent::Cursor => command_spec(&options)
+            Agent::Claude | Agent::Cursor | Agent::Grok => command_spec(&options)
                 .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
             Agent::Codex => {
                 self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, startup_timeout)
@@ -977,7 +987,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(25));
         }
         let provider_id = match agent {
-            Agent::Claude | Agent::Cursor => pending_provider_id
+            Agent::Claude | Agent::Cursor | Agent::Grok => pending_provider_id
                 .as_mut()
                 .context("missing hook provider ID binding")?
                 .take()?,
@@ -1103,9 +1113,9 @@ impl Daemon {
 
         let (agent, provider_id) = selector
             .split_once(':')
-            .filter(|(agent, id)| matches!(*agent, "codex" | "claude" | "cursor") && !id.is_empty())
+            .filter(|(agent, id)| matches!(*agent, "codex" | "claude" | "cursor" | "grok") && !id.is_empty())
             .context(
-                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id>, claude:<id>, or cursor:<id> with --resume",
+                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id>, claude:<id>, cursor:<id>, or grok:<id> with --resume",
             )?;
         self.launch_resumed_session(params, agent, provider_id, None, None)
     }
@@ -1165,7 +1175,7 @@ impl Daemon {
         if !cwd.is_dir() {
             bail!("session cwd is not a directory: {}", cwd.display());
         }
-        let environment = params
+        let mut environment = params
             .get("environment")
             .and_then(Value::as_object)
             .context("missing launch environment snapshot")?
@@ -1237,6 +1247,10 @@ impl Daemon {
             self.lock_store()?.set_session_failed(&session.id);
             bail!("restart launch timed out before starting the replacement process");
         }
+        if agent == Agent::Grok {
+            crate::grok_agent::configure(&mut environment, &session.id)
+                .context("failed to configure Grok hooks for restart")?;
+        }
         let options = LaunchOptions {
             agent,
             session_id: &session.id,
@@ -1261,7 +1275,7 @@ impl Daemon {
             )?)
         };
         let runtime = match agent {
-            Agent::Claude | Agent::Cursor => command_spec(&options)
+            Agent::Claude | Agent::Cursor | Agent::Grok => command_spec(&options)
                 .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
             Agent::Codex => {
                 self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, remaining)
@@ -1326,7 +1340,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(25));
         }
         let rebound_provider_id = match agent {
-            Agent::Claude | Agent::Cursor => pending_provider_id
+            Agent::Claude | Agent::Cursor | Agent::Grok => pending_provider_id
                 .as_mut()
                 .context("missing hook provider ID binding")?
                 .take()?,
@@ -1663,7 +1677,7 @@ impl Daemon {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let input = match agent {
             Agent::Codex => prompt.as_bytes().to_vec(),
-            Agent::Claude | Agent::Cursor => agent.semantic_input(prompt)?,
+            Agent::Claude | Agent::Cursor | Agent::Grok => agent.semantic_input(prompt)?,
         };
         let (turn, acceptance_cursor) = {
             let mut store = self.lock_store()?;
@@ -1711,7 +1725,7 @@ impl Daemon {
                     return Err(error);
                 }
             },
-            Agent::Claude | Agent::Cursor => {
+            Agent::Claude | Agent::Cursor | Agent::Grok => {
                 if let Err(error) = write_semantic_input(&runtime, &input) {
                     let store = self.lock_store()?;
                     let message = sanitize_message(&error.to_string());
@@ -2215,6 +2229,10 @@ impl Daemon {
                 json!({"harness":"cursor","source":"cli","discovery":"unavailable",
                 "models":[],"hint":"Use cursor-agent --list-models; pass the chosen ID with --model"}),
             ),
+            "grok" => Ok(
+                json!({"harness":"grok","source":"cli","discovery":"unavailable",
+                "models":[],"hint":"Use grok inspect or pass --model with a Grok model ID"}),
+            ),
             "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
                 let socket = paths::home_dir()?
@@ -2245,7 +2263,8 @@ impl Daemon {
         let all = json!([
             {"id":"codex","model_discovery":"complete","effort":true},
             {"id":"claude","model_discovery":"snapshot","effort":true},
-            {"id":"cursor","model_discovery":"unavailable","effort":false,"restart":false}
+            {"id":"cursor","model_discovery":"unavailable","effort":false,"restart":false},
+            {"id":"grok","model_discovery":"unavailable","effort":true}
         ]);
         if let Some(name) = params.get("harness").and_then(Value::as_str) {
             return all
@@ -2312,7 +2331,12 @@ impl Daemon {
         if agent == "cursor" {
             return self.handle_cursor_hook(params);
         }
-        let payload = params.get("payload").cloned().unwrap_or(Value::Null);
+        let raw_payload = params.get("payload").cloned().unwrap_or(Value::Null);
+        let payload = if agent == "grok" {
+            crate::grok_agent::normalize_payload(&raw_payload)
+        } else {
+            raw_payload
+        };
         let session = self.resolve_session(selector).or_else(|_| {
             let provider_id = payload
                 .get("session_id")
@@ -2866,7 +2890,11 @@ fn start_hook_turn(
 }
 
 fn claude_submission_matches_session(session: &SessionRecord, payload: &Value) -> bool {
-    let Some(expected_provider_id) = session.id.strip_prefix("claude:") else {
+    let Some(expected_provider_id) = session
+        .id
+        .strip_prefix("claude:")
+        .or_else(|| session.id.strip_prefix("grok:"))
+    else {
         return false;
     };
     if payload.get("session_id").and_then(Value::as_str) != Some(expected_provider_id) {

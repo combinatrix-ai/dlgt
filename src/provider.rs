@@ -44,6 +44,7 @@ pub enum Agent {
     Codex,
     Claude,
     Cursor,
+    Grok,
 }
 
 impl Agent {
@@ -52,7 +53,8 @@ impl Agent {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             "cursor" => Ok(Self::Cursor),
-            _ => bail!("unsupported agent {value:?}; expected codex, claude, or cursor"),
+            "grok" => Ok(Self::Grok),
+            _ => bail!("unsupported agent {value:?}; expected codex, claude, cursor, or grok"),
         }
     }
 
@@ -61,12 +63,13 @@ impl Agent {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Cursor => "cursor",
+            Self::Grok => "grok",
         }
     }
 
     pub fn semantic_input(self, prompt: &str) -> Result<Vec<u8>> {
         match self {
-            Self::Claude | Self::Cursor => bracketed_paste_input(prompt),
+            Self::Claude | Self::Cursor | Self::Grok => bracketed_paste_input(prompt),
             Self::Codex => bail!("Codex semantic input must use app-server turn/start"),
         }
     }
@@ -74,7 +77,7 @@ impl Agent {
     pub const fn cancel_input(self) -> &'static [u8] {
         match self {
             Self::Codex => &[0x03],
-            Self::Claude | Self::Cursor => &[0x1b],
+            Self::Claude | Self::Cursor | Self::Grok => &[0x1b],
         }
     }
 }
@@ -135,6 +138,7 @@ pub fn command_spec(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         Agent::Codex => bail!("Codex requires the app-server runtime"),
         Agent::Claude => claude_command(options),
         Agent::Cursor => crate::cursor_agent::command(options),
+        Agent::Grok => crate::grok_agent::command(options),
     }
 }
 
@@ -194,7 +198,7 @@ pub(crate) fn codex_app_server_args(
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
     match agent {
-        Agent::Cursor => {}
+        Agent::Cursor | Agent::Grok => {}
         Agent::Codex => {
             let home = std::env::var_os("CODEX_HOME").map_or_else(
                 || {
