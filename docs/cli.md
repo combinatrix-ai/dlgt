@@ -12,7 +12,7 @@ invariants, lifecycle rationale, security model, and acceptance criteria.
 ## Product definition
 
 `dlgt` is a local, single-binary runtime for live, addressable, and
-attachable Codex and Claude subagents.
+attachable Codex, Claude, and Cursor CLI subagents.
 
 The only public runtime object is a **Session**:
 
@@ -31,7 +31,7 @@ have public IDs.
 Other terms:
 
 ```text
-Harness   The provider adapter, initially codex or claude
+Harness   The provider adapter, codex, claude, or cursor
 Profile   A reusable client-side launch specification
 Alias     A human-readable address for an active Session
 Title     A non-unique human description used to generate an Alias
@@ -210,7 +210,7 @@ dlgt new
   --title <TITLE>
   [--alias <@ALIAS>]
   [--profile <PROFILE>]
-  [--harness codex|claude]
+  [--harness codex|claude|cursor]
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
@@ -1098,3 +1098,63 @@ after binding includes the canonical `session_id`.
 The provider lifecycle mapping, acceptance criteria, and design rationale are
 in [Design](design.md). The public JSONL method set and schemas are in
 [RPC](rpc.md).
+
+## Cursor interactive CLI
+
+Cursor support uses the official interactive `cursor-agent` executable in a
+live PTY. It does not start ACP, MCP server mode, print mode, or the desktop
+application. Install and log in to Cursor CLI first. `DLGT_CURSOR_BIN` can
+select another executable path when starting the dlgt daemon.
+
+```sh
+dlgt new --harness cursor --title "Cursor review" --cwd . \
+  --request-id cursor-review-1 -- "Review this change"
+dlgt fetch cursor:<conversation-id> --wait 5m
+dlgt send cursor:<conversation-id> --request-id cursor-review-2 -- "Review the revision"
+dlgt stop cursor:<conversation-id>
+dlgt send cursor:<conversation-id> --resume --request-id cursor-review-3 -- "Continue"
+```
+
+On launch, dlgt adds one idempotent bridge to each of `beforeSubmitPrompt`,
+`afterAgentResponse`, and `stop` in `$HOME/.cursor/hooks.json`, preserving
+existing handlers. The bridge remains installed but is inert outside dlgt
+children: the executable, owning socket, and unique launch selector come from
+child-only environment variables. A sidecar `dlgt-hooks.lock` serializes
+registration across dlgt daemons. Invalid JSON or handler arrays are rejected
+without overwriting the file. No hooks are added to the workspace.
+
+New sessions and resumes pass the first prompt to the interactive CLI. Cursor
+may not emit `sessionStart` on resume, so dlgt binds the conversation only on a
+matching `beforeSubmitPrompt`. This confirms the provider's submission hook,
+not a backend acknowledgement; another user hook can still block that prompt.
+Follow-ups are bracketed PTY pastes. Final results require a matching `stop`
+and `afterAgentResponse` pair, in either arrival order; `error` and `aborted`
+are terminal without response text. A missing hook leaves the result pending,
+never inferred from the screen. Existing hooks that block prompts or generate
+automatic follow-ups can affect the conversation.
+
+The adapter supports `--model`, `--harness-option mode=plan|ask`, and
+`--harness-option sandbox=enabled|disabled`. Default auto-approval passes
+`--trust --force`; `--no-auto-approve` omits both. Other launch options and
+`--effort` are rejected. Use `cursor-agent --list-models` to discover available
+models: dlgt currently reports model discovery as unavailable.
+
+Current limitations: `restart` is rejected before changing the session; use
+`stop` followed by `send --resume`. Permission prompts do not yet have a
+structured blocked-state signal, so inspect `fetch` and use `attach` when
+needed. Cursor's conversation title is provider-managed; dlgt's `--title`
+sets the local title and alias.
+
+Authenticated macOS validation on 2026-09-22 used CLI
+`2026.09.18-9a7762b` with `gpt-5.4-nano-none`: new-session completion,
+same-conversation follow-up, stop/resume with retained conversation context,
+cancellation of a running tool, and another completed prompt after cancellation
+all passed. Results came from lifecycle hooks, not screen inference. The
+automated PTY fixture additionally checks concurrent-session isolation,
+request replay, and Japanese multiline input. This is not the Docker
+pre-release matrix required by `AGENTS.md`.
+
+References: [Cursor CLI](https://cursor.com/docs/cli/overview),
+[parameters](https://cursor.com/docs/cli/reference/parameters), and
+[hooks](https://cursor.com/docs/hooks). The adapter was developed against
+CLI `2026.09.18-9a7762b`.

@@ -227,6 +227,8 @@ pub struct SessionRecord {
     pub alias: String,
     pub title: String,
     pub agent: String,
+    #[serde(skip)]
+    pub cursor_launch_id: Option<String>,
     pub cwd: String,
     pub state: SessionState,
     pub model: Option<String>,
@@ -251,6 +253,8 @@ pub struct TurnRecord {
     /// The hook did not report the final message and it was recovered from
     /// the provider transcript instead.
     pub final_text_recovered: bool,
+    #[serde(skip)]
+    pub cursor_stop_status: Option<String>,
     /// Provider transcript path and the byte offset recorded when this
     /// execution was accepted, used only for that bounded recovery.
     pub transcript_path: Option<String>,
