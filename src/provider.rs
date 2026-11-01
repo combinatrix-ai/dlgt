@@ -551,7 +551,10 @@ fn claude_hook_settings(command: &str) -> serde_json::Value {
             }]
         }])
     };
+    // Pin the renderer: an unset `tui` makes Claude open a renderer upsell
+    // dialog that swallows the first submitted prompt.
     serde_json::json!({
+        "tui": "default",
         "hooks": {
             "SessionStart": handler(),
             "UserPromptSubmit": handler(),
@@ -920,6 +923,7 @@ mod tests {
             .map_or_else(|| panic!("Claude settings missing"), |args| &args[1]);
         assert!(settings.contains("StopFailure"));
         assert!(settings.contains("Stop"));
+        assert!(settings.contains(r#""tui":"default""#));
     }
 
     #[test]
