@@ -461,6 +461,7 @@ ALREADY_ATTACHED       Another client owns the attach lease
 CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
+LAUNCH_BLOCKED         Harness startup stopped at a screen only a human can answer
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
@@ -470,6 +471,15 @@ Methods may add contextual error fields but must not overload a code with a
 different retry or human-action policy. A `session.create` failure before
 provider binding includes an `internal:<short-id>` as `launch_id`, never as
 `session_id`. A failure after binding includes the canonical `session_id`.
+A launch failure (`LAUNCH_BLOCKED` or `LAUNCH_FAILED`) also carries `screen`,
+the provider's last rendered rows, and a `hint` naming `scrollback` and
+`logs --raw` for that ID. `LAUNCH_BLOCKED` adds an `action` the user must take;
+dlgt never answers such a screen itself. The known blocker is Codex's "Hooks
+need review" dialog, which appears when a configured hook is new or changed.
+dlgt does not trust hooks or pass `--dangerously-bypass-hook-trust`; the user
+runs `codex` once in that directory and reviews the hooks.
+`session.read` accepts that `launch_id` and returns the same diagnostics as
+`launch_failure`.
 CLI exit-status mapping is defined in [CLI](cli.md#exit-statuses).
 
 ## Security boundary

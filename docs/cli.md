@@ -52,7 +52,9 @@ During startup only, dlgt correlates the not-yet-bound process with an
 `internal:<short-id>`. It atomically rekeys all retained state to the
 provider-qualified ID before accepting the first prompt or returning success.
 The internal launch ID is not a public Session ID; it may appear only as
-`error.launch_id` when startup fails before provider binding.
+`error.launch_id` when startup fails before provider binding. That failed
+launch stays addressable for diagnostics: `show`, `fetch`, `scrollback`, and
+`logs --raw` accept the `launch_id`.
 
 Aliases are for humans:
 
@@ -823,7 +825,9 @@ dlgt restart <SESSION_ID> [environment options]
 - `list --all-versions` queries every live versioned daemon socket and adds
   `runtime_version` and `runtime_socket` to each Session.
 - `show` returns identity, Harness, model selection, state, current timing,
-  latest retained result, and relevant failure data.
+  latest retained result, and relevant failure data. A Session that failed
+  before it became ready also has `launch_failure` with the same `code`,
+  `message`, `hint`, `action`, and `screen` that the launch error returned.
 - `attach` takes an exclusive input lease, replays the retained terminal view,
   and follows the live PTY. It requires an interactive terminal on stdin and
   stdout and otherwise returns `ATTACH_REQUIRES_TTY` pointing at `fetch`. A
@@ -1046,12 +1050,13 @@ both provider processes.
 0  command succeeded, including every fetch observation
 1  usage, configuration, identity, launch, cursor, or RPC error
 3  bounded cancellation timeout; the cancellation continues
-4  Session is blocked on input
+4  Session or launch is blocked on human input
 5  Session is busy and rejected a send
 ```
 
 The JSON error code is the primary machine-readable reason. Exit status is the
-shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
+shell-level summary. `SESSION_BLOCKED` and `LAUNCH_BLOCKED` use exit 4 and
+`SESSION_BUSY` uses exit
 5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ATTACH_REQUIRES_TTY`,
 `ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`,
 and `CURSOR_INVALID` use exit 1.
@@ -1079,6 +1084,7 @@ ATTACH_REQUIRES_TTY    attach needs an interactive terminal; use fetch
 CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
+LAUNCH_BLOCKED         Harness startup stopped at a screen only a human can answer
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
@@ -1090,6 +1096,14 @@ different retry or human-action policy.
 If `new` fails before provider binding, its error includes the temporary
 `launch_id` for diagnostics and never presents it as a Session ID. A failure
 after binding includes the canonical `session_id`.
+
+A launch failure (`LAUNCH_BLOCKED` or `LAUNCH_FAILED`) also carries `screen`,
+the provider's last rendered rows, and a `hint` naming `scrollback` and
+`logs --raw` for that ID. `LAUNCH_BLOCKED` adds an `action` the user must take;
+dlgt never answers such a screen itself. The known blocker is Codex's "Hooks
+need review" dialog, which appears when a configured hook is new or changed.
+dlgt does not trust hooks or pass `--dangerously-bypass-hook-trust`; the user
+runs `codex` once in that directory and reviews the hooks.
 
 ## Design and RPC contracts
 
