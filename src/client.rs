@@ -31,6 +31,7 @@ pub struct RpcFailure {
     pub hint: Option<String>,
     pub session_state: Option<String>,
     pub action: Option<String>,
+    pub screen: Option<Vec<String>>,
 }
 
 impl std::fmt::Display for RpcFailure {
@@ -354,17 +355,21 @@ pub fn rpc_stdio() -> Result<()> {
             Err(error) => error.downcast_ref::<RpcFailure>().map_or_else(
                 || Response::error(&request.id, "RPC_UNAVAILABLE", error.to_string()),
                 |failure| {
-                    if failure.session_id.is_some() || failure.launch_id.is_some() {
-                        Response::session_error(
-                            &request.id,
-                            &failure.code,
-                            &failure.message,
-                            failure.session_id.clone(),
-                            failure.launch_id.clone(),
-                        )
-                    } else {
-                        Response::error(&request.id, &failure.code, &failure.message)
+                    let mut response = Response::session_error(
+                        &request.id,
+                        &failure.code,
+                        &failure.message,
+                        failure.session_id.clone(),
+                        failure.launch_id.clone(),
+                    );
+                    if let Some(error) = response.error.as_mut() {
+                        error.correlation_id.clone_from(&failure.correlation_id);
+                        error.hint.clone_from(&failure.hint);
+                        error.session_state.clone_from(&failure.session_state);
+                        error.action.clone_from(&failure.action);
+                        error.screen.clone_from(&failure.screen);
                     }
+                    response
                 },
             ),
         };
@@ -458,6 +463,7 @@ fn rpc_unavailable_failure(message: String, offer_sandbox_retry: bool) -> RpcFai
         hint: offer_sandbox_retry.then(|| SANDBOX_RETRY_HINT.to_owned()),
         session_state: None,
         action: None,
+        screen: None,
     }
 }
 
@@ -547,6 +553,7 @@ fn decode_response(line: &str) -> Result<Value> {
             hint: error.hint,
             session_state: error.session_state,
             action: error.action,
+            screen: error.screen,
         }
         .into());
     }

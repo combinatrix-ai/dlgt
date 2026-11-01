@@ -23,8 +23,9 @@ use crate::cursor;
 use crate::paths;
 use crate::protocol::{Request, Response, SessionRecord, SessionState, TurnRecord, TurnState};
 use crate::provider::{
-    Agent, CommandSpec, LaunchOptions, claude_session_marker, codex_remote_tui_command,
-    command_spec, prepare_workspace, provider_display_name,
+    Agent, CommandSpec, LaunchOptions, StartupBlocker, claude_session_marker,
+    codex_remote_tui_command, command_spec, prepare_workspace, provider_display_name,
+    startup_blocker,
 };
 use crate::reaper::Reaper;
 use crate::session::SessionRuntime;
@@ -47,6 +48,10 @@ const FETCH_LIVE_ROWS: usize = 40;
 /// A long poll is bounded only to catch typos and leaked waiters.
 const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often a launch checks its screen for a known blocking dialog.
+const STARTUP_BLOCKER_POLL: Duration = Duration::from_millis(250);
+/// Rendered rows retained with a launch failure.
+const LAUNCH_FAILURE_SCREEN_LINES: usize = 40;
 /// Acceptance receipts retained per daemon, evicted first-in-first-out.
 const REQUEST_RECEIPT_LIMIT: usize = 1024;
 const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
@@ -595,18 +600,7 @@ impl Daemon {
             ),
             Err(error) => {
                 if let Some(failure) = error.downcast_ref::<SessionLaunchFailure>() {
-                    let (session_id, launch_id) = if failure.session_id.starts_with("internal:") {
-                        (None, Some(failure.session_id.clone()))
-                    } else {
-                        (Some(failure.session_id.clone()), None)
-                    };
-                    Response::session_error(
-                        request.id,
-                        classify_error(&error),
-                        format!("{error:#}"),
-                        session_id,
-                        launch_id,
-                    )
+                    failure.response(request.id)
                 } else {
                     Response::error(request.id, classify_error(&error), format!("{error:#}"))
                 }
@@ -925,7 +919,7 @@ impl Daemon {
                 store.set_session_failed(&id);
                 store.record_event(Some(&id), None, "session.failed");
                 drop(store);
-                return Err(Self::session_launch_failure(&id, &error));
+                return Err(self.session_launch_failure(&id, &error));
             }
         };
         let pid = runtime.pid();
@@ -944,7 +938,7 @@ impl Daemon {
                 .lock_store()?
                 .get_session(&id)
                 .context("exited session not found")?;
-            return Err(Self::session_launch_failure(
+            return Err(self.session_launch_failure(
                 &id,
                 &anyhow!(
                     "launch failed before the Session became ready: state={}",
@@ -962,14 +956,14 @@ impl Daemon {
             let remaining = startup_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let _ = runtime.force_stop();
-                return Err(Self::session_launch_failure(
+                return Err(self.session_launch_failure(
                     &id,
                     &anyhow!("launch timed out before the Session became ready"),
                 ));
             }
             if let Err(error) = runtime.wait_for_input_ready(remaining) {
                 let _ = runtime.force_stop();
-                return Err(Self::session_launch_failure(
+                return Err(self.session_launch_failure(
                     &id,
                     &error.context("Codex PTY did not become input-ready"),
                 ));
@@ -989,15 +983,23 @@ impl Daemon {
                 break;
             }
             if current.state.is_terminal() {
-                return Err(Self::session_launch_failure(
+                return Err(self.session_launch_failure(
                     &id,
                     &anyhow!("launch failed before the Session became ready"),
+                ));
+            }
+            if self.screen_blocker(agent, &id).is_some() {
+                let _ = runtime.force_stop();
+                self.lock_store()?.set_session_failed(&id);
+                return Err(self.session_launch_failure(
+                    &id,
+                    &anyhow!("launch blocked before the Session became ready"),
                 ));
             }
             if Instant::now() >= startup_deadline {
                 let _ = runtime.force_stop();
                 self.lock_store()?.set_session_failed(&id);
-                return Err(Self::session_launch_failure(
+                return Err(self.session_launch_failure(
                     &id,
                     &anyhow!("launch timed out before the Session became ready"),
                 ));
@@ -1020,7 +1022,7 @@ impl Daemon {
         if let Err(error) = self.promote_session(&id, &canonical_id, &runtime_session_id) {
             let _ = runtime.force_stop();
             self.lock_store()?.set_session_failed(&id);
-            return Err(Self::session_launch_failure(
+            return Err(self.session_launch_failure(
                 &id,
                 &error.context("failed to publish provider Session ID"),
             ));
@@ -1066,7 +1068,7 @@ impl Daemon {
                 Err(error) => {
                     let _ = runtime.force_stop();
                     self.lock_store()?.set_session_failed(&id);
-                    return Err(Self::session_launch_failure(
+                    return Err(self.session_launch_failure(
                         &id,
                         &error.context("initial prompt acceptance failed"),
                     ));
@@ -1079,12 +1081,36 @@ impl Daemon {
         Ok(response)
     }
 
-    fn session_launch_failure(session_id: &str, error: &anyhow::Error) -> anyhow::Error {
-        SessionLaunchFailure {
-            session_id: session_id.to_owned(),
-            message: format!("{error:#}"),
+    /// Describe a launch that never became ready. The rendered screen tail
+    /// is the provider's own explanation, so it travels with the error and
+    /// stays on the failed Session for `show`.
+    fn session_launch_failure(&self, session_id: &str, error: &anyhow::Error) -> anyhow::Error {
+        let (agent, screen) = self.lock_store().map_or_else(
+            |_| (None, Vec::new()),
+            |store| {
+                let agent = store
+                    .get_session(session_id)
+                    .and_then(|session| Agent::parse(&session.agent).ok());
+                let rows = store.session_uid(session_id).map_or_else(Vec::new, |uid| {
+                    store
+                        .rendered_rows(&uid, None, LAUNCH_FAILURE_SCREEN_LINES)
+                        .lines
+                });
+                (agent, trim_screen(rows))
+            },
+        );
+        let failure = SessionLaunchFailure::new(session_id, agent, screen, error);
+        if let Ok(store) = self.lock_store() {
+            store.set_launch_failure(session_id, failure.to_json());
         }
-        .into()
+        failure.into()
+    }
+
+    /// A known interactive dialog currently on the Session's live screen.
+    fn screen_blocker(&self, agent: Agent, session_id: &str) -> Option<StartupBlocker> {
+        let store = self.lock_store().ok()?;
+        let uid = store.session_uid(session_id)?;
+        startup_blocker(agent, &store.live_screen(&uid, FETCH_LIVE_ROWS).rows)
     }
 
     /// Resume a provider conversation without mutating an existing live
@@ -1308,7 +1334,11 @@ impl Daemon {
                 let store = self.lock_store()?;
                 store.set_session_failed(&session.id);
                 store.record_event(Some(&session.id), None, "session.failed");
-                return Err(error).context("session restart launch failed");
+                drop(store);
+                return Err(self.session_launch_failure(
+                    &session.id,
+                    &error.context("session restart launch failed"),
+                ));
             }
         };
         let pid = runtime.pid();
@@ -1504,13 +1534,7 @@ impl Daemon {
         let provider_thread_id = if let Some(expected) = options.resume_provider_id {
             expected.to_owned()
         } else {
-            match thread_receiver.recv_timeout(startup_timeout) {
-                Ok(thread_id) => thread_id,
-                Err(error) => {
-                    let _ = view.force_stop();
-                    return Err(error).context("Codex remote TUI did not create a thread");
-                }
-            }
+            self.wait_for_codex_thread(&thread_receiver, &view, &session_id, startup_timeout)?
         };
         if let Err(error) =
             control.set_thread_name(&provider_thread_id, &provider_display_name(options.title))
@@ -1523,6 +1547,36 @@ impl Daemon {
             provider_thread_id,
             view,
         }))
+    }
+
+    /// Wait for the remote TUI to start its thread, failing fast when the
+    /// screen shows a dialog that only a human can answer.
+    fn wait_for_codex_thread(
+        &self,
+        thread_receiver: &Receiver<String>,
+        view: &SessionRuntime,
+        session_id: &str,
+        startup_timeout: Duration,
+    ) -> Result<String> {
+        let deadline = Instant::now() + startup_timeout;
+        loop {
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(STARTUP_BLOCKER_POLL);
+            match thread_receiver.recv_timeout(wait) {
+                Ok(thread_id) => return Ok(thread_id),
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {
+                    if self.screen_blocker(Agent::Codex, session_id).is_some() {
+                        let _ = view.force_stop();
+                        bail!("Codex remote TUI stopped at a startup dialog");
+                    }
+                }
+                Err(error) => {
+                    let _ = view.force_stop();
+                    return Err(error).context("Codex remote TUI did not create a thread");
+                }
+            }
+        }
     }
 
     fn public_session(&self, session: &SessionRecord) -> Result<Value> {
@@ -1838,20 +1892,24 @@ impl Daemon {
 
     fn read_session(&self, params: &Value) -> Result<Value> {
         let session = self.resolve_session(params_string(params, "session")?)?;
-        if session.id.starts_with("internal:") {
-            bail!("SESSION_UNAVAILABLE: Session has not published its provider ID");
-        }
         let store = self.lock_store()?;
         let latest = store.latest_turn(&session.id);
         // A running execution must not hide the answer to the previous one.
         let result = store.latest_terminal_turn(&session.id);
+        let launch_failure = (session.state == SessionState::Failed)
+            .then(|| store.launch_failure(&session.id))
+            .flatten();
         let public = self.public_session_locked(&store, &session)?;
         drop(store);
-        Ok(json!({
+        let mut value = json!({
             "session": public,
             "result": result.as_ref().map(public_result),
             "execution_seq": latest.as_ref().map(|turn| turn.execution_seq),
-        }))
+        });
+        if let Some(launch_failure) = launch_failure {
+            value["launch_failure"] = launch_failure;
+        }
+        Ok(value)
     }
 
     fn cancel_session(&self, params: &Value) -> Result<Value> {
@@ -3501,7 +3559,92 @@ fn public_session_with_metrics(
 #[derive(Debug)]
 struct SessionLaunchFailure {
     session_id: String,
+    code: &'static str,
     message: String,
+    reason: Option<&'static str>,
+    hint: String,
+    action: Option<String>,
+    screen: Vec<String>,
+}
+
+impl SessionLaunchFailure {
+    fn new(
+        session_id: &str,
+        agent: Option<Agent>,
+        screen: Vec<String>,
+        error: &anyhow::Error,
+    ) -> Self {
+        let blocker = agent.and_then(|agent| startup_blocker(agent, &screen));
+        Self {
+            session_id: session_id.to_owned(),
+            code: if blocker.is_some() {
+                "LAUNCH_BLOCKED"
+            } else {
+                classify_error(error)
+            },
+            message: blocker.map_or_else(
+                || format!("{error:#}"),
+                |blocker| format!("{}: {error:#}", blocker.message),
+            ),
+            reason: blocker.map(|blocker| blocker.reason),
+            hint: format!(
+                "the screen field is the provider's last rendered screen; read more with \
+                 `dlgt scrollback {session_id} --lines 200`, or the sensitive raw PTY bytes \
+                 with `dlgt logs --raw {session_id}`"
+            ),
+            action: blocker.map(|blocker| blocker.action.to_owned()),
+            screen,
+        }
+    }
+
+    fn response(&self, request_id: String) -> Response {
+        let (session_id, launch_id) = if self.session_id.starts_with("internal:") {
+            (None, Some(self.session_id.clone()))
+        } else {
+            (Some(self.session_id.clone()), None)
+        };
+        let mut response = Response::session_error(
+            request_id,
+            self.code,
+            self.message.clone(),
+            session_id,
+            launch_id,
+        );
+        if let Some(error) = response.error.as_mut() {
+            error.hint = Some(self.hint.clone());
+            error.action.clone_from(&self.action);
+            error.screen = Some(self.screen.clone());
+        }
+        response
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "code": self.code,
+            "message": self.message,
+            "reason": self.reason,
+            "hint": self.hint,
+            "action": self.action,
+            "screen": self.screen,
+        })
+    }
+}
+
+/// Drop trailing whitespace and the blank rows around a rendered screen.
+fn trim_screen(rows: Vec<String>) -> Vec<String> {
+    let rows = rows
+        .into_iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .position(|row| !row.is_empty())
+        .unwrap_or(rows.len());
+    let end = rows
+        .iter()
+        .rposition(|row| !row.is_empty())
+        .map_or(start, |end| end + 1);
+    rows[start..end].to_vec()
 }
 
 impl std::fmt::Display for SessionLaunchFailure {
@@ -4807,14 +4950,15 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        BucketSource, BusyMetrics, Cut, DaemonLock, FETCH_DEFAULT_MAX_BYTES, FETCH_EVENT_PAGE,
-        FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions, ProviderReservation, ReceiptLedger,
-        TranscriptRecovery, apply_codex_notification, apply_hook_event, canonical_session_id,
-        clamp_busy_metrics, classify_error, cli_wrapper_overhead, generate_alias,
-        generate_internal_id, is_stale_socket_error, ownership_lock_path, prepare_socket_path,
-        provider_id_from_session, public_result, public_session, public_session_with_metrics,
-        read_rpc_line, refresh_submission_receipt_from_store, remove_owned_socket, retention_gap,
-        signal_shutdown, socket_identity, start_hook_turn, transcript_window, validate_alias,
+        Agent, BucketSource, BusyMetrics, Cut, DaemonLock, FETCH_DEFAULT_MAX_BYTES,
+        FETCH_EVENT_PAGE, FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions,
+        ProviderReservation, ReceiptLedger, SessionLaunchFailure, TranscriptRecovery,
+        apply_codex_notification, apply_hook_event, canonical_session_id, clamp_busy_metrics,
+        classify_error, cli_wrapper_overhead, generate_alias, generate_internal_id,
+        is_stale_socket_error, ownership_lock_path, prepare_socket_path, provider_id_from_session,
+        public_result, public_session, public_session_with_metrics, read_rpc_line,
+        refresh_submission_receipt_from_store, remove_owned_socket, retention_gap, signal_shutdown,
+        socket_identity, start_hook_turn, transcript_window, trim_screen, validate_alias,
         validate_continuation, wait_for_update_check,
     };
     use crate::protocol::{SessionState, TurnState};
@@ -5097,6 +5241,57 @@ mod tests {
                 "{message} must not be reported as an internal invariant failure"
             );
         }
+    }
+
+    #[test]
+    fn codex_hook_review_screen_is_a_blocked_launch() {
+        let screen = trim_screen(vec![
+            String::new(),
+            "  Hooks need review   ".to_owned(),
+            "  1 hook is new or changed.".to_owned(),
+            "  › Review hooks".to_owned(),
+            String::new(),
+        ]);
+        let failure = SessionLaunchFailure::new(
+            "internal:ABC12345",
+            Some(Agent::Codex),
+            screen.clone(),
+            &anyhow::anyhow!("Codex remote TUI stopped at a startup dialog"),
+        );
+        assert_eq!(failure.code, "LAUNCH_BLOCKED");
+        assert_eq!(failure.reason, Some("codex_hooks_need_review"));
+        assert!(
+            failure
+                .message
+                .starts_with("Codex is waiting for hook review")
+        );
+        assert!(
+            failure
+                .action
+                .as_deref()
+                .is_some_and(|action| action.contains("trust"))
+        );
+        assert_eq!(failure.screen, screen);
+        assert_eq!(
+            screen.first().map(String::as_str),
+            Some("  Hooks need review")
+        );
+        assert_eq!(screen.len(), 3);
+        assert!(failure.hint.contains("dlgt logs --raw internal:ABC12345"));
+    }
+
+    #[test]
+    fn unknown_startup_screen_keeps_the_launch_failure_code() {
+        let failure = SessionLaunchFailure::new(
+            "internal:ABC12345",
+            Some(Agent::Codex),
+            vec!["Loading…".to_owned()],
+            &anyhow::anyhow!("Codex remote TUI did not create a thread: timed out"),
+        );
+        assert_eq!(failure.code, "LAUNCH_FAILED");
+        assert_eq!(failure.reason, None);
+        assert_eq!(failure.action, None);
+        assert_eq!(failure.screen, vec!["Loading…".to_owned()]);
     }
 
     #[test]

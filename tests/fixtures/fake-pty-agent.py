@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import tty
 import uuid
 
@@ -44,6 +45,12 @@ def interactive(agent):
         pid_file.write(str(os.getpid()))
     if sys.stdin.isatty():
         tty.setraw(0)
+    if os.environ.get("FAKE_PTY_AGENT_STALL"):
+        # Stand in for an interactive startup screen that never reports a
+        # session, so dlgt's launch times out with this text on screen.
+        print("Startup dialog: waiting for a human", flush=True)
+        while True:
+            time.sleep(60)
     print(f"{agent} fixture ready", flush=True)
     emit(
         agent,

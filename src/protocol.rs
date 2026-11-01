@@ -155,6 +155,9 @@ pub struct RpcError {
     pub session_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Rendered tail of the provider screen when a launch failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Vec<String>>,
 }
 
 impl Response {
@@ -184,6 +187,7 @@ impl Response {
                 hint: None,
                 session_state: None,
                 action: None,
+                screen: None,
             }),
             info: None,
         }
@@ -208,6 +212,7 @@ impl Response {
                 hint: None,
                 session_state: None,
                 action: None,
+                screen: None,
             }),
             info: None,
         }

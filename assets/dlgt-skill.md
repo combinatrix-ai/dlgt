@@ -521,7 +521,8 @@ when a delegation must keep the Harness's own permission prompts.
 | `CURSOR_EXPIRED` / `CURSOR_INVALID` | Third case of the cursor rule: one cursorless `fetch` to rebase. |
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address by ID. |
-| `LAUNCH_FAILED` | The provider process could not be launched. Read `fetch` and `show`, and only then the sensitive `logs --raw`. This differs from a process that launched and later failed: that execution failure appears in `results[].status`. |
+| `LAUNCH_BLOCKED` | The provider stopped at a startup screen that only a human can answer, such as Codex's "Hooks need review" dialog after a hook was added or changed. Do not retry and do not bypass it. Tell the user `error.action` (for Codex hooks: run `codex` once in that directory, review the hooks, trust them), then retry with a new `--request-id`. `error.screen` shows the dialog. |
+| `LAUNCH_FAILED` | The provider process could not be launched or never became ready. Read `error.screen` first: it is the provider's last rendered screen. Then `show <launch_id or session_id>` (its `launch_failure` keeps the same screen), `scrollback <id> --lines 200`, and only then the sensitive `logs --raw <id>`. This differs from a process that launched and later failed: that execution failure appears in `results[].status`. |
 
 ## Observation and control reference
 

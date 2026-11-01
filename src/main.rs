@@ -62,6 +62,9 @@ fn main() {
             if let Some(action) = &failure.action {
                 error_object.insert("action".to_owned(), json!(action));
             }
+            if let Some(screen) = &failure.screen {
+                error_object.insert("screen".to_owned(), json!(screen));
+            }
         }
         let response = json!({"ok":false,"error":error_json});
         println!("{response}");
@@ -415,6 +418,7 @@ fn command_attach(args: &[String]) -> Result<()> {
             hint: Some(format!("dlgt fetch {selector}")),
             session_state: None,
             action: Some(format!("dlgt fetch {selector}")),
+            screen: None,
         }
         .into());
     }
@@ -977,7 +981,7 @@ fn print_success(value: Value, pretty: bool) -> Result<()> {
 fn exit_status(code: &str) -> i32 {
     match code {
         "CANCEL_TIMEOUT" => 3,
-        "SESSION_BLOCKED" => 4,
+        "SESSION_BLOCKED" | "LAUNCH_BLOCKED" => 4,
         "SESSION_BUSY" => 5,
         _ => 1,
     }
