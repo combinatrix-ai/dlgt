@@ -245,3 +245,71 @@ fn opencode_round_trip_resume_restart_and_kill() -> Result<(), Box<dyn std::erro
 fn pi_round_trip_resume_restart_and_kill() -> Result<(), Box<dyn std::error::Error>> {
     exercise("pi")
 }
+
+#[test]
+fn launch_timeout_reports_the_rendered_screen() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let output = fixture
+        .command()
+        .args([
+            "new",
+            "--title",
+            "stalled",
+            "--harness",
+            "pi",
+            "--cwd",
+            "/tmp",
+            "--request-id",
+            "stall",
+            "--env",
+            "FAKE_PTY_AGENT_STALL=1",
+            "--startup-timeout",
+            "2s",
+            "--",
+            "never",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let failed: Value = serde_json::from_slice(&output.stdout)?;
+    let error = &failed["error"];
+    assert_eq!(error["code"], "LAUNCH_FAILED", "{failed}");
+    let launch_id = error["launch_id"]
+        .as_str()
+        .ok_or("missing launch_id")?
+        .to_owned();
+    assert_eq!(
+        error["screen"],
+        json!(["Startup dialog: waiting for a human"]),
+        "{failed}"
+    );
+    let hint = error["hint"].as_str().ok_or("missing hint")?;
+    assert!(
+        hint.contains(&format!("dlgt scrollback {launch_id}")),
+        "{hint}"
+    );
+    assert!(
+        hint.contains(&format!("dlgt logs --raw {launch_id}")),
+        "{hint}"
+    );
+
+    let shown = fixture.run(&["show", &launch_id])?;
+    assert_eq!(shown["session"]["state"], "failed", "{shown}");
+    assert_eq!(shown["launch_failure"]["code"], "LAUNCH_FAILED", "{shown}");
+    assert_eq!(
+        shown["launch_failure"]["screen"], error["screen"],
+        "{shown}"
+    );
+    let fetched = fixture.run(&["fetch", &launch_id])?;
+    assert_eq!(
+        fetched["sessions"][0]["session"]["state"], "failed",
+        "{fetched}"
+    );
+    let scrollback = fixture.run(&["scrollback", &launch_id, "--lines", "20"])?;
+    assert!(
+        scrollback
+            .to_string()
+            .contains("Startup dialog: waiting for a human"),
+        "{scrollback}"
+    );
+    Ok(())
+}

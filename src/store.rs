@@ -6,6 +6,7 @@ use crate::cursor::{Cursor, CursorTable};
 use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
 use crate::screen::{EpochReason, LIVE_ROW_LIMIT, ScreenStore, StablePage};
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use uuid::Uuid;
 
 pub struct Store {
@@ -50,6 +51,8 @@ struct StoredSession {
     uid: String,
     terminal_rows: u16,
     terminal_cols: u16,
+    /// Diagnostics retained when the Session failed before it became ready.
+    launch_failure: Option<Value>,
 }
 
 /// Live screen projection: a replaceable snapshot, never cursor history.
@@ -137,6 +140,7 @@ impl Store {
                 uid,
                 terminal_rows: 24,
                 terminal_cols: 80,
+                launch_failure: None,
             },
         );
         Ok(())
@@ -240,6 +244,20 @@ impl Store {
 
     pub fn set_session_failed(&self, id: &str) {
         set_terminal_session(&mut self.state.borrow_mut(), id, SessionState::Failed);
+    }
+
+    pub fn set_launch_failure(&self, id: &str, failure: Value) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
+            session.launch_failure = Some(failure);
+        }
+    }
+
+    pub fn launch_failure(&self, id: &str) -> Option<Value> {
+        self.state
+            .borrow()
+            .sessions
+            .get(id)
+            .and_then(|session| session.launch_failure.clone())
     }
 
     pub fn rekey_session(&self, from: &str, to: &str) -> Result<()> {

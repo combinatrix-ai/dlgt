@@ -208,6 +208,39 @@ pub(crate) fn codex_app_server_args(
     Ok(args)
 }
 
+/// An interactive provider screen that keeps a launch from becoming ready.
+/// dlgt never answers these: each one changes provider trust or account
+/// state, which is the user's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupBlocker {
+    pub reason: &'static str,
+    pub message: &'static str,
+    pub action: &'static str,
+}
+
+const CODEX_STARTUP_BLOCKERS: &[(&str, StartupBlocker)] = &[(
+    "Hooks need review",
+    StartupBlocker {
+        reason: "codex_hooks_need_review",
+        message: "Codex is waiting for hook review: a hook is new or changed and must be trusted \
+                  before Codex starts",
+        action: "have a human run `codex` once in this directory, review the hooks, and trust \
+                 them; then retry",
+    },
+)];
+
+/// Recognize a known blocking startup screen from rendered rows.
+pub fn startup_blocker(agent: Agent, rows: &[String]) -> Option<StartupBlocker> {
+    let blockers = match agent {
+        Agent::Codex => CODEX_STARTUP_BLOCKERS,
+        Agent::Claude | Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => &[],
+    };
+    blockers
+        .iter()
+        .find(|(needle, _)| rows.iter().any(|row| row.contains(needle)))
+        .map(|(_, blocker)| *blocker)
+}
+
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
     match agent {
         Agent::Cursor | Agent::Grok | Agent::OpenCode | Agent::Pi => {}
@@ -546,8 +579,20 @@ mod tests {
 
     use super::{
         Agent, LaunchOptions, claude_session_marker, codex_app_server_args,
-        codex_remote_tui_command, command_spec, trust_claude_workspace, trust_codex_workspace,
+        codex_remote_tui_command, command_spec, startup_blocker, trust_claude_workspace,
+        trust_codex_workspace,
     };
+
+    #[test]
+    fn startup_blockers_match_only_their_own_harness() {
+        let rows = vec!["Hooks need review".to_owned()];
+        assert_eq!(
+            startup_blocker(Agent::Codex, &rows).map(|blocker| blocker.reason),
+            Some("codex_hooks_need_review")
+        );
+        assert_eq!(startup_blocker(Agent::Claude, &rows), None);
+        assert_eq!(startup_blocker(Agent::Codex, &["› Ready".to_owned()]), None);
+    }
 
     #[test]
     fn claude_marker_is_stable_and_short() {
