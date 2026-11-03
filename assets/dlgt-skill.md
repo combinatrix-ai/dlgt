@@ -23,7 +23,8 @@ and a PTY.
 
 Use repeatable `--harness-option KEY[=VALUE]` entries for provider-specific
 launch configuration. Claude receives a bare key such as `chrome` as
-`--chrome`, and a keyed value as `--KEY=VALUE`. Codex requires `KEY=VALUE` and
+`--chrome`, and a keyed value as `--KEY=VALUE`; Grok passes options through the
+same way. Codex requires `KEY=VALUE` and
 receives it as `--config KEY=VALUE` on both its managed app-server and remote
 TUI processes; values use Codex's TOML syntax, for example `--harness-option
 'web_search="live"'`. Do not use this to pass prompt text or secrets.

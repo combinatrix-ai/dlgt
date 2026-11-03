@@ -243,9 +243,11 @@ Rules:
   permissions follow the auto-approve rule above.
 - `--harness-option KEY[=VALUE]` is repeatable, stored with the Session, and
   reused by `restart`. Claude receives a bare key as `--KEY` and a keyed value
-  as `--KEY=VALUE`. Codex requires `KEY=VALUE` and receives it as `--config
-  KEY=VALUE` on both its managed app-server and remote TUI processes. Options
-  whose values are managed by dlgt are rejected.
+  as `--KEY=VALUE`; Grok passes options through the same way. Codex requires
+  `KEY=VALUE` and receives it as `--config KEY=VALUE` on both its managed
+  app-server and remote TUI processes. Cursor, OpenCode, and Pi accept only
+  their documented `KEY=VALUE` options. Options whose values are managed by
+  dlgt are rejected.
 - `--startup-timeout` is optional and defaults to 60 seconds, but startup is
   never unbounded.
 - Session creation and acceptance of the first prompt are one atomic daemon
