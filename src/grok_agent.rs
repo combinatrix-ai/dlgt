@@ -155,9 +155,12 @@ pub fn validate(options: &[String]) -> Result<()> {
     for option in options {
         let (key, value) = option
             .split_once('=')
-            .context("harness option requires KEY=VALUE")?;
-        if key.is_empty() || value.is_empty() {
-            bail!("harness option {key:?} requires a non-empty value");
+            .map_or((option.as_str(), None), |(key, value)| (key, Some(value)));
+        if key.is_empty() {
+            bail!("invalid harness option key {key:?}");
+        }
+        if value.is_some_and(str::is_empty) {
+            bail!("harness option {key:?} requires a non-empty value after '='");
         }
         if matches!(
             key,
@@ -182,12 +185,12 @@ pub fn command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         args.push("--always-approve".to_owned());
         args.push("--trust".to_owned());
     }
-    for option in options.harness_options {
-        let (key, value) = option
-            .split_once('=')
-            .context("harness option requires KEY=VALUE")?;
-        args.push(format!("--{key}={value}"));
-    }
+    args.extend(
+        options
+            .harness_options
+            .iter()
+            .map(|option| format!("--{option}")),
+    );
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["--resume".to_owned(), provider_id.to_owned()]);
     } else if let Some(provider_id) = options.new_provider_id {
@@ -273,6 +276,30 @@ mod tests {
             ]
         );
         assert!(validate(&["model=x".to_owned()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn harness_options_pass_through_as_bare_or_keyed_flags() -> Result<()> {
+        let environment = HashMap::new();
+        let harness_options = ["verbose".to_owned(), "theme=dark".to_owned()];
+        let options = LaunchOptions {
+            agent: crate::provider::Agent::Grok,
+            session_id: "internal:TEST",
+            title: "review",
+            cwd: Path::new("/tmp"),
+            model: None,
+            effort: None,
+            harness_options: &harness_options,
+            new_provider_id: None,
+            resume_provider_id: None,
+            environment: &environment,
+            auto_approve: false,
+            initial_prompt: None,
+        };
+        assert_eq!(command(&options)?.args, ["--verbose", "--theme=dark"]);
+        assert!(validate(&["theme=".to_owned()]).is_err());
+        assert!(validate(&["=dark".to_owned()]).is_err());
         Ok(())
     }
 

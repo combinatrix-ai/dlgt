@@ -94,7 +94,7 @@ fn fetch_help_is_single_session_and_wait_binds_the_result() -> Result<(), Box<dy
 fn harness_option_help_is_provider_neutral() -> Result<(), Box<dyn std::error::Error>> {
     for command in ["new", "send"] {
         let help = String::from_utf8(dlgt(&[command, "--help"])?.stdout)?;
-        assert!(help.contains("--harness-option <KEY=VALUE>"));
+        assert!(help.contains("--harness-option <KEY[=VALUE]>"));
         assert!(!help.contains("Claude CLI option"));
     }
     Ok(())
