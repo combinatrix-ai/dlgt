@@ -77,7 +77,8 @@ fn gaps<'a>(response: &'a Value, bucket: &'a Value) -> impl Iterator<Item = &'a 
         .filter_map(|gap| gap.get("component").and_then(Value::as_str))
 }
 
-/// Text lines for one fetch bucket: new Requests, messages, then results.
+/// Text lines for one fetch bucket: messages with each execution's result
+/// after them, then Requests that have not been announced yet.
 fn render(bucket: &Value, asked: &mut HashSet<String>, history: bool) -> Vec<String> {
     let harness = bucket
         .pointer("/session/harness")
@@ -90,10 +91,26 @@ fn render(bucket: &Value, asked: &mut HashSet<String>, history: bool) -> Vec<Str
             .into_iter()
             .flatten()
     };
+    let execution = |value: &Value| value.get("execution_seq").and_then(Value::as_i64);
+    // A result that starts in this bucket closes its execution: it is
+    // printed after that execution's messages, not after the whole page.
+    let mut results = list("results")
+        .filter(|result| {
+            !history && result.get("final_text_offset").and_then(Value::as_u64) == Some(0)
+        })
+        .peekable();
+    let done = |result: &Value| {
+        let status = result.get("status").and_then(Value::as_str).unwrap_or("?");
+        format!("{} done   {status}", prefix(result))
+    };
     let mut lines = Vec::new();
     for message in list("messages") {
+        while let Some(result) = results.next_if(|result| execution(result) < execution(message)) {
+            lines.push(done(result));
+        }
         lines.push(message_line(harness, message));
     }
+    lines.extend(results.map(done));
     for request in list("requests") {
         let text = |name: &str| {
             request
@@ -114,15 +131,6 @@ fn render(bucket: &Value, asked: &mut HashSet<String>, history: bool) -> Vec<Str
             prefix(request),
             text("id")
         ));
-    }
-    if !history {
-        for result in list("results") {
-            if result.get("final_text_offset").and_then(Value::as_u64) != Some(0) {
-                continue;
-            }
-            let status = result.get("status").and_then(Value::as_str).unwrap_or("?");
-            lines.push(format!("{} done   {status}", prefix(result)));
-        }
     }
     lines
 }
@@ -196,9 +204,11 @@ mod tests {
                  "summary": "git push --force origin main"},
             ],
             "results": [
+                {"execution_seq": 6, "status": "canceled", "final_text_offset": 0},
                 {"execution_seq": 7, "status": "completed", "final_text_offset": 0},
             ],
             "messages": [
+                {"seq": 0, "execution_seq": 6, "kind": "notice", "text": "earlier"},
                 {"seq": 1, "execution_seq": 7, "kind": "tool_call", "tool": "Bash",
                  "summary": "cargo test"},
                 {"seq": 2, "execution_seq": 7, "kind": "tool_result", "tool": "Bash",
@@ -212,12 +222,14 @@ mod tests {
         assert_eq!(
             render(&bucket, &mut asked, false),
             [
+                "[exec 6] note   earlier",
+                "[exec 6] done   canceled",
                 "[exec 7] tool   Bash  cargo test",
                 "[exec 7] ok     Bash  42 passed",
                 "[exec 7] claude Found one race.",
                 "[exec 7] deny   r3  by caller",
-                "[exec 7] ask    r4  Bash  git push --force origin main",
                 "[exec 7] done   completed",
+                "[exec 7] ask    r4  Bash  git push --force origin main",
             ]
         );
         assert!(

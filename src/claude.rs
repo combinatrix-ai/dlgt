@@ -288,6 +288,9 @@ pub struct ClaudeTurns {
     unread: Vec<Unread>,
     /// A provider turn is running and its `result` has not arrived.
     turn_open: bool,
+    /// Claude has started this execution's own prompt. A `result` before
+    /// that belongs to a turn dlgt did not start and cannot end this one.
+    engaged: bool,
     result_texts: Vec<String>,
     last_assistant: Option<String>,
     failure: Option<String>,
@@ -484,6 +487,7 @@ pub fn apply_event(
                 return Ok(actions);
             };
             turns.turn_open = true;
+            turns.engaged = true;
             let turn_id = session.active_turn_id.as_deref();
             let canceled = turn_id
                 .and_then(|id| store.get_turn(id))
@@ -508,6 +512,7 @@ pub fn apply_event(
                     if let Some(unread) = turns.unread.iter_mut().find(|u| u.uuid == uuid) {
                         unread.started = true;
                         turns.turn_open = true;
+                        turns.engaged = true;
                         // Claude dequeued the prompt and began the turn: that
                         // is its acceptance, ahead of the model reading it.
                         if unread.steer.is_none() {
@@ -521,6 +526,13 @@ pub fn apply_event(
                 }
                 _ => {}
             }
+        }
+        (Some("result"), _) if !turns.engaged => {
+            store.record_event(
+                Some(session_id),
+                session.active_turn_id.as_deref(),
+                "provider.stop_unmatched",
+            );
         }
         (Some("result"), subtype) => {
             turns.turn_open = false;
@@ -693,6 +705,11 @@ pub fn input_summary(input: &Value) -> String {
     ];
     KEYS.iter()
         .find_map(|key| input.get(key).and_then(Value::as_str))
+        .or_else(|| {
+            input
+                .pointer("/questions/0/question")
+                .and_then(Value::as_str)
+        })
         .map_or_else(
             || {
                 if input.is_null() {
@@ -1033,6 +1050,26 @@ mod tests {
         apply(&store, &mut turns, &lifecycle("u-prompt", "cancelled"));
         assert_eq!(state(&store), SessionState::Idle);
         assert_eq!(turn(&store).state, TurnState::Canceled);
+    }
+
+    #[test]
+    fn a_result_from_a_turn_dlgt_did_not_start_cannot_end_a_new_execution() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &lifecycle("u-prompt", "queued"));
+        // A provider turn that was already running reports its result while
+        // this execution's prompt is still waiting to start.
+        apply(&store, &mut turns, &result("someone else's answer"));
+        assert_eq!(state(&store), SessionState::Busy);
+        assert_eq!(turn(&store).state, TurnState::Submitted);
+
+        apply(&store, &mut turns, &lifecycle("u-prompt", "started"));
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(&store, &mut turns, &result("the real answer"));
+        assert_eq!(
+            turn(&store).final_message.as_deref(),
+            Some("the real answer")
+        );
+        assert_eq!(state(&store), SessionState::Idle);
     }
 
     #[test]
