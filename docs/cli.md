@@ -1,4 +1,4 @@
-# dlgt CLI v1 reference
+# dlgt CLI v2 reference
 
 This reference is also published as raw Markdown at
 https://combinatrix.ai/dlgt/cli.md for agents to fetch with curl.
@@ -7,19 +7,31 @@ This document is the normative command reference. See [RPC](rpc.md) for the
 programmatic interface and [Design](design.md) for the product boundary,
 invariants, lifecycle rationale, security model, and acceptance criteria.
 
+> **Status: target contract for the terminal-less rewrite.** dlgt 0.5.x still
+> implements the PTY-based v1 CLI. [RPC](rpc.md) and [Design](design.md) have
+> not been rewritten yet and still describe v1. Behavior that has not been
+> measured against a provider is listed under
+> [Open questions](#open-questions-before-implementation).
+
 ## Product definition
 
-`dlgt` is a local, single-binary runtime for live, addressable, and
-attachable Codex, Claude, Cursor, Grok, OpenCode, and Pi subagents.
+`dlgt` is a local, single-binary runtime for live, addressable Codex and Claude
+subagents. It drives each provider through its structured interface and owns
+no terminal.
 
 The only public runtime object is a **Session**:
 
 ```text
 Session
-  One dlgt-owned harness process and PTY
-  One controller at a time
+  One dlgt-owned harness process, driven over a structured channel
   At most one active execution
   No server-side queue
+  No PTY, no screen, no attach
+```
+
+```text
+Codex    codex app-server, JSON-RPC over stdio
+Claude   claude -p with stream-json input and output, one long-lived process
 ```
 
 Provider turns and execution receipts may remain internal for lifecycle
@@ -29,10 +41,11 @@ have public IDs.
 Other terms:
 
 ```text
-Harness   The provider adapter, codex, claude, cursor, grok, opencode, or pi
+Harness   The provider adapter, codex or claude
 Profile   A reusable client-side launch specification
 Alias     A human-readable address for an active Session
 Title     A non-unique human description used to generate an Alias
+Request   A pending approval or question that only the caller can answer
 ```
 
 ## Identifier and naming model
@@ -53,8 +66,8 @@ During startup only, dlgt correlates the not-yet-bound process with an
 provider-qualified ID before accepting the first prompt or returning success.
 The internal launch ID is not a public Session ID; it may appear only as
 `error.launch_id` when startup fails before provider binding. That failed
-launch stays addressable for diagnostics: `show`, `fetch`, `scrollback`, and
-`logs --raw` accept the `launch_id`.
+launch stays addressable for diagnostics: `show` and `fetch` accept the
+`launch_id`.
 
 Aliases are for humans:
 
@@ -95,8 +108,7 @@ panic or corrupted executable startup.
 The exceptions are deliberate:
 
 ```text
-attach             raw interactive terminal
-logs --raw         raw PTY bytes
+watch              human-readable text stream
 help / skill       text
 rpc --stdio        JSONL request/response stream
 ```
@@ -114,25 +126,21 @@ USAGE
 
 DELEGATION
   new          Create a Session with its first prompt
-  restart      Restart a Session
-  send         Send work to an existing idle Session or --resume a provider conversation
-  fetch        Read new state, results, events, and screen from a cursor
+  send         Send work to an idle Session, --steer a busy one, or --resume
+  fetch        Read new state, results, events, and messages from a cursor
+  answer       Answer a pending approval or question
   cancel       Interrupt the active execution
 
 SESSIONS
   list, ls     List Sessions
   show         Show Session state and latest result
-  attach       Attach to the Session screen
+  watch        Follow a Session's messages as text (read-only)
+  restart      Restart a Session
   stop         Stop the Session
-
-OBSERVABILITY
-  scrollback   Read rendered terminal scrollback
-  logs         Read raw retained PTY bytes (requires --raw)
 
 CONFIGURATION
   models       Discover Harness models
   profiles     List or inspect Profiles
-  harnesses    List Harness capabilities
   doctor       Diagnose the local dlgt installation
   skill        Print the embedded dlgt skill
 
@@ -142,6 +150,11 @@ RUNTIME
   rpc          Use JSONL RPC
 ```
 
+Removed from v1: `attach`, `scrollback`, `logs`, `harnesses`,
+`fetch --screen`, `--no-auto-approve`, and the `cursor`, `grok`, `opencode`,
+and `pi` Harnesses. `--harness` remains so that further Harnesses can return
+as values of the same option.
+
 Each release uses its own socket at
 `$DLGT_HOME/run/<version>/dlgt.sock`. Most commands address the daemon for the
 invoking binary's version. `send` first scans all live versioned sockets for an
@@ -149,8 +162,7 @@ exact provider-qualified Session ID and routes to its owning daemon; multiple
 matches fail rather than choosing or launching. `dlgt list
 --all-versions` queries every currently running version and annotates each
 Session with `runtime_version` and `runtime_socket`. Session state, results,
-events, and terminal history exist only while their owning daemon remains
-alive.
+events, and messages exist only while their owning daemon remains alive.
 
 Busy Session snapshots include two integer diagnostics when `state` is exactly
 `busy`:
@@ -159,16 +171,16 @@ Busy Session snapshots include two integer diagnostics when `state` is exactly
 {
   "state": "busy",
   "busy_for_ms": 183000,
-  "pty_quiet_for_ms": 72000
+  "quiet_for_ms": 72000
 }
 ```
 
-`busy_for_ms` measures from reservation of the current turn. `pty_quiet_for_ms`
-measures PTY silence, clamped to that same busy interval so output from an
-earlier turn cannot inflate it. If no PTY output has occurred, it equals
-`busy_for_ms`. These counters are diagnostic only; PTY silence never changes
-Session state or makes a busy Session accept another prompt. Both fields are
-omitted for every other state.
+`busy_for_ms` measures from reservation of the current turn. `quiet_for_ms`
+measures time since the provider last emitted any event, clamped to that same
+busy interval. If no event has occurred, it equals `busy_for_ms`. These
+counters are diagnostic only; provider silence never changes Session state or
+makes a busy Session accept another prompt. Both fields are omitted for every
+other state.
 
 Successful commands may include an optional non-error notice:
 
@@ -189,12 +201,54 @@ binary's build target, atomically replaces the current executable, and
 refreshes the embedded Codex and Claude Skills. Existing older-version daemons
 and their live Sessions continue on their versioned sockets.
 
+## Approvals
+
+One option decides who approves what a worker does. It is set at `new`, stored
+with the Session, and reused by `restart` and `send --resume` unless that
+command supplies a new value.
+
+```text
+--approvals auto|ask|bypass     (default: auto)
+```
+
+| Value | Claude | Codex | What reaches the caller |
+| --- | --- | --- | --- |
+| `auto` | `--permission-mode auto` | `sandbox=workspace-write`, `approvalPolicy=on-request`, `approvalsReviewer=auto_review` | Only what the provider's own reviewer does not settle |
+| `ask` | `--permission-mode manual` | `sandbox=workspace-write`, `approvalPolicy=on-request`, `approvalsReviewer=user` | Every approval request |
+| `bypass` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | Nothing |
+
+Rules:
+
+- dlgt never approves on its own. In `auto` the provider's reviewer decides;
+  in `ask` the caller decides through [`answer`](#answer); in `bypass` nothing
+  is asked.
+- Every reviewer decision that dlgt can observe is recorded as an `approval`
+  message, so the caller can read afterwards what was approved or denied and
+  by whom. See [Messages](#messages).
+- Claude's auto mode is not available for every model. When Claude reports a
+  different mode than the one requested, the Session snapshot says so and the
+  Session behaves as the effective mode:
+
+  ```json
+  {"approvals":{"requested":"auto","effective":"ask","reason":"provider reported permission mode default"}}
+  ```
+
+- A request that nobody answers never times out into an approval. It stays
+  pending and the Session stays `blocked` until `answer`, `cancel`, or `stop`.
+- Harness options that would override the mapping above
+  (`permission-mode`, `permission-prompt-tool`, `permission-prompts`,
+  `dangerously-skip-permissions`, `approval_policy`, `sandbox_mode`,
+  `approvals_reviewer`) are managed by dlgt and rejected with
+  `INVALID_ARGUMENT`.
+- Codex `workspace-write` still allows writes under the system temporary
+  directories. Those writes produce no approval request in any mode.
+
 ## `new`
 
 `new` is the only Session creation command and always requires its first
 prompt. Launch and local reservation are one atomic operation. The command
 waits briefly for provider confirmation from Codex's app-server turn lifecycle
-or Claude's matching `UserPromptSubmit` hook, then returns success with
+or Claude's replay of the submitted user message, then returns success with
 `submission` set to `confirmed` or `pending`. Observation of later progress and
 the answer is a separate `fetch`.
 
@@ -210,12 +264,12 @@ dlgt new
   --title <TITLE>
   [--alias <@ALIAS>]
   [--profile <PROFILE>]
-  [--harness codex|claude|cursor|grok|opencode|pi]
+  [--harness codex|claude]
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
+  [--approvals auto|ask|bypass]
   [--harness-option <KEY[=VALUE]>]...
-  [--no-auto-approve]
   [--startup-timeout <DURATION>]
   [--clean-env]
   [--pass-env <KEY>]...
@@ -230,24 +284,12 @@ Rules:
 - `--title` is required and may be non-unique.
 - A Profile or Harness must resolve the Harness selection.
 - Model and effort are optional. Omission selects the provider default.
-- By default dlgt launches workers auto-approved:
-  `--dangerously-bypass-approvals-and-sandbox` for Codex and
-  `--permission-mode=auto` for Claude. `--no-auto-approve` (or Profile
-  `auto_approve = false`) keeps the Harness's own approval prompts. An
-  explicit `permission-mode=...` Harness option replaces the implicit Claude
-  mode. An explicit Codex `approval_policy=...` or `sandbox_mode=...` Harness
-  option likewise suppresses the implicit Codex bypass flag.
-- Before launching either Harness, dlgt records the Session working directory
-  as trusted in that provider's local workspace state. For Claude this updates
-  `~/.claude.json` and suppresses only the workspace trust dialog; tool
-  permissions follow the auto-approve rule above.
+- `--approvals` defaults to `auto`. See [Approvals](#approvals).
 - `--harness-option KEY[=VALUE]` is repeatable, stored with the Session, and
   reused by `restart`. Claude receives a bare key as `--KEY` and a keyed value
-  as `--KEY=VALUE`; Grok passes options through the same way. Codex requires
-  `KEY=VALUE` and receives it as `--config KEY=VALUE` on both its managed
-  app-server and remote TUI processes. Cursor, OpenCode, and Pi accept only
-  their documented `KEY=VALUE` options. Options whose values are managed by
-  dlgt are rejected.
+  as `--KEY=VALUE`. Codex requires `KEY=VALUE` and receives it as
+  `--config KEY=VALUE` on its app-server process. Options whose values are
+  managed by dlgt are rejected.
 - `--startup-timeout` is optional and defaults to 60 seconds, but startup is
   never unbounded.
 - Session creation and acceptance of the first prompt are one atomic daemon
@@ -288,9 +330,9 @@ Example:
 
 ```bash
 dlgt new \
-  --title "prompting Claude worker" \
+  --title "careful Claude worker" \
   --harness claude \
-  --no-auto-approve \
+  --approvals ask \
   --cwd . \
   --request-id review-1 \
   -- "Review the current design"
@@ -300,9 +342,9 @@ The unsafe full bypass remains available only when deliberately requested:
 
 ```bash
 dlgt new \
-  --title "unrestricted Claude worker" \
-  --harness claude \
-  --harness-option dangerously-skip-permissions=true \
+  --title "unrestricted Codex worker" \
+  --harness codex \
+  --approvals bypass \
   --cwd . \
   --request-id review-2 \
   -- "Review the current design"
@@ -389,13 +431,15 @@ Rules:
 - Startup is bounded by `--startup-timeout`, which defaults to 60 seconds.
 - Launch environment values are freshly supplied by the invoking client and
   are not retained for replay.
-- Existing results, events, raw output, and scrollback remain readable; new
-  executions continue the same monotonic `execution_seq`.
+- Existing results, events, and messages remain readable; new executions
+  continue the same monotonic `execution_seq`.
+- Pending Requests of the replaced process are closed as `canceled`.
 
 ## `send`
 
 ```text
 dlgt send <SESSION_ID|@ALIAS>
+  [--steer]
   --request-id <ID>         (required)
   [--pretty]
   [--prompt-file <PATH> | --stdin | -- <PROMPT>]   (required)
@@ -409,8 +453,8 @@ dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
+  [--approvals auto|ask|bypass]
   [--harness-option <KEY[=VALUE]>]...
-  [--no-auto-approve]
   [--startup-timeout <DURATION>]
   [--clean-env]
   [--pass-env <KEY>]...
@@ -428,7 +472,9 @@ waits for bind/readiness, and atomically accepts the prompt. Success returns
 the same canonical `session.id` and caller correlation ID. If Claude rotates
 its provider session ID while resuming, success returns that new canonical ID.
 Plain `send` never launches and returns `SESSION_NOT_RUNNING` with a
-`--resume` hint when its target is not live.
+`--resume` hint when its target is not live. dlgt holds one process per
+provider conversation: a second `--resume` of a conversation that is already
+live reuses that Session and never starts a second process on it.
 
 Rules:
 
@@ -442,15 +488,14 @@ Rules:
   Prefer `--prompt-file` for long prompts from an agent-controlled shell so
   no shell pipe or redirection wraps the direct `dlgt send` invocation.
 - If the Session is idle, dlgt accepts the prompt and transitions it to busy.
-- If the Session is busy, canceling, blocked, stopping, stopped, or
-  attached, the command fails immediately and has no side effects. Busy and
-  canceling return `SESSION_BUSY`; blocked returns `SESSION_BLOCKED`; attached
-  returns `SESSION_ATTACHED`; other non-idle states return
-  `SESSION_UNAVAILABLE`.
+- If the Session is busy, canceling, blocked, stopping, or stopped, plain
+  `send` fails immediately and has no side effects. Busy and canceling return
+  `SESSION_BUSY`; blocked returns `SESSION_BLOCKED` with an `answer` action;
+  other non-idle states return `SESSION_UNAVAILABLE`.
 - `--request-id` is required and behaves exactly as it does for `new`,
-  including with `--resume`: the same ID and payload replay the original
-  receipt with `"replayed": true`, and the same ID with a different payload is
-  `INVALID_ARGUMENT`.
+  including with `--resume` and `--steer`: the same ID and payload replay the
+  original receipt with `"replayed": true`, and the same ID with a different
+  payload is `INVALID_ARGUMENT`.
 - There is no `--wait`, `--create`, `--enqueue`, `--after`, or `--fail-if-busy`.
   Creation, queueing, and waiting are not `send` responsibilities, and busy
   rejection is always the default.
@@ -480,6 +525,45 @@ dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-4 \
   && dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait 15m
 ```
 
+### `send --steer`
+
+`--steer` adds a message to the execution that is already running. It never
+creates an execution, never queues work for later, and never interrupts.
+
+```bash
+dlgt send claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629 --steer \
+  --request-id steer-1 -- "Skip the integration tests; unit tests are enough"
+```
+
+```json
+{"ok":true,"session":{"id":"claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629","state":"busy"},"execution_seq":2,"steer":"accepted","cursor":"9"}
+```
+
+- The Session must be `busy`. An idle Session returns `NO_ACTIVE_WORK`; send
+  the prompt without `--steer` instead. A blocked Session returns
+  `SESSION_BLOCKED`: answer the Request first.
+- The response carries the running `execution_seq`. A steer has no result of
+  its own; the execution still ends with exactly one retained result.
+- Acceptance means dlgt handed the message to the provider. Delivery to the
+  model is reported later as a `steer` message with `delivered: true`.
+
+The two Harnesses deliver at different moments, and callers should not expect
+them to match:
+
+```text
+Codex    turn/steer; the message joins the active turn immediately
+Claude   the message is read at the next model request, which is after the
+         tool call in flight returns. If the turn ends first, Claude runs the
+         message as a continuation and dlgt keeps it in the same execution
+```
+
+For Claude, dlgt treats an execution as finished only when the provider has
+reported a turn result and every accepted steer has been replayed back by the
+provider. A steer therefore cannot be lost between two executions.
+
+To replace the running work instead of adding to it, use `cancel` and then a
+plain `send`.
+
 ## Retained result
 
 Every accepted execution receives a per-Session monotonic `execution_seq`.
@@ -494,7 +578,8 @@ The retained result shape is:
   "execution_seq": 2,
   "status": "completed",
   "final_text": "Review result...",
-  "final_text_source": "hook",
+  "final_text_source": "provider",
+  "denied_requests": 0,
   "error": null,
   "started_at_ms": 1784024104395,
   "completed_at_ms": 1784024252019,
@@ -508,10 +593,16 @@ string for `completed`, although it may be empty. Failed terminal states may
 provide partial final text and must provide a structured error. Usage is
 nullable because availability differs by Harness.
 
+`denied_requests` counts approvals that were denied during the execution, by
+the provider's reviewer or by the caller. A provider reports a turn as
+successful even when a tool it needed was denied, so a `completed` result with
+a non-zero count is not evidence that the work was done. The matching
+`approval` messages say what was denied.
+
 `final_text_source` is a diagnostic:
 
 ```text
-hook         the Harness lifecycle event reported the text
+provider     the Harness turn result reported the text
 transcript   the Harness reported nothing and dlgt recovered the text from
              the Session's own provider transcript, bounded to this execution
 missing      no text was recovered; the execution status is still authoritative
@@ -525,14 +616,15 @@ A failed recovery never turns a completed execution into a failure.
 dlgt fetch <SESSION_ID|@ALIAS>
   [--cursor <N>]
   [--wait <DURATION>]
-  [--screen[=<MAX_STABLE_LINES>] | --no-screen]
+  [--messages[=<MAX>] | --no-messages]
   [--max-bytes <BYTES>]
   [--pretty]
 ```
 
 `fetch` is the one observation command. It returns, in a single JSON document,
-the current Session snapshot, every terminal result and lifecycle event after
-the cursor, the forward screen delta, and the response's cursor position.
+the current Session snapshot, pending Requests, every terminal result and
+lifecycle event after the cursor, the forward message delta, and the response's
+cursor position.
 
 Every observation succeeds. A long poll that expires with nothing new is
 `{"ok":true,"reason":"timeout"}` with empty deltas, not an error. The same
@@ -542,9 +634,9 @@ bookkeeping advanced beneath it. `reason` is one of:
 
 ```text
 snapshot    bounded baseline; no cursor was supplied
-change      new events, results, or stable rows were delivered
+change      new events, results, or messages were delivered
 result      the bound execution has a retained terminal result
-blocked     the Session needs a human answer; the live screen is included
+blocked     the Session has a pending Request; it is included
 page_full   more data already exists beyond the returned cursor
 gap         retention evicted part of the cursor window
 timeout     nothing new in the cursor window
@@ -552,67 +644,95 @@ timeout     nothing new in the cursor window
 
 Rules:
 
-- Without `--cursor`, `fetch` returns a bounded baseline: current state, the
-  latest retained result, the last 128 stable screen lines, the live screen,
-  and a fresh position. This is the documented recovery path after a lost
-  position or a lost response.
-- `--wait` requires an explicit duration and accepts up to 24h. Omitted, the
-  command returns immediately.
+- Without `--cursor`, `fetch` returns a bounded baseline: current state,
+  pending Requests, the latest retained result, the last 64 messages, and a
+  fresh position. This is the documented recovery path after a lost position
+  or a lost response.
+- `--wait` is optional. Omitted, the command returns immediately. Given, it
+  requires an explicit duration and accepts up to 24h; there is no unbounded
+  wait.
 - `--wait` binds to the execution that is active, or latest, at the first
   evaluation and completes when that execution has a retained terminal result.
-  A later execution never extends the bind. Blocked input, a page-full
+  A later execution never extends the bind. A pending Request, a page-full
   response, a retention gap, and the deadline all return early.
-- A live-screen repaint alone never completes a `--wait`. Spinner redraws are
-  included opportunistically when something else wakes the poll or the deadline
-  fires.
+- New messages alone never complete a `--wait`. They are included when
+  something else wakes the poll or the deadline fires.
 - Replaying the same cursor replays the same immutable events, results, and
-  stable rows. Nothing is consumed or advanced server-side; the Session
-  snapshot and live screen are always current.
+  messages. Nothing is consumed or advanced server-side; the Session snapshot
+  and pending Requests are always current.
 
 Response:
 
 ```json
 {
   "ok": true,
-  "schema_version": 1,
-  "runtime": {"version":"0.4.0","instance_id":"1f2c…"},
+  "schema_version": 2,
+  "runtime": {"version":"0.6.0","instance_id":"1f2c…"},
   "reason": "result",
   "has_more": false,
   "gaps": [],
   "cursor": "4",
   "sessions": [
     {
-      "session": {"id":"claude:8bc7859c","state":"idle"},
+      "session": {"id":"claude:8bc7859c","state":"idle","approvals":{"requested":"auto","effective":"auto"}},
+      "requests": [],
       "events": [
-        {"schema_version":1,"seq":104,"type":"session.idle","session_id":"claude:8bc7859c","execution_seq":7,"result_status":"completed"}
+        {"schema_version":2,"seq":104,"type":"session.idle","session_id":"claude:8bc7859c","execution_seq":7,"result_status":"completed"}
       ],
       "results": [
         {
           "execution_seq": 7,
           "status": "completed",
           "final_text": "Review result...",
-          "final_text_source": "hook",
+          "final_text_source": "provider",
           "final_text_offset": 0,
           "final_text_complete": true,
+          "denied_requests": 0,
           "error": null,
           "started_at_ms": 1784024104395,
           "completed_at_ms": 1784024252019,
           "usage": null
         }
       ],
-      "screen": {
-        "epoch": 3,
-        "reset": false,
-        "reset_reason": null,
-        "stable": ["Checking tests...", "Found one race."],
-        "live": ["Writing final review..."],
-        "live_truncated": false
-      },
+      "messages": [
+        {"seq":41,"execution_seq":7,"kind":"tool_call","tool":"Bash","summary":"cargo test"},
+        {"seq":42,"execution_seq":7,"kind":"tool_result","tool":"Bash","ok":true,"summary":"42 passed"},
+        {"seq":43,"execution_seq":7,"kind":"assistant","text":"Found one race."}
+      ],
       "gaps": []
     }
   ]
 }
 ```
+
+### Messages
+
+Messages are the structured replacement for the v1 screen. They are what the
+provider reported, in order, reduced to a bounded form. They are for following
+progress; the authoritative answer is always `results[].final_text`.
+
+```text
+assistant     text the model wrote between tool calls
+tool_call     a tool invocation: tool name and a one-line summary of its input
+tool_result   the outcome: ok or not, and a one-line summary
+approval      a reviewer decision on an approval request
+steer         a message accepted through send --steer
+notice        a provider warning or a dlgt observation about the Session
+```
+
+```json
+{"seq":57,"execution_seq":7,"kind":"approval","decision":"approved","by":"provider_reviewer","risk":"low","tool":"exec","summary":"sudo -n true"}
+{"seq":58,"execution_seq":7,"kind":"approval","decision":"denied","by":"caller","request_id":"r3","tool":"Bash","summary":"git push --force origin main"}
+{"seq":61,"execution_seq":7,"kind":"steer","delivered":true,"text":"Skip the integration tests; unit tests are enough"}
+```
+
+- `by` is `provider_reviewer`, `caller`, or `provider_policy`. dlgt is never a
+  value of `by`.
+- `text` and `summary` are truncated at 4 KiB with `"truncated": true`. A
+  message is never split across responses. Full tool output is not retained.
+- Model reasoning is not included.
+- `--messages=<MAX>` caps messages per response (default 64, limit 512).
+  `--no-messages` omits them; Requests, results, and events are unaffected.
 
 ### Bounds and pagination
 
@@ -624,8 +744,8 @@ Response size is part of the contract:
 | Long poll | none | 24h |
 | Lifecycle events per page | 64 | 64 |
 | Results per page | 4 | 4 |
-| Stable screen lines per page | 128 | 512 |
-| Live rows | current screen, cropped to 40 | 40 |
+| Messages per page | 64 | 512 |
+| Pending Requests | all | 16 per Session |
 
 `has_more: true` means requested data already exists beyond the returned
 cursor; that response uses `reason: "page_full"` and the next call returns
@@ -636,8 +756,8 @@ immediately even with `--wait`.
 content is committed, and the finished line is measured. The cursor is derived
 from what the document actually carries, so it can never advance past content
 that was left out. When the budget squeezes a response, dlgt keeps state, then
-gaps, then terminal results, then events, then blocked information, and drops
-screen text first.
+pending Requests, then gaps, then terminal results, then events, and drops
+messages first.
 
 Three things are outside the bound, all deliberately:
 
@@ -651,41 +771,12 @@ The contract covers the compact CLI response without `info`.
 
 Progress comes from chunking, never from oversizing. A long `final_text` is
 chunked at a UTF-8 boundary and continued through `final_text_offset` and
-`final_text_complete`; a screen row wider than the remaining budget is chunked
-mid-line. Both continuations are carried in the cursor, so every `has_more`
-response advances at least one watermark.
+`final_text_complete`. The continuation is carried in the cursor, so every
+`has_more` response advances at least one watermark.
 
-`screen.stable` always contains complete rows and nothing else. A row that had
-to be split is carried in one of two explicitly ordered slots:
-
-```json
-{
-  "screen": {
-    "fragment_before": {"row_id": 8412, "offset": 4096, "text": "...", "complete": true},
-    "stable": ["Found one race."],
-    "fragment_after": {"row_id": 8414, "offset": 0, "text": "...", "complete": false}
-  }
-}
-```
-
-- `fragment_before` continues the row the *previous* response split. It
-  logically precedes `stable[0]` and is the only place `complete: true`
-  appears.
-- `fragment_after` is the row *this* response had to split. It logically
-  follows the last entry of `stable` and is never complete.
-
-The screen delta of one response is therefore, in order: `fragment_before`,
-then every row of `stable`, then `fragment_after`.
-
-Callers **must** retain every fragment piece: concatenate the pieces for a
-given `row_id` in `offset` order until one arrives with `complete: true`, which
-yields the whole row. Discarding pieces until a complete one arrives loses
-data, because the completing piece carries only its own tail. A row never
-appears in both `stable` and a fragment slot.
-
-Lifecycle events are delivered as a strictly ascending prefix: the response
-never skips an event to deliver a later one, so the event watermark is always
-a position with nothing outstanding behind it.
+Lifecycle events and messages are each delivered as a strictly ascending
+prefix: the response never skips one to deliver a later one, so each watermark
+is always a position with nothing outstanding behind it.
 
 If `--max-bytes` is too small to carry the response envelope plus one chunk of
 progress, `fetch` fails with `INVALID_ARGUMENT` and names a budget verified to
@@ -694,8 +785,9 @@ actually rendering a response at it, not estimated, so retrying at exactly the
 reported value succeeds. It is a verified candidate, not a minimum: whether a
 budget makes progress is not monotonic, so a value between the rejected budget
 and the reported one may or may not work, and only the reported value carries
-the guarantee. The practical floor is roughly 1 KiB for a single Session; the
-default of 32 KiB is far above it.
+the guarantee. The practical floor is roughly 6 KiB for a single Session,
+because one message can carry 4 KiB of text; the default of 32 KiB is far above
+it.
 
 ### Cursors
 
@@ -747,20 +839,20 @@ Both are non-zero exits, and the recovery for both is a single cursorless
 
 ### Retention gaps
 
-Retention is bounded per daemon: 10,000 stable screen rows per Session, 50,000
+Retention is bounded per daemon: 10,000 messages per Session, 50,000
 lifecycle events, and 128 results or 16 MiB of result bodies per Session. When
 a cursor predates an eviction, `fetch` exits 0 with `reason: "gap"`, a
 structured `gaps` entry, a bounded baseline, and a fresh cursor. It never
 silently resets.
 
 ```json
-{"gaps":[{"component":"screen","reason":"retention_overrun"}]}
+{"gaps":[{"component":"messages","reason":"retention_overrun"}]}
 ```
 
-`component` is `screen`, `events`, or `results`. Per-Session gaps (`screen`,
-`results`) appear on the Session bucket; scope-wide gaps (`events`) appear in
-the top-level `gaps` array, so a gap cannot disappear with a bucket that the
-response did not carry.
+`component` is `messages`, `events`, or `results`. Per-Session gaps
+(`messages`, `results`) appear on the Session bucket; scope-wide gaps
+(`events`) appear in the top-level `gaps` array, so a gap cannot disappear with
+a bucket that the response did not carry.
 
 ### Waiting from an agent harness
 
@@ -771,6 +863,87 @@ response did not carry.
   long cell wait. Pre-yield output is retained and delivered at the next wait.
 - After any lost response, run a cursorless `fetch` to rebase.
 
+## Blocked input and `answer`
+
+Input that only the caller can give is a first-class Session state, not a
+failure and not an infinite wait. A Session is `blocked` while it has at least
+one pending Request. There are two kinds:
+
+```text
+approval   the worker wants to run something that needs permission
+question   the worker asked the user something and is waiting for the reply
+```
+
+`fetch` reports the state as `reason: "blocked"` and carries the Requests:
+
+```json
+{
+  "requests": [
+    {
+      "id": "r3",
+      "kind": "approval",
+      "execution_seq": 7,
+      "tool": "Bash",
+      "summary": "git push --force origin main",
+      "input": {"command": "git push --force origin main"},
+      "cwd": "/work/repo",
+      "reason": "May I force-push the rebased branch?",
+      "created_at_ms": 1784024104395
+    }
+  ]
+}
+```
+
+A question carries `text` and, when the provider supplied them, `choices`.
+`id` is a short per-Session ordinal, so it survives an agent's context.
+
+```text
+dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID>
+  (--allow | --deny [--message <TEXT>] | --text <TEXT> | --choice <N>)
+  [--pretty]
+```
+
+```bash
+dlgt answer claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629 r3 --deny \
+  --message "Do not force-push. Open a new branch instead."
+```
+
+```json
+{"ok":true,"session":{"id":"claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629","state":"busy"},"request":{"id":"r3","resolution":"denied"},"cursor":"11"}
+```
+
+Rules:
+
+- `--allow` and `--deny` answer an `approval`. `--text` and `--choice` answer
+  a `question`. The wrong pairing is `INVALID_ARGUMENT`.
+- An allow applies to that one Request. There is no "allow for the rest of
+  the Session"; use `--approvals` to change the policy.
+- `--deny --message` gives the worker the reason. The worker continues its
+  turn and normally reports that it could not do the step.
+- `answer` returns as soon as the provider accepted the answer. It does not
+  wait for the execution; follow it with `fetch --wait`.
+- Answering is idempotent by Request. Repeating the same answer returns the
+  original receipt with `"replayed": true`. A different answer to a resolved
+  Request is `REQUEST_RESOLVED`. An unknown ID is `REQUEST_NOT_FOUND`.
+- While a Session is blocked, plain `send` and `send --steer` fail with
+  `SESSION_BLOCKED` and name the pending Request IDs:
+
+  ```json
+  {
+    "ok": false,
+    "error": {
+      "code": "SESSION_BLOCKED",
+      "session_id": "claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629",
+      "request_ids": ["r3"],
+      "action": "dlgt answer claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629 r3 --allow|--deny"
+    }
+  }
+  ```
+
+- `cancel` closes every pending Request as `canceled` and interrupts the
+  execution. `stop` and `restart` close them the same way.
+- dlgt never infers completion, approval, or denial from provider silence.
+
 ## `cancel`
 
 ```text
@@ -778,9 +951,18 @@ dlgt cancel <SESSION_ID|@ALIAS> [--timeout <DURATION>]
 ```
 
 `cancel` interrupts the active provider execution. It does not stop the
-Session. A successful cancellation terminalizes the current result as
-`canceled` or `interrupted` according to the normalized provider mapping and
-returns the Session to idle only after provider quiescence is proven.
+Session or its process. A successful cancellation terminalizes the current
+result as `canceled` or `interrupted` according to the normalized provider
+mapping and returns the Session to idle only after the provider has reported
+the interrupted turn's result.
+
+```text
+Codex    turn/interrupt
+Claude   interrupt control request on the same process
+```
+
+A steer that the provider had not yet read is discarded with the execution; it
+never starts a turn of its own after a cancel.
 
 Cancellation is bounded and defaults to 30 seconds. On timeout, dlgt returns
 `CANCEL_TIMEOUT`, leaves the Session in `canceling`, and continues observing
@@ -790,34 +972,12 @@ state.
 Canceling an idle Session is idempotent: it returns exit 0 with
 `{"canceled":false,"reason":"NO_ACTIVE_WORK"}`.
 
-## Blocked input
-
-Input required from a human is a first-class Session state, not a failure and
-not an infinite wait.
-
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "SESSION_BLOCKED",
-    "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
-    "action": "have a human run in a terminal: dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345"
-  }
-}
-```
-
-`fetch` reports the same state as `reason: "blocked"` with the live screen
-attached, so the caller can see the question before attaching. After a human
-attaches, answers, and detaches, the same `fetch` may be issued again.
-Provider-specific detection may initially be conservative, but dlgt must never
-infer completion from a quiet screen.
-
 ## Session commands
 
 ```text
 dlgt list [--all] [--all-versions] [--pretty]
 dlgt show <SESSION_ID|@ALIAS> [--pretty]
-dlgt attach <SESSION_ID|@ALIAS> [--steal]
+dlgt watch <SESSION_ID|@ALIAS> [--from-start] [--until-idle]
 dlgt stop <SESSION_ID|@ALIAS> [--force]
 dlgt restart <SESSION_ID> [environment options]
 ```
@@ -826,79 +986,59 @@ dlgt restart <SESSION_ID> [environment options]
 - `list --all` includes terminal historical Sessions.
 - `list --all-versions` queries every live versioned daemon socket and adds
   `runtime_version` and `runtime_socket` to each Session.
-- `show` returns identity, Harness, model selection, state, current timing,
-  latest retained result, and relevant failure data. A Session that failed
-  before it became ready also has `launch_failure` with the same `code`,
-  `message`, `hint`, `action`, and `screen` that the launch error returned.
-- `attach` takes an exclusive input lease, replays the retained terminal view,
-  and follows the live PTY. It requires an interactive terminal on stdin and
-  stdout and otherwise returns `ATTACH_REQUIRES_TTY` pointing at `fetch`. A
-  second attach returns `ALREADY_ATTACHED` unless `--steal` explicitly
-  transfers the lease. Detach with `Ctrl-b d`. Mirrored multi-attach is
-  outside v1.
+- `show` returns identity, Harness, model selection, approvals, state, current
+  timing, pending Requests, latest retained result, and relevant failure data.
+  A Session that failed before it became ready also has `launch_failure` with
+  the same `code`, `message`, `hint`, and `action` that the launch error
+  returned. `show` also carries `resume_command`, the provider's own command
+  for opening the conversation in its interactive UI.
 - `stop` requests graceful Session termination.
 - `stop --force` terminates the provider process group.
 
-The daemon owns provider PTYs and the Codex app-server in separate process
-groups. A sibling reaper has its own process group, ignores ordinary terminal
-and service shutdown signals, and keeps provider groups registered until
-normal teardown. If the daemon exits without running destructors,
-control-pipe EOF makes the reaper terminate every remaining registered group.
+The daemon owns each provider process in its own process group. A sibling
+reaper has its own process group, ignores ordinary terminal and service
+shutdown signals, and keeps provider groups registered until normal teardown.
+If the daemon exits without running destructors, control-pipe EOF makes the
+reaper terminate every remaining registered group.
+
+### `watch`
+
+`watch` is the human view. It prints a Session's messages as text and follows
+new ones until interrupted.
+
+```text
+$ dlgt watch @run-review-361csx
+[exec 7] tool   Bash  cargo test
+[exec 7] ok     Bash  42 passed
+[exec 7] claude Found one race.
+[exec 7] ask    r3  Bash  git push --force origin main
+[exec 7] deny   r3  by caller
+[exec 7] done   completed
+```
+
+- It is read-only. It takes no lease, sends nothing to the provider, and any
+  number of watchers may follow one Session.
+- By default it starts at the current position. `--from-start` replays the
+  retained messages first.
+- It exits when the Session reaches a terminal state, or with `--until-idle`
+  when the current execution ends.
+- It prints text, not JSON, and is not a stable format. Agents use `fetch`.
+- There is no way to type into a worker. To take a conversation over by hand,
+  `stop` the Session and run its `resume_command`:
+
+  ```json
+  {"resume_command":"claude --resume 8bc7859c-4c82-4b9a-a00d-2f3c483a9629"}
+  ```
 
 ## Lifecycle events
 
 Lifecycle events are read through `fetch`, which returns them for one Session
-alongside state, results, and screen. There is no separate event command and no
-cross-Session event stream: `list` reports current state across Sessions, and
-`fetch` reports the ordered history of one.
+alongside state, Requests, results, and messages. There is no separate event
+command and no cross-Session event stream: `list` reports current state across
+Sessions, and `fetch` reports the ordered history of one.
 
 The versioned event schema and the complete event set are defined in
 [RPC](rpc.md#lifecycle-events).
-
-## Rendered scrollback and raw logs
-
-Normal observation uses a headless VT emulator and plain-text scrollback:
-
-```text
-dlgt scrollback <SESSION_ID|@ALIAS>
-  [--lines <COUNT>]
-  [--before <CURSOR>]
-```
-
-The default is the latest 100 rendered lines. v1 retains at most 10,000
-rendered rows per Session. Rows are served from the same persistent stable-row
-store that backs `fetch`, so a read no longer re-renders retained raw bytes.
-The response includes the terminal dimensions, plain-text lines, truncation
-state, and an opaque cursor for older pages. `scrollback` is the human
-debugging view; agents should use `fetch`, which returns the forward delta
-instead of an overlapping tail.
-
-```json
-{
-  "ok": true,
-  "session_id": "codex:019f6307-341e-7e81-8a33-7ab61e804345",
-  "screen": {"rows":24,"cols":120},
-  "lines": ["Review complete.","","Main concerns:","1. Timeout behavior..."],
-  "truncated": true,
-  "before": "scr_84A2"
-}
-```
-
-Raw PTY bytes are explicitly diagnostic:
-
-```text
-dlgt logs <SESSION_ID|@ALIAS> --raw
-dlgt logs <SESSION_ID|@ALIAS> --raw --json
-```
-
-Plain `dlgt logs` without `--raw` is invalid. `--raw` writes bytes directly;
-`--raw --json` returns base64. There is no `logs --follow`. Live lifecycle
-observation uses `fetch --wait`, and live terminal observation uses
-`attach`.
-
-Requiring `--raw` is an intentional capability gate. See
-[Design](design.md#rendered-scrollback-and-raw-pty) for the VT rendering and
-raw-retention rationale.
 
 ## Model discovery
 
@@ -995,7 +1135,6 @@ not the top-level transport `ok` field.
 dlgt profiles
 dlgt profiles list
 dlgt profiles show <NAME>
-dlgt harnesses [<HARNESS>]
 ```
 
 Bare `dlgt profiles` is the same request as `dlgt profiles list`.
@@ -1008,7 +1147,8 @@ RPC so the daemon does not need to reread mutable configuration.
 harness = "claude"
 model = "best"
 effort = "high"
-harness_options = ["chrome", "permission-mode=auto"]
+approvals = "auto"
+harness_options = ["chrome"]
 clean_env = true
 pass_env = ["PATH", "HOME", "SSH_AUTH_SOCK"]
 
@@ -1026,8 +1166,8 @@ client snapshot or clean base < Profile < explicit launch options
 Profile `harness_options` are followed by explicit `--harness-option` values.
 They configure the provider CLI rather than the launch environment. Claude
 bare entries become `--KEY` and keyed entries become `--KEY=VALUE`; Codex
-requires keyed entries and converts them to `--config KEY=VALUE` for both
-provider processes.
+requires keyed entries and converts them to `--config KEY=VALUE`. An explicit
+`--approvals` replaces the Profile's `approvals`.
 
 - Default launch environment is a snapshot of the invoking client's
   environment, never the daemon's startup environment.
@@ -1041,11 +1181,20 @@ provider processes.
   `check_for_update_on_startup=false` for Codex and `DISABLE_AUTOUPDATER=1` for
   Claude. They cannot be overridden per Session and do not change provider
   global configuration.
+- The Session snapshot reports how Claude authenticated, as the provider
+  itself reported it:
+
+  ```json
+  {"auth":"subscription"}
+  ```
+
+  `auth` is `subscription` or `api_key`. A client environment that carries
+  `ANTHROPIC_API_KEY` makes Claude bill that key instead of the subscription.
 - Launch environment values are passed in RPC memory, never argv, and are never
   directly serialized into Session records, `list`, `show`, `fetch`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its
-  environment, so results, scrollback, and especially `logs --raw` must be
-  treated as potentially sensitive output rather than as a redaction boundary.
+  environment, so results and messages must be treated as potentially
+  sensitive output rather than as a redaction boundary.
 
 ## Exit statuses
 
@@ -1053,14 +1202,13 @@ provider processes.
 0  command succeeded, including every fetch observation
 1  usage, configuration, identity, launch, cursor, or RPC error
 3  bounded cancellation timeout; the cancellation continues
-4  Session or launch is blocked on human input
+4  Session is blocked on a pending Request
 5  Session is busy and rejected a send
 ```
 
 The JSON error code is the primary machine-readable reason. Exit status is the
-shell-level summary. `SESSION_BLOCKED` and `LAUNCH_BLOCKED` use exit 4 and
-`SESSION_BUSY` uses exit
-5. `NO_RESULT`, `SESSION_ATTACHED`, `ALREADY_ATTACHED`, `ATTACH_REQUIRES_TTY`,
+shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
+5. `NO_RESULT`, `NO_ACTIVE_WORK`, `REQUEST_NOT_FOUND`, `REQUEST_RESOLVED`,
 `ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`,
 and `CURSOR_INVALID` use exit 1.
 `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
@@ -1070,24 +1218,23 @@ idempotent exit-0 no-op.
 canceled, or interrupted execution is reported inside `results[].status`, and a
 blocked Session is reported as `reason: "blocked"`.
 
-The stable v1 structured error-code families are:
+The stable v2 structured error-code families are:
 
 ```text
 INVALID_ARGUMENT       Invocation cannot be retried unchanged
 NOT_FOUND              Session or configuration object does not exist
 NO_RESULT              Session has never accepted work
+NO_ACTIVE_WORK         send --steer found no running execution
 SESSION_NOT_RUNNING    No live Session matches; retry with --resume
 ALIAS_IN_USE           Exact Alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
-SESSION_BLOCKED        Human input is required
-SESSION_ATTACHED       Exclusive attach lease prevents semantic send
+SESSION_BLOCKED        A Request is pending; answer it
 SESSION_UNAVAILABLE    Session state cannot accept the requested operation
-ALREADY_ATTACHED       Another client owns the attach lease
-ATTACH_REQUIRES_TTY    attach needs an interactive terminal; use fetch
+REQUEST_NOT_FOUND      No such Request on this Session
+REQUEST_RESOLVED       The Request already has a different answer
 CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
-LAUNCH_BLOCKED         Harness startup stopped at a screen only a human can answer
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
@@ -1100,13 +1247,11 @@ If `new` fails before provider binding, its error includes the temporary
 `launch_id` for diagnostics and never presents it as a Session ID. A failure
 after binding includes the canonical `session_id`.
 
-A launch failure (`LAUNCH_BLOCKED` or `LAUNCH_FAILED`) also carries `screen`,
-the provider's last rendered rows, and a `hint` naming `scrollback` and
-`logs --raw` for that ID. `LAUNCH_BLOCKED` adds an `action` the user must take;
-dlgt never answers such a screen itself. The known blocker is Codex's "Hooks
-need review" dialog, which appears when a configured hook is new or changed.
-dlgt does not trust hooks or pass `--dangerously-bypass-hook-trust`; the user
-runs `codex` once in that directory and reviews the hooks.
+A launch failure carries the provider's last reported error and its stderr
+tail in `detail`, and a `hint`. There is no `LAUNCH_BLOCKED`: without a
+terminal there is no startup screen for a human to answer, so a provider that
+cannot start without interaction is a `LAUNCH_FAILED` whose `action` names the
+command the user runs once by hand.
 
 ## Design and RPC contracts
 
@@ -1114,165 +1259,34 @@ The provider lifecycle mapping, acceptance criteria, and design rationale are
 in [Design](design.md). The public JSONL method set and schemas are in
 [RPC](rpc.md).
 
-## Cursor interactive CLI
+## Open questions before implementation
 
-Cursor support uses the official interactive `cursor-agent` executable in a
-live PTY. It does not start ACP, MCP server mode, print mode, or the desktop
-application. Install and log in to Cursor CLI first. `DLGT_CURSOR_BIN` can
-select another executable path when starting the dlgt daemon.
+The contract above rests on measurements taken on 2026-11-15 with Claude Code
+2.1.283 and codex-cli 0.167.0-alpha.4.1. These points were not measured and
+can change the contract:
 
-```sh
-dlgt new --harness cursor --title "Cursor review" --cwd . \
-  --request-id cursor-review-1 -- "Review this change"
-dlgt fetch cursor:<conversation-id> --wait 5m
-dlgt send cursor:<conversation-id> --request-id cursor-review-2 -- "Review the revision"
-dlgt stop cursor:<conversation-id>
-dlgt send cursor:<conversation-id> --resume --request-id cursor-review-3 -- "Continue"
-```
-
-On launch, dlgt adds one idempotent bridge to each of `beforeSubmitPrompt`,
-`afterAgentResponse`, and `stop` in `$HOME/.cursor/hooks.json`, preserving
-existing handlers. The bridge remains installed but is inert outside dlgt
-children: the executable, owning socket, and unique launch selector come from
-child-only environment variables. A sidecar `dlgt-hooks.lock` serializes
-registration across dlgt daemons. Invalid JSON or handler arrays are rejected
-without overwriting the file. No hooks are added to the workspace.
-
-New sessions and resumes pass the first prompt to the interactive CLI. Cursor
-may not emit `sessionStart` on resume, so dlgt binds the conversation only on a
-matching `beforeSubmitPrompt`. This confirms the provider's submission hook,
-not a backend acknowledgement; another user hook can still block that prompt.
-Follow-ups are bracketed PTY pastes. Final results require a matching `stop`
-and `afterAgentResponse` pair, in either arrival order; `error` and `aborted`
-are terminal without response text. A missing hook leaves the result pending,
-never inferred from the screen. Existing hooks that block prompts or generate
-automatic follow-ups can affect the conversation.
-
-The adapter supports `--model`, `--harness-option mode=plan|ask`, and
-`--harness-option sandbox=enabled|disabled`. Default auto-approval passes
-`--trust --force`; `--no-auto-approve` omits both. Other launch options and
-`--effort` are rejected. Model IDs come from CLI discovery (`dlgt models --harness cursor`
-runs `cursor-agent --list-models`).
-
-Current limitations: `restart` is rejected before changing the session; use
-`stop` followed by `send --resume`. Permission prompts do not yet have a
-structured blocked-state signal, so inspect `fetch` and use `attach` when
-needed. Cursor's conversation title is provider-managed; dlgt's `--title`
-sets the local title and alias.
-
-Authenticated macOS validation on 2026-09-22 used CLI
-`2026.09.18-9a7762b` with `gpt-5.4-nano-none`: new-session completion,
-same-conversation follow-up, stop/resume with retained conversation context,
-cancellation of a running tool, and another completed prompt after cancellation
-all passed. Results came from lifecycle hooks, not screen inference. The
-automated PTY fixture additionally checks concurrent-session isolation,
-request replay, and Japanese multiline input. This is not the Docker
-pre-release matrix required by `AGENTS.md`.
-
-References: [Cursor CLI](https://cursor.com/docs/cli/overview),
-[parameters](https://cursor.com/docs/cli/reference/parameters), and
-[hooks](https://cursor.com/docs/hooks). The adapter was developed against
-CLI `2026.09.18-9a7762b`.
-
-## Grok Build
-
-Grok support uses the interactive `grok` TUI in a live PTY. It does not start
-ACP agent mode or headless `-p` runs. Install and authenticate Grok Build
-first. `DLGT_GROK_BIN` can select another executable when starting the dlgt
-daemon.
-
-```sh
-dlgt new --harness grok --title "Grok review" --cwd . \
-  --request-id grok-review-1 -- "Review this change"
-dlgt fetch grok:<session-id> --wait 5m
-dlgt send grok:<session-id> --request-id grok-review-2 -- "Review the revision"
-dlgt stop grok:<session-id>
-dlgt send grok:<session-id> --resume --request-id grok-review-3 -- "Continue"
-```
-
-On launch, dlgt installs an idempotent Claude-shaped hook bridge in
-`$HOME/.grok/hooks/dlgt.json` for `SessionStart`, `UserPromptSubmit`, `Stop`,
-`StopFailure`, `Notification`, and `SessionEnd`. The bridge is inert outside
-dlgt children (`DLGT_GROK_LAUNCH` / `DLGT_GROK_HOOK_BIN`). CamelCase Grok hook
-payloads are normalized to the snake_case fields Claude handlers expect.
-Default auto-approval passes `--always-approve --trust`; `--no-auto-approve`
-omits both. `--model` and `--effort` are supported; model discovery is
-currently unavailable in dlgt. Completion comes from lifecycle hooks, not PTY
-silence.
-
-## OpenCode
-
-OpenCode support runs the interactive `opencode` TUI in a live PTY. It does
-not use `opencode run`, which exits after one prompt. Install OpenCode first.
-`DLGT_OPENCODE_BIN` can select another executable when starting the dlgt
-daemon.
-
-```sh
-# Export the Grok CLI OIDC access token. It is the `key` field of
-# ~/.grok/auth.json and it expires. Sign in with the Grok CLI again to refresh
-# it, then export the new value. Do not print, log, or commit the token.
-export XAI_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.grok/auth.json")))["key"])')"
-
-dlgt new --harness opencode --model xai/grok-4.7 --title "OpenCode review" --cwd . \
-  --request-id opencode-review-1 -- "Review this change"
-dlgt fetch opencode:<session-id> --wait 5m
-dlgt send opencode:<session-id> --request-id opencode-review-2 -- "Review the revision"
-dlgt stop opencode:<session-id>
-dlgt send opencode:<session-id> --resume --request-id opencode-review-3 -- "Continue"
-```
-
-On launch, dlgt installs `dlgt.js` in `$XDG_CONFIG_HOME/opencode/plugins/` or
-`~/.config/opencode/plugins/`. The plugin is inert unless `DLGT_OPENCODE_LAUNCH`
-is set, which only dlgt children receive. It emits Claude-shaped `SessionStart`,
-`UserPromptSubmit`, `Stop`, and `StopFailure` hooks. A foreign `dlgt.js` that
-lacks that marker is left unchanged.
-
-Default auto-approval passes `--auto`. `--no-auto-approve` omits it. `--model`
-takes `provider/model`. `--effort` is rejected. The only harness option is
-`agent=<name>`. `opencode` can reopen a session with `--session` and no prompt,
-so `restart` is supported. Discover model IDs with `dlgt models --harness opencode`
-(`opencode models`). Completion comes from the hooks, not PTY silence.
-
-## Pi
-
-Pi support runs the interactive `pi` TUI in a live PTY. Install
-`@earendil-works/pi-coding-agent` first. `DLGT_PI_BIN` can select another
-executable when starting the dlgt daemon.
-
-Pi's `--mode rpc` protocol reports `agent_settled` on stdout, which is the
-right completion signal. That same event is available to an extension inside
-the interactive TUI. RPC would replace the PTY session `attach` and follow-up
-pastes use, so dlgt stays on the TUI and the extension waits for
-`agent_settled` rather than `agent_end` (a retry or compaction can still follow
-`agent_end`).
-
-```sh
-# Same Grok CLI JWT as OpenCode. Refresh ~/.grok/auth.json `key` when it
-# expires. Do not print the token.
-export XAI_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.grok/auth.json")))["key"])')"
-
-dlgt new --harness pi --model grok-4.7 --harness-option provider=xai \
-  --title "Pi review" --cwd . --request-id pi-review-1 -- "Review this change"
-dlgt fetch pi:<session-id> --wait 5m
-dlgt send pi:<session-id> --request-id pi-review-2 -- "Review the revision"
-dlgt stop pi:<session-id>
-dlgt send pi:<session-id> --resume --request-id pi-review-3 -- "Continue"
-```
-
-`--model xai/grok-4.7` also selects the provider. `--effort` maps to Pi's
-`--thinking` level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
-The only harness option is `provider=<name>`.
-
-On launch, dlgt writes `~/.pi/agent/dlgt/bridge.js` and passes it with
-`--extension`. That directory is outside Pi's extension autoload path. The
-extension is inert unless `DLGT_PI_LAUNCH` is set. A foreign `bridge.js` that
-lacks that marker is left unchanged.
-
-Pi does not prompt before each tool call. Default auto-approval passes
-`--approve`, which skips the project-trust dialog so the TUI can become idle.
-`--no-auto-approve` omits it and Pi may wait on that dialog. `pi --session`
-reopens a conversation without a prompt, so `restart` is supported. Discover
-model IDs with `dlgt models --harness pi` (`pi --list-models`). IDs are
-`provider/model`. Completion comes from `agent_settled`, not PTY silence.
-These CLIs can stall when stdout is a pipe; dlgt already runs the harness in
-a PTY.
+- **Claude auto mode, blocked action.** Whether an action that Claude's auto
+  mode classifier stops arrives as an approval Request or is denied in place.
+  The `auto` row of [Approvals](#approvals) assumes it can arrive as a Request.
+- **Codex auto review, denial.** The protocol schema gives an auto review four
+  terminal states (`approved`, `denied`, `timedOut`, `aborted`) and none that
+  hands the request to the client, so in `auto` a Codex approval is expected
+  never to become a Request. No denial was observed.
+- **Concurrent Requests.** More than one pending Request on a Session, for
+  example from parallel tool calls or from a provider-side subagent.
+- **Steer and cancel during a provider-side subagent.** Both were measured
+  only on a top-level tool call.
+- **Claude steer after an interrupt.** A steer written just before an
+  interrupt was observed to start a turn of its own afterwards. `cancel`
+  promises to discard it, which needs a second interrupt or a process restart.
+- **Claude Code version drift.** Stream-json input and its control requests
+  are not a documented stable interface. dlgt needs a minimum supported
+  version and a `doctor` check.
+- **Codex hooks that need review.** v1 stops at a `LAUNCH_BLOCKED` screen.
+  `codex exec` skips untrusted hooks silently; the app-server path without a
+  TUI was not measured.
+- **Claude environment.** Whether dlgt should strip `ANTHROPIC_API_KEY` and
+  the variables a Claude host injects (`CLAUDECODE`, `CLAUDE_CODE_*`) from the
+  default snapshot, or only report `auth`.
+- **Interactive-only features.** Which user slash commands, skills, plugins,
+  and hooks load under `claude -p` with stream-json.
