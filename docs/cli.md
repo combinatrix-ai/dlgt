@@ -7,11 +7,11 @@ This document is the normative command reference. See [RPC](rpc.md) for the
 programmatic interface and [Design](design.md) for the product boundary,
 invariants, lifecycle rationale, security model, and acceptance criteria.
 
-> **Status: target contract for the terminal-less rewrite.** dlgt 0.5.x still
-> implements the PTY-based v1 CLI. [RPC](rpc.md) and [Design](design.md) have
-> not been rewritten yet and still describe v1. Behavior that has not been
-> measured against a provider is listed under
-> [Open questions](#open-questions-before-implementation).
+> **Status: implemented on the terminal-less branch, not released.** Released
+> dlgt 0.5.x still implements the PTY-based v1 CLI. [RPC](rpc.md) and
+> [Design](design.md) have not been rewritten yet and still describe v1.
+> Behavior that has not been measured against a provider is listed under
+> [Open questions](#open-questions).
 
 ## Product definition
 
@@ -215,7 +215,13 @@ command supplies a new value.
 | --- | --- | --- | --- |
 | `auto` | `--permission-mode auto` | `sandbox=workspace-write`, `approvalPolicy=on-request`, `approvalsReviewer=auto_review` | Only what the provider's own reviewer does not settle |
 | `ask` | `--permission-mode manual` | `sandbox=workspace-write`, `approvalPolicy=on-request`, `approvalsReviewer=user` | Every approval request |
-| `bypass` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | Nothing |
+| `bypass` | `--dangerously-skip-permissions` | `sandbox=danger-full-access`, `approvalPolicy=never` | Nothing |
+
+The Codex column is the `thread/start` and `thread/resume` parameters. The
+app-server has no `--dangerously-bypass-approvals-and-sandbox` flag, so
+`bypass` is the pair of thread parameters that flag stands for. Claude always
+runs with `--permission-prompt-tool stdio`, which is how its requests reach
+dlgt.
 
 Rules:
 
@@ -233,6 +239,12 @@ Rules:
   {"approvals":{"requested":"auto","effective":"ask","reason":"provider reported permission mode default"}}
   ```
 
+  Claude reports its mode when it starts and again on each turn. A fallback
+  can therefore first show up during the first execution, where it is also
+  recorded as a `notice` message.
+- Claude does not report what its auto mode approved. Only its denials are
+  observable, so in `auto` a Claude Session has no `approval` message for an
+  action the provider let through.
 - A request that nobody answers never times out into an approval. It stays
   pending and the Session stays `blocked` until `answer`, `cancel`, or `stop`.
 - Harness options that would override the mapping above
@@ -248,7 +260,7 @@ Rules:
 `new` is the only Session creation command and always requires its first
 prompt. Launch and local reservation are one atomic operation. The command
 waits briefly for provider confirmation from Codex's app-server turn lifecycle
-or Claude's replay of the submitted user message, then returns success with
+or from Claude starting the submitted user message, then returns success with
 `submission` set to `confirmed` or `pending`. Observation of later progress and
 the answer is a separate `fetch`.
 
@@ -410,9 +422,13 @@ dlgt restart <SESSION_ID>
 ```
 
 `restart` replaces a Session's provider process while preserving its alias,
-retained history, execution sequence, and provider conversation. Codex normally
-keeps the same Session ID. If Claude reports a rotated provider session ID,
-dlgt atomically rekeys the Session and returns the new canonical `session.id`.
+retained history, execution sequence, and provider conversation. Codex keeps
+the same Session ID. Claude names its session on the first turn of a process,
+so a rotated provider session ID becomes known when the next execution starts.
+dlgt then atomically rekeys the Session, and every later snapshot carries the
+new canonical `session.id`. The ID `restart` returned stays valid for `fetch`
+and its cursors for the daemon lifetime; other commands need the new ID or the
+alias.
 
 Rules:
 
@@ -470,7 +486,8 @@ is rejected because the provider prefix selects the Harness. A matching live Ses
 none exists dlgt reserves the provider conversation, launches a new Session,
 waits for bind/readiness, and atomically accepts the prompt. Success returns
 the same canonical `session.id` and caller correlation ID. If Claude rotates
-its provider session ID while resuming, success returns that new canonical ID.
+its provider session ID while resuming, the Session is rekeyed when the
+resumed execution starts, as described under [`restart`](#restart).
 Plain `send` never launches and returns `SESSION_NOT_RUNNING` with a
 `--resume` hint when its target is not live. dlgt holds one process per
 provider conversation: a second `--resume` of a conversation that is already
@@ -539,13 +556,16 @@ dlgt send claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629 --steer \
 {"ok":true,"session":{"id":"claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629","state":"busy"},"execution_seq":2,"steer":"accepted","cursor":"9"}
 ```
 
-- The Session must be `busy`. An idle Session returns `NO_ACTIVE_WORK`; send
-  the prompt without `--steer` instead. A blocked Session returns
-  `SESSION_BLOCKED`: answer the Request first.
+- The Session must be `busy`. An idle Session returns `NO_ACTIVE_EXECUTION`;
+  send the prompt without `--steer` instead. A blocked Session returns
+  `SESSION_BLOCKED`: answer the Request first. A canceling Session returns
+  `SESSION_UNAVAILABLE`.
 - The response carries the running `execution_seq`. A steer has no result of
   its own; the execution still ends with exactly one retained result.
-- Acceptance means dlgt handed the message to the provider. Delivery to the
-  model is reported later as a `steer` message with `delivered: true`.
+- Acceptance means dlgt handed the message to the provider and is recorded
+  as a `steer` message with `delivered: false`. Delivery to the model is
+  reported later as a second `steer` message with `delivered: true`. A steer
+  the provider never read is reported with `expired: true` instead.
 
 The two Harnesses deliver at different moments, and callers should not expect
 them to match:
@@ -559,7 +579,9 @@ Claude   the message is read at the next model request, which is after the
 
 For Claude, dlgt treats an execution as finished only when the provider has
 reported a turn result and every accepted steer has been replayed back by the
-provider. A steer therefore cannot be lost between two executions.
+provider. A steer therefore cannot be lost between two executions. When a
+steer runs as a continuation, the execution's `final_text` is the text of each
+provider turn result in order, joined by a blank line.
 
 To replace the running work instead of adding to it, use `cancel` and then a
 plain `send`.
@@ -591,7 +613,8 @@ The retained result shape is:
 `final_text` is the Harness-reported final assistant message and is always a
 string for `completed`, although it may be empty. Failed terminal states may
 provide partial final text and must provide a structured error. Usage is
-nullable because availability differs by Harness.
+nullable because availability differs by Harness: Claude reports its token
+counts, and Codex reports none.
 
 `denied_requests` counts approvals that were denied during the execution, by
 the provider's reviewer or by the caller. A provider reports a turn as
@@ -603,8 +626,8 @@ a non-zero count is not evidence that the work was done. The matching
 
 ```text
 provider     the Harness turn result reported the text
-transcript   the Harness reported nothing and dlgt recovered the text from
-             the Session's own provider transcript, bounded to this execution
+messages     the turn result carried no text and dlgt used the last assistant
+             message the provider streamed during this execution
 missing      no text was recovered; the execution status is still authoritative
 ```
 
@@ -636,7 +659,8 @@ bookkeeping advanced beneath it. `reason` is one of:
 snapshot    bounded baseline; no cursor was supplied
 change      new events, results, or messages were delivered
 result      the bound execution has a retained terminal result
-blocked     the Session has a pending Request; it is included
+blocked     the Session has a pending Request; it is included, and the
+            response returns at once even with --wait
 page_full   more data already exists beyond the returned cursor
 gap         retention evicted part of the cursor window
 timeout     nothing new in the cursor window
@@ -726,8 +750,14 @@ notice        a provider warning or a dlgt observation about the Session
 {"seq":61,"execution_seq":7,"kind":"steer","delivered":true,"text":"Skip the integration tests; unit tests are enough"}
 ```
 
+- `decision` is `approved`, `denied`, `timed_out`, or `aborted`. `denied` and
+  `timed_out` count toward the result's `denied_requests`.
 - `by` is `provider_reviewer`, `caller`, or `provider_policy`. dlgt is never a
   value of `by`.
+- A `tool_result` `summary` is the first non-empty line of the tool's output,
+  cut at 240 bytes. When there is no output it is the exit status.
+- A `steer` message carries `delivered` and, when the provider never read it,
+  `expired: true`.
 - `text` and `summary` are truncated at 4 KiB with `"truncated": true`. A
   message is never split across responses. Full tool output is not retained.
 - Model reasoning is not included.
@@ -745,7 +775,7 @@ Response size is part of the contract:
 | Lifecycle events per page | 64 | 64 |
 | Results per page | 4 | 4 |
 | Messages per page | 64 | 512 |
-| Pending Requests | all | 16 per Session |
+| Pending Requests | 16 | 16 per response |
 
 `has_more: true` means requested data already exists beyond the returned
 cursor; that response uses `reason: "page_full"` and the next call returns
@@ -755,9 +785,13 @@ immediately even with `--wait`.
 `{"ok":true,...}` wrapper and its trailing newline are reserved before any
 content is committed, and the finished line is measured. The cursor is derived
 from what the document actually carries, so it can never advance past content
-that was left out. When the budget squeezes a response, dlgt keeps state, then
-pending Requests, then gaps, then terminal results, then events, and drops
-messages first.
+that was left out. When the budget squeezes a response, dlgt keeps state and
+gaps, then pending Requests, then terminal results, then events, and drops
+messages first. Requests are current state rather than cursor history, so they
+are never paged: when more are pending than the response carries, the bucket
+has `"requests_truncated": true` and the rest appear as the published ones
+are answered. A Request's `input` larger than 2 KiB is replaced by
+`{"truncated": true, "preview": "..."}`.
 
 Three things are outside the bound, all deliberately:
 
@@ -895,7 +929,9 @@ question   the worker asked the user something and is waiting for the reply
 ```
 
 A question carries `text` and, when the provider supplied them, `choices`.
-`id` is a short per-Session ordinal, so it survives an agent's context.
+`id` is a short per-Session ordinal, so it survives an agent's context. When a
+provider asks several questions in one request, `text` lists them one per line,
+there are no `choices`, and one `--text` answer is given to all of them.
 
 ```text
 dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID>
@@ -919,7 +955,13 @@ Rules:
 - An allow applies to that one Request. There is no "allow for the rest of
   the Session"; use `--approvals` to change the policy.
 - `--deny --message` gives the worker the reason. The worker continues its
-  turn and normally reports that it could not do the step.
+  turn and normally reports that it could not do the step. Claude receives
+  the message as the denial itself. Codex's decline carries no text, so dlgt
+  hands the message to the same turn through `turn/steer` right after it.
+- `--choice <N>` is 1-based and answers with that choice's label. `--text`
+  answers in free text. For an MCP form elicitation with more than one field,
+  `--text` is a JSON object of the form's fields.
+- The Session must be live: a stopped Session returns `SESSION_NOT_RUNNING`.
 - `answer` returns as soon as the provider accepted the answer. It does not
   wait for the execution; follow it with `fetch --wait`.
 - Answering is idempotent by Request. Repeating the same answer returns the
@@ -962,7 +1004,10 @@ Claude   interrupt control request on the same process
 ```
 
 A steer that the provider had not yet read is discarded with the execution; it
-never starts a turn of its own after a cancel.
+never starts a turn of its own after a cancel. For Claude, dlgt first withdraws
+each unread message with a `cancel_async_message` control request and then
+interrupts. The discarded steer is reported as a `steer` message with
+`expired: true`.
 
 Cancellation is bounded and defaults to 30 seconds. On timeout, dlgt returns
 `CANCEL_TIMEOUT`, leaves the Session in `canceling`, and continues observing
@@ -986,8 +1031,9 @@ dlgt restart <SESSION_ID> [environment options]
 - `list --all` includes terminal historical Sessions.
 - `list --all-versions` queries every live versioned daemon socket and adds
   `runtime_version` and `runtime_socket` to each Session.
-- `show` returns identity, Harness, model selection, approvals, state, current
-  timing, pending Requests, latest retained result, and relevant failure data.
+- `show` returns identity, Harness, model selection, the provider-resolved
+  model as `resolved_model`, approvals, state, current timing, pending
+  Requests, latest retained result, and relevant failure data.
   A Session that failed before it became ready also has `launch_failure` with
   the same `code`, `message`, `hint`, and `action` that the launch error
   returned. `show` also carries `resume_command`, the provider's own command
@@ -1017,11 +1063,11 @@ $ dlgt watch @run-review-361csx
 ```
 
 - It is read-only. It takes no lease, sends nothing to the provider, and any
-  number of watchers may follow one Session.
+  number of watchers may follow one Session. It polls `fetch` twice a second.
 - By default it starts at the current position. `--from-start` replays the
   retained messages first.
 - It exits when the Session reaches a terminal state, or with `--until-idle`
-  when the current execution ends.
+  as soon as the Session is idle.
 - It prints text, not JSON, and is not a stable format. Agents use `fetch`.
 - There is no way to type into a worker. To take a conversation over by hand,
   `stop` the Session and run its `resume_command`:
@@ -1190,6 +1236,9 @@ requires keyed entries and converts them to `--config KEY=VALUE`. An explicit
 
   `auth` is `subscription` or `api_key`. A client environment that carries
   `ANTHROPIC_API_KEY` makes Claude bill that key instead of the subscription.
+  Claude reports this on the first turn of a process, so the field is absent
+  until then, and an `api_key` login is also recorded as a `notice` message.
+  Codex Sessions have no `auth` field.
 - Launch environment values are passed in RPC memory, never argv, and are never
   directly serialized into Session records, `list`, `show`, `fetch`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its
@@ -1208,7 +1257,7 @@ requires keyed entries and converts them to `--config KEY=VALUE`. An explicit
 
 The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
-5. `NO_RESULT`, `NO_ACTIVE_WORK`, `REQUEST_NOT_FOUND`, `REQUEST_RESOLVED`,
+5. `NO_RESULT`, `NO_ACTIVE_EXECUTION`, `REQUEST_NOT_FOUND`, `REQUEST_RESOLVED`,
 `ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`,
 and `CURSOR_INVALID` use exit 1.
 `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
@@ -1224,7 +1273,7 @@ The stable v2 structured error-code families are:
 INVALID_ARGUMENT       Invocation cannot be retried unchanged
 NOT_FOUND              Session or configuration object does not exist
 NO_RESULT              Session has never accepted work
-NO_ACTIVE_WORK         send --steer found no running execution
+NO_ACTIVE_EXECUTION    send --steer found no running execution
 SESSION_NOT_RUNNING    No live Session matches; retry with --resume
 ALIAS_IN_USE           Exact Alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
@@ -1247,11 +1296,13 @@ If `new` fails before provider binding, its error includes the temporary
 `launch_id` for diagnostics and never presents it as a Session ID. A failure
 after binding includes the canonical `session_id`.
 
-A launch failure carries the provider's last reported error and its stderr
-tail in `detail`, and a `hint`. There is no `LAUNCH_BLOCKED`: without a
-terminal there is no startup screen for a human to answer, so a provider that
-cannot start without interaction is a `LAUNCH_FAILED` whose `action` names the
-command the user runs once by hand.
+A launch failure carries the provider's stderr tail in `detail`, and a `hint`.
+There is no `LAUNCH_BLOCKED`: without a terminal there is no startup screen
+for a human to answer, so a provider that cannot start without interaction is
+a `LAUNCH_FAILED` whose `action` names the provider command, `claude` or
+`codex`, that the user runs once by hand in the Session's working directory.
+A provider process that dies later fails the Session, and its stderr tail is
+kept as a `notice` message.
 
 ## Design and RPC contracts
 
@@ -1259,29 +1310,47 @@ The provider lifecycle mapping, acceptance criteria, and design rationale are
 in [Design](design.md). The public JSONL method set and schemas are in
 [RPC](rpc.md).
 
-## Open questions before implementation
+## Open questions
 
 The contract above rests on measurements taken on 2026-11-15 with Claude Code
-2.1.283 and codex-cli 0.167.0-alpha.4.1. These points were not measured and
+2.1.283 and codex-cli 0.167.0-alpha.4.1, through the probe scripts and through
+this implementation against both providers. These points were not measured and
 can change the contract:
 
 - **Claude auto mode, blocked action.** Whether an action that Claude's auto
   mode classifier stops arrives as an approval Request or is denied in place.
-  The `auto` row of [Approvals](#approvals) assumes it can arrive as a Request.
+  dlgt handles both: a `can_use_tool` request becomes a Request, and a
+  `permission_denied` event becomes a `denied` approval message. Only allowed
+  actions were observed.
 - **Codex auto review, denial.** The protocol schema gives an auto review four
   terminal states (`approved`, `denied`, `timedOut`, `aborted`) and none that
   hands the request to the client, so in `auto` a Codex approval is expected
-  never to become a Request. No denial was observed.
+  never to become a Request. An approval by the reviewer was observed; a
+  denial was not.
 - **Concurrent Requests.** More than one pending Request on a Session, for
-  example from parallel tool calls or from a provider-side subagent.
+  example from parallel tool calls or from a provider-side subagent. dlgt
+  keeps any number pending and answers each by ID, but only one at a time was
+  observed.
+- **Other Request kinds.** Codex file-change and permission approvals, Codex
+  `request_user_input` questions, and MCP elicitations are mapped from the
+  protocol schema and covered by fixtures. Only command approvals on Codex,
+  and tool approvals and `AskUserQuestion` on Claude, were observed live.
+- **`bypass`.** The provider arguments are unit-tested. No Session was run in
+  `bypass` against a real provider.
 - **Steer and cancel during a provider-side subagent.** Both were measured
   only on a top-level tool call.
-- **Claude steer after an interrupt.** A steer written just before an
-  interrupt was observed to start a turn of its own afterwards. `cancel`
-  promises to discard it, which needs a second interrupt or a process restart.
-- **Claude Code version drift.** Stream-json input and its control requests
-  are not a documented stable interface. dlgt needs a minimum supported
-  version and a `doctor` check.
+- **Claude background tasks.** Claude can end a turn while a command it
+  started keeps running in the background. No provider turn was seen to start
+  on its own when such a command finished, but the wait was one minute. A
+  result from a turn dlgt did not start is ignored rather than attributed to
+  an execution.
+- **Claude Code version drift.** Stream-json input, its control requests, and
+  the `command_lifecycle` events are not a documented stable interface. A
+  Claude that does not answer the `initialize` control request is a
+  `LAUNCH_FAILED`. dlgt still needs a minimum supported version and a `doctor`
+  check.
+- **Claude session ID rotation.** `--resume` kept the same session ID in every
+  run. The rekey path is covered by fixtures only.
 - **Codex hooks that need review.** v1 stops at a `LAUNCH_BLOCKED` screen.
   `codex exec` skips untrusted hooks silently; the app-server path without a
   TUI was not measured.
