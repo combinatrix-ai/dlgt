@@ -1096,6 +1096,11 @@ impl Daemon {
                             let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
                         }
                     }
+                    claude::Action::Refuse { request_id, reason } => {
+                        if let Some(process) = event_process.get().and_then(Weak::upgrade) {
+                            let _ = process.refuse(&request_id, reason);
+                        }
+                    }
                     claude::Action::Rekey(provider_id) => {
                         let canonical = canonical_session_id("claude", &provider_id);
                         if let Err(error) = promote_session(

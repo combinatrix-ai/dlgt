@@ -199,6 +199,14 @@ impl ClaudeProcess {
         self.write_line(&json!({"type": "control_request", "request_id": id, "request": request}))
     }
 
+    /// Tell Claude a control request will not be answered.
+    pub fn refuse(&self, request_id: &str, reason: &str) -> Result<()> {
+        self.write_line(&json!({
+            "type": "control_response",
+            "response": {"subtype": "error", "request_id": request_id, "error": reason},
+        }))
+    }
+
     /// Answer a `can_use_tool` request.
     pub fn respond(&self, request_id: &str, response: &Value) -> Result<()> {
         self.write_line(&json!({
@@ -306,6 +314,13 @@ pub enum Action {
     Rekey(String),
     /// A canceled execution's leftover message started a provider turn.
     Interrupt,
+    /// A control request nobody can answer: an unsupported kind, or a
+    /// permission request from a turn no execution owns. Left unanswered it
+    /// would hold the provider forever.
+    Refuse {
+        request_id: String,
+        reason: &'static str,
+    },
 }
 
 impl ClaudeTurns {
@@ -570,10 +585,25 @@ pub fn apply_event(
             turns.settle(store, session_id)?;
         }
         (Some("control_request"), _) => {
+            let Some(provider_key) = text("request_id") else {
+                return Ok(actions);
+            };
             let request = event.get("request").unwrap_or(&Value::Null);
-            if request.get("subtype").and_then(Value::as_str) == Some("can_use_tool")
-                && let Some(provider_key) = text("request_id")
-            {
+            let refuse = |reason| Action::Refuse {
+                request_id: provider_key.to_owned(),
+                reason,
+            };
+            if request.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
+                actions.push(refuse("dlgt does not handle this control request"));
+            } else if session.active_turn_id.is_none() {
+                store.append_message(
+                    session_id,
+                    MessageBody::notice(
+                        "Claude asked for permission outside any execution; the request was refused",
+                    ),
+                );
+                actions.push(refuse("no caller is waiting on this turn"));
+            } else {
                 store.open_request(
                     session_id,
                     tool_request(&session.cwd, provider_key, request),
@@ -1150,6 +1180,42 @@ mod tests {
         }
         assert!(store.pending_requests(&uid).is_empty());
         assert_eq!(state(&store), SessionState::Busy);
+    }
+
+    #[test]
+    fn a_control_request_nobody_can_answer_is_refused_instead_of_left_hanging() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        assert_eq!(
+            apply(
+                &store,
+                &mut turns,
+                &json!({"type": "control_request", "request_id": "h1",
+                        "request": {"subtype": "hook_callback"}}),
+            ),
+            [Action::Refuse {
+                request_id: "h1".to_owned(),
+                reason: "dlgt does not handle this control request",
+            }]
+        );
+        assert_eq!(state(&store), SessionState::Busy);
+
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(&store, &mut turns, &result("done"));
+        let orphan = apply(
+            &store,
+            &mut turns,
+            &json!({"type": "control_request", "request_id": "p9", "request": {
+                "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}}}),
+        );
+        assert!(matches!(
+            orphan.as_slice(),
+            [Action::Refuse { request_id, .. }] if request_id == "p9"
+        ));
+        assert_eq!(
+            state(&store),
+            SessionState::Idle,
+            "an idle Session is never blocked"
+        );
     }
 
     #[test]
