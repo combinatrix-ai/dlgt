@@ -7,6 +7,8 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::protocol::ApprovalsMode;
 use toml_edit::{DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
@@ -61,36 +63,18 @@ impl Agent {
         }
     }
 
-    pub fn semantic_input(self, prompt: &str) -> Result<Vec<u8>> {
+    /// The provider's own command for opening a conversation by hand.
+    pub fn resume_command(self, provider_id: &str) -> String {
         match self {
-            Self::Claude => bracketed_paste_input(prompt),
-            Self::Codex => bail!("Codex semantic input must use app-server turn/start"),
+            Self::Codex => format!("codex resume {provider_id}"),
+            Self::Claude => format!("claude --resume {provider_id}"),
         }
     }
-
-    pub const fn cancel_input(self) -> &'static [u8] {
-        match self {
-            Self::Codex => &[0x03],
-            Self::Claude => &[0x1b],
-        }
-    }
-}
-
-fn bracketed_paste_input(prompt: &str) -> Result<Vec<u8>> {
-    if prompt.contains(['\0', '\u{1b}']) {
-        bail!("semantic prompts must not contain NUL or ESC control bytes");
-    }
-    let mut input = Vec::with_capacity(prompt.len() + 13);
-    input.extend_from_slice(b"\x1b[200~");
-    input.extend_from_slice(prompt.as_bytes());
-    input.extend_from_slice(b"\x1b[201~\r");
-    Ok(input)
 }
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions<'a> {
     pub agent: Agent,
-    pub session_id: &'a str,
     pub title: &'a str,
     pub cwd: &'a Path,
     pub model: Option<&'a str>,
@@ -100,7 +84,7 @@ pub struct LaunchOptions<'a> {
     pub new_provider_id: Option<&'a str>,
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
-    pub auto_approve: bool,
+    pub approvals: ApprovalsMode,
 }
 
 pub(crate) fn provider_display_name(title: &str) -> String {
@@ -126,98 +110,53 @@ pub struct CommandSpec {
     pub environment: HashMap<String, String>,
 }
 
-pub fn command_spec(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
-    match options.agent {
-        Agent::Codex => bail!("Codex requires the app-server runtime"),
-        Agent::Claude => claude_command(options),
-    }
-}
-
 pub fn codex_program() -> PathBuf {
     std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from)
 }
 
-pub fn codex_remote_tui_command(
-    options: &LaunchOptions<'_>,
-    socket_path: &Path,
-) -> Result<CommandSpec> {
-    let program =
-        std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from);
+/// Arguments for the app-server process that owns one Session.
+pub(crate) fn codex_session_args(options: &LaunchOptions<'_>) -> Result<Vec<String>> {
     let mut args = vec!["--config".to_owned(), CODEX_UPDATE_SUPPRESSION.to_owned()];
-    args.extend(codex_harness_args(options.harness_options)?);
-    if let Some(provider_id) = options.resume_provider_id {
-        args.extend(["resume".to_owned(), provider_id.to_owned()]);
-    }
-    args.extend([
-        "--remote".to_owned(),
-        format!("unix://{}", socket_path.display()),
-        "--no-alt-screen".to_owned(),
-    ]);
-    if options.auto_approve && !has_codex_execution_policy_option(options.harness_options) {
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
-    }
-    if let Some(model) = options.model {
-        args.extend(["--model".to_owned(), model.to_owned()]);
-    }
     if let Some(effort) = options.effort {
         args.extend([
             "--config".to_owned(),
             format!("model_reasoning_effort={}", toml_string(effort)),
         ]);
     }
-    Ok(CommandSpec {
-        program,
-        args,
-        cwd: options.cwd.to_path_buf(),
-        environment: options.environment.clone(),
-    })
-}
-
-pub(crate) fn codex_app_server_args(
-    endpoint: &str,
-    harness_options: &[String],
-) -> Result<Vec<String>> {
-    let mut args = vec!["--config".to_owned(), CODEX_UPDATE_SUPPRESSION.to_owned()];
-    args.extend(codex_harness_args(harness_options)?);
-    args.extend([
-        "app-server".to_owned(),
-        "--listen".to_owned(),
-        endpoint.to_owned(),
-    ]);
+    args.extend(codex_harness_args(options.harness_options)?);
+    args.push("app-server".to_owned());
     Ok(args)
 }
 
-/// An interactive provider screen that keeps a launch from becoming ready.
-/// dlgt never answers these: each one changes provider trust or account
-/// state, which is the user's decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StartupBlocker {
-    pub reason: &'static str,
-    pub message: &'static str,
-    pub action: &'static str,
+/// Arguments for an app-server that only answers discovery requests.
+pub(crate) fn codex_discovery_args() -> Vec<String> {
+    vec![
+        "--config".to_owned(),
+        CODEX_UPDATE_SUPPRESSION.to_owned(),
+        "app-server".to_owned(),
+    ]
 }
 
-const CODEX_STARTUP_BLOCKERS: &[(&str, StartupBlocker)] = &[(
-    "Hooks need review",
-    StartupBlocker {
-        reason: "codex_hooks_need_review",
-        message: "Codex is waiting for hook review: a hook is new or changed and must be trusted \
-                  before Codex starts",
-        action: "have a human run `codex` once in this directory, review the hooks, and trust \
-                 them; then retry",
-    },
-)];
-
-/// Recognize a known blocking startup screen from rendered rows.
-pub fn startup_blocker(agent: Agent, rows: &[String]) -> Option<StartupBlocker> {
-    let blockers = match agent {
-        Agent::Codex => CODEX_STARTUP_BLOCKERS,
-        Agent::Claude => &[],
+/// `thread/start` or `thread/resume` parameters, including who approves.
+pub(crate) fn codex_thread_params(options: &LaunchOptions<'_>) -> serde_json::Value {
+    let (policy, sandbox, reviewer) = match options.approvals {
+        ApprovalsMode::Auto => ("on-request", "workspace-write", "auto_review"),
+        ApprovalsMode::Ask => ("on-request", "workspace-write", "user"),
+        ApprovalsMode::Bypass => ("never", "danger-full-access", "user"),
     };
-    blockers
-        .iter()
-        .find(|(needle, _)| rows.iter().any(|row| row.contains(needle)))
-        .map(|(_, blocker)| *blocker)
+    let mut params = serde_json::json!({
+        "cwd": options.cwd,
+        "approvalPolicy": policy,
+        "sandbox": sandbox,
+        "approvalsReviewer": reviewer,
+    });
+    if let Some(model) = options.model {
+        params["model"] = serde_json::json!(model);
+    }
+    if let Some(thread_id) = options.resume_provider_id {
+        params["threadId"] = serde_json::json!(thread_id);
+    }
+    params
 }
 
 pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
@@ -396,19 +335,24 @@ pub(crate) fn write_config_atomic(path: &Path, contents: &str) -> Result<()> {
     result
 }
 
-fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
+pub fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     let program =
         std::env::var_os("DLGT_CLAUDE_BIN").map_or_else(|| PathBuf::from("claude"), PathBuf::from);
-    let hook_command = hook_command(options)?;
-    let auto_permission_mode =
-        options.auto_approve && !has_permission_mode_option(options.harness_options);
-    let settings = claude_hook_settings(&hook_command);
-    let mut args = vec![
-        "--name".to_owned(),
-        claude_provider_display_name(options),
-        "--settings".to_owned(),
-        settings.to_string(),
-    ];
+    let mut args = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--replay-user-messages",
+        "--permission-prompt-tool",
+        "stdio",
+        "--name",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    args.push(claude_provider_display_name(options));
     if let Some(model) = options.model {
         args.extend(["--model".to_owned(), model.to_owned()]);
     }
@@ -416,8 +360,10 @@ fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
         args.extend(["--effort".to_owned(), effort.to_owned()]);
     }
     args.extend(claude_harness_args(options.harness_options)?);
-    if auto_permission_mode {
-        args.push("--permission-mode=auto".to_owned());
+    match options.approvals {
+        ApprovalsMode::Auto => args.extend(["--permission-mode".to_owned(), "auto".to_owned()]),
+        ApprovalsMode::Ask => args.extend(["--permission-mode".to_owned(), "manual".to_owned()]),
+        ApprovalsMode::Bypass => args.push("--dangerously-skip-permissions".to_owned()),
     }
     if let Some(provider_id) = options.resume_provider_id {
         args.extend(["--resume".to_owned(), provider_id.to_owned()]);
@@ -451,7 +397,22 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
             }
             if matches!(
                 key,
-                "name" | "settings" | "model" | "effort" | "resume" | "session-id"
+                "name"
+                    | "model"
+                    | "effort"
+                    | "resume"
+                    | "continue"
+                    | "session-id"
+                    | "print"
+                    | "input-format"
+                    | "output-format"
+                    | "verbose"
+                    | "replay-user-messages"
+                    | "permission-mode"
+                    | "permission-prompt-tool"
+                    | "permission-prompts"
+                    | "dangerously-skip-permissions"
+                    | "allow-dangerously-skip-permissions"
             ) {
                 bail!("harness option {key:?} is managed by dlgt");
             }
@@ -478,7 +439,12 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
         }
         if matches!(
             key,
-            "check_for_update_on_startup" | "model" | "model_reasoning_effort"
+            "check_for_update_on_startup"
+                | "model"
+                | "model_reasoning_effort"
+                | "approval_policy"
+                | "sandbox_mode"
+                | "approvals_reviewer"
         ) {
             bail!("harness option {key:?} is managed by dlgt");
         }
@@ -487,65 +453,10 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
     Ok(args)
 }
 
-fn has_codex_execution_policy_option(options: &[String]) -> bool {
-    options.iter().any(|option| {
-        option
-            .split_once('=')
-            .is_some_and(|(key, _)| matches!(key, "approval_policy" | "sandbox_mode"))
-    })
-}
-
-fn has_permission_mode_option(options: &[String]) -> bool {
-    options.iter().any(|option| {
-        option
-            .split_once('=')
-            .is_some_and(|(key, _)| key == "permission-mode")
-    })
-}
-
 fn claude_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {
     let mut environment = environment.clone();
     environment.insert(CLAUDE_AUTOUPDATER_ENV.to_owned(), "1".to_owned());
     environment
-}
-
-fn hook_command(options: &LaunchOptions<'_>) -> Result<String> {
-    let executable = std::env::current_exe()?;
-    Ok(format!(
-        "{} hook emit {} {}",
-        shell_quote(&executable.to_string_lossy()),
-        shell_quote(options.session_id),
-        shell_quote(options.agent.as_str()),
-    ))
-}
-
-fn claude_hook_settings(command: &str) -> serde_json::Value {
-    let handler = || {
-        serde_json::json!([{
-            "hooks": [{
-                "type": "command",
-                "command": command,
-                "timeout": 5,
-            }]
-        }])
-    };
-    // Pin the renderer: an unset `tui` makes Claude open a renderer upsell
-    // dialog that swallows the first submitted prompt.
-    serde_json::json!({
-        "tui": "default",
-        "hooks": {
-            "SessionStart": handler(),
-            "UserPromptSubmit": handler(),
-            "Stop": handler(),
-            "StopFailure": handler(),
-            "Notification": handler(),
-            "SessionEnd": handler(),
-        }
-    })
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn toml_string(value: &str) -> String {
@@ -554,25 +465,50 @@ fn toml_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
+    use serde_json::json;
+
     use super::{
-        Agent, LaunchOptions, claude_harness_args, claude_session_marker, codex_app_server_args,
-        codex_remote_tui_command, command_spec, startup_blocker, trust_claude_workspace,
+        Agent, LaunchOptions, claude_command, claude_harness_args, claude_session_marker,
+        codex_harness_args, codex_session_args, codex_thread_params, trust_claude_workspace,
         trust_codex_workspace,
     };
+    use crate::protocol::ApprovalsMode;
 
-    #[test]
-    fn startup_blockers_match_only_their_own_harness() {
-        let rows = vec!["Hooks need review".to_owned()];
-        assert_eq!(
-            startup_blocker(Agent::Codex, &rows).map(|blocker| blocker.reason),
-            Some("codex_hooks_need_review")
-        );
-        assert_eq!(startup_blocker(Agent::Claude, &rows), None);
-        assert_eq!(startup_blocker(Agent::Codex, &["› Ready".to_owned()]), None);
+    fn options<'a>(
+        agent: Agent,
+        approvals: ApprovalsMode,
+        environment: &'a HashMap<String, String>,
+        harness_options: &'a [String],
+    ) -> LaunchOptions<'a> {
+        LaunchOptions {
+            agent,
+            title: "review",
+            cwd: Path::new("/work"),
+            model: Some("m1"),
+            effort: Some("high"),
+            harness_options,
+            new_provider_id: Some("9b634cb7-2e3e-437b-96cb-8199ce17afa6"),
+            resume_provider_id: None,
+            environment,
+            approvals,
+        }
+    }
+
+    fn claude_args(approvals: ApprovalsMode) -> Vec<String> {
+        let environment = HashMap::new();
+        claude_command(&options(Agent::Claude, approvals, &environment, &[]))
+            .unwrap_or_else(|error| panic!("{error}"))
+            .args
+    }
+
+    fn has_pair(args: &[String], key: &str, value: &str) -> bool {
+        args.windows(2)
+            .any(|pair| pair[0] == key && pair[1] == value)
     }
 
     #[test]
@@ -583,460 +519,195 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_to_auto_approve() {
-        let environment =
-            std::collections::HashMap::from([("DISABLE_AUTOUPDATER".to_owned(), "0".to_owned())]);
-        let spec = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: Some("haiku"),
-            effort: None,
-            harness_options: &[],
-            new_provider_id: None,
-            resume_provider_id: None,
-            environment: &environment,
-            auto_approve: true,
-        })
-        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-        assert!(!spec.args.iter().any(|arg| arg == "--print"));
-        assert_eq!(
-            spec.environment.get("DISABLE_AUTOUPDATER"),
-            Some(&"1".to_owned())
-        );
-    }
-
-    #[test]
-    fn claude_uses_a_prefixed_title_with_an_exact_search_marker() {
-        let spec = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Review API boundaries",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &[],
-            new_provider_id: Some("9b634cb7-2e3e-437b-96cb-8199ce17afa6"),
-            resume_provider_id: None,
-            environment: &std::collections::HashMap::new(),
-            auto_approve: true,
-        })
-        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        assert!(
-            spec.args
-                .windows(2)
-                .any(|args| args == ["--name", "[dlgt] Review API boundaries [dlgt:9b634cb72e3e]"])
-        );
-        assert!(
-            spec.args
-                .windows(2)
-                .any(|args| { args == ["--session-id", "9b634cb7-2e3e-437b-96cb-8199ce17afa6"] })
-        );
-    }
-
-    #[test]
-    fn claude_no_auto_approve_omits_implicit_skip_permissions() {
-        let environment = std::collections::HashMap::new();
-        let spec = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &[],
-            new_provider_id: None,
-            resume_provider_id: None,
-            environment: &environment,
-            auto_approve: false,
-        })
-        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg.starts_with("--permission-mode"))
-        );
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-    }
-
-    #[test]
-    fn claude_permission_mode_option_suppresses_implicit_auto_approve() {
-        let environment = std::collections::HashMap::new();
-        let options = vec!["permission-mode=plan".to_owned()];
-        let spec = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &options,
-            new_provider_id: None,
-            resume_provider_id: None,
-            environment: &environment,
-            auto_approve: true,
-        })
-        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=plan"));
-        assert!(!spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-    }
-
-    #[test]
-    fn codex_remote_tui_keeps_the_primary_screen_visible_without_hooks() {
-        let environment = std::collections::HashMap::from([(
-            "CODEX_HOME".to_owned(),
-            "/tmp/user-codex-home".to_owned(),
-        )]);
-        let spec = codex_remote_tui_command(
-            &LaunchOptions {
-                agent: Agent::Codex,
-                session_id: "internal:TESTID1",
-                title: "Worker title",
-                cwd: Path::new("/tmp"),
-                model: None,
-                effort: Some("xhigh"),
-                harness_options: &[],
-                new_provider_id: None,
-                resume_provider_id: None,
-                environment: &environment,
-                auto_approve: true,
-            },
-            Path::new("/tmp/dlgt.sock"),
-        )
-        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
-        assert_eq!(
-            &spec.args[..2],
-            ["--config", "check_for_update_on_startup=false"]
-        );
-        assert!(
-            spec.args
-                .windows(2)
-                .any(|args| args == ["--remote", "unix:///tmp/dlgt.sock"])
-        );
-        assert!(!spec.args.iter().any(|arg| arg == "resume"));
-        assert!(spec.args.iter().any(|arg| arg == "--no-alt-screen"));
-        assert!(
-            spec.args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-        );
-        assert!(
-            spec.args
-                .iter()
-                .any(|arg| arg.contains("model_reasoning_effort"))
-        );
-        assert_eq!(spec.environment, environment);
-    }
-
-    #[test]
-    fn codex_no_auto_approve_omits_bypass_flag() {
-        let environment = std::collections::HashMap::new();
-        let spec = codex_remote_tui_command(
-            &LaunchOptions {
-                agent: Agent::Codex,
-                session_id: "internal:TESTID1",
-                title: "Worker title",
-                cwd: Path::new("/tmp"),
-                model: None,
-                effort: None,
-                harness_options: &[],
-                new_provider_id: None,
-                resume_provider_id: None,
-                environment: &environment,
-                auto_approve: false,
-            },
-            Path::new("/tmp/dlgt.sock"),
-        )
-        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-        );
-    }
-
-    #[test]
-    fn codex_app_server_suppresses_startup_update_prompts() {
-        assert_eq!(
-            codex_app_server_args("unix:///tmp/dlgt.sock", &[])
-                .unwrap_or_else(|error| panic!("failed to build app-server args: {error}")),
-            [
-                "--config",
-                "check_for_update_on_startup=false",
-                "app-server",
-                "--listen",
-                "unix:///tmp/dlgt.sock",
-            ]
-        );
-    }
-
-    #[test]
-    fn codex_passes_explicit_harness_options_to_app_server_and_tui() {
-        let options = vec![
-            "web_search=\"live\"".to_owned(),
-            "features.experimental=true".to_owned(),
-        ];
-        let app_server = codex_app_server_args("unix:///tmp/dlgt.sock", &options)
-            .unwrap_or_else(|error| panic!("failed to build app-server args: {error}"));
-        let spec = codex_remote_tui_command(
-            &LaunchOptions {
-                agent: Agent::Codex,
-                session_id: "internal:TESTID1",
-                title: "Worker title",
-                cwd: Path::new("/tmp"),
-                model: None,
-                effort: None,
-                harness_options: &options,
-                new_provider_id: None,
-                resume_provider_id: None,
-                environment: &std::collections::HashMap::new(),
-                auto_approve: true,
-            },
-            Path::new("/tmp/dlgt.sock"),
-        )
-        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
-
-        for option in &options {
-            let expected = ["--config", option.as_str()];
-            assert!(app_server.windows(2).any(|args| args == expected));
-            assert!(spec.args.windows(2).any(|args| args == expected));
-        }
-    }
-
-    #[test]
-    fn codex_rejects_bare_harness_options() {
-        let result = codex_app_server_args("unix:///tmp/dlgt.sock", &["chrome".to_owned()]);
-        let Err(error) = result else {
-            panic!("bare Codex harness option should fail");
-        };
-        assert!(error.to_string().contains("requires KEY=VALUE"));
-    }
-
-    #[test]
-    fn claude_rejects_empty_and_managed_bare_harness_options() {
-        for option in ["chrome=", "model"] {
-            let result = claude_harness_args(&[option.to_owned()]);
-            let Err(error) = result else {
-                panic!("invalid Claude harness option {option:?} should fail");
-            };
+    fn claude_runs_as_one_stream_json_process_that_asks_over_stdio() {
+        let args = claude_args(ApprovalsMode::Auto);
+        assert_eq!(args[0], "-p");
+        for (key, value) in [
+            ("--input-format", "stream-json"),
+            ("--output-format", "stream-json"),
+            ("--permission-prompt-tool", "stdio"),
+            ("--model", "m1"),
+            ("--effort", "high"),
+            ("--session-id", "9b634cb7-2e3e-437b-96cb-8199ce17afa6"),
+            ("--name", "[dlgt] review [dlgt:9b634cb72e3e]"),
+        ] {
             assert!(
-                error.to_string().contains(if option == "model" {
-                    "managed by dlgt"
-                } else {
-                    "requires a non-empty value"
-                }),
-                "unexpected error for {option:?}: {error}"
+                has_pair(&args, key, value),
+                "missing {key} {value}: {args:?}"
+            );
+        }
+        assert!(args.iter().any(|arg| arg == "--replay-user-messages"));
+        assert!(!args.iter().any(|arg| arg == "--settings"));
+    }
+
+    #[test]
+    fn claude_approvals_map_to_permission_modes() {
+        assert!(has_pair(
+            &claude_args(ApprovalsMode::Auto),
+            "--permission-mode",
+            "auto"
+        ));
+        assert!(has_pair(
+            &claude_args(ApprovalsMode::Ask),
+            "--permission-mode",
+            "manual"
+        ));
+        let bypass = claude_args(ApprovalsMode::Bypass);
+        assert!(
+            bypass
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        assert!(!bypass.iter().any(|arg| arg == "--permission-mode"));
+        for mode in [ApprovalsMode::Auto, ApprovalsMode::Ask] {
+            assert!(
+                !claude_args(mode)
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions")
             );
         }
     }
 
     #[test]
-    fn codex_execution_policy_option_suppresses_implicit_auto_approve() {
-        let options = vec!["sandbox_mode=\"read-only\"".to_owned()];
-        let spec = codex_remote_tui_command(
-            &LaunchOptions {
-                agent: Agent::Codex,
-                session_id: "internal:TESTID1",
-                title: "Worker title",
-                cwd: Path::new("/tmp"),
-                model: None,
-                effort: None,
-                harness_options: &options,
-                new_provider_id: None,
-                resume_provider_id: None,
-                environment: &std::collections::HashMap::new(),
-                auto_approve: true,
-            },
-            Path::new("/tmp/dlgt.sock"),
-        )
-        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
+    fn claude_resume_reopens_the_stored_conversation() {
+        let environment = HashMap::new();
+        let mut options = options(Agent::Claude, ApprovalsMode::Auto, &environment, &[]);
+        options.resume_provider_id = Some("old-session");
+        let args = claude_command(&options)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .args;
+        assert!(has_pair(&args, "--resume", "old-session"));
+        assert!(!args.iter().any(|arg| arg == "--session-id"));
+    }
 
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+    #[test]
+    fn claude_disables_its_autoupdater_without_touching_other_variables() {
+        let environment = HashMap::from([("KEEP".to_owned(), "1".to_owned())]);
+        let spec = claude_command(&options(
+            Agent::Claude,
+            ApprovalsMode::Auto,
+            &environment,
+            &[],
+        ))
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            spec.environment
+                .get("DISABLE_AUTOUPDATER")
+                .map(String::as_str),
+            Some("1")
         );
-    }
-
-    #[test]
-    fn codex_rejects_harness_options_managed_by_dlgt() {
-        for option in [
-            "check_for_update_on_startup=true",
-            "model=\"gpt-5\"",
-            "model_reasoning_effort=\"high\"",
-        ] {
-            let result = codex_app_server_args("unix:///tmp/dlgt.sock", &[option.to_owned()]);
-            let Err(error) = result else {
-                panic!("managed harness option should fail: {option}");
-            };
-            assert!(error.to_string().contains("managed by dlgt"));
-        }
-    }
-
-    #[test]
-    fn claude_registers_success_and_failure_hooks() {
-        let environment = std::collections::HashMap::new();
-        let spec = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &[],
-            new_provider_id: None,
-            resume_provider_id: None,
-            environment: &environment,
-            auto_approve: true,
-        })
-        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        let settings = spec
-            .args
-            .windows(2)
-            .find(|args| args[0] == "--settings")
-            .map_or_else(|| panic!("Claude settings missing"), |args| &args[1]);
-        assert!(settings.contains("StopFailure"));
-        assert!(settings.contains("Stop"));
-        assert!(settings.contains(r#""tui":"default""#));
-    }
-
-    #[test]
-    fn semantic_input_uses_bracketed_paste_then_enter() {
-        let input = Agent::Claude
-            .semantic_input("first\nsecond")
-            .unwrap_or_else(|error| panic!("failed to frame prompt: {error}"));
-        assert_eq!(input, b"\x1b[200~first\nsecond\x1b[201~\r");
-    }
-
-    #[test]
-    fn provider_commands_resume_the_stored_conversation() {
-        let environment = std::collections::HashMap::new();
-        let claude = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &[],
-            new_provider_id: None,
-            resume_provider_id: Some("claude-session"),
-            environment: &environment,
-            auto_approve: true,
-        })
-        .unwrap_or_else(|error| panic!("failed to build Claude command: {error}"));
-        assert!(
-            claude
-                .args
-                .windows(2)
-                .any(|args| args == ["--resume", "claude-session"])
-        );
-
-        let codex = codex_remote_tui_command(
-            &LaunchOptions {
-                agent: Agent::Codex,
-                session_id: "internal:TESTID1",
-                title: "Worker title",
-                cwd: Path::new("/tmp"),
-                model: None,
-                effort: None,
-                harness_options: &[],
-                new_provider_id: None,
-                resume_provider_id: Some("codex-thread"),
-                environment: &environment,
-                auto_approve: true,
-            },
-            Path::new("/tmp/dlgt.sock"),
-        )
-        .unwrap_or_else(|error| panic!("failed to build Codex command: {error}"));
-        assert!(
-            codex
-                .args
-                .windows(2)
-                .any(|args| args == ["resume", "codex-thread"])
-        );
+        assert_eq!(spec.environment.get("KEEP").map(String::as_str), Some("1"));
     }
 
     #[test]
     fn claude_passes_explicit_harness_options() {
-        let environment = std::collections::HashMap::new();
-        let options = vec![
-            "chrome".to_owned(),
-            "permission-mode=auto".to_owned(),
-            "dangerously-skip-permissions=true".to_owned(),
-        ];
-        let spec = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &options,
-            new_provider_id: None,
-            resume_provider_id: None,
-            environment: &environment,
-            auto_approve: true,
-        })
-        .unwrap_or_else(|error| panic!("failed to build command: {error}"));
-        assert!(spec.args.iter().any(|arg| arg == "--chrome"));
-        assert!(spec.args.iter().any(|arg| arg == "--permission-mode=auto"));
-        assert!(
-            spec.args
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions=true")
+        assert_eq!(
+            claude_harness_args(&["chrome".to_owned(), "max-turns=3".to_owned()])
+                .unwrap_or_else(|error| panic!("{error}")),
+            ["--chrome", "--max-turns=3"]
         );
     }
 
     #[test]
-    fn claude_rejects_harness_options_managed_by_dlgt() {
-        let environment = std::collections::HashMap::new();
-        let options = vec!["settings={}".to_owned()];
-        let result = command_spec(&LaunchOptions {
-            agent: Agent::Claude,
-            session_id: "internal:TESTID1",
-            title: "Worker title",
-            cwd: Path::new("/tmp"),
-            model: None,
-            effort: None,
-            harness_options: &options,
-            new_provider_id: None,
-            resume_provider_id: None,
-            environment: &environment,
-            auto_approve: true,
-        });
-        let Err(error) = result else {
-            panic!("managed harness option should fail");
-        };
-        assert!(error.to_string().contains("managed by dlgt"));
+    fn claude_rejects_empty_and_managed_harness_options() {
+        for option in [
+            "",
+            "=value",
+            "max-turns=",
+            "name=x",
+            "model=x",
+            "resume=x",
+            "session-id=x",
+            "permission-mode=plan",
+            "permission-prompt-tool=x",
+            "permission-prompts=none",
+            "dangerously-skip-permissions",
+            "output-format=text",
+        ] {
+            assert!(
+                claude_harness_args(&[option.to_owned()]).is_err(),
+                "{option:?} was accepted"
+            );
+        }
     }
 
     #[test]
-    fn semantic_input_rejects_terminal_escape_injection() {
-        assert!(Agent::Claude.semantic_input("unsafe\x1b[201~").is_err());
-        assert!(Agent::Codex.semantic_input("safe").is_err());
+    fn codex_approvals_map_to_thread_parameters() {
+        let environment = HashMap::new();
+        let params =
+            |approvals| codex_thread_params(&options(Agent::Codex, approvals, &environment, &[]));
+        let auto = params(ApprovalsMode::Auto);
+        assert_eq!(auto["approvalPolicy"], "on-request");
+        assert_eq!(auto["sandbox"], "workspace-write");
+        assert_eq!(auto["approvalsReviewer"], "auto_review");
+        assert_eq!(auto["model"], "m1");
+        assert_eq!(auto["cwd"], "/work");
+        let ask = params(ApprovalsMode::Ask);
+        assert_eq!(ask["approvalPolicy"], "on-request");
+        assert_eq!(ask["sandbox"], "workspace-write");
+        assert_eq!(ask["approvalsReviewer"], "user");
+        let bypass = params(ApprovalsMode::Bypass);
+        assert_eq!(bypass["approvalPolicy"], "never");
+        assert_eq!(bypass["sandbox"], "danger-full-access");
+        assert!(auto.get("threadId").is_none());
+    }
+
+    #[test]
+    fn codex_resume_names_the_stored_thread() {
+        let environment = HashMap::new();
+        let mut options = options(Agent::Codex, ApprovalsMode::Ask, &environment, &[]);
+        options.resume_provider_id = Some("thread-1");
+        assert_eq!(codex_thread_params(&options)["threadId"], json!("thread-1"));
+    }
+
+    #[test]
+    fn codex_app_server_suppresses_update_prompts_and_carries_effort_and_options() {
+        let environment = HashMap::new();
+        let harness_options = [r#"web_search="live""#.to_owned()];
+        let args = codex_session_args(&options(
+            Agent::Codex,
+            ApprovalsMode::Auto,
+            &environment,
+            &harness_options,
+        ))
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(has_pair(
+            &args,
+            "--config",
+            "check_for_update_on_startup=false"
+        ));
+        assert!(has_pair(
+            &args,
+            "--config",
+            r#"model_reasoning_effort="high""#
+        ));
+        assert!(has_pair(&args, "--config", r#"web_search="live""#));
+        assert_eq!(args.last().map(String::as_str), Some("app-server"));
+        assert!(!args.iter().any(|arg| arg.contains("bypass")));
+    }
+
+    #[test]
+    fn codex_rejects_bare_and_managed_harness_options() {
+        for option in [
+            "web_search",
+            "model=x",
+            "model_reasoning_effort=high",
+            "approval_policy=never",
+            "sandbox_mode=danger-full-access",
+            "approvals_reviewer=user",
+            "check_for_update_on_startup=true",
+        ] {
+            assert!(
+                codex_harness_args(&[option.to_owned()]).is_err(),
+                "{option:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_commands_are_the_providers_own() {
+        assert_eq!(Agent::Claude.resume_command("abc"), "claude --resume abc");
+        assert_eq!(Agent::Codex.resume_command("abc"), "codex resume abc");
     }
 
     #[test]

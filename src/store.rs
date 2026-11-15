@@ -3,8 +3,11 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cursor::{Cursor, CursorTable};
-use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
-use crate::screen::{EpochReason, LIVE_ROW_LIMIT, ScreenStore, StablePage};
+use crate::messages::{MessageBody, MessageLog, MessagePage};
+use crate::protocol::{
+    Approvals, ApprovalsMode, Auth, EventRecord, SessionRecord, SessionState, TurnRecord, TurnState,
+};
+use crate::requests::{RequestDraft, RequestRecord, RequestTable, Resolution};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,7 +16,6 @@ pub struct Store {
     state: RefCell<MemoryState>,
 }
 
-const OUTPUT_CHUNK_LIMIT: usize = 8192;
 /// Lifecycle events retained per daemon before the oldest are evicted.
 const EVENT_RETENTION: usize = 50_000;
 /// Terminal results retained per Session.
@@ -34,14 +36,13 @@ struct MemoryState {
     evicted_event_seq: i64,
     /// Highest execution sequence whose result was evicted, per Session UID.
     evicted_result_seq: HashMap<String, i64>,
-    screens: HashMap<String, ScreenStore>,
+    /// Messages and Requests, per Session UID.
+    messages: HashMap<String, MessageLog>,
+    requests: HashMap<String, RequestTable>,
     /// Observation positions and the watermarks behind them. Held here so
     /// minting a position is atomic with the state capture it describes.
     cursors: CursorTable,
-    outputs: HashMap<String, VecDeque<OutputChunk>>,
     next_event_seq: i64,
-    next_input_seq: i64,
-    next_output_seq: i64,
 }
 
 struct StoredSession {
@@ -49,30 +50,10 @@ struct StoredSession {
     /// Immutable internal identity. Public Session IDs rotate when Claude
     /// reports a new provider session, so cursors bind to this instead.
     uid: String,
-    terminal_rows: u16,
-    terminal_cols: u16,
+    /// When the provider last emitted any event.
+    last_provider_event_ms: Option<i64>,
     /// Diagnostics retained when the Session failed before it became ready.
     launch_failure: Option<Value>,
-}
-
-/// Live screen projection: a replaceable snapshot, never cursor history.
-#[derive(Debug, Default)]
-pub struct LiveScreen {
-    pub epoch: u64,
-    pub reset_reason: Option<&'static str>,
-    pub rows: Vec<String>,
-    pub truncated: bool,
-}
-
-struct OutputChunk {
-    seq: i64,
-    data: Vec<u8>,
-}
-
-pub struct OutputPage {
-    pub data: Vec<u8>,
-    pub next_after: i64,
-    pub has_more: bool,
 }
 
 struct FinishTurn<'a> {
@@ -93,7 +74,7 @@ pub struct NewSession<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub harness_options: &'a [String],
-    pub auto_approve: bool,
+    pub approvals: ApprovalsMode,
 }
 
 impl Store {
@@ -116,7 +97,6 @@ impl Store {
         let now = now_ms();
         let uid = format!("su_{}", Uuid::new_v4().simple());
         state.uid_index.insert(session.id.to_owned(), uid.clone());
-        state.screens.insert(uid.clone(), ScreenStore::new(24, 80));
         state.sessions.insert(
             session.id.to_owned(),
             StoredSession {
@@ -130,15 +110,16 @@ impl Store {
                     model: session.model.map(str::to_owned),
                     effort: session.effort.map(str::to_owned),
                     harness_options: session.harness_options.to_vec(),
-                    auto_approve: session.auto_approve,
+                    approvals: Approvals::new(session.approvals),
+                    auth: None,
+                    resolved_model: None,
                     active_turn_id: None,
                     pid: None,
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
                 uid,
-                terminal_rows: 24,
-                terminal_cols: 80,
+                last_provider_event_ms: None,
                 launch_failure: None,
             },
         );
@@ -287,20 +268,23 @@ impl Store {
                 .created_at_ms
                 .min(replaced.record.created_at_ms);
             // Resuming a retained provider conversation continues one logical
-            // Session. Adopt its immutable identity so cursors, screen
-            // history, and retention floors survive the replacement process,
-            // and retire the launch identity that was only ever a placeholder.
+            // Session. Adopt its immutable identity so cursors, messages, and
+            // retention floors survive the replacement process, and retire
+            // the launch identity that was only ever a placeholder.
             let launch_uid = std::mem::replace(&mut session.uid, replaced.uid.clone());
-            state.screens.remove(&launch_uid);
+            if let Some(launched) = state.messages.remove(&launch_uid) {
+                state
+                    .messages
+                    .entry(session.uid.clone())
+                    .or_default()
+                    .absorb(launched);
+            }
+            state.requests.remove(&launch_uid);
             state.cursors.forget(&launch_uid);
             state.evicted_result_seq.remove(&launch_uid);
             state
                 .uid_index
                 .retain(|_, uid| uid.as_str() != launch_uid.as_str());
-            // A replacement PTY is still a new terminal generation.
-            if let Some(screen) = state.screens.get_mut(&session.uid) {
-                screen.restart();
-            }
         }
         to.clone_into(&mut session.record.id);
         session.record.updated_at_ms = now_ms();
@@ -314,17 +298,6 @@ impl Store {
             if turn.session_id == from {
                 to.clone_into(&mut turn.session_id);
             }
-        }
-        let mut merged = state.outputs.remove(to).unwrap_or_default();
-        if let Some(mut launched) = state.outputs.remove(from) {
-            merged.append(&mut launched);
-        }
-        if !merged.is_empty() {
-            merged.make_contiguous().sort_by_key(|chunk| chunk.seq);
-            while merged.len() > OUTPUT_CHUNK_LIMIT {
-                merged.pop_front();
-            }
-            state.outputs.insert(to.to_owned(), merged);
         }
         Ok(())
     }
@@ -356,31 +329,6 @@ impl Store {
             == Some(session_id)
         {
             state.provider_reservations.remove(provider_ref);
-        }
-    }
-
-    pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) {
-        let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get_mut(session_id) else {
-            return;
-        };
-        session.terminal_rows = rows;
-        session.terminal_cols = cols;
-        session.record.updated_at_ms = now_ms();
-        let uid = session.uid.clone();
-        if let Some(screen) = state.screens.get_mut(&uid) {
-            screen.resize(rows, cols);
-        }
-    }
-
-    /// Start a new terminal generation for a replacement provider process.
-    pub fn restart_screen(&self, session_id: &str) {
-        let mut state = self.state.borrow_mut();
-        let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
-            return;
-        };
-        if let Some(screen) = state.screens.get_mut(&uid) {
-            screen.restart();
         }
     }
 
@@ -440,8 +388,7 @@ impl Store {
             provider_turn_id: None,
             final_message: None,
             final_text_recovered: false,
-            transcript_path: None,
-            transcript_offset: None,
+            denied_requests: 0,
             error: None,
             created_at_ms: now,
             started_at_ms: None,
@@ -542,15 +489,6 @@ impl Store {
         })
     }
 
-    /// Record the provider transcript boundary for an execution, so a later
-    /// fallback can never read a previous turn's assistant message.
-    pub fn set_turn_transcript(&self, id: &str, path: &str, offset: Option<u64>) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.transcript_path = Some(path.to_owned());
-            turn.transcript_offset = offset;
-        }
-    }
-
     fn finish_turn(&self, finish: &FinishTurn<'_>) -> Result<bool> {
         let FinishTurn {
             id,
@@ -587,6 +525,7 @@ impl Store {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
+        close_requests(&mut memory, &session_id);
         enforce_result_retention(&mut memory, &session_id);
         Ok(true)
     }
@@ -606,6 +545,7 @@ impl Store {
             session.record.active_turn_id = None;
             session.record.updated_at_ms = now_ms();
         }
+        close_requests(&mut state, session_id);
         enforce_result_retention(&mut state, session_id);
         Some(turn_id)
     }
@@ -627,6 +567,7 @@ impl Store {
             session.record.state = SessionState::Quiescing;
             session.record.updated_at_ms = now_ms();
         }
+        close_requests(&mut state, &session_id);
         enforce_result_retention(&mut state, &session_id);
         Ok(true)
     }
@@ -712,60 +653,6 @@ impl Store {
             }
         }
         seq
-    }
-
-    /// Allocate an acknowledgement sequence without retaining input bytes or
-    /// metadata. The sequence is emitted in the corresponding input event.
-    pub fn allocate_input_sequence(&self) -> i64 {
-        let mut state = self.state.borrow_mut();
-        state.next_input_seq += 1;
-        state.next_input_seq
-    }
-
-    pub fn record_output(&self, session_id: &str, data: &[u8]) {
-        let mut state = self.state.borrow_mut();
-        state.next_output_seq += 1;
-        let seq = state.next_output_seq;
-        let chunks = state.outputs.entry(session_id.to_owned()).or_default();
-        chunks.push_back(OutputChunk {
-            seq,
-            data: data.to_vec(),
-        });
-        while chunks.len() > OUTPUT_CHUNK_LIMIT {
-            chunks.pop_front();
-        }
-        let uid = state.sessions.get(session_id).map(|s| s.uid.clone());
-        if let Some(screen) = uid.and_then(|uid| state.screens.get_mut(&uid)) {
-            screen.feed(data);
-        }
-    }
-
-    pub fn read_output_page(&self, session_id: &str, after: i64, limit_bytes: usize) -> OutputPage {
-        let state = self.state.borrow();
-        let chunks = state.outputs.get(session_id);
-        let mut output = Vec::new();
-        let mut next_after = after;
-        for chunk in chunks
-            .into_iter()
-            .flatten()
-            .filter(|chunk| chunk.seq > after)
-        {
-            if !output.is_empty() && output.len().saturating_add(chunk.data.len()) > limit_bytes {
-                break;
-            }
-            output.extend(&chunk.data);
-            next_after = chunk.seq;
-            if output.len() >= limit_bytes {
-                break;
-            }
-        }
-        let has_more =
-            chunks.is_some_and(|chunks| chunks.iter().any(|chunk| chunk.seq > next_after));
-        OutputPage {
-            data: output,
-            next_after,
-            has_more,
-        }
     }
 
     /// Events after `after`, optionally scoped to one immutable Session UID.
@@ -898,102 +785,251 @@ impl Store {
             .unwrap_or(0)
     }
 
-    pub fn screen_epoch(&self, uid: &str) -> u64 {
+    pub fn message_head(&self, uid: &str) -> u64 {
         self.state
             .borrow()
-            .screens
+            .messages
             .get(uid)
-            .map_or(0, ScreenStore::epoch)
+            .map_or(0, MessageLog::head)
     }
 
-    pub fn stable_page(&self, uid: &str, after: u64, limit: usize) -> StablePage {
+    pub fn messages_after(&self, uid: &str, after: u64, limit: usize) -> MessagePage {
         self.state
             .borrow()
-            .screens
+            .messages
             .get(uid)
-            .map_or_else(StablePage::default, |screen| {
-                screen.stable_page(after, limit)
-            })
+            .map_or_else(MessagePage::default, |log| log.page_after(after, limit))
     }
 
-    pub fn stable_tail(&self, uid: &str, limit: usize) -> StablePage {
+    pub fn messages_tail(&self, uid: &str, limit: usize) -> MessagePage {
         self.state
             .borrow()
-            .screens
+            .messages
             .get(uid)
-            .map_or_else(StablePage::default, |screen| screen.stable_tail(limit))
+            .map_or_else(MessagePage::default, |log| log.tail(limit))
     }
 
-    pub fn stable_head(&self, uid: &str) -> u64 {
-        self.state
-            .borrow()
-            .screens
-            .get(uid)
-            .map_or(0, ScreenStore::head_row_id)
-    }
-
-    pub fn live_screen(&self, uid: &str, limit: usize) -> LiveScreen {
-        let state = self.state.borrow();
-        let Some(screen) = state.screens.get(uid) else {
-            return LiveScreen::default();
-        };
-        let (rows, truncated) = screen.live_rows(limit.min(LIVE_ROW_LIMIT));
-        LiveScreen {
-            epoch: screen.epoch(),
-            reset_reason: screen.last_reset_reason().map(EpochReason::as_str),
-            rows,
-            truncated,
-        }
-    }
-
-    /// Rendered rows addressed by absolute row ID, live grid included.
-    pub fn rendered_rows(&self, uid: &str, before: Option<u64>, lines: usize) -> RenderedRows {
-        let state = self.state.borrow();
-        let Some(screen) = state.screens.get(uid) else {
-            return RenderedRows::default();
-        };
-        let head = screen.head_row_id();
-        let (live, _) = screen.live_rows(usize::MAX);
-        let live_len = u64::try_from(live.len()).unwrap_or(0);
-        let (rows, cols) = screen.size();
-        let end = before
-            .unwrap_or(head + live_len + 1)
-            .min(head + live_len + 1);
-        let floor = screen.floor_row_id();
-        let start = end
-            .saturating_sub(u64::try_from(lines).unwrap_or(0))
-            .max(floor);
-        let mut selected = Vec::new();
-        if start < end.min(head + 1) {
-            let page = screen.stable_page(
-                start - 1,
-                usize::try_from(end.min(head + 1) - start).unwrap_or(0),
-            );
-            selected.extend(page.lines);
-        }
-        for (index, row) in live.into_iter().enumerate() {
-            let id = head + u64::try_from(index).unwrap_or(0) + 1;
-            if id >= start && id < end {
-                selected.push(row);
+    /// Record a message against the Session's active execution, if any. A
+    /// refused approval is counted on that execution's result.
+    pub fn append_message(&self, session_id: &str, body: MessageBody) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        let session = state.sessions.get(session_id)?;
+        let uid = session.uid.clone();
+        let turn_id = session.record.active_turn_id.clone();
+        let refuses = body.refuses();
+        let execution_seq = turn_id.and_then(|id| {
+            let turn = state.turns.get_mut(&id)?;
+            if refuses {
+                turn.denied_requests += 1;
             }
-        }
-        RenderedRows {
-            rows,
-            cols,
-            lines: selected,
-            truncated: start > floor || floor > 1,
-            before: (start > floor).then_some(start),
+            Some(turn.execution_seq)
+        });
+        Some(
+            state
+                .messages
+                .entry(uid)
+                .or_default()
+                .push(execution_seq, body),
+        )
+    }
+
+    /// Note that the provider emitted something, for `quiet_for_ms`.
+    pub fn touch_provider(&self, session_id: &str) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.last_provider_event_ms = Some(now_ms());
         }
     }
-}
 
-#[derive(Debug, Default)]
-pub struct RenderedRows {
-    pub rows: u16,
-    pub cols: u16,
-    pub lines: Vec<String>,
-    pub truncated: bool,
-    pub before: Option<u64>,
+    pub fn last_provider_event_ms(&self, session_id: &str) -> Option<i64> {
+        self.state
+            .borrow()
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.last_provider_event_ms)
+    }
+
+    /// Open a Request and block the Session on it. A Session that is not
+    /// running an execution cannot be blocked, so the Request is not opened.
+    pub fn open_request(&self, session_id: &str, draft: RequestDraft) -> Option<RequestRecord> {
+        let (record, blocked_now) = {
+            let mut state = self.state.borrow_mut();
+            let session = state.sessions.get(session_id)?;
+            if !matches!(
+                session.record.state,
+                SessionState::Busy | SessionState::Blocked
+            ) {
+                return None;
+            }
+            let uid = session.uid.clone();
+            let blocked_now = session.record.state == SessionState::Busy;
+            let execution_seq = session
+                .record
+                .active_turn_id
+                .as_ref()
+                .and_then(|id| state.turns.get(id))
+                .map(|turn| turn.execution_seq);
+            let record =
+                state
+                    .requests
+                    .entry(uid)
+                    .or_default()
+                    .open(draft, execution_seq, now_ms());
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.record.state = SessionState::Blocked;
+                session.record.updated_at_ms = now_ms();
+            }
+            (record, blocked_now)
+        };
+        if blocked_now {
+            let turn_id = self
+                .get_session(session_id)
+                .and_then(|session| session.active_turn_id);
+            self.record_event(Some(session_id), turn_id.as_deref(), "session.blocked");
+        }
+        Some(record)
+    }
+
+    pub fn request(&self, session_id: &str, id: &str) -> Option<RequestRecord> {
+        let state = self.state.borrow();
+        let uid = &state.sessions.get(session_id)?.uid;
+        state.requests.get(uid)?.get(id).cloned()
+    }
+
+    pub fn pending_requests(&self, uid: &str) -> Vec<RequestRecord> {
+        self.state
+            .borrow()
+            .requests
+            .get(uid)
+            .map(RequestTable::pending)
+            .unwrap_or_default()
+    }
+
+    /// Record the caller's answer. The Session leaves `blocked` once its last
+    /// pending Request is resolved.
+    pub fn resolve_request(&self, session_id: &str, id: &str, resolution: Resolution) -> bool {
+        let resolved = {
+            let mut state = self.state.borrow_mut();
+            let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+                return false;
+            };
+            state
+                .requests
+                .get_mut(&uid)
+                .and_then(|table| table.resolve(id, resolution))
+                .is_some()
+        };
+        if resolved {
+            self.unblock_if_settled(session_id);
+        }
+        resolved
+    }
+
+    /// Close pending Requests as canceled: all of them, or the one the
+    /// provider withdrew.
+    pub fn cancel_requests(
+        &self,
+        session_id: &str,
+        provider_key: Option<&str>,
+    ) -> Vec<RequestRecord> {
+        let closed = {
+            let mut state = self.state.borrow_mut();
+            let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+                return Vec::new();
+            };
+            state
+                .requests
+                .get_mut(&uid)
+                .map(|table| table.cancel(provider_key))
+                .unwrap_or_default()
+        };
+        if !closed.is_empty() {
+            self.unblock_if_settled(session_id);
+        }
+        closed
+    }
+
+    fn unblock_if_settled(&self, session_id: &str) {
+        let turn_id = {
+            let mut state = self.state.borrow_mut();
+            let Some(session) = state.sessions.get(session_id) else {
+                return;
+            };
+            if session.record.state != SessionState::Blocked
+                || state
+                    .requests
+                    .get(&session.uid)
+                    .is_some_and(RequestTable::has_pending)
+            {
+                return;
+            }
+            let Some(session) = state.sessions.get_mut(session_id) else {
+                return;
+            };
+            session.record.state = SessionState::Busy;
+            session.record.updated_at_ms = now_ms();
+            session.record.active_turn_id.clone()
+        };
+        self.record_event(Some(session_id), turn_id.as_deref(), "session.resumed");
+    }
+
+    /// Record the mode the provider says it runs, when it differs from the
+    /// one the Session asked for.
+    pub fn set_effective_approvals(
+        &self,
+        session_id: &str,
+        effective: ApprovalsMode,
+        reason: &str,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let approvals = &mut session.record.approvals;
+        if approvals.effective == effective {
+            return false;
+        }
+        approvals.effective = effective;
+        approvals.reason = (effective != approvals.requested).then(|| reason.to_owned());
+        session.record.updated_at_ms = now_ms();
+        true
+    }
+
+    /// Returns whether the reported authentication is new information.
+    pub fn set_auth(&self, session_id: &str, auth: Auth) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let changed = session.record.auth != Some(auth);
+        session.record.auth = Some(auth);
+        changed
+    }
+
+    pub fn set_resolved_model(&self, session_id: &str, model: &str) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.resolved_model = Some(model.to_owned());
+        }
+    }
+
+    /// Replace the launch selection a restart or resume reuses.
+    pub fn set_requested_approvals(&self, session_id: &str, requested: ApprovalsMode) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.approvals = Approvals::new(requested);
+        }
+    }
+
+    pub fn set_turn_usage(&self, id: &str, usage: Value) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+            turn.usage = Some(usage);
+        }
+    }
+
+    /// Raise an execution's denial count to what the provider itself counted.
+    pub fn raise_denied_requests(&self, id: &str, count: u32) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+            turn.denied_requests = turn.denied_requests.max(count);
+        }
+    }
 }
 
 /// Evict the oldest retained results once a Session exceeds either bound.
@@ -1030,7 +1066,16 @@ fn enforce_result_retention(state: &mut MemoryState, session_id: &str) {
     }
 }
 
+fn close_requests(state: &mut MemoryState, session_id: &str) {
+    if let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone())
+        && let Some(table) = state.requests.get_mut(&uid)
+    {
+        table.cancel(None);
+    }
+}
+
 fn set_terminal_session(state: &mut MemoryState, id: &str, terminal_state: SessionState) {
+    close_requests(state, id);
     if let Some(session) = state.sessions.get_mut(id) {
         session.record.state = terminal_state;
         session.record.pid = None;
@@ -1049,7 +1094,11 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{NewSession, Store};
-    use crate::protocol::{SessionState, TurnState};
+    use crate::messages::{Decider, Decision, MessageBody};
+    use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnState};
+    use crate::requests::{
+        Answer, Outcome, ProviderRequest, RequestDraft, RequestKind, Resolution,
+    };
 
     fn ready_store() -> Store {
         let store = Store::new();
@@ -1063,7 +1112,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(store.set_session_running("codex:thread-1", Some(42)));
@@ -1077,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_explicit_auto_approve_opt_out() {
+    fn retains_the_requested_approvals_mode() {
         let store = Store::new();
         store
             .insert_session(&NewSession {
@@ -1089,17 +1138,19 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: false,
+                approvals: ApprovalsMode::Ask,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         let session = store
             .get_session("claude:thread-1")
             .unwrap_or_else(|| panic!("session missing"));
-        assert!(!session.auto_approve);
+        assert_eq!(session.approvals.requested, ApprovalsMode::Ask);
+        assert_eq!(session.approvals.effective, ApprovalsMode::Ask);
+        assert!(session.approvals.reason.is_none());
     }
 
     #[test]
-    fn retains_session_turn_event_and_input_sequence() {
+    fn retains_session_turn_and_event() {
         let mut store = Store::new();
         store
             .insert_session(&NewSession {
@@ -1111,7 +1162,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1119,9 +1170,10 @@ mod tests {
             .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         assert_eq!(turn.state, TurnState::Submitted);
-        store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.submitted");
-        assert_eq!(store.allocate_input_sequence(), 1);
-        assert_eq!(store.allocate_input_sequence(), 2);
+        assert_eq!(
+            store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.submitted"),
+            1
+        );
     }
 
     #[test]
@@ -1137,7 +1189,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1226,7 +1278,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store.record_event(Some("internal:LAUNCH01"), None, "session.created");
@@ -1315,7 +1367,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:old-session");
@@ -1330,7 +1382,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to reuse alias: {error}"));
         let archived = store
@@ -1360,7 +1412,7 @@ mod tests {
                 model: Some("gpt-test"),
                 effort: Some("high"),
                 harness_options: &harness_options,
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "claude:provider-thread");
@@ -1407,7 +1459,7 @@ mod tests {
                     model: None,
                     effort: None,
                     harness_options: &[],
-                    auto_approve: true,
+                    approvals: ApprovalsMode::Auto,
                 })
                 .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
             mark_ready(&store, id);
@@ -1439,7 +1491,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1475,7 +1527,7 @@ mod tests {
                     model: None,
                     effort: None,
                     harness_options: &[],
-                    auto_approve: true,
+                    approvals: ApprovalsMode::Auto,
                 })
                 .is_err()
         );
@@ -1494,7 +1546,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1511,32 +1563,6 @@ mod tests {
     }
 
     #[test]
-    fn output_reads_are_paginated() {
-        let store = Store::new();
-        store
-            .insert_session(&NewSession {
-                id: "codex:thread-1",
-                alias: "@worker",
-                title: "worker",
-                agent: "codex",
-                cwd: "/tmp",
-                model: None,
-                effort: None,
-                harness_options: &[],
-                auto_approve: true,
-            })
-            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        store.record_output("codex:thread-1", b"first");
-        store.record_output("codex:thread-1", b"second");
-        let first = store.read_output_page("codex:thread-1", 0, 5);
-        assert_eq!(first.data, b"first");
-        assert!(first.has_more);
-        let second = store.read_output_page("codex:thread-1", first.next_after, 5);
-        assert_eq!(second.data, b"second");
-        assert!(!second.has_more);
-    }
-
-    #[test]
     fn only_one_turn_can_claim_a_session() {
         let mut store = Store::new();
         store
@@ -1549,7 +1575,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1576,7 +1602,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(store.set_session_running("claude:session", Some(42)));
@@ -1601,7 +1627,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1634,7 +1660,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1674,7 +1700,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1718,7 +1744,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store.set_session_stopped("codex:thread-1");
@@ -1742,7 +1768,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert_eq!(
@@ -1770,11 +1796,11 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert old Session: {error}"));
         mark_ready(&store, "codex:thread-1");
-        store.record_output("codex:thread-1", b"old");
+        store.append_message("codex:thread-1", MessageBody::notice("old"));
         store.set_session_stopped("codex:thread-1");
 
         store
@@ -1787,7 +1813,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert launch Session: {error}"));
         mark_ready(&store, "internal:ABC12345");
@@ -1795,7 +1821,7 @@ mod tests {
             .insert_turn("turn_rekey", "internal:ABC12345", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         store.record_event(Some("internal:ABC12345"), Some(&turn.id), "turn.submitted");
-        store.record_output("internal:ABC12345", b"new");
+        store.append_message("internal:ABC12345", MessageBody::notice("new"));
 
         store
             .rekey_session("internal:ABC12345", "codex:thread-1")
@@ -1818,9 +1844,168 @@ mod tests {
         assert!(store.read_events(Some(&uid), 0).is_empty());
         store.record_event(Some("codex:thread-1"), None, "session.created");
         assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
+        let messages = store.messages_after(&uid, 0, 64).messages;
         assert_eq!(
-            store.read_output_page("codex:thread-1", 0, 64).data,
-            b"oldnew"
+            messages
+                .iter()
+                .map(|message| (message.seq, message.execution_seq, message.body.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (1, None, MessageBody::notice("old")),
+                (2, Some(1), MessageBody::notice("new")),
+            ],
+            "the resumed Session continues one message history"
         );
+    }
+
+    fn approval_draft(provider_key: &str) -> RequestDraft {
+        RequestDraft {
+            kind: RequestKind::Approval,
+            provider_key: provider_key.to_owned(),
+            provider: ProviderRequest::CodexCommand,
+            tool: "exec".to_owned(),
+            summary: "touch a".to_owned(),
+            input: serde_json::json!({"command": "touch a"}),
+            cwd: None,
+            reason: None,
+            text: None,
+            choices: Vec::new(),
+        }
+    }
+
+    fn busy_store() -> Store {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.set_session_state("codex:thread-1", SessionState::Busy));
+        store
+    }
+
+    fn state(store: &Store) -> SessionState {
+        store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|| panic!("session missing"))
+            .state
+    }
+
+    #[test]
+    fn a_session_is_blocked_exactly_while_a_request_is_pending() {
+        let store = busy_store();
+        let first = store
+            .open_request("codex:thread-1", approval_draft("p1"))
+            .unwrap_or_else(|| panic!("request was not opened"));
+        let second = store
+            .open_request("codex:thread-1", approval_draft("p2"))
+            .unwrap_or_else(|| panic!("request was not opened"));
+        assert_eq!((first.id.as_str(), second.id.as_str()), ("r1", "r2"));
+        assert_eq!(first.execution_seq, Some(1));
+        assert_eq!(state(&store), SessionState::Blocked);
+
+        let allowed = Resolution {
+            outcome: Outcome::Allowed,
+            answer: Some(Answer::Allow),
+        };
+        assert!(store.resolve_request("codex:thread-1", "r1", allowed.clone()));
+        assert_eq!(state(&store), SessionState::Blocked, "r2 is still pending");
+        assert!(
+            !store.resolve_request("codex:thread-1", "r1", allowed.clone()),
+            "a Request is resolved once"
+        );
+        assert!(store.resolve_request("codex:thread-1", "r2", allowed));
+        assert_eq!(state(&store), SessionState::Busy);
+
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let kinds = store
+            .read_events(Some(&uid), 0)
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["session.blocked", "session.resumed"]);
+    }
+
+    #[test]
+    fn an_idle_session_cannot_be_blocked() {
+        let store = ready_store();
+        assert!(
+            store
+                .open_request("codex:thread-1", approval_draft("p1"))
+                .is_none()
+        );
+        assert_eq!(state(&store), SessionState::Idle);
+    }
+
+    #[test]
+    fn ending_the_execution_closes_its_pending_requests_as_canceled() {
+        let mut store = busy_store();
+        store.open_request("codex:thread-1", approval_draft("p1"));
+        assert!(
+            store
+                .cancel_turn("turn_1")
+                .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
+        );
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        assert!(store.pending_requests(&uid).is_empty());
+        assert_eq!(
+            store
+                .request("codex:thread-1", "r1")
+                .and_then(|request| request.resolution)
+                .map(|resolution| resolution.outcome),
+            Some(Outcome::Canceled)
+        );
+        assert_eq!(state(&store), SessionState::Quiescing);
+    }
+
+    #[test]
+    fn a_refused_approval_is_counted_on_the_running_execution() {
+        let store = busy_store();
+        for decision in [Decision::Approved, Decision::Denied, Decision::TimedOut] {
+            store.append_message(
+                "codex:thread-1",
+                MessageBody::approval(decision, Decider::ProviderReviewer, None, None, "exec", "x"),
+            );
+        }
+        assert_eq!(
+            store.get_turn("turn_1").map(|turn| turn.denied_requests),
+            Some(2)
+        );
+        store.raise_denied_requests("turn_1", 1);
+        assert_eq!(
+            store.get_turn("turn_1").map(|turn| turn.denied_requests),
+            Some(2),
+            "the provider's own count never lowers what dlgt observed"
+        );
+    }
+
+    #[test]
+    fn the_effective_approvals_mode_reports_why_it_differs() {
+        let store = ready_store();
+        assert!(store.set_effective_approvals(
+            "codex:thread-1",
+            ApprovalsMode::Ask,
+            "provider reported permission mode default"
+        ));
+        let approvals = store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|| panic!("session missing"))
+            .approvals;
+        assert_eq!(approvals.requested, ApprovalsMode::Auto);
+        assert_eq!(approvals.effective, ApprovalsMode::Ask);
+        assert_eq!(
+            approvals.reason.as_deref(),
+            Some("provider reported permission mode default")
+        );
+        assert!(store.set_effective_approvals("codex:thread-1", ApprovalsMode::Auto, "back"));
+        assert!(
+            store
+                .get_session("codex:thread-1")
+                .is_some_and(|session| session.approvals.reason.is_none())
+        );
+        assert!(store.set_auth("codex:thread-1", Auth::Subscription));
+        assert!(!store.set_auth("codex:thread-1", Auth::Subscription));
     }
 }

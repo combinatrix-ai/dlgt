@@ -42,13 +42,8 @@ pub struct Cursor {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionCursor {
-    /// Stable absolute row watermark: the last row delivered in full.
-    pub r: u64,
-    /// Bytes of row `r + 1` a previous response already delivered. Non-zero
-    /// only while one oversized row is being chunked across responses.
-    pub ro: u64,
-    /// Screen epoch observed when the cursor was issued.
-    pub ep: u64,
+    /// Message watermark: the last message sequence delivered.
+    pub m: u64,
     /// Highest fully delivered terminal result execution sequence.
     pub x: i64,
     /// Execution sequence of a partially delivered final text, if any.
@@ -62,9 +57,7 @@ impl Cursor {
         Self {
             e: 0,
             p: SessionCursor {
-                r: 0,
-                ro: 0,
-                ep: 0,
+                m: 0,
                 x: 0,
                 px: None,
                 po: 0,
@@ -170,9 +163,7 @@ mod tests {
         let mut cursor = Cursor::new();
         cursor.e = 104;
         cursor.set_session(SessionCursor {
-            r: row,
-            ro: 0,
-            ep: 3,
+            m: row,
             x: 7,
             px: Some(8),
             po: 4_096,

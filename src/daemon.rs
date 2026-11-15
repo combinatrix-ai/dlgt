@@ -9,32 +9,36 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine as _;
-use portable_pty::PtySize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::codex::{CodexConnection, final_agent_message_text};
+use crate::claude::{self, ClaudeProcess, ClaudeTurns};
+use crate::codex::CodexConnection;
+use crate::codex_events::{self, CodexItems};
 use crate::cursor;
+use crate::messages::{Decider, Decision, MessageBody};
 use crate::paths;
-use crate::protocol::{Request, Response, SessionRecord, SessionState, TurnRecord, TurnState};
+use crate::protocol::{
+    ApprovalsMode, Request, Response, SessionRecord, SessionState, TurnRecord, TurnState,
+};
 use crate::provider::{
-    Agent, CommandSpec, LaunchOptions, StartupBlocker, claude_session_marker,
-    codex_remote_tui_command, command_spec, prepare_workspace, provider_display_name,
-    startup_blocker,
+    Agent, LaunchOptions, claude_command, claude_session_marker, codex_discovery_args,
+    codex_session_args, codex_thread_params, prepare_workspace, provider_display_name,
 };
 use crate::reaper::Reaper;
-use crate::session::SessionRuntime;
+use crate::requests::{
+    Answer, Outcome, PUBLISHED_REQUEST_LIMIT, ProviderRequest, RequestKind, Resolution,
+};
 use crate::store::{NewSession, Store, now_ms};
 use crate::update;
 
-const CLAUDE_INPUT_READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// A short confirmation window covers the normal hook path without turning
-/// submission into observation. Expiry is a successful `pending` receipt.
+/// A short confirmation window covers the normal provider acknowledgement
+/// without turning submission into observation. Expiry is a successful
+/// `pending` receipt.
 const SUBMISSION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Composite read bounds. Response size is part of the protocol: an LLM caller
 /// pays for every byte, so pagination is not optional implementation tuning.
@@ -42,20 +46,17 @@ const FETCH_DEFAULT_MAX_BYTES: usize = 32 * 1024;
 const FETCH_HARD_MAX_BYTES: usize = 256 * 1024;
 const FETCH_EVENT_PAGE: usize = 64;
 const FETCH_RESULT_PAGE: usize = 4;
-const FETCH_STABLE_PAGE: usize = 128;
-const FETCH_STABLE_MAX: usize = 512;
-const FETCH_LIVE_ROWS: usize = 40;
+const FETCH_MESSAGE_PAGE: usize = 64;
+const FETCH_MESSAGE_MAX: usize = 512;
 /// A long poll is bounded only to catch typos and leaked waiters.
 const FETCH_MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 const FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How often a launch checks its screen for a known blocking dialog.
-const STARTUP_BLOCKER_POLL: Duration = Duration::from_millis(250);
-/// Rendered rows retained with a launch failure.
-const LAUNCH_FAILURE_SCREEN_LINES: usize = 40;
 /// Acceptance receipts retained per daemon, evicted first-in-first-out.
 const REQUEST_RECEIPT_LIMIT: usize = 1024;
-const CLAUDE_INPUT_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 const EMPTY_DAEMON_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+/// How long a provider gets to acknowledge a control request it normally
+/// answers at once.
+const CLAUDE_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn is_stale_socket_error(error: &std::io::Error) -> bool {
     matches!(
@@ -271,10 +272,8 @@ pub fn run() -> Result<()> {
         instance_id: Uuid::new_v4().simple().to_string(),
         receipts: ReceiptLedger::default(),
         store: Arc::new(Mutex::new(store)),
-        submission_changed: Condvar::new(),
+        submission_changed: Arc::new(Condvar::new()),
         sessions: Arc::new(RwLock::new(HashMap::new())),
-        attach_leases: Mutex::new(HashMap::new()),
-        pending_provider_ids: Arc::new(Mutex::new(HashMap::new())),
         shutting_down: AtomicBool::new(false),
         update_notice: Arc::new(RwLock::new(None)),
         update_shutdown,
@@ -345,9 +344,9 @@ pub fn run() -> Result<()> {
         for runtime in sessions.values() {
             // Daemon shutdown is the ownership boundary: no provider process
             // may outlive the runtime that created it. A graceful child-only
-            // stop can leave descendants alive, so terminate the whole PTY
+            // stop can leave descendants alive, so terminate the whole
             // process group here.
-            let _ = runtime.force_stop();
+            runtime.force_stop();
         }
     }
     // Unlink while this listener and the advisory ownership lock are still
@@ -371,15 +370,15 @@ struct Daemon {
     /// creating a duplicate Session or execution.
     receipts: ReceiptLedger,
     store: Arc<Mutex<Store>>,
-    submission_changed: Condvar,
-    sessions: Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
-    attach_leases: Mutex<HashMap<String, String>>,
-    pending_provider_ids: Arc<Mutex<HashMap<String, Option<String>>>>,
+    submission_changed: Arc<Condvar>,
+    sessions: SessionMap,
     shutting_down: AtomicBool,
     update_notice: Arc<RwLock<Option<Value>>>,
     update_shutdown: SyncSender<()>,
     reaper: Arc<Reaper>,
 }
+
+type SessionMap = Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>;
 
 impl Daemon {
     fn request_shutdown(&self) {
@@ -393,46 +392,6 @@ struct ProviderReservation {
     session_id: String,
 }
 
-struct PendingProviderId {
-    pending: Arc<Mutex<HashMap<String, Option<String>>>>,
-    launch_id: String,
-}
-
-impl PendingProviderId {
-    fn register(
-        pending: &Arc<Mutex<HashMap<String, Option<String>>>>,
-        launch_id: &str,
-    ) -> Result<Self> {
-        let mut bindings = pending
-            .lock()
-            .map_err(|_| anyhow!("pending provider ID map lock poisoned"))?;
-        if bindings.insert(launch_id.to_owned(), None).is_some() {
-            bail!("pending provider ID already exists: {launch_id}");
-        }
-        Ok(Self {
-            pending: Arc::clone(pending),
-            launch_id: launch_id.to_owned(),
-        })
-    }
-
-    fn take(&mut self) -> Result<String> {
-        self.pending
-            .lock()
-            .map_err(|_| anyhow!("pending provider ID map lock poisoned"))?
-            .remove(&self.launch_id)
-            .flatten()
-            .context("provider did not report a Session ID")
-    }
-}
-
-impl Drop for PendingProviderId {
-    fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&self.launch_id);
-        }
-    }
-}
-
 impl Drop for ProviderReservation {
     fn drop(&mut self) {
         if let Ok(store) = self.store.lock() {
@@ -441,105 +400,60 @@ impl Drop for ProviderReservation {
     }
 }
 
+/// The provider process behind one Session and its structured channel.
 enum AgentRuntime {
-    Pty(Arc<SessionRuntime>),
     Codex {
         control: Arc<CodexConnection>,
-        provider_thread_id: String,
-        view: Arc<SessionRuntime>,
+        thread_id: String,
+    },
+    Claude {
+        process: Arc<ClaudeProcess>,
+        turns: Arc<Mutex<ClaudeTurns>>,
     },
 }
 
 impl AgentRuntime {
-    fn provider_id(&self) -> Option<&str> {
+    fn pid(&self) -> u32 {
         match self {
-            Self::Pty(_) => None,
-            Self::Codex {
-                provider_thread_id, ..
-            } => Some(provider_thread_id),
+            Self::Codex { control, .. } => control.pid(),
+            Self::Claude { process, .. } => process.pid(),
         }
     }
 
-    fn pid(&self) -> Option<u32> {
+    fn stop(&self) {
         match self {
-            Self::Pty(runtime) => runtime.pid(),
-            Self::Codex { view, .. } => view.pid(),
+            Self::Codex { control, .. } => control.stop(),
+            Self::Claude { process, .. } => process.stop(),
         }
     }
 
-    fn write(&self, data: &[u8]) -> Result<()> {
+    fn force_stop(&self) {
         match self {
-            Self::Pty(runtime) => runtime.write(data),
-            Self::Codex { view, .. } => view.write(data),
+            Self::Codex { control, .. } => control.force_stop(),
+            Self::Claude { process, .. } => process.force_stop(),
         }
     }
 
-    fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+    fn stderr_tail(&self) -> String {
         match self {
-            Self::Pty(runtime) => runtime.resize(rows, cols),
-            Self::Codex { view, .. } => view.resize(rows, cols),
+            Self::Codex { control, .. } => control.stderr_tail(),
+            Self::Claude { process, .. } => process.stderr_tail(),
         }
     }
+}
 
-    fn subscribe(&self) -> Result<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
-        match self {
-            Self::Pty(runtime) => runtime.subscribe(),
-            Self::Codex { view, .. } => view.subscribe(),
-        }
-    }
+/// Why a provider process never became a ready Session.
+struct LaunchError {
+    error: anyhow::Error,
+    /// The provider's stderr tail, when the process got far enough to write.
+    detail: Option<String>,
+}
 
-    fn last_output_age(&self) -> Result<Option<Duration>> {
-        match self {
-            Self::Pty(runtime) => runtime.last_output_age(),
-            Self::Codex { view, .. } => view.last_output_age(),
-        }
-    }
-
-    fn stop(&self) -> Result<()> {
-        match self {
-            Self::Pty(runtime) => runtime.stop(),
-            Self::Codex { view, .. } => view.stop(),
-        }
-    }
-
-    fn force_stop(&self) -> Result<()> {
-        match self {
-            Self::Pty(runtime) => runtime.force_stop(),
-            Self::Codex { view, .. } => view.force_stop(),
-        }
-    }
-
-    fn wait_for_input_ready(&self, timeout: Duration) -> Result<()> {
-        match self {
-            Self::Pty(runtime) => runtime.wait_for_input_ready(timeout),
-            Self::Codex { view, .. } => view.wait_for_input_ready(timeout),
-        }
-    }
-
-    fn start_codex_turn(&self, prompt: &str) -> Result<String> {
-        match self {
-            Self::Codex {
-                control,
-                provider_thread_id,
-                ..
-            } => {
-                control.join_thread(provider_thread_id)?;
-                let turn_id = control.start_turn(provider_thread_id, prompt)?;
-                control.watch_turn(provider_thread_id, &turn_id)?;
-                Ok(turn_id)
-            }
-            Self::Pty(_) => bail!("PTY turns use semantic PTY input"),
-        }
-    }
-
-    fn interrupt_codex_turn(&self, provider_turn_id: &str) -> Result<()> {
-        match self {
-            Self::Codex {
-                control,
-                provider_thread_id,
-                ..
-            } => control.interrupt_turn(provider_thread_id, provider_turn_id),
-            Self::Pty(_) => bail!("PTY turns use semantic PTY input"),
+impl From<anyhow::Error> for LaunchError {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            detail: None,
         }
     }
 }
@@ -588,9 +502,6 @@ impl Daemon {
                 ),
             );
         }
-        if request.method == "view.subscribe" {
-            return self.subscribe_view(&mut stream, &request);
-        }
         let response = match self.dispatch(&request.method, &request.params) {
             Ok(result) => Response::ok(request.id, result).with_info(
                 self.update_notice
@@ -619,7 +530,7 @@ impl Daemon {
             if (error.code == "SESSION_NOT_RUNNING"
                 || matches!(
                     request.method.as_str(),
-                    "session.send" | "session.fetch" | "session.cancel"
+                    "session.send" | "session.fetch" | "session.cancel" | "session.answer"
                 ))
                 && let Some(selector) = request.params.get("session").and_then(Value::as_str)
             {
@@ -633,14 +544,7 @@ impl Daemon {
                     }
                     error.session_state = Some(session.state.public_name().to_owned());
                     if error.code == "SESSION_BLOCKED" && error.session_id.is_some() {
-                        // Worded for a human on a real terminal: agents have
-                        // executed this hint verbatim from non-TTY tool calls
-                        // and received raw ANSI. Agents observe the question
-                        // through fetch's blocked screen instead.
-                        error.action = Some(format!(
-                            "have a human run in a terminal: dlgt attach {}",
-                            error.session_id.as_deref().unwrap_or(selector)
-                        ));
+                        self.describe_blocked(&session, error);
                     }
                 } else if selector
                     .split_once(':')
@@ -651,6 +555,23 @@ impl Daemon {
             }
         }
         write_response(&mut stream, &response)
+    }
+
+    /// Name the pending Requests and the command that answers the first one.
+    fn describe_blocked(&self, session: &SessionRecord, error: &mut crate::protocol::RpcError) {
+        let Ok(store) = self.lock_store() else { return };
+        let pending = store
+            .session_uid(&session.id)
+            .map(|uid| store.pending_requests(&uid))
+            .unwrap_or_default();
+        drop(store);
+        let Some(first) = pending.first() else { return };
+        let answer = match first.draft.kind {
+            RequestKind::Approval => "--allow|--deny",
+            RequestKind::Question => "--text <TEXT>|--choice <N>",
+        };
+        error.action = Some(format!("dlgt answer {} {} {answer}", session.id, first.id));
+        error.request_ids = Some(pending.iter().map(|request| request.id.clone()).collect());
     }
 
     fn dispatch(&self, method: &str, params: &Value) -> Result<Value> {
@@ -671,41 +592,41 @@ impl Daemon {
             "session.restart" => self.restart_session(params),
             "session.list" => {
                 let include_all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
-                let sessions = self.lock_store()?.list_sessions();
-                let mut public = Vec::new();
-                for session in sessions.into_iter().filter(|session| {
-                    !session.id.starts_with("internal:")
-                        && (include_all || !session.state.is_terminal())
-                }) {
-                    public.push(self.public_session(&session)?);
-                }
-                Ok(Value::Array(public))
+                let store = self.lock_store()?;
+                Ok(Value::Array(
+                    store
+                        .list_sessions()
+                        .into_iter()
+                        .filter(|session| {
+                            !session.id.starts_with("internal:")
+                                && (include_all || !session.state.is_terminal())
+                        })
+                        .map(|session| public_session_locked(&store, &session))
+                        .collect(),
+                ))
             }
             "session.read" => self.read_session(params),
-            "session.input" => self.input_session(params),
-            "session.resize" => self.resize_session(params),
             "session.stop" => self.stop_session(params),
             "session.send" => {
                 validate_request_id(params)?;
+                let flag = |name: &str| params.get(name).and_then(Value::as_bool).unwrap_or(false);
+                if flag("resume") && flag("steer") {
+                    bail!("invalid send: --steer and --resume are mutually exclusive");
+                }
                 self.accept_once(params, |params| {
-                    if params
-                        .get("resume")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
+                    if flag("resume") {
                         self.resume_session(params)
+                    } else if flag("steer") {
+                        self.steer_turn(params)
                     } else {
                         self.submit_turn(params)
                     }
                 })
             }
+            "session.answer" => self.answer_request(params),
             "session.fetch" => self.fetch(params),
             "session.cancel" => self.cancel_session(params),
-            "transcript.read_raw" => self.read_transcript(params),
-            "scrollback.read" => self.read_scrollback(params),
             "model.list" => self.list_models(params),
-            "harness.list" => Self::list_harnesses(params),
-            "hook.event" => self.handle_hook(params),
             _ => bail!("unknown method {method:?}"),
         }
     }
@@ -754,24 +675,13 @@ impl Daemon {
                 .context("invalid harness_options")?,
             Some(_) => bail!("harness_options must be an array"),
         };
-        let auto_approve = params
-            .get("auto_approve")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let environment = params
-            .get("environment")
-            .and_then(Value::as_object)
-            .context("missing launch environment snapshot")?
-            .iter()
-            .map(|(key, value)| {
-                value
-                    .as_str()
-                    .map(|value| (key.clone(), value.to_owned()))
-                    .with_context(|| format!("environment value for {key:?} must be a string"))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        let rows = params_u16(params, "rows", 24)?;
-        let cols = params_u16(params, "cols", 80)?;
+        let approvals = params
+            .get("approvals")
+            .and_then(Value::as_str)
+            .map(ApprovalsMode::parse)
+            .transpose()?
+            .unwrap_or(ApprovalsMode::Auto);
+        let environment = launch_environment(params)?;
         let mut id = generate_internal_id();
         let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
             .then(|| Uuid::new_v4().to_string());
@@ -787,7 +697,7 @@ impl Daemon {
                 model,
                 effort,
                 harness_options: &harness_options,
-                auto_approve,
+                approvals,
             });
             match inserted {
                 Ok(()) => break,
@@ -816,19 +726,9 @@ impl Daemon {
         };
         self.lock_store()?
             .record_event(Some(&id), None, "session.created");
-        self.lock_store()?.set_terminal_size(&id, rows, cols);
         let runtime_session_id = Arc::new(RwLock::new(id.clone()));
-        let mut pending_provider_id = if agent == Agent::Codex {
-            None
-        } else {
-            Some(PendingProviderId::register(
-                &self.pending_provider_ids,
-                &id,
-            )?)
-        };
         let options = LaunchOptions {
             agent,
-            session_id: &id,
             title,
             cwd: &cwd,
             model,
@@ -837,127 +737,30 @@ impl Daemon {
             new_provider_id: new_provider_id.as_deref(),
             resume_provider_id,
             environment: &environment,
-            auto_approve,
+            approvals,
         };
-
-        let startup_timeout = Duration::from_millis(
-            params
-                .get("startup_timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(60_000)
-                .min(300_000),
-        );
-        let startup_deadline = Instant::now() + startup_timeout;
-        let runtime = match agent {
-            Agent::Claude => command_spec(&options)
-                .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
-            Agent::Codex => {
-                self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, startup_timeout)
-            }
-        };
-        let runtime = match runtime {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let store = self.lock_store()?;
-                store.set_session_failed(&id);
-                store.record_event(Some(&id), None, "session.failed");
-                drop(store);
-                return Err(self.session_launch_failure(&id, &error));
-            }
-        };
-        let pid = runtime.pid();
-        self.sessions
-            .write()
-            .map_err(|_| anyhow!("session map lock poisoned"))?
-            .insert(id.clone(), Arc::clone(&runtime));
-        let store = self.lock_store()?;
-        if !store.set_session_running(&id, pid) {
-            drop(store);
-            self.sessions
-                .write()
-                .map_err(|_| anyhow!("session map lock poisoned"))?
-                .remove(&id);
-            let session = self
-                .lock_store()?
-                .get_session(&id)
-                .context("exited session not found")?;
-            return Err(self.session_launch_failure(
-                &id,
-                &anyhow!(
-                    "launch failed before the Session became ready: state={}",
-                    session.state
-                ),
-            ));
-        }
-        store.record_event(Some(&id), None, "session.started");
-        if agent == Agent::Codex {
-            store.set_session_state(&id, SessionState::Idle);
-            store.record_event(Some(&id), None, "session.ready");
-        }
-        drop(store);
-        if agent == Agent::Codex {
-            let remaining = startup_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let _ = runtime.force_stop();
-                return Err(self.session_launch_failure(
-                    &id,
-                    &anyhow!("launch timed out before the Session became ready"),
-                ));
-            }
-            if let Err(error) = runtime.wait_for_input_ready(remaining) {
-                let _ = runtime.force_stop();
-                return Err(self.session_launch_failure(
-                    &id,
-                    &error.context("Codex PTY did not become input-ready"),
-                ));
-            }
-        }
-        loop {
-            let current = self.resolve_session(&id)?;
-            if current.state == SessionState::Idle {
-                break;
-            }
-            if current.state.is_terminal() {
-                return Err(self.session_launch_failure(
-                    &id,
-                    &anyhow!("launch failed before the Session became ready"),
-                ));
-            }
-            if self.screen_blocker(agent, &id).is_some() {
-                let _ = runtime.force_stop();
-                self.lock_store()?.set_session_failed(&id);
-                return Err(self.session_launch_failure(
-                    &id,
-                    &anyhow!("launch blocked before the Session became ready"),
-                ));
-            }
-            if Instant::now() >= startup_deadline {
-                let _ = runtime.force_stop();
-                self.lock_store()?.set_session_failed(&id);
-                return Err(self.session_launch_failure(
-                    &id,
-                    &anyhow!("launch timed out before the Session became ready"),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let provider_id = match agent {
-            Agent::Claude => pending_provider_id
-                .as_mut()
-                .context("missing hook provider ID binding")?
-                .take()?,
-            Agent::Codex => runtime
-                .provider_id()
-                .context("Codex runtime did not report a provider thread ID")?
+        let runtime = self.launch_runtime(&id, &runtime_session_id, &options, params)?;
+        let provider_id = match runtime.as_ref() {
+            AgentRuntime::Codex { thread_id, .. } => thread_id.clone(),
+            AgentRuntime::Claude { .. } => resume_provider_id
+                .or(new_provider_id.as_deref())
+                .context("Claude launch had no provider session ID")?
                 .to_owned(),
         };
         let canonical_id = canonical_session_id(agent.as_str(), &provider_id);
-        if let Err(error) = self.promote_session(&id, &canonical_id, &runtime_session_id) {
-            let _ = runtime.force_stop();
+        if let Err(error) = promote_session(
+            &self.store,
+            &self.sessions,
+            &id,
+            &canonical_id,
+            &runtime_session_id,
+        ) {
+            runtime.force_stop();
             self.lock_store()?.set_session_failed(&id);
             return Err(self.session_launch_failure(
                 &id,
                 &error.context("failed to publish provider Session ID"),
+                None,
             ));
         }
         id = canonical_id;
@@ -980,11 +783,12 @@ impl Daemon {
         })) {
             Ok(result) => result,
             Err(error) => {
-                let _ = runtime.force_stop();
+                runtime.force_stop();
                 self.lock_store()?.set_session_failed(&id);
                 return Err(self.session_launch_failure(
                     &id,
                     &error.context("initial prompt acceptance failed"),
+                    Some(runtime.stderr_tail()),
                 ));
             }
         };
@@ -994,36 +798,76 @@ impl Daemon {
         Ok(response)
     }
 
-    /// Describe a launch that never became ready. The rendered screen tail
-    /// is the provider's own explanation, so it travels with the error and
-    /// stays on the failed Session for `show`.
-    fn session_launch_failure(&self, session_id: &str, error: &anyhow::Error) -> anyhow::Error {
-        let (agent, screen) = self.lock_store().map_or_else(
-            |_| (None, Vec::new()),
-            |store| {
-                let agent = store
-                    .get_session(session_id)
-                    .and_then(|session| Agent::parse(&session.agent).ok());
-                let rows = store.session_uid(session_id).map_or_else(Vec::new, |uid| {
-                    store
-                        .rendered_rows(&uid, None, LAUNCH_FAILURE_SCREEN_LINES)
-                        .lines
-                });
-                (agent, trim_screen(rows))
-            },
-        );
-        let failure = SessionLaunchFailure::new(session_id, agent, screen, error);
+    /// Start the provider process for a `starting` Session and bring the
+    /// Session to `idle`. Every failure is recorded on the Session.
+    fn launch_runtime(
+        &self,
+        id: &str,
+        runtime_session_id: &Arc<RwLock<String>>,
+        options: &LaunchOptions<'_>,
+        params: &Value,
+    ) -> Result<Arc<AgentRuntime>> {
+        let timeout = startup_timeout(params);
+        let spawned = match options.agent {
+            Agent::Claude => self.spawn_claude_runtime(runtime_session_id, options, timeout),
+            Agent::Codex => self.spawn_codex_runtime(runtime_session_id, options, timeout),
+        };
+        let runtime = match spawned {
+            Ok(runtime) => runtime,
+            Err(failure) => {
+                let store = self.lock_store()?;
+                store.set_session_failed(id);
+                store.record_event(Some(id), None, "session.failed");
+                drop(store);
+                return Err(self.session_launch_failure(id, &failure.error, failure.detail));
+            }
+        };
+        self.sessions
+            .write()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .insert(id.to_owned(), Arc::clone(&runtime));
+        let store = self.lock_store()?;
+        if !store.set_session_running(id, Some(runtime.pid())) {
+            store.set_session_failed(id);
+            drop(store);
+            self.sessions
+                .write()
+                .map_err(|_| anyhow!("session map lock poisoned"))?
+                .remove(id);
+            runtime.force_stop();
+            return Err(self.session_launch_failure(
+                id,
+                &anyhow!(
+                    "launch failed: the provider process exited before the Session became ready"
+                ),
+                Some(runtime.stderr_tail()),
+            ));
+        }
+        store.record_event(Some(id), None, "session.started");
+        store.set_session_state(id, SessionState::Idle);
+        store.record_event(Some(id), None, "session.ready");
+        Ok(runtime)
+    }
+
+    /// Describe a launch that never became ready. The provider's stderr tail
+    /// is its own explanation, so it travels with the error and stays on the
+    /// failed Session for `show`.
+    fn session_launch_failure(
+        &self,
+        session_id: &str,
+        error: &anyhow::Error,
+        detail: Option<String>,
+    ) -> anyhow::Error {
+        let agent = self.lock_store().ok().and_then(|store| {
+            store
+                .get_session(session_id)
+                .and_then(|session| Agent::parse(&session.agent).ok())
+        });
+        let failure = SessionLaunchFailure::new(session_id, agent, error, detail);
         if let Ok(store) = self.lock_store() {
             store.set_launch_failure(session_id, failure.to_json());
         }
         failure.into()
-    }
-
-    /// A known interactive dialog currently on the Session's live screen.
-    fn screen_blocker(&self, agent: Agent, session_id: &str) -> Option<StartupBlocker> {
-        let store = self.lock_store().ok()?;
-        let uid = store.session_uid(session_id)?;
-        startup_blocker(agent, &store.live_screen(&uid, FETCH_LIVE_ROWS).rows)
     }
 
     /// Resume a provider conversation without mutating an existing live
@@ -1065,8 +909,7 @@ impl Daemon {
                 params,
                 &existing.agent,
                 provider_id,
-                Some(&existing.alias),
-                Some(&existing.title),
+                Some(&existing),
             );
         }
 
@@ -1076,7 +919,7 @@ impl Daemon {
             .context(
                 "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id> or claude:<id> with --resume",
             )?;
-        self.launch_resumed_session(params, agent, provider_id, None, None)
+        self.launch_resumed_session(params, agent, provider_id, None)
     }
 
     fn launch_resumed_session(
@@ -1084,8 +927,7 @@ impl Daemon {
         params: &Value,
         agent: &str,
         provider_id: &str,
-        alias: Option<&str>,
-        title: Option<&str>,
+        retained: Option<&SessionRecord>,
     ) -> Result<Value> {
         let mut create = params.clone();
         let object = create
@@ -1095,10 +937,18 @@ impl Daemon {
         object.insert("resume_provider_id".to_owned(), json!(provider_id));
         object.insert(
             "title".to_owned(),
-            json!(title.unwrap_or("resumed provider conversation")),
+            json!(retained.map_or("resumed provider conversation", |session| &session.title)),
         );
-        if let Some(alias) = alias {
-            object.insert("alias".to_owned(), json!(alias));
+        if let Some(retained) = retained {
+            object.insert("alias".to_owned(), json!(retained.alias));
+            // The approvals mode is stored with the Session and reused
+            // unless this command supplies a new one.
+            if object.get("approvals").is_none_or(Value::is_null) {
+                object.insert(
+                    "approvals".to_owned(),
+                    json!(retained.approvals.requested.as_str()),
+                );
+            }
         } else {
             object.remove("alias");
         }
@@ -1131,44 +981,17 @@ impl Daemon {
         if !cwd.is_dir() {
             bail!("session cwd is not a directory: {}", cwd.display());
         }
-        let environment = params
-            .get("environment")
-            .and_then(Value::as_object)
-            .context("missing launch environment snapshot")?
-            .iter()
-            .map(|(key, value)| {
-                value
-                    .as_str()
-                    .map(|value| (key.clone(), value.to_owned()))
-                    .with_context(|| format!("environment value for {key:?} must be a string"))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        let rows = params_u16(params, "rows", 24)?;
-        let cols = params_u16(params, "cols", 80)?;
-        let startup_timeout = Duration::from_millis(
-            params
-                .get("startup_timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(60_000)
-                .min(300_000),
-        );
-        let startup_deadline = Instant::now() + startup_timeout;
+        let environment = launch_environment(params)?;
+        let startup_deadline = Instant::now() + startup_timeout(params);
 
         prepare_workspace(agent, &cwd)?;
         if !self.lock_store()?.begin_session_restart(&session.id)? {
             bail!("session is unavailable in state {}", session.state);
         }
-        {
-            let store = self.lock_store()?;
-            store.set_terminal_size(&session.id, rows, cols);
-            store.record_event(Some(&session.id), None, "session.restarting");
-        }
+        self.lock_store()?
+            .record_event(Some(&session.id), None, "session.restarting");
         if let Some(runtime) = previous_runtime {
-            self.attach_leases
-                .lock()
-                .map_err(|_| anyhow!("attach lease lock poisoned"))?
-                .remove(&session.id);
-            let _ = runtime.force_stop();
+            runtime.force_stop();
             loop {
                 let active = self
                     .sessions
@@ -1195,17 +1018,12 @@ impl Daemon {
         if !self.lock_store()?.start_restarted_session(&session.id) {
             bail!("session left restarting state before launch");
         }
-        // A replacement PTY is a new terminal generation even when the
-        // provider-qualified Session ID does not rotate.
-        self.lock_store()?.restart_screen(&session.id);
-        let remaining = startup_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if Instant::now() >= startup_deadline {
             self.lock_store()?.set_session_failed(&session.id);
             bail!("restart launch timed out before starting the replacement process");
         }
         let options = LaunchOptions {
             agent,
-            session_id: &session.id,
             title: &session.title,
             cwd: &cwd,
             model: session.model.as_deref(),
@@ -1214,370 +1032,203 @@ impl Daemon {
             new_provider_id: None,
             resume_provider_id: Some(&provider_id),
             environment: &environment,
-            auto_approve: session.auto_approve,
+            approvals: session.approvals.requested,
         };
+        // The replacement process reports its own effective mode.
+        self.lock_store()?
+            .set_requested_approvals(&session.id, session.approvals.requested);
         let runtime_session_id = Arc::new(RwLock::new(session.id.clone()));
-        let mut pending_provider_id = if agent == Agent::Codex {
-            None
-        } else {
-            Some(PendingProviderId::register(
-                &self.pending_provider_ids,
-                &session.id,
-            )?)
-        };
-        let runtime = match agent {
-            Agent::Claude => command_spec(&options)
-                .and_then(|spec| self.spawn_hook_runtime(&runtime_session_id, &spec, rows, cols)),
-            Agent::Codex => {
-                self.spawn_codex_runtime(&runtime_session_id, &options, rows, cols, remaining)
-            }
-        };
-        let runtime = match runtime {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let store = self.lock_store()?;
-                store.set_session_failed(&session.id);
-                store.record_event(Some(&session.id), None, "session.failed");
-                drop(store);
-                return Err(self.session_launch_failure(
-                    &session.id,
-                    &error.context("session restart launch failed"),
-                ));
-            }
-        };
-        let pid = runtime.pid();
-        self.sessions
-            .write()
-            .map_err(|_| anyhow!("session map lock poisoned"))?
-            .insert(session.id.clone(), Arc::clone(&runtime));
-        let store = self.lock_store()?;
-        if !store.set_session_running(&session.id, pid) {
-            drop(store);
-            self.sessions
-                .write()
-                .map_err(|_| anyhow!("session map lock poisoned"))?
-                .remove(&session.id);
-            let _ = runtime.force_stop();
-            bail!("restart launch exited before the Session became ready");
-        }
-        store.record_event(Some(&session.id), None, "session.started");
-        if agent == Agent::Codex {
-            store.set_session_state(&session.id, SessionState::Idle);
-            store.record_event(Some(&session.id), None, "session.ready");
-        }
-        drop(store);
-        if agent == Agent::Codex {
-            let remaining = startup_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let _ = runtime.force_stop();
-                self.lock_store()?.set_session_failed(&session.id);
-                bail!("restart launch timed out before the Session became ready");
-            }
-            if let Err(error) = runtime.wait_for_input_ready(remaining) {
-                let _ = runtime.force_stop();
-                self.lock_store()?.set_session_failed(&session.id);
-                return Err(error).context("restarted Codex PTY did not become input-ready");
-            }
-        }
-        loop {
-            let current = self.resolve_session(&session.id)?;
-            if current.state == SessionState::Idle {
-                break;
-            }
-            if current.state.is_terminal() {
-                bail!("restart launch failed before the Session became ready");
-            }
-            if Instant::now() >= startup_deadline {
-                let _ = runtime.force_stop();
-                self.lock_store()?.set_session_failed(&session.id);
-                bail!("restart launch timed out before the Session became ready");
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let rebound_provider_id = match agent {
-            Agent::Claude => pending_provider_id
-                .as_mut()
-                .context("missing hook provider ID binding")?
-                .take()?,
-            Agent::Codex => runtime
-                .provider_id()
-                .context("Codex runtime did not report a provider thread ID")?
-                .to_owned(),
-        };
-        let canonical_id = canonical_session_id(agent.as_str(), &rebound_provider_id);
-        self.promote_session(&session.id, &canonical_id, &runtime_session_id)?;
-        let current = self.resolve_session(&canonical_id)?;
+        let remaining = json!({
+            "startup_timeout_ms": u64::try_from(
+                startup_deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+            )
+            .unwrap_or(u64::MAX),
+        });
+        self.launch_runtime(&session.id, &runtime_session_id, &options, &remaining)
+            .map_err(|error| error.context("session restart launch failed"))?;
+        let current = self.resolve_session(&session.id)?;
         Ok(json!({"session": self.public_session(&current)?}))
     }
 
-    fn spawn_hook_runtime(
+    fn spawn_claude_runtime(
         &self,
         runtime_session_id: &Arc<RwLock<String>>,
-        spec: &CommandSpec,
-        rows: u16,
-        cols: u16,
-    ) -> Result<Arc<AgentRuntime>> {
-        let output_store = Arc::clone(&self.store);
-        let output_session_id = Arc::clone(runtime_session_id);
-        let on_output = Arc::new(move |data: &[u8]| {
-            if let Ok(session_id) = output_session_id.read()
-                && let Ok(store) = output_store.lock()
-            {
-                store.record_output(&session_id, data);
+        options: &LaunchOptions<'_>,
+        startup_timeout: Duration,
+    ) -> Result<Arc<AgentRuntime>, LaunchError> {
+        let spec = claude_command(options)?;
+        let turns = Arc::new(Mutex::new(ClaudeTurns::default()));
+        let process_slot: Arc<OnceLock<Weak<ClaudeProcess>>> = Arc::new(OnceLock::new());
+
+        let event_store = Arc::clone(&self.store);
+        let event_sessions = Arc::clone(&self.sessions);
+        let event_session_id = Arc::clone(runtime_session_id);
+        let event_turns = Arc::clone(&turns);
+        let event_process = Arc::clone(&process_slot);
+        let event_changed = Arc::clone(&self.submission_changed);
+        let on_event = Arc::new(move |event: Value| {
+            let Ok(session_id) = event_session_id.read().map(|id| id.clone()) else {
+                return;
+            };
+            let actions = {
+                let Ok(mut turns) = event_turns.lock() else {
+                    return;
+                };
+                let Ok(store) = event_store.lock() else {
+                    return;
+                };
+                claude::apply_event(&store, &session_id, &mut turns, &event)
+            };
+            event_changed.notify_all();
+            let actions = match actions {
+                Ok(actions) => actions,
+                Err(error) => {
+                    eprintln!("dlgt failed to apply Claude event: {error:#}");
+                    return;
+                }
+            };
+            for action in actions {
+                match action {
+                    claude::Action::Interrupt => {
+                        if let Some(process) = event_process.get().and_then(Weak::upgrade) {
+                            let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
+                        }
+                    }
+                    claude::Action::Rekey(provider_id) => {
+                        let canonical = canonical_session_id("claude", &provider_id);
+                        if let Err(error) = promote_session(
+                            &event_store,
+                            &event_sessions,
+                            &session_id,
+                            &canonical,
+                            &event_session_id,
+                        ) {
+                            eprintln!("dlgt failed to rekey a rotated Claude session: {error:#}");
+                        }
+                    }
+                }
             }
         });
+
         let exit_store = Arc::clone(&self.store);
         let exit_sessions = Arc::clone(&self.sessions);
         let exit_session_id = Arc::clone(runtime_session_id);
-        let on_exit = Arc::new(move |exit_code: u32| {
-            if let Ok(session_id) = exit_session_id.read() {
-                record_session_exit(&exit_store, &exit_sessions, &session_id, exit_code);
+        let exit_process = Arc::clone(&process_slot);
+        let exit_changed = Arc::clone(&self.submission_changed);
+        let on_exit = Arc::new(move |code: Option<i32>| {
+            let reason = code.map_or_else(
+                || "Claude process was terminated by a signal".to_owned(),
+                |code| format!("Claude process exited with code {code}"),
+            );
+            let detail = exit_process
+                .get()
+                .and_then(Weak::upgrade)
+                .map(|process| process.final_stderr_tail());
+            if let Ok(session_id) = exit_session_id.read().map(|id| id.clone()) {
+                record_session_exit(
+                    &exit_store,
+                    &exit_sessions,
+                    &session_id,
+                    &reason,
+                    detail.as_deref(),
+                );
             }
+            exit_changed.notify_all();
         });
-        let runtime = SessionRuntime::spawn(
-            spec,
-            PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            on_output,
-            on_exit,
-        )?;
-        runtime.track_with(
-            self.reaper
-                .watch(runtime.pid().context("PTY runtime had no pid")?)?,
-        )?;
-        Ok(Arc::new(AgentRuntime::Pty(runtime)))
+
+        let process = ClaudeProcess::spawn(&spec, on_event, on_exit, &self.reaper)?;
+        let _ = process_slot.set(Arc::downgrade(&process));
+        // Claude answers `initialize` before any prompt, which proves the
+        // stream-json control channel works and reports the mode it runs in.
+        let ready = process
+            .control(&json!({"subtype": "initialize"}), startup_timeout)
+            .map_err(|error| LaunchError {
+                error: error.context(
+                    "launch failed: Claude did not answer the stream-json initialize request",
+                ),
+                detail: Some(process.final_stderr_tail()),
+            })?;
+        if let Some(mode) = ready.get("current_permission_mode").and_then(Value::as_str)
+            && let Ok(session_id) = runtime_session_id.read()
+            && let Ok(store) = self.store.lock()
+        {
+            claude::apply_permission_mode(&store, &session_id, Some(mode));
+        }
+        Ok(Arc::new(AgentRuntime::Claude { process, turns }))
     }
 
     fn spawn_codex_runtime(
         &self,
         runtime_session_id: &Arc<RwLock<String>>,
         options: &LaunchOptions<'_>,
-        rows: u16,
-        cols: u16,
         startup_timeout: Duration,
-    ) -> Result<Arc<AgentRuntime>> {
-        let session_id = options.session_id.to_owned();
-        let socket_path = paths::home_dir()?
-            .join("run")
-            .join(&session_id)
-            .join("app-server.sock");
-        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+    ) -> Result<Arc<AgentRuntime>, LaunchError> {
         let event_store = Arc::clone(&self.store);
+        let event_sessions = Arc::clone(&self.sessions);
         let event_session_id = Arc::clone(runtime_session_id);
+        let event_changed = Arc::clone(&self.submission_changed);
+        let items = Mutex::new(CodexItems::default());
         let handler = Arc::new(move |message: Value| {
-            let started_thread_id = (message.get("method").and_then(Value::as_str)
-                == Some("thread/started"))
-            .then(|| {
-                message
-                    .pointer("/params/thread/id")
+            let Ok(session_id) = event_session_id.read().map(|id| id.clone()) else {
+                return;
+            };
+            if message.get("method").and_then(Value::as_str) == Some("dlgt/transport/closed") {
+                let reason = message
+                    .pointer("/params/message")
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .flatten();
-            if let Ok(session_id) = event_session_id.read()
-                && let Ok(mut store) = event_store.lock()
+                    .unwrap_or("Codex app-server connection closed");
+                record_session_exit(&event_store, &event_sessions, &session_id, reason, None);
+            } else if let Ok(mut store) = event_store.lock()
+                && let Ok(mut items) = items.lock()
+                && let Err(error) =
+                    codex_events::apply_notification(&mut store, &session_id, &mut items, &message)
             {
-                match apply_codex_notification(&mut store, &session_id, &message) {
-                    Ok(()) => {
-                        if let Some(thread_id) = started_thread_id {
-                            let _ = thread_sender.send(thread_id);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("dlgt failed to apply Codex notification: {error:#}");
-                    }
-                }
+                eprintln!("dlgt failed to apply Codex notification: {error:#}");
             }
+            event_changed.notify_all();
         });
-        let control = CodexConnection::connect_with_environment(
-            socket_path.clone(),
+        let control = CodexConnection::connect(
             handler,
             Some(options.environment),
-            options.harness_options,
+            Some(options.cwd),
+            &codex_session_args(options)?,
+            startup_timeout,
             &self.reaper,
         )?;
-        let spec = codex_remote_tui_command(options, &socket_path)?;
-        let output_store = Arc::clone(&self.store);
-        let output_session_id = Arc::clone(runtime_session_id);
-        let on_output = Arc::new(move |data: &[u8]| {
-            if let Ok(session_id) = output_session_id.read()
-                && let Ok(store) = output_store.lock()
-            {
-                store.record_output(&session_id, data);
-            }
-        });
-        let exit_store = Arc::clone(&self.store);
-        let exit_sessions = Arc::clone(&self.sessions);
-        let exit_session_id = Arc::clone(runtime_session_id);
-        let on_exit = Arc::new(move |exit_code: u32| {
-            if let Ok(session_id) = exit_session_id.read() {
-                record_session_exit(&exit_store, &exit_sessions, &session_id, exit_code);
-            }
-        });
-        let view = SessionRuntime::spawn(
-            &spec,
-            PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            on_output,
-            on_exit,
-        )?;
-        view.track_with(
-            self.reaper
-                .watch(view.pid().context("Codex TUI runtime had no pid")?)?,
-        )?;
-        let provider_thread_id = if let Some(expected) = options.resume_provider_id {
-            expected.to_owned()
-        } else {
-            self.wait_for_codex_thread(&thread_receiver, &view, &session_id, startup_timeout)?
+        let detailed = |error: anyhow::Error| LaunchError {
+            error,
+            detail: Some(control.stderr_tail()),
         };
-        if let Err(error) =
-            control.set_thread_name(&provider_thread_id, &provider_display_name(options.title))
+        let params = codex_thread_params(options);
+        let (thread_id, thread) = if let Some(thread_id) = options.resume_provider_id {
+            let thread = control
+                .resume_thread(&params, startup_timeout)
+                .map_err(|error| detailed(error.context("launch failed: Codex thread/resume")))?;
+            (thread_id.to_owned(), thread)
+        } else {
+            control
+                .start_thread(params, startup_timeout)
+                .map_err(|error| detailed(error.context("launch failed: Codex thread/start")))?
+        };
+        if let Some(model) = thread.get("model").and_then(Value::as_str)
+            && let Ok(session_id) = runtime_session_id.read()
+            && let Ok(store) = self.store.lock()
         {
-            let _ = view.force_stop();
-            return Err(error).context("failed to set Codex provider thread name");
+            store.set_resolved_model(&session_id, model);
         }
-        Ok(Arc::new(AgentRuntime::Codex {
-            control,
-            provider_thread_id,
-            view,
-        }))
-    }
-
-    /// Wait for the remote TUI to start its thread, failing fast when the
-    /// screen shows a dialog that only a human can answer.
-    fn wait_for_codex_thread(
-        &self,
-        thread_receiver: &Receiver<String>,
-        view: &SessionRuntime,
-        session_id: &str,
-        startup_timeout: Duration,
-    ) -> Result<String> {
-        let deadline = Instant::now() + startup_timeout;
-        loop {
-            let wait = deadline
-                .saturating_duration_since(Instant::now())
-                .min(STARTUP_BLOCKER_POLL);
-            match thread_receiver.recv_timeout(wait) {
-                Ok(thread_id) => return Ok(thread_id),
-                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {
-                    if self.screen_blocker(Agent::Codex, session_id).is_some() {
-                        let _ = view.force_stop();
-                        bail!("Codex remote TUI stopped at a startup dialog");
-                    }
-                }
-                Err(error) => {
-                    let _ = view.force_stop();
-                    return Err(error).context("Codex remote TUI did not create a thread");
-                }
-            }
-        }
+        control
+            .set_thread_name(&thread_id, &provider_display_name(options.title))
+            .map_err(|error| {
+                detailed(error.context("launch failed: could not set the Codex thread name"))
+            })?;
+        Ok(Arc::new(AgentRuntime::Codex { control, thread_id }))
     }
 
     fn public_session(&self, session: &SessionRecord) -> Result<Value> {
         let store = self.lock_store()?;
-        self.public_session_locked(&store, session)
-    }
-
-    /// Build the public snapshot from an already-held store guard. The store
-    /// mutex is not reentrant, so composite readers that take one cut under
-    /// the lock must use this instead of `public_session`.
-    fn public_session_locked(&self, store: &Store, session: &SessionRecord) -> Result<Value> {
-        let busy_metrics = self.busy_metrics(store, session)?;
-        Ok(public_session_with_metrics(session, busy_metrics))
-    }
-
-    fn busy_metrics(&self, store: &Store, session: &SessionRecord) -> Result<Option<BusyMetrics>> {
-        if session.state != SessionState::Busy {
-            return Ok(None);
-        }
-
-        // A turn is reserved before provider execution starts. Use that
-        // creation timestamp rather than the provider's started_at timestamp
-        // so the reported age cannot jump backwards while a provider binds.
-        let busy_for_ms = session
-            .active_turn_id
-            .as_deref()
-            .and_then(|turn_id| store.get_turn(turn_id))
-            .map_or(0, |turn| {
-                u64::try_from(now_ms().saturating_sub(turn.created_at_ms)).unwrap_or(0)
-            });
-
-        // PTY output is a presentation/fallback signal only. If this runtime
-        // has not emitted output yet (or has already exited), consider the
-        // entire current busy interval quiet. The pure helper below clamps a
-        // prior output's age to busy_for_ms, preventing pre-turn idle time from
-        // leaking into this interval.
-        let runtime = self
-            .sessions
-            .read()
-            .map_err(|_| anyhow!("session map lock poisoned"))?
-            .get(&session.id)
-            .cloned();
-        let last_output_age_ms = runtime
-            .map(|runtime| runtime.last_output_age())
-            .transpose()?
-            .flatten()
-            .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
-
-        Ok(Some(clamp_busy_metrics(busy_for_ms, last_output_age_ms)))
-    }
-
-    fn input_session(&self, params: &Value) -> Result<Value> {
-        let session = self.resolve_session(params_string(params, "session")?)?;
-        let encoded = params_string(params, "data_base64")?;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .context("invalid data_base64")?;
-        let source = params
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("api");
-        if source == "attach" {
-            let lease_id = params_string(params, "lease_id")?;
-            let leases = self
-                .attach_leases
-                .lock()
-                .map_err(|_| anyhow!("attach lease lock poisoned"))?;
-            if leases.get(&session.id).map(String::as_str) != Some(lease_id) {
-                bail!("attach lease is no longer active");
-            }
-        }
-        let turn_id = session.active_turn_id.as_deref();
-        let runtime = self.runtime(&session.id)?;
-        let seq = {
-            let store = self.lock_store()?;
-            if session.state == SessionState::Blocked {
-                store.set_session_state(&session.id, SessionState::Busy);
-                store.record_event(
-                    Some(&session.id),
-                    session.active_turn_id.as_deref(),
-                    "session.resumed",
-                );
-            }
-            let seq = store.allocate_input_sequence();
-            store.record_event(Some(&session.id), turn_id, "input.observed");
-            seq
-        };
-        runtime.write(&data)?;
-        Ok(json!({"accepted": true, "seq": seq, "byte_len": data.len()}))
-    }
-
-    fn resize_session(&self, params: &Value) -> Result<Value> {
-        let session = self.resolve_session(params_string(params, "session")?)?;
-        let rows = params_u16(params, "rows", 24)?;
-        let cols = params_u16(params, "cols", 80)?;
-        self.runtime(&session.id)?.resize(rows, cols)?;
-        self.lock_store()?
-            .set_terminal_size(&session.id, rows, cols);
-        Ok(json!({"rows": rows, "cols": cols}))
+        Ok(public_session_locked(&store, session))
     }
 
     fn stop_session(&self, params: &Value) -> Result<Value> {
@@ -1596,46 +1247,48 @@ impl Daemon {
         self.lock_store()?
             .record_event(Some(&session.id), None, "session.stopping");
         if force {
-            runtime.force_stop()?;
+            runtime.force_stop();
         } else {
-            runtime.stop()?;
+            runtime.stop();
         }
         Ok(json!({"stopping": true, "force": force, "session_id": session.id}))
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn submit_turn(&self, params: &Value) -> Result<Value> {
-        let selector = params_string(params, "session")?;
+    /// Resolve a selector to a Session whose provider process is live.
+    fn live_session(&self, selector: &str) -> Result<(SessionRecord, Arc<AgentRuntime>)> {
         let session = self.resolve_session(selector).map_err(|_| {
             anyhow!(
                 "SESSION_NOT_RUNNING: no live Session matches {selector}; retry with --resume using the same Session ID"
             )
         })?;
-        if matches!(
-            session.state,
-            SessionState::Stopped
-                | SessionState::Failed
-                | SessionState::Starting
-                | SessionState::Stopping
-        ) || !self
+        let runtime = self
             .sessions
             .read()
             .map_err(|_| anyhow!("session map lock poisoned"))?
-            .contains_key(&session.id)
-        {
-            bail!(
+            .get(&session.id)
+            .cloned();
+        match runtime {
+            Some(runtime)
+                if !matches!(
+                    session.state,
+                    SessionState::Stopped
+                        | SessionState::Failed
+                        | SessionState::Starting
+                        | SessionState::Stopping
+                ) =>
+            {
+                Ok((session, runtime))
+            }
+            _ => bail!(
                 "SESSION_NOT_RUNNING: Session {} is not running; retry with --resume using the same Session ID",
                 session.id
-            );
+            ),
         }
-        if self
-            .attach_leases
-            .lock()
-            .map_err(|_| anyhow!("attach lease lock poisoned"))?
-            .contains_key(&session.id)
-        {
-            bail!("session has an exclusive attach lease");
-        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn submit_turn(&self, params: &Value) -> Result<Value> {
+        let (session, runtime) = self.live_session(params_string(params, "session")?)?;
         if session.state == SessionState::Blocked {
             bail!("session blocked on input");
         }
@@ -1651,13 +1304,7 @@ impl Daemon {
         if prompt.is_empty() {
             bail!("prompt must not be empty");
         }
-        let runtime = self.runtime(&session.id)?;
-        let agent = Agent::parse(&session.agent)?;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
-        let input = match agent {
-            Agent::Codex => prompt.as_bytes().to_vec(),
-            Agent::Claude => agent.semantic_input(prompt)?,
-        };
         let (turn, acceptance_cursor) = {
             let mut store = self.lock_store()?;
             // The observation cursor is captured under this lock immediately
@@ -1665,47 +1312,61 @@ impl Daemon {
             // output or finish in front of the position it names.
             let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
             let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
-            store.allocate_input_sequence();
+            // Busy before delivery: a provider event for this execution must
+            // never find the Session idle.
+            store.set_session_state(&session.id, SessionState::Busy);
             store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
             (turn, acceptance_cursor)
         };
         // Build a receipt-safe snapshot before provider delivery. After the
         // delivery boundary, internal observation failures must degrade to a
         // pending receipt rather than erase idempotency and invite a retry.
-        let mut fallback_public_session = self.public_session(&session)?;
-        fallback_public_session["state"] = json!(SessionState::Busy.as_str());
+        let fallback_public_session = self.public_session(&session)?;
         let mut synchronously_confirmed = false;
-        match agent {
-            Agent::Codex => match runtime.start_codex_turn(prompt) {
-                Ok(provider_turn_id) => {
-                    synchronously_confirmed = true;
-                    if let Ok(store) = self.lock_store()
-                        && store.mark_turn_started(&turn_id, Some(&provider_turn_id))
-                    {
-                        store.set_session_state(&session.id, SessionState::Busy);
-                        store.record_event(Some(&session.id), Some(&turn_id), "turn.started");
+        match runtime.as_ref() {
+            AgentRuntime::Codex { control, thread_id } => {
+                let started = control.start_turn(thread_id, prompt).and_then(|turn| {
+                    control.watch_turn(thread_id, &turn)?;
+                    Ok(turn)
+                });
+                match started {
+                    Ok(provider_turn_id) => {
+                        synchronously_confirmed = true;
+                        if let Ok(store) = self.lock_store()
+                            && store.mark_turn_started(&turn_id, Some(&provider_turn_id))
+                        {
+                            store.record_event(Some(&session.id), Some(&turn_id), "turn.started");
+                        }
+                    }
+                    Err(error) => {
+                        let store = self.lock_store()?;
+                        let message = sanitize_message(&error.to_string());
+                        let _ = store.finish_turn_if_matching(
+                            &turn_id,
+                            None,
+                            TurnState::Failed,
+                            None,
+                            Some(&message),
+                        )?;
+                        store.set_session_failed(&session.id);
+                        store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
+                        store.record_event(Some(&session.id), None, "session.failed");
+                        drop(store);
+                        runtime.force_stop();
+                        return Err(error);
                     }
                 }
-                Err(error) => {
-                    let store = self.lock_store()?;
-                    let message = sanitize_message(&error.to_string());
-                    let _ = store.finish_turn_if_matching(
-                        &turn_id,
-                        None,
-                        TurnState::Failed,
-                        None,
-                        Some(&message),
-                    )?;
-                    store.set_session_failed(&session.id);
-                    store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
-                    store.record_event(Some(&session.id), None, "session.failed");
-                    drop(store);
-                    let _ = runtime.force_stop();
-                    return Err(error);
-                }
-            },
-            Agent::Claude => {
-                if let Err(error) = write_semantic_input(&runtime, &input) {
+            }
+            AgentRuntime::Claude { process, turns } => {
+                let uuid = Uuid::new_v4().to_string();
+                let written = turns
+                    .lock()
+                    .map_err(|_| anyhow!("Claude turn lock poisoned"))
+                    .and_then(|mut turns| {
+                        turns.begin(&uuid);
+                        process.send_user(&uuid, prompt)
+                    });
+                if let Err(error) = written {
                     let store = self.lock_store()?;
                     let message = sanitize_message(&error.to_string());
                     let _ = store.finish_turn_if_matching(
@@ -1718,13 +1379,6 @@ impl Daemon {
                     store.set_session_state(&session.id, SessionState::Idle);
                     store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
                     return Err(error);
-                }
-                if let Ok(store) = self.lock_store()
-                    && store
-                        .get_session(&session.id)
-                        .is_some_and(|current| current.active_turn_id.as_deref() == Some(&turn_id))
-                {
-                    store.set_session_state(&session.id, SessionState::Busy);
                 }
             }
         }
@@ -1758,6 +1412,207 @@ impl Daemon {
             result["correlation_id"] = json!(correlation_id);
         }
         Ok(result)
+    }
+
+    /// Add a message to the execution that is already running. Never creates
+    /// an execution, never queues work for later, and never interrupts.
+    fn steer_turn(&self, params: &Value) -> Result<Value> {
+        let (session, runtime) = self.live_session(params_string(params, "session")?)?;
+        let text = params_string(params, "prompt")?;
+        if text.is_empty() {
+            bail!("prompt must not be empty");
+        }
+        match session.state {
+            SessionState::Busy => {}
+            SessionState::Blocked => bail!("session blocked on input"),
+            SessionState::Idle => bail!(
+                "NO_ACTIVE_EXECUTION: Session {} has no running execution to steer; send the prompt without --steer",
+                session.id
+            ),
+            other => bail!("session is unavailable in state {}", other.public_name()),
+        }
+        let turn = session
+            .active_turn_id
+            .as_deref()
+            .and_then(|id| self.lock_store().ok()?.get_turn(id))
+            .with_context(|| {
+                format!(
+                    "NO_ACTIVE_EXECUTION: Session {} has no running execution to steer",
+                    session.id
+                )
+            })?;
+        // Whether the same execution is still the one running. Checked again
+        // at the point of delivery so a steer can never open a later turn.
+        let still_running = |store: &Store| {
+            store.get_session(&session.id).is_some_and(|current| {
+                current.state == SessionState::Busy
+                    && current.active_turn_id.as_deref() == Some(turn.id.as_str())
+            })
+        };
+        let gone = || {
+            anyhow!(
+                "NO_ACTIVE_EXECUTION: the execution on Session {} ended before the steer was delivered",
+                session.id
+            )
+        };
+        let cursor = match runtime.as_ref() {
+            AgentRuntime::Codex { control, thread_id } => {
+                let provider_turn_id = turn.provider_turn_id.as_deref().with_context(|| {
+                    format!(
+                        "session is unavailable: Codex has not acknowledged execution {} yet",
+                        turn.execution_seq
+                    )
+                })?;
+                let cursor = {
+                    let store = self.lock_store()?;
+                    if !still_running(&store) {
+                        return Err(gone());
+                    }
+                    let cursor = Self::acceptance_cursor(&store, &session.id)?;
+                    store.append_message(&session.id, MessageBody::steer(text, false, false));
+                    cursor
+                };
+                let delivered = control.steer_turn(thread_id, provider_turn_id, text);
+                let store = self.lock_store()?;
+                store.append_message(
+                    &session.id,
+                    MessageBody::steer(text, delivered.is_ok(), delivered.is_err()),
+                );
+                delivered?;
+                cursor
+            }
+            AgentRuntime::Claude { process, turns } => {
+                let uuid = Uuid::new_v4().to_string();
+                // Held across the check and the write: the event thread takes
+                // this lock before it can end the execution on a `result`.
+                let mut turns = turns
+                    .lock()
+                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+                let store = self.lock_store()?;
+                if !still_running(&store) {
+                    return Err(gone());
+                }
+                let cursor = Self::acceptance_cursor(&store, &session.id)?;
+                turns.add_steer(&uuid, text);
+                if let Err(error) = process.send_user(&uuid, text) {
+                    turns.discard(&store, &session.id, &uuid);
+                    return Err(error);
+                }
+                store.append_message(&session.id, MessageBody::steer(text, false, false));
+                cursor
+            }
+        };
+        let current = self.resolve_session(&session.id)?;
+        Ok(json!({
+            "session": self.public_session(&current)?,
+            "execution_seq": turn.execution_seq,
+            "steer": "accepted",
+            "cursor": cursor,
+        }))
+    }
+
+    /// Answer a pending Request. Idempotent by Request: the same answer
+    /// replays the original receipt, a different one is rejected.
+    fn answer_request(&self, params: &Value) -> Result<Value> {
+        let (session, runtime) = self.live_session(params_string(params, "session")?)?;
+        let request_id = params_string(params, "request")?;
+        let answer = Answer::parse(params)?;
+        let record = self
+            .lock_store()?
+            .request(&session.id, request_id)
+            .with_context(|| {
+                format!(
+                    "REQUEST_NOT_FOUND: Session {} has no Request {request_id}",
+                    session.id
+                )
+            })?;
+        let receipt = |outcome: Outcome, cursor: Option<String>| -> Result<Value> {
+            let current = self.resolve_session(&session.id)?;
+            let mut value = json!({
+                "session": self.public_session(&current)?,
+                "request": {"id": record.id, "resolution": outcome.as_str()},
+            });
+            match cursor {
+                Some(cursor) => value["cursor"] = json!(cursor),
+                None => value["replayed"] = json!(true),
+            }
+            Ok(value)
+        };
+        if let Some(resolution) = &record.resolution {
+            if resolution.answer.as_ref() == Some(&answer) {
+                return receipt(resolution.outcome, None);
+            }
+            bail!(
+                "REQUEST_RESOLVED: Request {} was already {}",
+                record.id,
+                resolution.outcome.as_str()
+            );
+        }
+        let (outcome, payload) = record.reply(&answer)?;
+        let cursor = {
+            let store = self.lock_store()?;
+            let cursor = Self::acceptance_cursor(&store, &session.id)?;
+            // Claim the Request before talking to the provider, so two
+            // concurrent answers cannot both be sent.
+            let resolution = Resolution {
+                outcome,
+                answer: Some(answer.clone()),
+            };
+            if !store.resolve_request(&session.id, &record.id, resolution) {
+                bail!(
+                    "REQUEST_RESOLVED: Request {} was resolved while this answer was in flight",
+                    record.id
+                );
+            }
+            if record.draft.kind == RequestKind::Approval {
+                store.append_message(
+                    &session.id,
+                    MessageBody::approval(
+                        if outcome == Outcome::Allowed {
+                            Decision::Approved
+                        } else {
+                            Decision::Denied
+                        },
+                        Decider::Caller,
+                        None,
+                        Some(&record.id),
+                        &record.draft.tool,
+                        &record.draft.summary,
+                    ),
+                );
+            }
+            cursor
+        };
+        match runtime.as_ref() {
+            AgentRuntime::Claude { process, .. } => {
+                process.respond(&record.draft.provider_key, &payload)?;
+            }
+            AgentRuntime::Codex { control, thread_id } => {
+                let id = serde_json::from_str::<Value>(&record.draft.provider_key)
+                    .context("retained Codex request ID is not valid JSON")?;
+                control.respond(&id, &payload)?;
+                // Codex's decline carries no text, so the caller's reason
+                // reaches the worker as input to the same turn.
+                if let Answer::Deny {
+                    message: Some(message),
+                } = &answer
+                    && matches!(
+                        record.draft.provider,
+                        ProviderRequest::CodexCommand
+                            | ProviderRequest::CodexFileChange
+                            | ProviderRequest::CodexPermissions { .. }
+                    )
+                    && let Some(turn_id) = session
+                        .active_turn_id
+                        .as_deref()
+                        .and_then(|id| self.lock_store().ok()?.get_turn(id))
+                        .and_then(|turn| turn.provider_turn_id)
+                {
+                    let _ = control.steer_turn(thread_id, &turn_id, message);
+                }
+            }
+        }
+        receipt(outcome, Some(cursor))
     }
 
     fn wait_for_submission_confirmation(&self, turn_id: &str) -> Result<bool> {
@@ -1799,13 +1654,27 @@ impl Daemon {
         let launch_failure = (session.state == SessionState::Failed)
             .then(|| store.launch_failure(&session.id))
             .flatten();
-        let public = self.public_session_locked(&store, &session)?;
+        let requests = store
+            .session_uid(&session.id)
+            .map(|uid| store.pending_requests(&uid))
+            .unwrap_or_default();
+        let public = public_session_locked(&store, &session);
         drop(store);
         let mut value = json!({
             "session": public,
+            "requests": requests
+                .iter()
+                .take(PUBLISHED_REQUEST_LIMIT)
+                .map(crate::requests::RequestRecord::public)
+                .collect::<Vec<_>>(),
             "result": result.as_ref().map(public_result),
             "execution_seq": latest.as_ref().map(|turn| turn.execution_seq),
         });
+        if let Some(provider_id) = provider_id_from_session(&session)
+            && let Ok(agent) = Agent::parse(&session.agent)
+        {
+            value["resume_command"] = json!(agent.resume_command(provider_id));
+        }
         if let Some(launch_failure) = launch_failure {
             value["launch_failure"] = launch_failure;
         }
@@ -1814,7 +1683,7 @@ impl Daemon {
 
     fn cancel_session(&self, params: &Value) -> Result<Value> {
         let session = self.resolve_session(params_string(params, "session")?)?;
-        let Some(turn_id) = session.active_turn_id else {
+        let Some(turn_id) = session.active_turn_id.clone() else {
             return Ok(json!({
                 "session_id": session.id,
                 "canceled": false,
@@ -1825,7 +1694,7 @@ impl Daemon {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000);
-        self.cancel_turn(&json!({"turn": turn_id}))?;
+        self.interrupt_turn(&session, &turn_id)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let current = self.resolve_session(&session.id)?;
@@ -1844,33 +1713,60 @@ impl Daemon {
         }
     }
 
-    fn cancel_turn(&self, params: &Value) -> Result<Value> {
-        let turn = self.resolve_turn(params_string(params, "turn")?)?;
-        let session = self.resolve_session(&turn.session_id)?;
-        let agent = Agent::parse(&session.agent)?;
-        let cancel_input = agent.cancel_input();
-        let runtime = self.runtime(&turn.session_id)?;
-        if agent == Agent::Codex {
-            let provider_turn_id = turn
-                .provider_turn_id
-                .as_deref()
-                .context("Codex turn has not been accepted by app-server")?;
-            runtime.interrupt_codex_turn(provider_turn_id)?;
+    /// Record the cancel intent, close pending Requests, and ask the provider
+    /// to interrupt. The Session returns to idle only when the provider
+    /// reports the interrupted turn's result.
+    fn interrupt_turn(&self, session: &SessionRecord, turn_id: &str) -> Result<()> {
+        let runtime = self.runtime(&session.id)?;
+        let turn = self.resolve_turn(turn_id)?;
+        if let AgentRuntime::Codex { .. } = runtime.as_ref()
+            && turn.provider_turn_id.is_none()
+        {
+            bail!("session is unavailable: Codex has not acknowledged the execution yet");
         }
         {
             let mut store = self.lock_store()?;
-            if !store.cancel_turn(&turn.id)? {
+            if !store.cancel_turn(turn_id)? {
                 bail!("turn is already terminal or no longer active");
             }
-            if agent != Agent::Codex {
-                store.allocate_input_sequence();
+            store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
+        }
+        match runtime.as_ref() {
+            AgentRuntime::Codex { control, thread_id } => {
+                control.interrupt_turn(thread_id, turn.provider_turn_id.as_deref().unwrap_or(""))
             }
-            store.record_event(Some(&turn.session_id), Some(&turn.id), "turn.canceled");
+            AgentRuntime::Claude { process, turns } => {
+                // A message the model has not read yet would otherwise run as
+                // a turn of its own after the interrupt.
+                let unread = turns
+                    .lock()
+                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?
+                    .unread();
+                for message in unread {
+                    let canceled = process
+                        .control(
+                            &json!({"subtype": "cancel_async_message", "message_uuid": message.uuid}),
+                            CLAUDE_CONTROL_TIMEOUT,
+                        )
+                        .is_ok_and(|response| {
+                            response.get("cancelled").and_then(Value::as_bool) == Some(true)
+                        });
+                    if canceled {
+                        let mut turns = turns
+                            .lock()
+                            .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+                        let store = self.lock_store()?;
+                        turns.discard(&store, &session.id, &message.uuid);
+                    }
+                }
+                process.control(&json!({"subtype": "interrupt"}), CLAUDE_CONTROL_TIMEOUT)?;
+                let mut turns = turns
+                    .lock()
+                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+                let store = self.lock_store()?;
+                turns.settle(&store, &session.id)
+            }
         }
-        if agent != Agent::Codex {
-            runtime.write(cancel_input)?;
-        }
-        Ok(json!({"canceled": true, "turn_id": turn.id}))
     }
 
     /// Position an observation cursor immediately before an acceptance.
@@ -1881,9 +1777,7 @@ impl Daemon {
         let mut cursor = cursor::Cursor::new();
         cursor.e = store.latest_event_seq();
         cursor.set_session(cursor::SessionCursor {
-            r: store.stable_head(&uid),
-            ro: 0,
-            ep: store.screen_epoch(&uid),
+            m: store.message_head(&uid),
             x: store.latest_result_seq(&uid),
             px: None,
             po: 0,
@@ -1917,10 +1811,10 @@ impl Daemon {
         Ok(receipt)
     }
 
-    /// One composite forward-delta read: current state, newly terminalized
-    /// results, lifecycle events, and the forward screen delta, from a cursor
-    /// position. Every observation is a success; only malformed requests,
-    /// unknown Sessions, and unusable cursors are errors.
+    /// One composite forward-delta read: current state, pending Requests,
+    /// newly terminalized results, lifecycle events, and the forward message
+    /// delta, from a cursor position. Every observation is a success; only
+    /// malformed requests, unknown Sessions, and unusable cursors are errors.
     fn fetch(&self, params: &Value) -> Result<Value> {
         let options = self.fetch_options(params)?;
         let deadline = Instant::now() + options.wait;
@@ -1949,10 +1843,11 @@ impl Daemon {
         let mut value = rendered.value;
         if let Some(previous) = options.cursor.as_ref()
             && *previous == rendered.cursor
+            && let Some(incoming) = options.incoming.as_ref()
         {
             // Never longer than the reserved number, so the measured document
             // can only shrink.
-            value["cursor"] = json!(options.incoming.clone().unwrap_or_default());
+            value["cursor"] = json!(incoming);
             return Ok(value);
         }
         self.lock_store()?
@@ -1978,19 +1873,19 @@ impl Daemon {
         if max_bytes == 0 {
             bail!("invalid max_bytes; the response budget must be positive");
         }
-        let screen = params.get("screen").unwrap_or(&Value::Null);
-        let stable_limit = match screen {
+        let message_limit = match params.get("messages").unwrap_or(&Value::Null) {
             Value::Bool(false) => 0,
-            // Absent means the documented default: the screen delta is on.
-            Value::Null | Value::Bool(true) => FETCH_STABLE_PAGE,
-            Value::Number(lines) => usize::try_from(
-                lines
+            // Absent means the documented default: the message delta is on.
+            Value::Null | Value::Bool(true) => FETCH_MESSAGE_PAGE,
+            Value::Number(count) => usize::try_from(
+                count
                     .as_u64()
-                    .context("invalid screen line budget")?
-                    .min(FETCH_STABLE_MAX as u64),
+                    .filter(|count| *count > 0)
+                    .context("invalid message budget; use a positive count")?
+                    .min(FETCH_MESSAGE_MAX as u64),
             )
-            .unwrap_or(FETCH_STABLE_PAGE),
-            _ => bail!("invalid screen selection; use a boolean or a line count"),
+            .unwrap_or(FETCH_MESSAGE_PAGE),
+            _ => bail!("invalid messages selection; use a boolean or a count"),
         };
         // Resolve through the UID index so a pre-rekey public ID, which a
         // UID-bound cursor implies is still valid, keeps addressing the same
@@ -2019,10 +1914,16 @@ impl Daemon {
                 .map_err(|_| anyhow!("CURSOR_INVALID: {position:?} is not a cursor position"))
         })
         .transpose()?;
-        let cursor = incoming
-            .as_deref()
-            .map(|position| self.lock_store()?.resolve_cursor(&scope, position))
-            .transpose()?;
+        let from_start = params
+            .get("from_start")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let cursor = match incoming.as_deref() {
+            Some(position) => Some(self.lock_store()?.resolve_cursor(&scope, position)?),
+            // The start of everything this daemon retains for the Session.
+            None if from_start => Some(cursor::Cursor::new()),
+            None => None,
+        };
         // A response that advances the observation takes the scope's next
         // position. It is reserved before rendering so the document can carry
         // its own number while it is being measured.
@@ -2033,13 +1934,12 @@ impl Daemon {
             incoming,
             cursor,
             wait: Duration::from_millis(wait_ms),
-            stable_limit,
+            message_limit,
             max_bytes,
             instance_id: self.instance_id.clone(),
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn fetch_session_cut(&self, options: &FetchOptions, bound: &mut Option<i64>) -> Result<Cut> {
         let uid = options.scope.clone();
         let store = self.lock_store()?;
@@ -2078,32 +1978,22 @@ impl Daemon {
             }
             store.results_after(&uid, position.x, FETCH_RESULT_PAGE)
         };
+        validate_continuation(&position, &results)?;
 
-        let stable = if options.stable_limit == 0 {
-            crate::screen::StablePage {
-                next_after: store.stable_head(&uid),
-                ..crate::screen::StablePage::default()
+        let messages = if options.message_limit == 0 {
+            crate::messages::MessagePage {
+                start: store.message_head(&uid),
+                ..crate::messages::MessagePage::default()
             }
         } else if baseline {
-            position.ro = 0;
-            store.stable_tail(&uid, options.stable_limit)
+            store.messages_tail(&uid, options.message_limit)
         } else {
-            store.stable_page(&uid, position.r, options.stable_limit)
+            store.messages_after(&uid, position.m, options.message_limit)
         };
-        if stable.gap {
-            gaps.push(retention_gap("screen"));
-            position.ro = 0;
+        if messages.gap {
+            gaps.push(retention_gap("messages"));
         }
-        validate_continuation(&position, &results, &stable.lines)?;
-        let live = if options.stable_limit == 0 {
-            crate::store::LiveScreen {
-                epoch: store.screen_epoch(&uid),
-                ..crate::store::LiveScreen::default()
-            }
-        } else {
-            store.live_screen(&uid, FETCH_LIVE_ROWS)
-        };
-        let epoch_reset = !baseline && position.ep != 0 && position.ep != live.epoch;
+        position.m = messages.start;
 
         if bound.is_none() {
             *bound = session
@@ -2119,12 +2009,10 @@ impl Daemon {
                     .turn_for_execution(&session.id, seq)
                     .is_some_and(|turn| turn.state.is_terminal())
         });
-        let public = self.public_session_locked(&store, &session)?;
+        let requests = store.pending_requests(&uid);
+        let public = public_session_locked(&store, &session);
         drop(store);
 
-        let stable_start = stable
-            .next_after
-            .saturating_sub(u64::try_from(stable.lines.len()).unwrap_or(0));
         Ok(Cut {
             baseline,
             state: Some(session.state),
@@ -2136,85 +2024,40 @@ impl Daemon {
             scope_gaps,
             sources: vec![BucketSource {
                 session: public,
+                requests: requests
+                    .iter()
+                    .take(PUBLISHED_REQUEST_LIMIT)
+                    .map(crate::requests::RequestRecord::public)
+                    .collect(),
+                requests_more: requests.len() > PUBLISHED_REQUEST_LIMIT,
                 gaps,
                 events: events.into_iter().map(|(_, event)| event).collect(),
                 results,
                 results_more,
-                stable_offset: usize::try_from(position.ro).unwrap_or(0),
-                stable: stable.lines,
-                stable_start,
-                stable_more: stable.has_more,
-                live: live.rows,
-                live_truncated: live.truncated,
-                epoch: live.epoch,
-                epoch_reset,
-                reset_reason: live.reset_reason,
-                screen: options.stable_limit > 0,
+                messages: messages
+                    .messages
+                    .iter()
+                    .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
+                    .collect(),
+                messages_more: messages.has_more,
+                include_messages: options.message_limit > 0,
                 incoming: position,
             }],
         })
-    }
-
-    fn read_transcript(&self, params: &Value) -> Result<Value> {
-        let session = self.resolve_session(params_string(params, "session")?)?;
-        let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        let limit_bytes = params
-            .get("limit_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(1024 * 1024)
-            .min(8 * 1024 * 1024);
-        let limit_bytes = usize::try_from(limit_bytes).context("limit_bytes is too large")?;
-        let page = self
-            .lock_store()?
-            .read_output_page(&session.id, after, limit_bytes.max(1));
-        Ok(json!({
-            "session_id": session.id,
-            "data_base64": base64::engine::general_purpose::STANDARD.encode(&page.data),
-            "byte_len": page.data.len(),
-            "next_after": page.next_after,
-            "has_more": page.has_more,
-        }))
-    }
-
-    fn read_scrollback(&self, params: &Value) -> Result<Value> {
-        let session = self.resolve_session(params_string(params, "session")?)?;
-        let lines = usize::try_from(
-            params
-                .get("lines")
-                .and_then(Value::as_u64)
-                .unwrap_or(100)
-                .clamp(1, 10_000),
-        )
-        .unwrap_or(100);
-        let before = params
-            .get("before")
-            .and_then(Value::as_str)
-            .and_then(|cursor| cursor.strip_prefix("scr_"))
-            .and_then(|value| value.parse::<u64>().ok());
-        let store = self.lock_store()?;
-        let uid = store
-            .session_uid(&session.id)
-            .context("session has no retained screen")?;
-        let page = store.rendered_rows(&uid, before, lines);
-        drop(store);
-        Ok(json!({
-            "session_id": session.id,
-            "screen": {"rows": page.rows, "cols": page.cols},
-            "lines": page.lines,
-            "truncated": page.truncated,
-            "before": page.before.map(|row| format!("scr_{row}")),
-        }))
     }
 
     fn list_models(&self, params: &Value) -> Result<Value> {
         match params_string(params, "harness")? {
             "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
-                let socket = paths::home_dir()?
-                    .join("run")
-                    .join(format!("models-{}", Uuid::new_v4().simple()))
-                    .join("app-server.sock");
-                let connection = CodexConnection::connect(socket, Arc::new(|_| {}), &self.reaper)?;
+                let connection = CodexConnection::connect(
+                    Arc::new(|_| {}),
+                    None,
+                    None,
+                    &codex_discovery_args(),
+                    Duration::from_mins(1),
+                    &self.reaper,
+                )?;
                 let response = connection.list_models(
                     params
                         .get("include_hidden")
@@ -2234,236 +2077,10 @@ impl Daemon {
         }
     }
 
-    fn list_harnesses(params: &Value) -> Result<Value> {
-        let all = json!([
-            {"id":"codex","model_discovery":"complete","effort":true},
-            {"id":"claude","model_discovery":"snapshot","effort":true}
-        ]);
-        if let Some(name) = params.get("harness").and_then(Value::as_str) {
-            return all
-                .as_array()
-                .and_then(|items| items.iter().find(|item| item["id"] == name))
-                .cloned()
-                .with_context(|| format!("harness not found: {name}"));
-        }
-        Ok(all)
-    }
-
-    fn handle_hook(&self, params: &Value) -> Result<Value> {
-        let selector = params_string(params, "session")?;
-        let agent = params_string(params, "agent")?;
-        let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-        let session = self.resolve_session(selector).or_else(|_| {
-            let provider_id = payload
-                .get("session_id")
-                .and_then(Value::as_str)
-                .context("hook payload has no provider Session ID")?;
-            self.resolve_session(&canonical_session_id(agent, provider_id))
-        })?;
-        if agent != session.agent {
-            bail!(
-                "hook agent mismatch: session uses {}, hook reported {agent}",
-                session.agent
-            );
-        }
-        let event_name = payload
-            .get("hook_event_name")
-            .and_then(Value::as_str)
-            .context("hook payload has no hook_event_name")?;
-        if matches!(event_name, "SessionStart" | "UserPromptSubmit")
-            && let Some(provider_id) = payload
-                .get("session_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-        {
-            let mut pending = self
-                .pending_provider_ids
-                .lock()
-                .map_err(|_| anyhow!("pending provider ID map lock poisoned"))?;
-            if let Some(binding) = pending.get_mut(selector)
-                && binding.is_none()
-            {
-                *binding = Some(provider_id.to_owned());
-            }
-        }
-        // The transcript fallback reads an untrusted provider file, so it runs
-        // with no store lock held and is revalidated before it terminalizes
-        // anything.
-        let recovery = if event_name == "Stop" {
-            self.recover_final_text(&session, &payload)?
-        } else {
-            None
-        };
-        let mut store = self.lock_store()?;
-        let outcome = apply_hook_event(&mut store, &session, event_name, &payload, recovery)?;
-        let seq = store.record_event(Some(&session.id), outcome.turn_id.as_deref(), outcome.kind);
-        let response = json!({
-            "accepted": true,
-            "seq": seq,
-            "event": outcome.kind,
-            "turn_id": outcome.turn_id,
-        });
-        drop(store);
-        self.submission_changed.notify_all();
-        Ok(response)
-    }
-
-    /// Recover a missing Claude `final_text` from the Session transcript.
-    /// Returns the guard values the caller must revalidate before use.
-    fn recover_final_text(
-        &self,
-        session: &SessionRecord,
-        payload: &Value,
-    ) -> Result<Option<TranscriptRecovery>> {
-        if payload
-            .get("last_assistant_message")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
-        {
-            return Ok(None);
-        }
-        let Some(provider_session_id) = provider_id_from_session(session).map(str::to_owned) else {
-            return Ok(None);
-        };
-        let captured = {
-            let store = self.lock_store()?;
-            let Some(current) = store.get_session(&session.id) else {
-                return Ok(None);
-            };
-            let Some(turn_id) = current.active_turn_id else {
-                return Ok(None);
-            };
-            let Some(turn) = store.get_turn(&turn_id) else {
-                return Ok(None);
-            };
-            let Some(uid) = store.session_uid(&session.id) else {
-                return Ok(None);
-            };
-            let Some((path, boundary)) = transcript_window(&turn) else {
-                return Ok(None);
-            };
-            TranscriptRecovery {
-                // A new PTY is a new screen epoch, so it doubles as the
-                // process-generation guard.
-                generation: store.screen_epoch(&uid),
-                provider_turn_id: turn.provider_turn_id.clone(),
-                boundary,
-                turn_id,
-                uid,
-                path,
-                text: String::new(),
-            }
-        };
-        let Some(text) =
-            crate::transcript::recover(&captured.path, &provider_session_id, captured.boundary)
-        else {
-            return Ok(None);
-        };
-        Ok(Some(TranscriptRecovery { text, ..captured }))
-    }
-
-    fn subscribe_view(&self, stream: &mut UnixStream, request: &Request) -> Result<()> {
-        let result = (|| -> Result<_> {
-            let selector = params_string(&request.params, "session")?;
-            let session = self.resolve_session(selector)?;
-            let lease_id = params_string(&request.params, "lease_id")?.to_owned();
-            let steal = request
-                .params
-                .get("steal")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let mut leases = self
-                .attach_leases
-                .lock()
-                .map_err(|_| anyhow!("attach lease lock poisoned"))?;
-            if leases.contains_key(&session.id) && !steal {
-                bail!("session is already attached");
-            }
-            leases.insert(session.id.clone(), lease_id.clone());
-            drop(leases);
-            let (replay, receiver) = self.runtime(&session.id)?.subscribe()?;
-            Ok((session, lease_id, replay, receiver))
-        })();
-        let (session, lease_id, replay, receiver) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                return write_response(
-                    stream,
-                    &Response::error(&request.id, classify_error(&error), format!("{error:#}")),
-                );
-            }
-        };
-        write_response(
-            stream,
-            &Response::ok(
-                &request.id,
-                json!({
-                    "session_id": session.id,
-                    "replay_base64": base64::engine::general_purpose::STANDARD.encode(replay),
-                }),
-            ),
-        )?;
-        for chunk in receiver {
-            if stream.write_all(&chunk).is_err() || stream.flush().is_err() {
-                break;
-            }
-        }
-        if let Ok(mut leases) = self.attach_leases.lock()
-            && leases.get(&session.id) == Some(&lease_id)
-        {
-            leases.remove(&session.id);
-        }
-        Ok(())
-    }
-
     fn resolve_session(&self, selector: &str) -> Result<SessionRecord> {
         self.lock_store()?
             .get_session(selector)
             .with_context(|| format!("session not found: {selector}"))
-    }
-
-    fn promote_session(
-        &self,
-        from: &str,
-        to: &str,
-        runtime_session_id: &Arc<RwLock<String>>,
-    ) -> Result<()> {
-        let mut runtime_id = runtime_session_id
-            .write()
-            .map_err(|_| anyhow!("runtime session ID lock poisoned"))?;
-        if from == to {
-            to.clone_into(&mut runtime_id);
-            return Ok(());
-        }
-
-        if self
-            .sessions
-            .read()
-            .map_err(|_| anyhow!("session map lock poisoned"))?
-            .contains_key(to)
-        {
-            bail!("active runtime already exists for Session {to}");
-        }
-        let store = self.lock_store()?;
-        store.rekey_session(from, to)?;
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|_| anyhow!("session map lock poisoned"))?;
-        if let Some(runtime) = sessions.remove(from)
-            && sessions.insert(to.to_owned(), runtime).is_some()
-        {
-            bail!("active runtime already exists for Session {to}");
-        }
-        let mut leases = self
-            .attach_leases
-            .lock()
-            .map_err(|_| anyhow!("attach lease lock poisoned"))?;
-        if let Some(lease) = leases.remove(from) {
-            leases.insert(to.to_owned(), lease);
-        }
-        to.clone_into(&mut runtime_id);
-        Ok(())
     }
 
     fn resolve_turn(&self, id: &str) -> Result<TurnRecord> {
@@ -2488,548 +2105,81 @@ impl Daemon {
     }
 }
 
-fn write_semantic_input(runtime: &AgentRuntime, input: &[u8]) -> Result<()> {
-    let Some((&commit, paste)) = input.split_last() else {
-        bail!("semantic input cannot be empty");
-    };
-    if commit != b'\r' {
-        bail!("semantic input must end with carriage return");
+/// Move a Session and its runtime to a new public ID.
+fn promote_session(
+    store: &Mutex<Store>,
+    sessions: &SessionMap,
+    from: &str,
+    to: &str,
+    runtime_session_id: &RwLock<String>,
+) -> Result<()> {
+    let mut runtime_id = runtime_session_id
+        .write()
+        .map_err(|_| anyhow!("runtime session ID lock poisoned"))?;
+    if from == to {
+        to.clone_into(&mut runtime_id);
+        return Ok(());
     }
-    runtime
-        .wait_for_input_ready(CLAUDE_INPUT_READY_TIMEOUT)
-        .context("Claude PTY did not become input-ready")?;
-    // Claude emits SessionStart before its interactive input handler is fully
-    // installed. Keep a provider-specific settle interval after terminal mode
-    // and output become quiet, then recheck in case startup rendered again.
-    std::thread::sleep(CLAUDE_INPUT_SETTLE_INTERVAL);
-    runtime
-        .wait_for_input_ready(CLAUDE_INPUT_READY_TIMEOUT)
-        .context("Claude PTY did not remain input-ready")?;
-    runtime.write(paste)?;
-    // Interactive CLIs may turn a large bracketed paste into an asynchronous
-    // placeholder. Committing in the same write can be consumed before that
-    // placeholder is installed, so deliver Enter separately after a short
-    // provider-agnostic settle interval.
-    std::thread::sleep(Duration::from_secs(1));
-    runtime.write(&[commit])
-}
-
-struct HookOutcome {
-    kind: &'static str,
-    turn_id: Option<String>,
-}
-
-/// The transcript fallback is eligible only when the execution recorded both
-/// a transcript path and the byte boundary where it began. Substituting a zero
-/// boundary would let a previous turn's answer be returned as this one's.
-fn transcript_window(turn: &TurnRecord) -> Option<(String, u64)> {
-    Some((turn.transcript_path.clone()?, turn.transcript_offset?))
-}
-
-/// A transcript fallback captured outside the store lock, together with the
-/// identity it was captured against.
-struct TranscriptRecovery {
-    turn_id: String,
-    uid: String,
-    generation: u64,
-    provider_turn_id: Option<String>,
-    boundary: u64,
-    path: String,
-    text: String,
-}
-
-fn apply_hook_event(
-    store: &mut Store,
-    session: &SessionRecord,
-    event_name: &str,
-    payload: &Value,
-    recovery: Option<TranscriptRecovery>,
-) -> Result<HookOutcome> {
-    match event_name {
-        "SessionStart" => {
-            store.set_session_state(&session.id, SessionState::Idle);
-            Ok(HookOutcome {
-                kind: "session.ready",
-                turn_id: session.active_turn_id.clone(),
-            })
-        }
-        "UserPromptSubmit" => start_hook_turn(store, session, payload),
-        "Stop" => complete_hook_turn(store, session, payload, recovery),
-        "StopFailure" => fail_hook_turn(store, session, payload),
-        "Notification"
-            if payload
-                .get("notification_type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| matches!(kind, "permission_prompt" | "elicitation_dialog")) =>
-        {
-            store.set_session_state(&session.id, SessionState::Blocked);
-            Ok(HookOutcome {
-                kind: "session.blocked",
-                turn_id: session.active_turn_id.clone(),
-            })
-        }
-        "SessionEnd" => Ok(end_hook_session(store, session)),
-        _ => Ok(HookOutcome {
-            kind: "provider.hook",
-            turn_id: session.active_turn_id.clone(),
-        }),
+    if sessions
+        .read()
+        .map_err(|_| anyhow!("session map lock poisoned"))?
+        .contains_key(to)
+    {
+        bail!("active runtime already exists for Session {to}");
     }
-}
-
-fn fail_hook_turn(store: &Store, session: &SessionRecord, payload: &Value) -> Result<HookOutcome> {
-    let current = store
-        .get_session(&session.id)
-        .context("session disappeared while handling hook")?;
-    let Some(turn_id) = current.active_turn_id else {
-        store.set_session_state(&session.id, SessionState::Idle);
-        return Ok(HookOutcome {
-            kind: "provider.failure_unmatched",
-            turn_id: None,
-        });
-    };
-    let provider_turn_id = payload.get("turn_id").and_then(Value::as_str);
-    let final_message = payload
-        .get("last_assistant_message")
-        .and_then(Value::as_str);
-    let error = sanitize_claude_error(payload).to_string();
-    let failed = store.finish_turn_if_matching(
-        &turn_id,
-        provider_turn_id,
-        TurnState::Failed,
-        final_message,
-        Some(&error),
-    )?;
-    if failed {
-        store.set_session_state(&session.id, SessionState::Idle);
+    let store = store
+        .lock()
+        .map_err(|_| anyhow!("session store lock poisoned"))?;
+    store.rekey_session(from, to)?;
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("session map lock poisoned"))?;
+    if let Some(runtime) = sessions.remove(from)
+        && sessions.insert(to.to_owned(), runtime).is_some()
+    {
+        bail!("active runtime already exists for Session {to}");
     }
-    let quiesced = !failed && store.settle_canceled_turn(&turn_id, provider_turn_id)?;
-    Ok(HookOutcome {
-        kind: if failed {
-            "turn.failed"
-        } else if quiesced {
-            "provider.quiesced"
-        } else {
-            "provider.failure_unmatched"
-        },
-        turn_id: Some(turn_id),
-    })
-}
-
-fn start_hook_turn(
-    store: &mut Store,
-    session: &SessionRecord,
-    payload: &Value,
-) -> Result<HookOutcome> {
-    if !claude_submission_matches_session(session, payload) {
-        return Ok(HookOutcome {
-            kind: "provider.prompt_unmatched",
-            turn_id: session.active_turn_id.clone(),
-        });
-    }
-    let current = store
-        .get_session(&session.id)
-        .context("session disappeared while handling hook")?;
-    let turn_id = if let Some(turn_id) = current.active_turn_id {
-        if !hook_prompt_matches_turn(store, &turn_id, payload)? {
-            return Ok(HookOutcome {
-                kind: "provider.prompt_unmatched",
-                turn_id: Some(turn_id),
-            });
-        }
-        turn_id
-    } else {
-        let turn_id = format!("turn_{}", Uuid::new_v4().simple());
-        let prompt = payload
-            .get("prompt")
-            .or_else(|| payload.get("user_prompt"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        store.insert_turn(&turn_id, &session.id, prompt)?;
-        turn_id
-    };
-    let provider_turn_id = payload.get("turn_id").and_then(Value::as_str);
-    let started = store.mark_turn_started(&turn_id, provider_turn_id);
-    if started {
-        store.set_session_state(&session.id, SessionState::Busy);
-        // Record where this execution starts in the provider transcript so a
-        // later fallback cannot return the previous turn's answer.
-        if let Some(path) = payload.get("transcript_path").and_then(Value::as_str) {
-            store.set_turn_transcript(&turn_id, path, crate::transcript::boundary(path));
-        }
-    }
-    Ok(HookOutcome {
-        kind: if started {
-            "turn.started"
-        } else {
-            "provider.prompt_unmatched"
-        },
-        turn_id: Some(turn_id),
-    })
-}
-
-fn hook_cwd_matches(session: &SessionRecord, payload: &Value) -> bool {
-    let Some(provider_cwd) = payload.get("cwd").and_then(Value::as_str) else {
-        return false;
-    };
-    let Ok(expected_cwd) = PathBuf::from(&session.cwd).canonicalize() else {
-        return false;
-    };
-    let Ok(provider_cwd) = PathBuf::from(provider_cwd).canonicalize() else {
-        return false;
-    };
-    expected_cwd == provider_cwd
-}
-
-fn claude_submission_matches_session(session: &SessionRecord, payload: &Value) -> bool {
-    let Some((prefix, expected_provider_id)) = session.id.split_once(':') else {
-        return false;
-    };
-    // The launch id is not provider-qualified yet. The hook was already
-    // addressed to this launch.
-    if prefix == "internal" {
-        return hook_cwd_matches(session, payload);
-    }
-    if prefix != session.agent || prefix != "claude" || expected_provider_id.is_empty() {
-        return false;
-    }
-    if payload.get("session_id").and_then(Value::as_str) != Some(expected_provider_id) {
-        return false;
-    }
-    hook_cwd_matches(session, payload)
-}
-
-fn hook_prompt_matches_turn(store: &Store, turn_id: &str, payload: &Value) -> Result<bool> {
-    let provider_prompt = payload
-        .get("prompt")
-        .or_else(|| payload.get("user_prompt"))
-        .and_then(Value::as_str);
-    let Some(provider_prompt) = provider_prompt else {
-        return Ok(false);
-    };
-    let turn = store.get_turn(turn_id).context("active turn not found")?;
-    Ok(turn.prompt == provider_prompt)
-}
-
-fn complete_hook_turn(
-    store: &Store,
-    session: &SessionRecord,
-    payload: &Value,
-    recovery: Option<TranscriptRecovery>,
-) -> Result<HookOutcome> {
-    let current = store
-        .get_session(&session.id)
-        .context("session disappeared while handling hook")?;
-    let Some(turn_id) = current.active_turn_id else {
-        store.set_session_state(&session.id, SessionState::Idle);
-        return Ok(HookOutcome {
-            kind: "provider.stop_unmatched",
-            turn_id: None,
-        });
-    };
-    let provider_turn_id = payload.get("turn_id").and_then(Value::as_str);
-    let hook_message = payload
-        .get("last_assistant_message")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty());
-    // The fallback text is only usable if the Session identity, process
-    // generation, active execution, and provider turn are all unchanged since
-    // it was read outside the lock. Failing that check never fails the
-    // execution; it only leaves the text missing.
-    let recovered = recovery.filter(|recovery| {
-        hook_message.is_none()
-            && recovery.turn_id == turn_id
-            && store.session_uid(&session.id).as_deref() == Some(recovery.uid.as_str())
-            && store.screen_epoch(&recovery.uid) == recovery.generation
-            && store
-                .get_turn(&turn_id)
-                .and_then(|turn| turn.provider_turn_id)
-                .as_deref()
-                == recovery.provider_turn_id.as_deref()
-    });
-    let final_message = hook_message.or(recovered.as_ref().map(|recovery| recovery.text.as_str()));
-    let completed = store.complete_turn_if_matching(
-        &turn_id,
-        provider_turn_id,
-        final_message.or_else(|| {
-            payload
-                .get("last_assistant_message")
-                .and_then(Value::as_str)
-        }),
-        recovered.is_some(),
-    )?;
-    if completed {
-        store.set_session_state(&session.id, SessionState::Idle);
-    }
-    let quiesced = !completed && store.settle_canceled_turn(&turn_id, provider_turn_id)?;
-    Ok(HookOutcome {
-        kind: if completed {
-            "turn.completed"
-        } else if quiesced {
-            "provider.quiesced"
-        } else {
-            "provider.stop_unmatched"
-        },
-        turn_id: Some(turn_id),
-    })
-}
-
-fn end_hook_session(store: &Store, session: &SessionRecord) -> HookOutcome {
-    let reason = "provider session ended before turn completion";
-    let turn_id = store.interrupt_active_turn(&session.id, reason);
-    if let Some(turn_id) = &turn_id {
-        store.record_event(Some(&session.id), Some(turn_id), "turn.interrupted");
-    }
-    let restarting = store
-        .get_session(&session.id)
-        .is_some_and(|current| current.state == SessionState::Restarting);
-    if restarting {
-        store.finish_session_restart_stop(&session.id);
-    } else {
-        store.set_session_stopped(&session.id);
-    }
-    HookOutcome {
-        kind: if restarting {
-            "provider.session_ended_for_restart"
-        } else {
-            "session.stopped"
-        },
-        turn_id,
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn apply_codex_notification(store: &mut Store, session_id: &str, message: &Value) -> Result<()> {
-    let method = message
-        .get("method")
-        .and_then(Value::as_str)
-        .context("Codex notification has no method")?;
-    let params = message.get("params").unwrap_or(&Value::Null);
-    let session = store
-        .get_session(session_id)
-        .context("session disappeared while handling Codex notification")?;
-    match method {
-        "thread/started" => {
-            let _thread_id = params
-                .pointer("/thread/id")
-                .and_then(Value::as_str)
-                .context("Codex thread/started had no thread id")?;
-            store.record_event(Some(session_id), None, "provider.thread_started");
-        }
-        "turn/started" => {
-            if !codex_thread_matches(&session, params)? {
-                return Ok(());
-            }
-            let provider_turn_id = params
-                .pointer("/turn/id")
-                .and_then(Value::as_str)
-                .context("Codex turn/started had no turn id")?;
-            let current = store
-                .get_session(session_id)
-                .context("session disappeared while starting Codex turn")?;
-            let turn_id = if let Some(turn_id) = current.active_turn_id {
-                turn_id
-            } else {
-                let turn_id = format!("turn_{}", Uuid::new_v4().simple());
-                let prompt = codex_turn_prompt(params);
-                store.insert_turn(&turn_id, session_id, &prompt)?;
-                store.allocate_input_sequence();
-                store.record_event(Some(session_id), Some(&turn_id), "turn.submitted");
-                turn_id
-            };
-            if store.mark_turn_started(&turn_id, Some(provider_turn_id)) {
-                store.set_session_state(session_id, SessionState::Busy);
-                store.record_event(Some(session_id), Some(&turn_id), "turn.started");
-            }
-        }
-        "error" => {
-            if !codex_thread_matches(&session, params)? {
-                return Ok(());
-            }
-            let provider_turn_id = params.get("turnId").and_then(Value::as_str);
-            let turn_id = local_turn_for_provider(store, session_id, provider_turn_id)?;
-            let will_retry = params
-                .get("willRetry")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if will_retry {
-                let attempt = params.get("attempt").and_then(Value::as_u64).unwrap_or(1);
-                store.record_provider_retry_event(Some(session_id), turn_id.as_deref(), attempt);
-            } else {
-                store.record_event(Some(session_id), turn_id.as_deref(), "provider.error");
-            }
-        }
-        "turn/completed" => {
-            if !codex_thread_matches(&session, params)? {
-                return Ok(());
-            }
-            let provider_turn_id = params
-                .pointer("/turn/id")
-                .and_then(Value::as_str)
-                .context("Codex turn/completed had no turn id")?;
-            let status = params
-                .pointer("/turn/status")
-                .and_then(Value::as_str)
-                .context("Codex turn/completed had no status")?;
-            let turn_state = match status {
-                "completed" => TurnState::Completed,
-                "failed" => TurnState::Failed,
-                "interrupted" => TurnState::Interrupted,
-                _ => bail!("invalid Codex terminal turn status {status:?}"),
-            };
-            let Some(turn_id) = local_turn_for_provider(store, session_id, Some(provider_turn_id))?
-            else {
-                store.record_event(Some(session_id), None, "provider.completion_unmatched");
-                return Ok(());
-            };
-            let final_message = codex_final_message(params);
-            let error_value = sanitize_codex_error(params.pointer("/turn/error"));
-            let error = (turn_state != TurnState::Completed).then(|| error_value.to_string());
-            let completed = store.finish_turn_if_matching(
-                &turn_id,
-                Some(provider_turn_id),
-                turn_state,
-                final_message.as_deref(),
-                error.as_deref(),
-            )?;
-            if completed {
-                store.set_session_state(session_id, SessionState::Idle);
-            }
-            let quiesced =
-                !completed && store.settle_canceled_turn(&turn_id, Some(provider_turn_id))?;
-            let event_kind = if completed {
-                match turn_state {
-                    TurnState::Completed => "turn.completed",
-                    TurnState::Failed => "turn.failed",
-                    TurnState::Interrupted => "turn.interrupted",
-                    _ => unreachable!(),
-                }
-            } else if quiesced {
-                "provider.quiesced"
-            } else {
-                "provider.completion_unmatched"
-            };
-            store.record_event(Some(session_id), Some(&turn_id), event_kind);
-        }
-        "dlgt/server/request" => {
-            store.set_session_state(session_id, SessionState::Blocked);
-            store.record_event(
-                Some(session_id),
-                session.active_turn_id.as_deref(),
-                "session.blocked",
-            );
-        }
-        "dlgt/protocol/error" => {
-            store.record_event(
-                Some(session_id),
-                session.active_turn_id.as_deref(),
-                "provider.protocol_error",
-            );
-        }
-        "dlgt/transport/closed" => {
-            if session.state == SessionState::Stopping || session.state.is_terminal() {
-                return Ok(());
-            }
-            let reason = sanitize_message(
-                params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex app-server connection closed"),
-            );
-            if let Some(turn_id) = store.interrupt_active_turn(session_id, &reason) {
-                store.record_event(Some(session_id), Some(&turn_id), "turn.interrupted");
-            }
-            store.set_session_failed(session_id);
-            store.record_event(Some(session_id), None, "session.failed");
-        }
-        _ => {}
-    }
+    to.clone_into(&mut runtime_id);
     Ok(())
 }
 
-fn codex_thread_matches(session: &SessionRecord, params: &Value) -> Result<bool> {
-    let thread_id = params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .context("Codex notification had no threadId")?;
-    Ok(provider_id_from_session(session).is_some_and(|provider_id| provider_id == thread_id))
-}
-
-fn local_turn_for_provider(
-    store: &Store,
-    session_id: &str,
-    provider_turn_id: Option<&str>,
-) -> Result<Option<String>> {
-    let Some(turn_id) = store
-        .get_session(session_id)
-        .and_then(|value| value.active_turn_id)
-    else {
-        return Ok(None);
-    };
-    let turn = store.get_turn(&turn_id).context("active turn not found")?;
-    if provider_turn_id.is_some()
-        && turn.provider_turn_id.is_some()
-        && turn.provider_turn_id.as_deref() != provider_turn_id
-    {
-        return Ok(None);
-    }
-    Ok(Some(turn_id))
-}
-
-fn codex_turn_prompt(params: &Value) -> String {
+fn launch_environment(params: &Value) -> Result<HashMap<String, String>> {
     params
-        .pointer("/turn/items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
-        .and_then(|item| item.get("content"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|input| input.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|input| input.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .get("environment")
+        .and_then(Value::as_object)
+        .context("missing launch environment snapshot")?
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .with_context(|| format!("environment value for {key:?} must be a string"))
+        })
+        .collect()
 }
 
-fn codex_final_message(params: &Value) -> Option<String> {
-    params
-        .get("turn")
-        .and_then(final_agent_message_text)
-        .map(str::to_owned)
-}
-
-fn sanitize_codex_error(error: Option<&Value>) -> Value {
-    let Some(error) = error.filter(|value| !value.is_null()) else {
-        return Value::Null;
-    };
-    json!({
-        "message": sanitize_message(error.get("message").and_then(Value::as_str).unwrap_or("Codex turn failed")),
-        "code": error.get("codexErrorInfo").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn sanitize_claude_error(payload: &Value) -> Value {
-    json!({
-        "code": payload.get("error").and_then(Value::as_str).unwrap_or("unknown"),
-        "message": sanitize_message(
-            payload
-                .get("error_details")
-                .and_then(Value::as_str)
-                .unwrap_or("Claude turn failed"),
-        ),
-    })
+fn startup_timeout(params: &Value) -> Duration {
+    Duration::from_millis(
+        params
+            .get("startup_timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(60_000)
+            .min(300_000),
+    )
 }
 
 fn sanitize_message(message: &str) -> String {
     message.chars().take(4_096).collect()
 }
 
+/// Record that a Session's provider process is gone. An exit nobody asked
+/// for fails the Session and whatever it was executing.
 fn record_session_exit(
-    store: &Arc<Mutex<Store>>,
-    sessions: &Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>,
+    store: &Mutex<Store>,
+    sessions: &SessionMap,
     session_id: &str,
-    exit_code: u32,
+    reason: &str,
+    detail: Option<&str>,
 ) {
     if let Ok(store) = store.lock() {
         let session = store.get_session(session_id);
@@ -3042,7 +2192,17 @@ fn record_session_exit(
                 SessionState::Stopping | SessionState::Stopped | SessionState::Restarting
             )
         });
-        record_exit_result(&store, session.as_ref(), exit_code, intentional);
+        if !intentional {
+            let detail = detail.filter(|detail| !detail.is_empty());
+            store.append_message(
+                session_id,
+                MessageBody::notice(&detail.map_or_else(
+                    || reason.to_owned(),
+                    |detail| format!("{reason}; stderr: {detail}"),
+                )),
+            );
+        }
+        record_exit_result(&store, session.as_ref(), reason, intentional);
         if restarting {
             store.finish_session_restart_stop(session_id);
         } else if intentional {
@@ -3070,10 +2230,9 @@ fn record_session_exit(
 fn record_exit_result(
     store: &Store,
     session: Option<&SessionRecord>,
-    exit_code: u32,
+    reason: &str,
     intentional: bool,
 ) {
-    let reason = format!("agent process exited with code {exit_code}");
     let Some(session) = session else { return };
     let Some(turn_id) = session.active_turn_id.as_deref() else {
         return;
@@ -3083,7 +2242,7 @@ fn record_exit_result(
     } else {
         TurnState::Failed
     };
-    match store.finish_turn_if_matching(turn_id, None, state, None, Some(&reason)) {
+    match store.finish_turn_if_matching(turn_id, None, state, None, Some(reason)) {
         Ok(true) => {
             let _ = store.record_event(
                 Some(&session.id),
@@ -3117,16 +2276,6 @@ fn validate_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
-fn params_u16(params: &Value, name: &str, default: u16) -> Result<u16> {
-    let Some(value) = params.get(name) else {
-        return Ok(default);
-    };
-    let value = value
-        .as_u64()
-        .with_context(|| format!("parameter {name:?} must be an unsigned integer"))?;
-    u16::try_from(value).with_context(|| format!("parameter {name:?} is too large"))
-}
-
 fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
     serde_json::to_writer(&mut *stream, response).context("failed to encode RPC response")?;
     stream.write_all(b"\n")?;
@@ -3142,6 +2291,12 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "CURSOR_EXPIRED"
     } else if message.contains("CURSOR_INVALID") {
         "CURSOR_INVALID"
+    } else if message.contains("NO_ACTIVE_EXECUTION") {
+        "NO_ACTIVE_EXECUTION"
+    } else if message.contains("REQUEST_NOT_FOUND") {
+        "REQUEST_NOT_FOUND"
+    } else if message.contains("REQUEST_RESOLVED") {
+        "REQUEST_RESOLVED"
     } else if message.contains("cancel timed out") {
         "CANCEL_TIMEOUT"
     } else if message.contains("blocked on input") {
@@ -3154,19 +2309,11 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "SESSION_BUSY"
     } else if message.contains("has no result") {
         "NO_RESULT"
-    } else if message.contains("exclusive attach lease") {
-        "SESSION_ATTACHED"
-    } else if message.contains("already attached") {
-        "ALREADY_ATTACHED"
     } else if message.contains("active session alias already exists") {
         "ALIAS_IN_USE"
     } else if message.contains("launch")
         || message.contains("failed to spawn")
         || message.contains("failed to start")
-        || message.contains("failed to establish")
-        || message.contains("did not become")
-        || message.contains("did not create a thread")
-        || message.contains("did not report a Session ID")
         || message.contains("app-server child was unavailable")
     {
         "LAUNCH_FAILED"
@@ -3188,17 +2335,44 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BusyMetrics {
     busy_for_ms: u64,
-    pty_quiet_for_ms: u64,
+    quiet_for_ms: u64,
 }
 
-fn clamp_busy_metrics(busy_for_ms: u64, last_output_age_ms: Option<u64>) -> BusyMetrics {
+fn clamp_busy_metrics(busy_for_ms: u64, last_event_age_ms: Option<u64>) -> BusyMetrics {
     BusyMetrics {
         busy_for_ms,
-        // No output observed means no evidence of activity during this busy
-        // interval, so report the whole interval as quiet. If output predates
-        // the turn, min() removes that prior-idle time from the public value.
-        pty_quiet_for_ms: last_output_age_ms.map_or(busy_for_ms, |age| age.min(busy_for_ms)),
+        // No provider event means no evidence of activity during this busy
+        // interval, so report the whole interval as quiet. If the last event
+        // predates the turn, min() removes that prior-idle time.
+        quiet_for_ms: last_event_age_ms.map_or(busy_for_ms, |age| age.min(busy_for_ms)),
     }
+}
+
+fn busy_metrics(store: &Store, session: &SessionRecord) -> Option<BusyMetrics> {
+    if session.state != SessionState::Busy {
+        return None;
+    }
+    let now = now_ms();
+    let age = |since: i64| u64::try_from(now.saturating_sub(since)).unwrap_or(0);
+    // A turn is reserved before provider execution starts. Use that creation
+    // timestamp rather than the provider's started_at timestamp so the
+    // reported age cannot jump backwards while a provider binds.
+    let busy_for_ms = session
+        .active_turn_id
+        .as_deref()
+        .and_then(|turn_id| store.get_turn(turn_id))
+        .map_or(0, |turn| age(turn.created_at_ms));
+    Some(clamp_busy_metrics(
+        busy_for_ms,
+        store.last_provider_event_ms(&session.id).map(age),
+    ))
+}
+
+/// Build the public snapshot from an already-held store guard. The store
+/// mutex is not reentrant, so composite readers that take one cut under the
+/// lock use this directly.
+fn public_session_locked(store: &Store, session: &SessionRecord) -> Value {
+    public_session_with_metrics(session, busy_metrics(store, session))
 }
 
 #[cfg(test)]
@@ -3219,23 +2393,27 @@ fn public_session_with_metrics(
         "state": session.state.public_name(),
         "model": session.model,
         "effort": session.effort,
-        "auto_approve": session.auto_approve,
+        "approvals": session.approvals,
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
     });
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if let Some(auth) = session.auth {
+        object.insert("auth".to_owned(), json!(auth));
+    }
+    if let Some(model) = &session.resolved_model {
+        object.insert("resolved_model".to_owned(), json!(model));
+    }
     if let Some(metrics) = busy_metrics
         && session.state == SessionState::Busy
-        && let Some(object) = value.as_object_mut()
     {
         object.insert("busy_for_ms".to_owned(), json!(metrics.busy_for_ms));
-        object.insert(
-            "pty_quiet_for_ms".to_owned(),
-            json!(metrics.pty_quiet_for_ms),
-        );
+        object.insert("quiet_for_ms".to_owned(), json!(metrics.quiet_for_ms));
     }
     if session.agent == Agent::Claude.as_str()
         && let Some(provider_id) = provider_id_from_session(session)
-        && let Some(object) = value.as_object_mut()
     {
         object.insert(
             "marker".to_owned(),
@@ -3250,39 +2428,35 @@ struct SessionLaunchFailure {
     session_id: String,
     code: &'static str,
     message: String,
-    reason: Option<&'static str>,
     hint: String,
     action: Option<String>,
-    screen: Vec<String>,
+    detail: Option<String>,
 }
 
 impl SessionLaunchFailure {
     fn new(
         session_id: &str,
         agent: Option<Agent>,
-        screen: Vec<String>,
         error: &anyhow::Error,
+        detail: Option<String>,
     ) -> Self {
-        let blocker = agent.and_then(|agent| startup_blocker(agent, &screen));
+        // Without a terminal there is no startup screen for a human to
+        // answer, so a provider that needs interaction to start is a failed
+        // launch that names the command to run once by hand.
+        let code = match classify_error(error) {
+            "INTERNAL" | "NOT_FOUND" | "SESSION_UNAVAILABLE" => "LAUNCH_FAILED",
+            code => code,
+        };
         Self {
             session_id: session_id.to_owned(),
-            code: if blocker.is_some() {
-                "LAUNCH_BLOCKED"
-            } else {
-                classify_error(error)
-            },
-            message: blocker.map_or_else(
-                || format!("{error:#}"),
-                |blocker| format!("{}: {error:#}", blocker.message),
-            ),
-            reason: blocker.map(|blocker| blocker.reason),
-            hint: format!(
-                "the screen field is the provider's last rendered screen; read more with \
-                 `dlgt scrollback {session_id} --lines 200`, or the sensitive raw PTY bytes \
-                 with `dlgt logs --raw {session_id}`"
-            ),
-            action: blocker.map(|blocker| blocker.action.to_owned()),
-            screen,
+            code,
+            message: format!("{error:#}"),
+            hint: "detail carries the provider's own stderr tail; if the provider needs a login, \
+                   a trust decision, or first-run setup, run it once by hand in the Session's \
+                   working directory and retry"
+                .to_owned(),
+            action: agent.map(|agent| agent.as_str().to_owned()),
+            detail: detail.filter(|detail| !detail.is_empty()),
         }
     }
 
@@ -3302,7 +2476,7 @@ impl SessionLaunchFailure {
         if let Some(error) = response.error.as_mut() {
             error.hint = Some(self.hint.clone());
             error.action.clone_from(&self.action);
-            error.screen = Some(self.screen.clone());
+            error.detail.clone_from(&self.detail);
         }
         response
     }
@@ -3311,29 +2485,11 @@ impl SessionLaunchFailure {
         json!({
             "code": self.code,
             "message": self.message,
-            "reason": self.reason,
             "hint": self.hint,
             "action": self.action,
-            "screen": self.screen,
+            "detail": self.detail,
         })
     }
-}
-
-/// Drop trailing whitespace and the blank rows around a rendered screen.
-fn trim_screen(rows: Vec<String>) -> Vec<String> {
-    let rows = rows
-        .into_iter()
-        .map(|row| row.trim_end().to_owned())
-        .collect::<Vec<_>>();
-    let start = rows
-        .iter()
-        .position(|row| !row.is_empty())
-        .unwrap_or(rows.len());
-    let end = rows
-        .iter()
-        .rposition(|row| !row.is_empty())
-        .map_or(start, |end| end + 1);
-    rows[start..end].to_vec()
 }
 
 impl std::fmt::Display for SessionLaunchFailure {
@@ -3351,6 +2507,7 @@ fn public_result(turn: &TurnRecord) -> Value {
         "status": status,
         "final_text": turn.final_message.clone().unwrap_or_default(),
         "final_text_source": final_text_source(turn),
+        "denied_requests": turn.denied_requests,
         "error": turn.error,
         "started_at_ms": turn.started_at_ms.unwrap_or(turn.created_at_ms),
         "completed_at_ms": turn.completed_at_ms,
@@ -3361,16 +2518,12 @@ fn public_result(turn: &TurnRecord) -> Value {
 /// Where a retained `final_text` came from. `missing` is an explicit
 /// diagnostic: the execution still completed, but no answer was recovered.
 fn final_text_source(turn: &TurnRecord) -> &'static str {
-    if turn.final_text_recovered {
-        "transcript"
-    } else if turn
-        .final_message
-        .as_deref()
-        .is_some_and(|text| !text.is_empty())
-    {
-        "hook"
-    } else {
+    if turn.final_message.as_deref().is_none_or(str::is_empty) {
         "missing"
+    } else if turn.final_text_recovered {
+        "messages"
+    } else {
+        "provider"
     }
 }
 
@@ -3582,13 +2735,7 @@ fn validate_request_id(params: &Value) -> Result<()> {
 }
 
 fn request_digest(params: &Value) -> u128 {
-    const VOLATILE: [&str; 5] = [
-        "environment",
-        "rows",
-        "cols",
-        "correlation_id",
-        "request_id",
-    ];
+    const VOLATILE: [&str; 3] = ["environment", "correlation_id", "request_id"];
     let mut canonical = params.clone();
     if let Some(object) = canonical.as_object_mut() {
         for key in VOLATILE {
@@ -3624,8 +2771,8 @@ struct FetchOptions {
     incoming: Option<String>,
     cursor: Option<cursor::Cursor>,
     wait: Duration,
-    /// Zero disables the screen projection entirely.
-    stable_limit: usize,
+    /// Zero omits messages entirely.
+    message_limit: usize,
     max_bytes: usize,
     instance_id: String,
 }
@@ -3649,9 +2796,8 @@ impl FetchOptions {
 }
 
 /// An immutable observation cut taken under the store lock. Serialization
-/// happens after the lock is released, so output arriving during serialization
-/// belongs to the next cursor.
-#[allow(clippy::struct_excessive_bools)]
+/// happens after the lock is released, so anything arriving during
+/// serialization belongs to the next cursor.
 struct Cut {
     baseline: bool,
     state: Option<SessionState>,
@@ -3676,91 +2822,50 @@ struct Cut {
 #[allow(clippy::struct_excessive_bools)]
 struct BucketSource {
     session: Value,
+    /// Pending Requests. Always current, never positioned by the cursor.
+    requests: Vec<Value>,
+    /// More Requests are pending than one response publishes.
+    requests_more: bool,
     gaps: Vec<Value>,
     events: Vec<Value>,
     results: Vec<TurnRecord>,
     results_more: bool,
-    stable: Vec<String>,
-    /// Row ID immediately before `stable[0]`.
-    stable_start: u64,
-    /// Bytes of `stable[0]` a previous response already delivered.
-    stable_offset: usize,
-    stable_more: bool,
-    live: Vec<String>,
-    live_truncated: bool,
-    epoch: u64,
-    epoch_reset: bool,
-    reset_reason: Option<&'static str>,
-    screen: bool,
+    /// Messages after `incoming.m`, ascending, each carrying its `seq`.
+    messages: Vec<Value>,
+    messages_more: bool,
+    include_messages: bool,
     incoming: cursor::SessionCursor,
 }
 
 /// One Session bucket as committed so far.
-#[allow(clippy::struct_excessive_bools)]
 struct Committed {
     session: Value,
+    requests: Vec<Value>,
+    /// Pending Requests exist that this response does not carry.
+    requests_truncated: bool,
     gaps: Vec<Value>,
     results: Vec<Value>,
     events: Vec<Value>,
-    /// Complete rows only. A row split by the byte budget is never here.
-    stable: Vec<String>,
-    /// Continuation of the row a previous response split. Logically precedes
-    /// `stable[0]`, and is the only place `complete: true` can appear.
-    fragment_before: Option<StableFragment>,
-    /// The row this response had to split. Logically follows the last stable
-    /// row, and is never complete.
-    fragment_after: Option<StableFragment>,
-    live: Vec<String>,
-    live_truncated: bool,
-    screen: bool,
-    epoch: u64,
-    epoch_reset: bool,
-    reset_reason: Option<&'static str>,
+    messages: Vec<Value>,
+    include_messages: bool,
     /// Watermarks for exactly the units committed above.
     position: cursor::SessionCursor,
-}
-
-/// One piece of a screen row too wide for the response that carries it.
-/// Continuations keep arriving, offset advancing, until `complete` is true;
-/// only then do whole rows resume.
-struct StableFragment {
-    row_id: u64,
-    offset: u64,
-    text: String,
-    complete: bool,
 }
 
 impl Committed {
     fn value(&self) -> Value {
         let mut bucket = json!({
             "session": self.session,
+            "requests": self.requests,
             "gaps": self.gaps,
             "results": self.results,
             "events": self.events,
         });
-        if self.screen {
-            let mut screen = json!({
-                "epoch": self.epoch,
-                "reset": self.epoch_reset,
-                "reset_reason": self.epoch_reset.then_some(self.reset_reason).flatten(),
-                "stable": self.stable,
-                "live": self.live,
-                "live_truncated": self.live_truncated,
-            });
-            for (key, fragment) in [
-                ("fragment_before", self.fragment_before.as_ref()),
-                ("fragment_after", self.fragment_after.as_ref()),
-            ] {
-                if let Some(fragment) = fragment {
-                    screen[key] = json!({
-                        "row_id": fragment.row_id,
-                        "offset": fragment.offset,
-                        "text": fragment.text,
-                        "complete": fragment.complete,
-                    });
-                }
-            }
-            bucket["screen"] = screen;
+        if self.requests_truncated {
+            bucket["requests_truncated"] = json!(true);
+        }
+        if self.include_messages {
+            bucket["messages"] = json!(self.messages);
         }
         bucket
     }
@@ -3769,6 +2874,9 @@ impl Committed {
 /// A committed unit, recorded so a rollback can undo exactly what it did.
 enum Unit {
     Bucket,
+    Request {
+        bucket: usize,
+    },
     Result {
         bucket: usize,
         previous: cursor::SessionCursor,
@@ -3776,14 +2884,9 @@ enum Unit {
     Event {
         bucket: usize,
     },
-    Stable {
+    Message {
         bucket: usize,
         previous: cursor::SessionCursor,
-        /// Which slot the unit filled, if it was not a whole row.
-        slot: Option<FragmentSlot>,
-    },
-    Live {
-        bucket: usize,
     },
 }
 
@@ -3822,13 +2925,6 @@ struct Builder<'a> {
 /// attempt strictly shrinks, so this only bounds pathological input.
 const MAX_FIT_ATTEMPTS: usize = 24;
 
-/// Where a chunked row sits relative to the whole rows in the same response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FragmentSlot {
-    Before,
-    After,
-}
-
 impl<'a> Builder<'a> {
     const fn new(cut: &'a Cut, options: &'a FetchOptions) -> Self {
         Self {
@@ -3839,11 +2935,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Fixed cost of the document as currently committed: the skeleton plus
-    /// the cursor it would carry right now. Measured rather than reserved, so
-    /// the reported minimum budget is one a caller can actually use. The
-    /// cursor grows as watermarks advance; the final measurement and rollback
-    /// loop absorb that.
     /// Keep everything committed since `mark` only if the finished document
     /// fits the budget, and report by how much it did not.
     ///
@@ -3872,30 +2963,19 @@ impl<'a> Builder<'a> {
     }
 
     fn empty_bucket(source: &BucketSource) -> Committed {
-        let mut committed = Committed {
+        Committed {
             session: source.session.clone(),
+            requests: Vec::new(),
+            requests_truncated: source.requests_more,
             gaps: source.gaps.clone(),
             results: Vec::new(),
             events: Vec::new(),
-            stable: Vec::new(),
-            fragment_before: None,
-            fragment_after: None,
-            live: Vec::new(),
-            live_truncated: source.live_truncated,
-            screen: source.screen,
-            epoch: source.epoch,
-            epoch_reset: source.epoch_reset,
-            reset_reason: source.reset_reason,
+            messages: Vec::new(),
+            include_messages: source.include_messages,
+            // A bucket without messages carries the message head forward:
+            // the cut placed it in `incoming.m`.
             position: source.incoming,
-        };
-        // The screen projection publishes the current epoch even when no row
-        // ships, and a screenless bucket carries the head row forward.
-        committed.position.ep = source.epoch;
-        if !source.screen {
-            committed.position.r = source.stable_start;
-            committed.position.ro = 0;
         }
-        committed
     }
 
     /// Commit the mandatory part of each Session bucket: identity and gaps.
@@ -3906,6 +2986,23 @@ impl<'a> Builder<'a> {
             self.units.push(Unit::Bucket);
             if self.verify(mark)?.is_some() {
                 return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit pending Requests, oldest first. They are not positioned by the
+    /// cursor, so one that does not fit is flagged rather than paged.
+    fn commit_requests(&mut self) -> Result<()> {
+        for index in 0..self.buckets.len() {
+            for request in &self.cut.sources[index].requests {
+                let mark = self.units.len();
+                self.buckets[index].requests.push(request.clone());
+                self.units.push(Unit::Request { bucket: index });
+                if self.verify(mark)?.is_some() {
+                    self.buckets[index].requests_truncated = true;
+                    break;
+                }
             }
         }
         Ok(())
@@ -4011,129 +3108,36 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn commit_screen(&mut self) -> Result<()> {
+    /// Commit messages as an ascending prefix. A message is never split: one
+    /// that does not fit ends the messages for this response.
+    fn commit_messages(&mut self) -> Result<()> {
         for index in 0..self.buckets.len() {
-            if !self.cut.sources[index].screen {
+            if !self.cut.sources[index].include_messages {
                 continue;
             }
-            for row in 0..self.cut.sources[index].stable.len() {
-                if !self.commit_row(index, row)? {
+            for offset in 0..self.cut.sources[index].messages.len() {
+                let message = self.cut.sources[index].messages[offset].clone();
+                let mark = self.units.len();
+                let previous = self.buckets[index].position;
+                self.buckets[index].position.m = message_seq(&message);
+                self.buckets[index].messages.push(message);
+                self.units.push(Unit::Message {
+                    bucket: index,
+                    previous,
+                });
+                if self.verify(mark)?.is_some() {
                     return Ok(());
                 }
             }
         }
-        for index in 0..self.buckets.len() {
-            let source = &self.cut.sources[index];
-            if !source.screen || source.live.is_empty() {
-                continue;
-            }
-            // The empty `live` array is already part of the bucket, so only
-            // its contents and their separators are new.
-            let mark = self.units.len();
-            self.buckets[index].live.clone_from(&source.live);
-            self.units.push(Unit::Live { bucket: index });
-            let _ = self.verify(mark)?;
-        }
         Ok(())
-    }
-
-    /// Commit one screen row, chunked to fit. Returns whether the whole row
-    /// shipped; anything else ends the screen delta for this response.
-    fn commit_row(&mut self, index: usize, row: usize) -> Result<bool> {
-        let line = self.cut.sources[index].stable[row].clone();
-        let start = if row == 0 {
-            self.cut.sources[index].stable_offset
-        } else {
-            0
-        };
-        let start = char_floor(&line, start.min(line.len()));
-        let id = self.cut.sources[index].stable_start + u64::try_from(row).unwrap_or(0) + 1;
-        // Same reasoning as a result body: try the whole row first, because
-        // splitting it adds a frame and a cursor continuation.
-        let mut hint = usize::MAX;
-        for _ in 0..MAX_FIT_ATTEMPTS {
-            let remainder = &line[start..];
-            let separator = usize::from(!self.buckets[index].stable.is_empty());
-            let Some(take) = fit_text(remainder, hint.saturating_sub(separator)) else {
-                return Ok(false);
-            };
-            let complete = take == remainder.len();
-            // A row already partly delivered continues in the leading slot; a
-            // row this response has to split fills the trailing one. A whole
-            // row is never framed.
-            let slot = if start > 0 {
-                Some(FragmentSlot::Before)
-            } else if complete {
-                None
-            } else {
-                Some(FragmentSlot::After)
-            };
-            let mark = self.units.len();
-            let previous = self.buckets[index].position;
-            let text = remainder[..take].to_owned();
-            let attempted = serialized_len(&Value::String(text.clone()))?;
-            match slot {
-                Some(FragmentSlot::Before) => {
-                    self.buckets[index].fragment_before = Some(StableFragment {
-                        row_id: id,
-                        offset: u64::try_from(start).unwrap_or(0),
-                        text,
-                        complete,
-                    });
-                }
-                Some(FragmentSlot::After) => {
-                    self.buckets[index].fragment_after = Some(StableFragment {
-                        row_id: id,
-                        offset: 0,
-                        text,
-                        complete: false,
-                    });
-                }
-                None => self.buckets[index].stable.push(text),
-            }
-            let watermark = &mut self.buckets[index].position;
-            if complete {
-                watermark.r = id;
-                watermark.ro = 0;
-            } else {
-                watermark.r = id - 1;
-                watermark.ro = u64::try_from(start + take).unwrap_or(0);
-            }
-            self.units.push(Unit::Stable {
-                bucket: index,
-                previous,
-                slot,
-            });
-            let Some(excess) = self.verify(mark)? else {
-                return Ok(complete);
-            };
-            hint = attempted.saturating_sub(excess.max(1));
-            if hint == 0 {
-                return Ok(false);
-            }
-        }
-        Ok(false)
     }
 
     /// Undo the most recent commit, including the watermark it recorded.
     fn rollback(&mut self) -> bool {
         match self.units.pop() {
-            Some(Unit::Live { bucket }) => {
-                self.buckets[bucket].live.clear();
-                true
-            }
-            Some(Unit::Stable {
-                bucket,
-                previous,
-                slot,
-            }) => {
-                match slot {
-                    Some(FragmentSlot::Before) => self.buckets[bucket].fragment_before = None,
-                    Some(FragmentSlot::After) => self.buckets[bucket].fragment_after = None,
-                    None => {
-                        self.buckets[bucket].stable.pop();
-                    }
-                }
+            Some(Unit::Message { bucket, previous }) => {
+                self.buckets[bucket].messages.pop();
                 self.buckets[bucket].position = previous;
                 true
             }
@@ -4144,6 +3148,11 @@ impl<'a> Builder<'a> {
             Some(Unit::Result { bucket, previous }) => {
                 self.buckets[bucket].results.pop();
                 self.buckets[bucket].position = previous;
+                true
+            }
+            Some(Unit::Request { bucket }) => {
+                self.buckets[bucket].requests.pop();
+                self.buckets[bucket].requests_truncated = true;
                 true
             }
             Some(Unit::Bucket) => {
@@ -4166,26 +3175,17 @@ impl<'a> Builder<'a> {
             .zip(&self.cut.sources)
             .any(|(committed, source)| {
                 source.results_more
-                    || source.stable_more
+                    || source.messages_more
                     || committed.events.len() < source.events.len()
                     || committed.results.len() < source.results.len()
-                    || (source.screen
-                        && committed.stable.len()
-                            + usize::from(committed.fragment_before.is_some())
-                            + usize::from(committed.fragment_after.is_some())
-                            < source.stable.len())
+                    || committed.messages.len() < source.messages.len()
                     || committed.position.px.is_some()
-                    || committed.position.ro > 0
             })
     }
 
     fn delivered(&self) -> bool {
         self.buckets.iter().any(|bucket| {
-            !bucket.events.is_empty()
-                || !bucket.results.is_empty()
-                || !bucket.stable.is_empty()
-                || bucket.fragment_before.is_some()
-                || bucket.fragment_after.is_some()
+            !bucket.events.is_empty() || !bucket.results.is_empty() || !bucket.messages.is_empty()
         })
     }
 
@@ -4271,7 +3271,7 @@ impl<'a> Builder<'a> {
 
     fn document(&self) -> Value {
         json!({
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "runtime": {
                 "version": env!("CARGO_PKG_VERSION"),
                 "instance_id": self.options.instance_id,
@@ -4321,10 +3321,7 @@ impl<'a> Builder<'a> {
             ..self.options.clone()
         };
         let mut trial = Builder::new(self.cut, &options);
-        trial.commit_buckets()?;
-        trial.commit_results()?;
-        trial.commit_events()?;
-        trial.commit_screen()?;
+        trial.commit_all()?;
         let value = trial.settle()?;
         Ok(serialized_len(&value)? <= trial.budget() && (!trial.pending() || trial.progress()))
     }
@@ -4340,15 +3337,19 @@ impl<'a> Builder<'a> {
             self.buckets[0].results.push(minimum_result_value(turn));
         } else if let Some(event) = source.events.first() {
             self.buckets[0].events.push(event.clone());
-        } else if let Some(row) = source.stable.first() {
-            let head = row.chars().next().map(String::from).unwrap_or_default();
-            self.buckets[0].fragment_after = Some(StableFragment {
-                row_id: source.stable_start + 1,
-                offset: 0,
-                text: head,
-                complete: false,
-            });
+        } else if let Some(message) = source.messages.first() {
+            self.buckets[0].messages.push(message.clone());
         }
+    }
+
+    /// State first, then pending Requests, terminal results, and events.
+    /// Messages go last, so they are what a squeezed response drops first.
+    fn commit_all(&mut self) -> Result<()> {
+        self.commit_buckets()?;
+        self.commit_requests()?;
+        self.commit_results()?;
+        self.commit_events()?;
+        self.commit_messages()
     }
 
     /// Roll units back until the encoded document fits the budget.
@@ -4380,6 +3381,8 @@ impl<'a> Builder<'a> {
                 self.options.max_bytes,
             );
         }
+        // New messages alone never complete a long poll: they ride along when
+        // something else wakes it or the deadline fires.
         let settled = self.gapped()
             || self.cut.state == Some(SessionState::Blocked)
             || self.pending()
@@ -4399,12 +3402,16 @@ impl<'a> Builder<'a> {
 impl Cut {
     fn render(self, options: &FetchOptions) -> Result<Rendered> {
         let mut builder = Builder::new(&self, options);
-        builder.commit_buckets()?;
-        builder.commit_results()?;
-        builder.commit_events()?;
-        builder.commit_screen()?;
+        builder.commit_all()?;
         builder.finish()
     }
+}
+
+/// Version of the fetch document and lifecycle event schemas.
+const SCHEMA_VERSION: u32 = 2;
+
+fn message_seq(message: &Value) -> u64 {
+    message.get("seq").and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// Largest index at or below `index` that is a UTF-8 character boundary.
@@ -4414,26 +3421,6 @@ fn char_floor(text: &str, index: usize) -> usize {
         index -= 1;
     }
     index
-}
-
-/// Largest UTF-8 prefix of `text` whose encoded JSON string fits `budget`.
-/// `None` when not even one character fits.
-fn fit_text(text: &str, budget: usize) -> Option<usize> {
-    let mut take = text.len();
-    loop {
-        if encoded_len(&Value::String(text[..take].to_owned())) <= budget {
-            return Some(take);
-        }
-        if take == 0 {
-            return None;
-        }
-        let next = char_floor(text, take * 3 / 4);
-        take = if next == take {
-            char_floor(text, take - 1)
-        } else {
-            next
-        };
-    }
 }
 
 /// Encode a result, chunking `final_text` at a UTF-8 boundary to fit `budget`.
@@ -4503,11 +3490,7 @@ fn retention_gap(component: &str) -> Value {
 /// A continuation offset is caller-supplied. Reject one that does not name a
 /// UTF-8 boundary inside the unit it claims to continue, rather than indexing
 /// with it.
-fn validate_continuation(
-    position: &cursor::SessionCursor,
-    results: &[TurnRecord],
-    stable: &[String],
-) -> Result<()> {
+fn validate_continuation(position: &cursor::SessionCursor, results: &[TurnRecord]) -> Result<()> {
     if let Some(execution_seq) = position.px
         && let Some(turn) = results
             .first()
@@ -4518,17 +3501,6 @@ fn validate_continuation(
         if offset > text.len() || !text.is_char_boundary(offset) {
             bail!(
                 "CURSOR_INVALID: continuation offset is not a character boundary in the retained result"
-            );
-        }
-    }
-    if position.ro > 0 {
-        let Some(row) = stable.first() else {
-            return Ok(());
-        };
-        let offset = usize::try_from(position.ro).unwrap_or(usize::MAX);
-        if offset > row.len() || !row.is_char_boundary(offset) {
-            bail!(
-                "CURSOR_INVALID: continuation offset is not a character boundary in the retained screen row"
             );
         }
     }
@@ -4567,7 +3539,7 @@ fn normalize_event(event: &crate::protocol::EventRecord) -> Option<Value> {
         return None;
     }
     let mut value = json!({
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "seq": event.seq,
         "type": event_type,
         "session_id": event.session_id,
@@ -4621,17 +3593,16 @@ mod tests {
 
     use super::{
         Agent, BucketSource, BusyMetrics, Cut, DaemonLock, FETCH_DEFAULT_MAX_BYTES,
-        FETCH_EVENT_PAGE, FETCH_HARD_MAX_BYTES, FETCH_STABLE_PAGE, FetchOptions,
-        ProviderReservation, ReceiptLedger, SessionLaunchFailure, TranscriptRecovery,
-        apply_codex_notification, apply_hook_event, canonical_session_id, clamp_busy_metrics,
-        classify_error, cli_wrapper_overhead, generate_alias, generate_internal_id,
-        is_stale_socket_error, ownership_lock_path, prepare_socket_path, provider_id_from_session,
-        public_result, public_session, public_session_with_metrics, read_rpc_line,
-        refresh_submission_receipt_from_store, remove_owned_socket, retention_gap, signal_shutdown,
-        socket_identity, start_hook_turn, transcript_window, trim_screen, validate_alias,
-        validate_continuation, wait_for_update_check,
+        FETCH_EVENT_PAGE, FETCH_HARD_MAX_BYTES, FETCH_MESSAGE_PAGE, FetchOptions,
+        ProviderReservation, ReceiptLedger, SessionLaunchFailure, canonical_session_id,
+        clamp_busy_metrics, classify_error, cli_wrapper_overhead, generate_alias,
+        generate_internal_id, is_stale_socket_error, ownership_lock_path, prepare_socket_path,
+        provider_id_from_session, public_result, public_session, public_session_with_metrics,
+        read_rpc_line, refresh_submission_receipt_from_store, remove_owned_socket, retention_gap,
+        signal_shutdown, socket_identity, validate_alias, validate_continuation,
+        wait_for_update_check,
     };
-    use crate::protocol::{SessionState, TurnState};
+    use crate::protocol::{ApprovalsMode, SessionState, TurnState};
     use crate::store::{NewSession, Store};
 
     fn ready_store(agent: &str) -> Store {
@@ -4647,7 +3618,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(store.set_session_running(&session_id, Some(42)));
@@ -4768,10 +3739,10 @@ mod tests {
     #[test]
     fn harness_startup_failures_are_launch_failures() {
         for message in [
-            "Codex remote TUI did not create a thread: timed out waiting on channel",
-            "provider did not report a Session ID",
+            "launch failed: Claude did not answer the stream-json initialize request",
+            "launch failed: Codex thread/start: timed out waiting for Codex thread/start",
             "Codex app-server child was unavailable",
-            "failed to establish Codex app-server WebSocket",
+            "failed to start the managed Codex app-server",
         ] {
             let error = anyhow::anyhow!("{message}");
             assert_eq!(
@@ -4783,54 +3754,41 @@ mod tests {
     }
 
     #[test]
-    fn codex_hook_review_screen_is_a_blocked_launch() {
-        let screen = trim_screen(vec![
-            String::new(),
-            "  Hooks need review   ".to_owned(),
-            "  1 hook is new or changed.".to_owned(),
-            "  › Review hooks".to_owned(),
-            String::new(),
-        ]);
+    fn a_launch_failure_names_the_provider_command_and_carries_its_stderr() {
         let failure = SessionLaunchFailure::new(
             "internal:ABC12345",
-            Some(Agent::Codex),
-            screen.clone(),
-            &anyhow::anyhow!("Codex remote TUI stopped at a startup dialog"),
+            Some(Agent::Claude),
+            &anyhow::anyhow!("Claude did not answer the initialize control request"),
+            Some("Invalid API key · Please run /login".to_owned()),
         );
-        assert_eq!(failure.code, "LAUNCH_BLOCKED");
-        assert_eq!(failure.reason, Some("codex_hooks_need_review"));
-        assert!(
-            failure
-                .message
-                .starts_with("Codex is waiting for hook review")
-        );
-        assert!(
-            failure
-                .action
-                .as_deref()
-                .is_some_and(|action| action.contains("trust"))
-        );
-        assert_eq!(failure.screen, screen);
         assert_eq!(
-            screen.first().map(String::as_str),
-            Some("  Hooks need review")
+            failure.code, "LAUNCH_FAILED",
+            "a provider that cannot start is never an internal error or a blocked launch"
         );
-        assert_eq!(screen.len(), 3);
-        assert!(failure.hint.contains("dlgt logs --raw internal:ABC12345"));
-    }
+        assert_eq!(failure.action.as_deref(), Some("claude"));
+        let response = failure.response("req_1".to_owned());
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("launch failure had no error"));
+        assert_eq!(error.launch_id.as_deref(), Some("internal:ABC12345"));
+        assert_eq!(error.session_id, None);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("Invalid API key · Please run /login")
+        );
+        assert_eq!(
+            failure.to_json()["detail"],
+            error.detail.as_deref().unwrap_or("")
+        );
 
-    #[test]
-    fn unknown_startup_screen_keeps_the_launch_failure_code() {
-        let failure = SessionLaunchFailure::new(
-            "internal:ABC12345",
+        let quiet = SessionLaunchFailure::new(
+            "codex:thread-1",
             Some(Agent::Codex),
-            vec!["Loading…".to_owned()],
-            &anyhow::anyhow!("Codex remote TUI did not create a thread: timed out"),
+            &anyhow::anyhow!("active session alias already exists"),
+            Some(String::new()),
         );
-        assert_eq!(failure.code, "LAUNCH_FAILED");
-        assert_eq!(failure.reason, None);
-        assert_eq!(failure.action, None);
-        assert_eq!(failure.screen, vec!["Loading…".to_owned()]);
+        assert_eq!(quiet.code, "ALIAS_IN_USE");
+        assert_eq!(quiet.detail, None);
     }
 
     #[test]
@@ -4905,29 +3863,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_hook_matches_the_unmodified_logical_prompt() {
-        let mut store = ready_store("claude");
-        store
-            .insert_turn("turn_prompt", "claude:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        let session = store
-            .get_session("claude:thread-1")
-            .unwrap_or_else(|| panic!("session missing"));
-        let outcome = start_hook_turn(
-            &mut store,
-            &session,
-            &json!({
-                "session_id": "thread-1",
-                "cwd": "/tmp",
-                "user_prompt": "hello",
-                "turn_id": "provider-turn",
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to match prompt hook: {error}"));
-        assert_eq!(outcome.kind, "turn.started");
-    }
-
-    #[test]
     fn busy_public_session_exposes_bounded_diagnostic_ages() {
         let mut store = ready_store("codex");
         store
@@ -4942,42 +3877,42 @@ mod tests {
             &session,
             Some(BusyMetrics {
                 busy_for_ms: 1_234,
-                pty_quiet_for_ms: 987,
+                quiet_for_ms: 987,
             }),
         );
         assert_eq!(value["state"], "busy");
         assert_eq!(value["busy_for_ms"], 1_234);
-        assert_eq!(value["pty_quiet_for_ms"], 987);
+        assert_eq!(value["quiet_for_ms"], 987);
 
         let idle = ready_store("codex")
             .get_session("codex:thread-1")
             .unwrap_or_else(|| panic!("idle session missing"));
         let idle_value = public_session(&idle);
         assert!(idle_value.get("busy_for_ms").is_none());
-        assert!(idle_value.get("pty_quiet_for_ms").is_none());
+        assert!(idle_value.get("quiet_for_ms").is_none());
     }
 
     #[test]
-    fn pty_quiet_age_is_clamped_to_current_busy_interval() {
+    fn quiet_age_is_clamped_to_current_busy_interval() {
         assert_eq!(
             clamp_busy_metrics(500, Some(1_200)),
             BusyMetrics {
                 busy_for_ms: 500,
-                pty_quiet_for_ms: 500,
+                quiet_for_ms: 500,
             }
         );
         assert_eq!(
             clamp_busy_metrics(500, Some(250)),
             BusyMetrics {
                 busy_for_ms: 500,
-                pty_quiet_for_ms: 250,
+                quiet_for_ms: 250,
             }
         );
         assert_eq!(
             clamp_busy_metrics(500, None),
             BusyMetrics {
                 busy_for_ms: 500,
-                pty_quiet_for_ms: 500,
+                quiet_for_ms: 500,
             }
         );
     }
@@ -5009,88 +3944,6 @@ mod tests {
         assert_eq!(value["final_text"], "done");
         assert!(!value.to_string().contains("turn_private"));
         assert!(!value.to_string().contains("provider_private"));
-    }
-
-    #[test]
-    fn claude_stop_failure_finishes_the_turn_as_failed() {
-        let mut store = ready_store("claude");
-        store
-            .insert_turn("turn_1", "claude:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
-        let session = store
-            .get_session("claude:thread-1")
-            .unwrap_or_else(|| panic!("session missing"));
-        let outcome = apply_hook_event(
-            &mut store,
-            &session,
-            "StopFailure",
-            &json!({
-                "turn_id": "provider-turn",
-                "error": "invalid_request",
-                "error_details": "bad model",
-            }),
-            None,
-        )
-        .unwrap_or_else(|error| panic!("failed to apply StopFailure: {error}"));
-        assert_eq!(outcome.kind, "turn.failed");
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, TurnState::Failed);
-        assert!(
-            turn.error
-                .is_some_and(|error| error.contains("invalid_request"))
-        );
-    }
-
-    #[test]
-    fn claude_submission_requires_matching_session_cwd_and_prompt() {
-        let mut store = ready_store("claude");
-        store
-            .insert_turn("turn_1", "claude:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        let session = store
-            .get_session("claude:thread-1")
-            .unwrap_or_else(|| panic!("session missing"));
-
-        for payload in [
-            json!({"session_id":"other","cwd":"/tmp","user_prompt":"hello"}),
-            json!({"session_id":"thread-1","cwd":"/","user_prompt":"hello"}),
-            json!({"session_id":"thread-1","cwd":"/tmp"}),
-            json!({"session_id":"thread-1","cwd":"/tmp","user_prompt":"different"}),
-        ] {
-            let outcome = start_hook_turn(&mut store, &session, &payload)
-                .unwrap_or_else(|error| panic!("failed to inspect hook: {error}"));
-            assert_eq!(outcome.kind, "provider.prompt_unmatched");
-            assert_eq!(
-                store
-                    .get_turn("turn_1")
-                    .unwrap_or_else(|| panic!("turn missing"))
-                    .state,
-                TurnState::Submitted
-            );
-        }
-
-        let outcome = start_hook_turn(
-            &mut store,
-            &session,
-            &json!({
-                "session_id":"thread-1",
-                "cwd":"/tmp",
-                "turn_id":"provider-turn",
-                "user_prompt":"hello"
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to apply matching hook: {error}"));
-        assert_eq!(outcome.kind, "turn.started");
-        assert_eq!(
-            store
-                .get_turn("turn_1")
-                .unwrap_or_else(|| panic!("turn missing"))
-                .state,
-            TurnState::Running
-        );
     }
 
     #[test]
@@ -5132,106 +3985,6 @@ mod tests {
         assert_eq!(receipt["submission"], "confirmed");
     }
 
-    fn started_claude_turn(store: &mut Store) -> (crate::protocol::SessionRecord, String) {
-        store
-            .insert_turn("turn_1", "claude:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
-        let session = store
-            .get_session("claude:thread-1")
-            .unwrap_or_else(|| panic!("session missing"));
-        let uid = store
-            .session_uid("claude:thread-1")
-            .unwrap_or_else(|| panic!("session uid missing"));
-        (session, uid)
-    }
-
-    fn recovery(turn_id: &str, uid: &str, generation: u64) -> TranscriptRecovery {
-        TranscriptRecovery {
-            turn_id: turn_id.to_owned(),
-            uid: uid.to_owned(),
-            generation,
-            provider_turn_id: Some("provider-turn".to_owned()),
-            boundary: 0,
-            path: "/transcript.jsonl".to_owned(),
-            text: "recovered answer".to_owned(),
-        }
-    }
-
-    #[test]
-    fn a_missing_hook_final_text_is_recovered_from_the_transcript() {
-        let mut store = ready_store("claude");
-        let (session, uid) = started_claude_turn(&mut store);
-        let generation = store.screen_epoch(&uid);
-
-        let outcome = apply_hook_event(
-            &mut store,
-            &session,
-            "Stop",
-            &json!({"turn_id": "provider-turn", "last_assistant_message": ""}),
-            Some(recovery("turn_1", &uid, generation)),
-        )
-        .unwrap_or_else(|error| panic!("failed to apply Stop: {error}"));
-
-        assert_eq!(outcome.kind, "turn.completed");
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, TurnState::Completed);
-        assert_eq!(turn.final_message.as_deref(), Some("recovered answer"));
-        assert_eq!(public_result(&turn)["final_text_source"], "transcript");
-    }
-
-    #[test]
-    fn a_stale_recovery_never_replaces_text_or_fails_the_execution() {
-        let mut store = ready_store("claude");
-        let (session, uid) = started_claude_turn(&mut store);
-        let generation = store.screen_epoch(&uid);
-
-        let outcome = apply_hook_event(
-            &mut store,
-            &session,
-            "Stop",
-            &json!({"turn_id": "provider-turn", "last_assistant_message": ""}),
-            Some(recovery(
-                "turn_from_a_previous_generation",
-                &uid,
-                generation,
-            )),
-        )
-        .unwrap_or_else(|error| panic!("failed to apply Stop: {error}"));
-
-        assert_eq!(outcome.kind, "turn.completed");
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, TurnState::Completed);
-        assert_eq!(public_result(&turn)["final_text"], "");
-        assert_eq!(public_result(&turn)["final_text_source"], "missing");
-    }
-
-    #[test]
-    fn a_reported_hook_final_text_always_wins_over_the_transcript() {
-        let mut store = ready_store("claude");
-        let (session, uid) = started_claude_turn(&mut store);
-        let generation = store.screen_epoch(&uid);
-
-        apply_hook_event(
-            &mut store,
-            &session,
-            "Stop",
-            &json!({"turn_id": "provider-turn", "last_assistant_message": "hook answer"}),
-            Some(recovery("turn_1", &uid, generation)),
-        )
-        .unwrap_or_else(|error| panic!("failed to apply Stop: {error}"));
-
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.final_message.as_deref(), Some("hook answer"));
-        assert_eq!(public_result(&turn)["final_text_source"], "hook");
-    }
-
     fn fetch_options(max_bytes: usize, cursor: Option<crate::cursor::Cursor>) -> FetchOptions {
         FetchOptions {
             scope: "su_test".to_owned(),
@@ -5239,7 +3992,7 @@ mod tests {
             incoming: None,
             cursor,
             wait: Duration::from_millis(0),
-            stable_limit: FETCH_STABLE_PAGE,
+            message_limit: FETCH_MESSAGE_PAGE,
             max_bytes,
             instance_id: "boot".to_owned(),
         }
@@ -5255,8 +4008,7 @@ mod tests {
             provider_turn_id: None,
             final_message: Some(text.to_owned()),
             final_text_recovered: false,
-            transcript_path: None,
-            transcript_offset: None,
+            denied_requests: 0,
             error: None,
             created_at_ms: 0,
             started_at_ms: Some(0),
@@ -5269,7 +4021,7 @@ mod tests {
         range
             .map(|seq| {
                 json!({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "seq": seq,
                     "type": "session.busy",
                     "session_id": "claude:x",
@@ -5279,46 +4031,52 @@ mod tests {
             .collect()
     }
 
+    fn text_message(seq: u64, text: &str) -> Value {
+        json!({"seq": seq, "execution_seq": 1, "kind": "assistant", "text": text})
+    }
+
+    fn message_seqs(value: &Value) -> Vec<u64> {
+        value["sessions"][0]["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message["seq"].as_u64())
+            .collect()
+    }
+
     struct SourceSpec {
         session: Value,
+        requests: Vec<Value>,
         events: Vec<Value>,
         results: Vec<crate::protocol::TurnRecord>,
-        stable: Vec<String>,
-        stable_start: u64,
+        messages: Vec<Value>,
         incoming: crate::cursor::SessionCursor,
-        screen: bool,
     }
 
     impl SourceSpec {
         fn new(_uid: &str) -> Self {
             Self {
                 session: json!({"id": "claude:x", "state": "idle"}),
+                requests: Vec::new(),
                 events: Vec::new(),
                 results: Vec::new(),
-                stable: Vec::new(),
-                stable_start: 0,
+                messages: Vec::new(),
                 incoming: crate::cursor::SessionCursor::default(),
-                screen: false,
             }
         }
 
         fn build(self) -> BucketSource {
             BucketSource {
                 session: self.session,
+                requests: self.requests,
+                requests_more: false,
                 gaps: Vec::new(),
                 events: self.events,
                 results: self.results,
                 results_more: false,
-                stable_offset: usize::try_from(self.incoming.ro).unwrap_or(0),
-                stable: self.stable,
-                stable_start: self.stable_start,
-                stable_more: false,
-                live: Vec::new(),
-                live_truncated: false,
-                epoch: 1,
-                epoch_reset: false,
-                reset_reason: None,
-                screen: self.screen,
+                messages: self.messages,
+                messages_more: false,
+                include_messages: true,
                 incoming: self.incoming,
             }
         }
@@ -5359,13 +4117,6 @@ mod tests {
             .map(|text| text.len())
             .unwrap_or_default()
             + cli_wrapper_overhead()
-    }
-
-    fn fragment_text<'a>(screen: &'a Value, slot: &str) -> &'a str {
-        screen
-            .get(slot)
-            .and_then(|piece| piece["text"].as_str())
-            .unwrap_or_default()
     }
 
     fn event_seqs(value: &Value) -> Vec<i64> {
@@ -5567,15 +4318,13 @@ mod tests {
     fn drain_history(
         events: &[Value],
         result: &crate::protocol::TurnRecord,
-        rows: &[String],
+        messages: &[Value],
         max_bytes: usize,
-    ) -> (Vec<i64>, String, String) {
-        let rows: Vec<String> = rows.to_vec();
-        let rows = rows.as_slice();
+    ) -> (Vec<i64>, String, Vec<u64>) {
         let mut cursor: Option<crate::cursor::Cursor> = None;
         let mut seen_events = Vec::new();
         let mut body = String::new();
-        let mut screen = String::new();
+        let mut seen_messages = Vec::new();
         for _ in 0..10_000 {
             let options = fetch_options(max_bytes, cursor.clone());
             let position = options.position();
@@ -5586,11 +4335,9 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>();
             let events_more = pending_events.len() > FETCH_EVENT_PAGE;
-            let delivered_rows = usize::try_from(position.r).unwrap_or(0);
-            let pending_rows = rows
+            let pending_messages = messages
                 .iter()
-                .skip(delivered_rows)
-                .take(FETCH_STABLE_PAGE)
+                .filter(|message| message["seq"].as_u64().unwrap_or(0) > position.m)
                 .cloned()
                 .collect::<Vec<_>>();
             let mut cut = test_cut(vec![
@@ -5601,15 +4348,17 @@ mod tests {
                     } else {
                         vec![result.clone()]
                     },
-                    stable_start: position.r,
-                    stable: pending_rows,
+                    messages: pending_messages
+                        .iter()
+                        .take(FETCH_MESSAGE_PAGE)
+                        .cloned()
+                        .collect(),
                     incoming: position,
-                    screen: true,
                     ..SourceSpec::new("su_test")
                 }
                 .build(),
             ]);
-            cut.sources[0].stable_more = rows.len() > delivered_rows + FETCH_STABLE_PAGE;
+            cut.sources[0].messages_more = pending_messages.len() > FETCH_MESSAGE_PAGE;
             cut.events_more = events_more;
             cut.full_event_watermark = events
                 .iter()
@@ -5636,131 +4385,128 @@ mod tests {
             {
                 body.push_str(chunk["final_text"].as_str().unwrap_or_default());
             }
-            // Reassembled purely from the schema's declared order:
-            // fragment_before, then whole rows, then fragment_after.
-            let view = &rendered.value["sessions"][0]["screen"];
-            screen.push_str(fragment_text(view, "fragment_before"));
-            for line in view["stable"].as_array().into_iter().flatten() {
-                let line = line.as_str().unwrap_or_default();
+            for message in rendered.value["sessions"][0]["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
                 assert!(
-                    rows.iter().any(|row| row == line),
-                    "screen.stable carried a partial row: {line:?}"
+                    messages.contains(message),
+                    "a message was altered or split: {message}"
                 );
-                screen.push_str(line);
+                seen_messages.push(message["seq"].as_u64().unwrap_or(0));
             }
-            screen.push_str(fragment_text(view, "fragment_after"));
             cursor = Some(rendered.cursor.clone());
             if rendered.value["has_more"] != json!(true) {
-                return (seen_events, body, screen);
+                return (seen_events, body, seen_messages);
             }
         }
         panic!("history never reached quiescence at {max_bytes} bytes");
     }
 
     #[test]
-    fn an_oversized_screen_row_pages_through_within_the_byte_bound() {
-        let rows = vec!["z".repeat(100_000), "tail".to_owned()];
-        let result = test_turn(1, "");
-        let (_, _, screen) = drain_history(&[], &result, &rows, 4 * 1024);
-        assert_eq!(screen, rows.concat());
-    }
-
-    #[test]
-    fn a_split_row_is_framed_by_slot_and_never_as_a_stable_row() {
-        let row = "z".repeat(100_000);
-        let rows = [row.clone(), "tail".to_owned()];
-        let mut cursor: Option<crate::cursor::Cursor> = None;
-        let mut rebuilt = String::new();
-        let mut expected_offset = 0_u64;
-        let mut mid_fragment: Option<(crate::cursor::Cursor, String)> = None;
-        let mut completions = 0;
-        for _ in 0..200 {
-            let options = fetch_options(4 * 1024, cursor.clone());
-            let position = options.position();
-            let delivered_rows = usize::try_from(position.r).unwrap_or(0);
-            let rendered = test_cut(vec![
+    fn a_squeezed_response_drops_messages_first_and_never_splits_one() {
+        let messages = (1..=3)
+            .map(|seq| text_message(seq, &"m".repeat(1_500)))
+            .collect::<Vec<_>>();
+        let cut = || {
+            test_cut(vec![
                 SourceSpec {
-                    stable: rows.iter().skip(delivered_rows).cloned().collect(),
-                    stable_start: position.r,
-                    incoming: position,
-                    screen: true,
+                    events: lifecycle_events(1..=2),
+                    results: vec![test_turn(1, "the answer")],
+                    messages: messages.clone(),
                     ..SourceSpec::new("su_test")
                 }
                 .build(),
             ])
-            .render(&options)
+        };
+        let roomy = cut()
+            .render(&fetch_options(FETCH_HARD_MAX_BYTES, None))
             .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert_eq!(message_seqs(&roomy.value), [1, 2, 3]);
+        assert_eq!(roomy.cursor.p.m, 3);
 
-            let view = &rendered.value["sessions"][0]["screen"];
-            for line in view["stable"].as_array().into_iter().flatten() {
-                assert!(
-                    rows.iter()
-                        .any(|known| known == line.as_str().unwrap_or_default()),
-                    "a partial row appeared in screen.stable"
-                );
-            }
-            if let Some(after) = view.get("fragment_after") {
-                assert_eq!(
-                    after["complete"],
-                    json!(false),
-                    "fragment_after is never complete"
-                );
-            }
-            for slot in ["fragment_before", "fragment_after"] {
-                let Some(fragment) = view.get(slot) else {
-                    continue;
-                };
-                assert_eq!(fragment["row_id"], 1, "the split row is row 1");
-                assert_eq!(
-                    fragment["offset"],
-                    json!(expected_offset),
-                    "{slot} offsets must advance without gaps"
-                );
-                let text = fragment["text"].as_str().unwrap_or_default();
-                if mid_fragment.is_none() && expected_offset > 0 {
-                    mid_fragment = Some((
-                        cursor.clone().unwrap_or_else(|| panic!("no cursor")),
-                        text.to_owned(),
-                    ));
-                }
-                rebuilt.push_str(text);
-                expected_offset += u64::try_from(text.len()).unwrap_or(0);
-                if fragment["complete"] == json!(true) {
-                    completions += 1;
-                    assert_eq!(slot, "fragment_before", "only a continuation completes");
-                    assert_eq!(rebuilt, row, "the fragments must rebuild the row");
-                }
-            }
-            cursor = Some(rendered.cursor.clone());
-            if rendered.value["has_more"] != json!(true) {
-                break;
-            }
-        }
-        assert_eq!(rebuilt, row);
-        assert_eq!(completions, 1, "the row must complete exactly once");
+        let tight = cut()
+            .render(&fetch_options(2_600, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        let bucket = &tight.value["sessions"][0];
+        assert_eq!(bucket["results"][0]["final_text"], "the answer");
+        assert_eq!(event_seqs(&tight.value), [1, 2]);
+        assert_eq!(message_seqs(&tight.value), [1], "only whole messages ship");
+        assert_eq!(bucket["messages"][0], messages[0]);
+        assert_eq!(tight.cursor.p.m, 1, "the watermark stops at what shipped");
+        assert_eq!(tight.value["reason"], "page_full");
+        assert_eq!(tight.value["has_more"], true);
+    }
 
-        // Replaying a mid-fragment cursor returns the identical suffix.
-        let (replay_cursor, expected_text) =
-            mid_fragment.unwrap_or_else(|| panic!("no mid-fragment cursor was captured"));
-        let options = fetch_options(4 * 1024, Some(replay_cursor));
-        let position = options.position();
-        let delivered_rows = usize::try_from(position.r).unwrap_or(0);
-        let replay = test_cut(vec![
-            SourceSpec {
-                stable: rows.iter().skip(delivered_rows).cloned().collect(),
-                stable_start: position.r,
-                incoming: position,
-                screen: true,
-                ..SourceSpec::new("su_test")
-            }
-            .build(),
-        ])
-        .render(&options)
-        .unwrap_or_else(|error| panic!("failed to replay: {error}"));
+    #[test]
+    fn new_messages_alone_never_complete_a_long_poll() {
+        let cut = |bound_terminal: bool| {
+            let mut cut = test_cut(vec![
+                SourceSpec {
+                    messages: vec![text_message(1, "still working")],
+                    ..SourceSpec::new("su_test")
+                }
+                .build(),
+            ]);
+            cut.state = Some(SessionState::Busy);
+            cut.bound_seq = Some(1);
+            cut.bound_terminal = bound_terminal;
+            cut
+        };
+        let mut waiting = fetch_options(FETCH_HARD_MAX_BYTES, None);
+        waiting.wait = Duration::from_mins(1);
+        let rendered = cut(false)
+            .render(&waiting)
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert!(!rendered.settled, "a message woke a waiting fetch");
         assert_eq!(
-            replay.value["sessions"][0]["screen"]["fragment_before"]["text"],
-            json!(expected_text)
+            message_seqs(&rendered.value),
+            [1],
+            "the message still rides along when the deadline fires"
         );
+
+        let immediate = cut(false)
+            .render(&fetch_options(FETCH_HARD_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert!(immediate.settled);
+        assert_eq!(immediate.value["reason"], "change");
+    }
+
+    #[test]
+    fn pending_requests_ship_with_state_and_are_flagged_when_they_do_not_fit() {
+        let request = |id: &str| json!({"id": id, "kind": "approval", "tool": "Bash", "summary": "s".repeat(900)});
+        let cut = || {
+            let mut cut = test_cut(vec![
+                SourceSpec {
+                    requests: vec![request("r1"), request("r2")],
+                    messages: vec![text_message(1, "asking")],
+                    ..SourceSpec::new("su_test")
+                }
+                .build(),
+            ]);
+            cut.state = Some(SessionState::Blocked);
+            cut
+        };
+        let mut waiting = fetch_options(FETCH_HARD_MAX_BYTES, None);
+        waiting.wait = Duration::from_mins(1);
+        let rendered = cut()
+            .render(&waiting)
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        assert!(rendered.settled, "a pending Request returns early");
+        assert_eq!(rendered.value["reason"], "blocked");
+        let bucket = &rendered.value["sessions"][0];
+        assert_eq!(bucket["requests"].as_array().map(Vec::len), Some(2));
+        assert!(bucket.get("requests_truncated").is_none());
+
+        let tight = cut()
+            .render(&fetch_options(1_400, None))
+            .unwrap_or_else(|error| panic!("failed to render: {error}"));
+        let bucket = &tight.value["sessions"][0];
+        assert_eq!(bucket["requests"].as_array().map(Vec::len), Some(1));
+        assert_eq!(bucket["requests"][0]["id"], "r1");
+        assert_eq!(bucket["requests_truncated"], true);
+        assert_eq!(tight.value["reason"], "blocked");
     }
 
     #[test]
@@ -5928,57 +4674,47 @@ mod tests {
     }
 
     #[test]
-    fn the_reported_minimum_holds_for_a_screen_only_response() {
-        // A stable-only screen response: the floor must include the fixed
-        // screen object as well as the fragment frame.
-        let screen_cut = || {
+    fn the_reported_minimum_holds_for_a_messages_only_response() {
+        let cut = || {
             test_cut(vec![
                 SourceSpec {
-                    stable: vec!["q".repeat(4_000)],
-                    screen: true,
+                    messages: vec![text_message(1, &"q".repeat(4_000))],
                     ..SourceSpec::new("su_test")
                 }
                 .build(),
             ])
         };
-        let (name, cut, options) = (
-            "screen",
-            Box::new(screen_cut) as Box<dyn Fn() -> Cut>,
-            fetch_options(32, None),
+        let options = fetch_options(32, None);
+        let error = cut()
+            .render(&options)
+            .err()
+            .unwrap_or_else(|| panic!("an unusable budget was accepted"));
+        let message = error.to_string();
+        let minimum = message
+            .rsplit("--max-bytes ")
+            .next()
+            .and_then(|tail| tail.split(' ').next())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("no minimum in {message}"));
+        let at_minimum = FetchOptions {
+            max_bytes: minimum,
+            ..options
+        };
+        let rendered = cut()
+            .render(&at_minimum)
+            .unwrap_or_else(|error| panic!("minimum {minimum} failed: {error}"));
+        assert!(
+            line_length(&rendered.value) <= minimum,
+            "the response exceeded the reported minimum {minimum}"
         );
-        {
-            let error = cut()
-                .render(&options)
-                .err()
-                .unwrap_or_else(|| panic!("{name}: an unusable budget was accepted"));
-            let message = error.to_string();
-            let minimum = message
-                .rsplit("--max-bytes ")
-                .next()
-                .and_then(|tail| tail.split(' ').next())
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or_else(|| panic!("{name}: no minimum in {message}"));
-
-            let at_minimum = FetchOptions {
-                max_bytes: minimum,
-                ..options.clone()
-            };
-            let rendered = cut()
-                .render(&at_minimum)
-                .unwrap_or_else(|error| panic!("{name}: minimum {minimum} failed: {error}"));
-            assert!(
-                line_length(&rendered.value) <= minimum,
-                "{name}: the response exceeded the reported minimum {minimum}"
-            );
-        }
+        assert_eq!(message_seqs(&rendered.value), [1]);
     }
 
     #[test]
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     fn a_reported_minimum_budget_always_renders() {
         // Each of these fails at a tiny budget for a different reason: an
-        // oversized Session record, an oversized result body, an oversized
-        // screen row.
+        // oversized Session record, an oversized result body, a wide message.
         type Case = (&'static str, Box<dyn Fn() -> Cut>, FetchOptions);
         let cases: Vec<Case> = vec![
             (
@@ -6007,12 +4743,11 @@ mod tests {
                 fetch_options(16, None),
             ),
             (
-                "oversized screen row",
+                "wide message",
                 Box::new(|| {
                     test_cut(vec![
                         SourceSpec {
-                            stable: vec!["w".repeat(80_000)],
-                            screen: true,
+                            messages: vec![text_message(1, &"w".repeat(4_096))],
                             ..SourceSpec::new("su_test")
                         }
                         .build(),
@@ -6058,8 +4793,8 @@ mod tests {
     fn every_delivered_window_covers_the_full_history_exactly() {
         let events = lifecycle_events(1..=40);
         let result = test_turn(1, &"body ".repeat(3_000));
-        let rows = (0..300)
-            .map(|index| format!("row-{index} {}", "w".repeat(index % 97)))
+        let messages = (1..=300_u64)
+            .map(|seq| text_message(seq, &"w".repeat(usize::try_from(seq % 97).unwrap_or(0))))
             .collect::<Vec<_>>();
         // A deterministic spread of tight budgets.
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -6068,7 +4803,7 @@ mod tests {
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
             let max_bytes = 1_400 + usize::try_from(seed >> 33).unwrap_or(0) % 6_000;
-            let (delivered, body, screen) = drain_history(&events, &result, &rows, max_bytes);
+            let (delivered, body, read) = drain_history(&events, &result, &messages, max_bytes);
 
             assert!(
                 delivered.windows(2).all(|pair| pair[0] < pair[1]),
@@ -6084,7 +4819,11 @@ mod tests {
                 result.final_message.clone().unwrap_or_default(),
                 "result body loss at {max_bytes}"
             );
-            assert_eq!(screen, rows.concat(), "screen row loss at {max_bytes}");
+            assert_eq!(
+                read,
+                (1..=300).collect::<Vec<_>>(),
+                "messages were lost, duplicated, or reordered at {max_bytes}"
+            );
         }
     }
 
@@ -6151,19 +4890,6 @@ mod tests {
     }
 
     #[test]
-    fn the_transcript_fallback_needs_a_recorded_boundary() {
-        let mut turn = test_turn(1, "");
-        assert!(transcript_window(&turn).is_none());
-        turn.transcript_path = Some("/x.jsonl".to_owned());
-        assert!(
-            transcript_window(&turn).is_none(),
-            "a path without a boundary must not enable the fallback"
-        );
-        turn.transcript_offset = Some(12);
-        assert_eq!(transcript_window(&turn), Some(("/x.jsonl".to_owned(), 12)));
-    }
-
-    #[test]
     fn a_continuation_offset_off_a_character_boundary_is_rejected() {
         let turn = test_turn(7, "héllo");
         let inside = crate::cursor::SessionCursor {
@@ -6171,7 +4897,7 @@ mod tests {
             po: 2,
             ..crate::cursor::SessionCursor::default()
         };
-        let error = validate_continuation(&inside, std::slice::from_ref(&turn), &[])
+        let error = validate_continuation(&inside, std::slice::from_ref(&turn))
             .err()
             .unwrap_or_else(|| panic!("a split character was accepted"));
         assert_eq!(classify_error(&error), "CURSOR_INVALID");
@@ -6181,14 +4907,14 @@ mod tests {
             po: 9_999,
             ..crate::cursor::SessionCursor::default()
         };
-        assert!(validate_continuation(&past_end, std::slice::from_ref(&turn), &[]).is_err());
+        assert!(validate_continuation(&past_end, std::slice::from_ref(&turn)).is_err());
 
         let valid = crate::cursor::SessionCursor {
             px: Some(7),
             po: 1,
             ..crate::cursor::SessionCursor::default()
         };
-        assert!(validate_continuation(&valid, std::slice::from_ref(&turn), &[]).is_ok());
+        assert!(validate_continuation(&valid, std::slice::from_ref(&turn)).is_ok());
         // A marker that no longer names the next retained result is stale, not
         // hostile: it is dropped rather than rejected.
         let stale = crate::cursor::SessionCursor {
@@ -6196,130 +4922,6 @@ mod tests {
             po: 5,
             ..crate::cursor::SessionCursor::default()
         };
-        assert!(validate_continuation(&stale, std::slice::from_ref(&turn), &[]).is_ok());
-    }
-
-    #[test]
-    fn codex_retry_error_does_not_finish_before_authoritative_completion() {
-        let mut store = ready_store("codex");
-        store
-            .insert_turn("turn_1", "codex:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        apply_codex_notification(
-            &mut store,
-            "codex:thread-1",
-            &json!({
-                "method": "turn/started",
-                "params": {"threadId": "thread-1", "turn": {"id": "provider-turn", "items": []}},
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to start Codex turn: {error}"));
-        apply_codex_notification(
-            &mut store,
-            "codex:thread-1",
-            &json!({
-                "method": "error",
-                "params": {
-                    "threadId": "thread-1",
-                    "turnId": "provider-turn",
-                    "willRetry": true,
-                    "error": {"message": "temporary", "codexErrorInfo": "serverOverloaded", "additionalDetails": "secret"},
-                },
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to apply retry error: {error}"));
-        assert_eq!(
-            store
-                .get_turn("turn_1")
-                .unwrap_or_else(|| panic!("turn missing"))
-                .state,
-            TurnState::Running
-        );
-        apply_codex_notification(
-            &mut store,
-            "codex:thread-1",
-            &json!({
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "thread-1",
-                    "turn": {
-                        "id": "provider-turn",
-                        "status": "failed",
-                        "items": [],
-                        "error": {"message": "bad request", "codexErrorInfo": "badRequest", "additionalDetails": "secret"},
-                    },
-                },
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to finish Codex turn: {error}"));
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, TurnState::Failed);
-        let error = turn.error.unwrap_or_else(|| panic!("turn error missing"));
-        assert!(error.contains("badRequest"));
-        assert!(!error.contains("secret"));
-        let uid = store
-            .session_uid("codex:thread-1")
-            .unwrap_or_else(|| panic!("session uid missing"));
-        let events = store.read_events(Some(&uid), 0);
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == "provider.error.retrying")
-        );
-        assert!(events.iter().any(|event| event.kind == "turn.failed"));
-    }
-
-    #[test]
-    fn codex_terminal_event_quiesces_without_resurrecting_a_canceled_turn() {
-        let mut store = ready_store("codex");
-        store
-            .insert_turn("turn_1", "codex:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
-        store.set_session_state("codex:thread-1", SessionState::Busy);
-        assert!(
-            store
-                .cancel_turn("turn_1")
-                .unwrap_or_else(|error| panic!("failed to cancel turn: {error}"))
-        );
-
-        apply_codex_notification(
-            &mut store,
-            "codex:thread-1",
-            &json!({
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "thread-1",
-                    "turn": {
-                        "id": "provider-turn",
-                        "status": "interrupted",
-                        "items": [],
-                        "error": null,
-                    },
-                },
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to quiesce canceled turn: {error}"));
-
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, TurnState::Canceled);
-        let session = store
-            .get_session("codex:thread-1")
-            .unwrap_or_else(|| panic!("session missing"));
-        assert_eq!(session.state, SessionState::Idle);
-        assert!(session.active_turn_id.is_none());
-        let uid = store
-            .session_uid("codex:thread-1")
-            .unwrap_or_else(|| panic!("session uid missing"));
-        assert!(
-            store
-                .read_events(Some(&uid), 0)
-                .iter()
-                .any(|event| event.kind == "provider.quiesced")
-        );
+        assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
     }
 }

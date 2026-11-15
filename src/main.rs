@@ -1,28 +1,28 @@
+mod claude;
 mod claude_models;
 mod client;
 mod codex;
+mod codex_events;
 mod cursor;
 mod daemon;
 mod doctor;
+mod messages;
 mod paths;
 mod protocol;
 mod provider;
-mod raw_mode;
 mod reaper;
-mod screen;
-mod session;
+mod requests;
 mod skill;
 mod store;
-mod transcript;
 mod update;
+mod watch;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -54,8 +54,11 @@ fn main() {
             if let Some(action) = &failure.action {
                 error_object.insert("action".to_owned(), json!(action));
             }
-            if let Some(screen) = &failure.screen {
-                error_object.insert("screen".to_owned(), json!(screen));
+            if let Some(request_ids) = &failure.request_ids {
+                error_object.insert("request_ids".to_owned(), json!(request_ids));
+            }
+            if let Some(detail) = &failure.detail {
+                error_object.insert("detail".to_owned(), json!(detail));
             }
         }
         let response = json!({"ok":false,"error":error_json});
@@ -82,19 +85,16 @@ fn run() -> Result<()> {
         "restart" => command_restart(&args[1..]),
         "send" => command_send(&args[1..]),
         "fetch" => command_fetch(&args[1..]),
+        "answer" => command_answer(&args[1..]),
         "cancel" => command_cancel(&args[1..]),
         "list" | "ls" => command_list(&args[1..]),
         "show" => command_show(&args[1..]),
-        "attach" => command_attach(&args[1..]),
+        "watch" => command_watch(&args[1..]),
         "stop" => command_stop(&args[1..]),
-        "scrollback" => command_scrollback(&args[1..]),
-        "logs" => command_logs(&args[1..]),
         "models" => command_models(&args[1..]),
         "profiles" => command_profiles(&args[1..]),
-        "harnesses" => command_harnesses(&args[1..]),
         "doctor" => command_doctor(&args[1..]),
         "rpc" => command_rpc(&args[1..]),
-        "hook" => command_hook(&args[1..]),
         "update" => command_update(&args[1..]),
         "skill" => {
             print!("{}", skill::TEXT);
@@ -146,7 +146,7 @@ fn command_new(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
         "new",
         args,
-        &["--stdin", "--pretty", "--clean-env", "--no-auto-approve"],
+        &["--stdin", "--pretty", "--clean-env"],
         &options,
     )?;
     let title = parsed.required("--title")?;
@@ -179,17 +179,13 @@ fn command_new(args: &[String]) -> Result<()> {
             .and_then(Value::as_str)
     });
     let harness_options = launch_harness_options(&parsed, profile.as_ref())?;
-    let auto_approve = if parsed.flag("--no-auto-approve") {
-        false
-    } else {
+    let approvals = approvals_option(&parsed)?.or_else(|| {
         profile
             .as_ref()
-            .and_then(|value| value.get("auto_approve"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-    };
+            .and_then(|value| value.get("approvals"))
+            .and_then(Value::as_str)
+    });
     let environment = launch_environment(&parsed, profile.as_ref())?;
-    let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
     let result = client::call(
         "session.create",
         json!({
@@ -201,16 +197,23 @@ fn command_new(args: &[String]) -> Result<()> {
             "model": model,
             "effort": effort,
             "harness_options": harness_options,
-            "auto_approve": auto_approve,
+            "approvals": approvals,
             "prompt": prompt,
             "startup_timeout_ms": parsed.one("--startup-timeout")
                 .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
             "environment": environment,
-            "rows": rows,
-            "cols": cols,
         }),
     )?;
     print_success(result, parsed.flag("--pretty"))
+}
+
+/// The approvals mode named on the command line, validated before any RPC.
+fn approvals_option(parsed: &Args) -> Result<Option<&str>> {
+    let Some(mode) = parsed.one("--approvals") else {
+        return Ok(None);
+    };
+    protocol::ApprovalsMode::parse(mode)?;
+    Ok(Some(mode))
 }
 
 fn command_send(args: &[String]) -> Result<()> {
@@ -218,13 +221,7 @@ fn command_send(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
         "send",
         args,
-        &[
-            "--stdin",
-            "--pretty",
-            "--resume",
-            "--clean-env",
-            "--no-auto-approve",
-        ],
+        &["--stdin", "--pretty", "--resume", "--steer", "--clean-env"],
         &options,
     )?;
     let session = parsed
@@ -237,6 +234,18 @@ fn command_send(args: &[String]) -> Result<()> {
     if parsed.one("--harness").is_some() {
         bail!("--harness is derived from the provider-qualified resume selector");
     }
+    if parsed.flag("--steer") && parsed.flag("--resume") {
+        bail!("--steer and --resume are mutually exclusive");
+    }
+    if !parsed.flag("--resume")
+        && let Some(option) = LAUNCH_OPTIONS
+            .iter()
+            .find(|option| **option != "--request-id" && parsed.one(option).is_some())
+            .copied()
+            .or_else(|| parsed.flag("--clean-env").then_some("--clean-env"))
+    {
+        bail!("{option} is accepted only with --resume");
+    }
     let correlation_id = format!("corr_{}", Uuid::new_v4().simple());
     let mut params = json!({
         "session":session,
@@ -244,6 +253,7 @@ fn command_send(args: &[String]) -> Result<()> {
         "correlation_id":correlation_id,
         "request_id": request_id,
         "resume": parsed.flag("--resume"),
+        "steer": parsed.flag("--steer"),
     });
     if parsed.flag("--resume") {
         let object = params.as_object_mut().context("invalid send parameters")?;
@@ -254,10 +264,7 @@ fn command_send(args: &[String]) -> Result<()> {
             "harness_options".to_owned(),
             json!(launch_harness_options(&parsed, None)?),
         );
-        object.insert(
-            "auto_approve".to_owned(),
-            json!(!parsed.flag("--no-auto-approve")),
-        );
+        object.insert("approvals".to_owned(), json!(approvals_option(&parsed)?));
         object.insert(
             "startup_timeout_ms".to_owned(),
             json!(
@@ -273,9 +280,6 @@ fn command_send(args: &[String]) -> Result<()> {
             "environment".to_owned(),
             json!(launch_environment(&parsed, None)?),
         );
-        let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
-        object.insert("rows".to_owned(), json!(rows));
-        object.insert("cols".to_owned(), json!(cols));
     }
     let route = client::find_live_session(session)?;
     if let Some(route) = &route {
@@ -298,7 +302,6 @@ fn command_restart(args: &[String]) -> Result<()> {
     )?;
     let session = parsed.one_positional("Session selector")?;
     let environment = launch_environment(&parsed, None)?;
-    let (rows, cols) = raw_mode::terminal_size(libc::STDIN_FILENO);
     let result = client::call(
         "session.restart",
         json!({
@@ -306,8 +309,6 @@ fn command_restart(args: &[String]) -> Result<()> {
             "startup_timeout_ms": parsed.one("--startup-timeout")
                 .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
             "environment": environment,
-            "rows": rows,
-            "cols": cols,
         }),
     )?;
     print_success(result, parsed.flag("--pretty"))
@@ -317,23 +318,23 @@ fn command_fetch(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
         "fetch",
         args,
-        &["--screen", "--no-screen", "--pretty"],
-        &["--cursor", "--wait", "--screen", "--max-bytes"],
+        &["--messages", "--no-messages", "--pretty"],
+        &["--cursor", "--wait", "--messages", "--max-bytes"],
     )?;
-    let session = Some(parsed.one_positional("Session selector")?);
-    if parsed.flag("--no-screen") && parsed.flag("--screen") {
-        bail!("--screen and --no-screen are mutually exclusive");
+    let session = parsed.one_positional("Session selector")?;
+    if parsed.flag("--no-messages") && parsed.flag("--messages") {
+        bail!("--messages and --no-messages are mutually exclusive");
     }
-    let screen = if parsed.flag("--no-screen") {
+    let messages = if parsed.flag("--no-messages") {
         json!(false)
-    } else if let Some(lines) = parsed.one("--screen") {
+    } else if let Some(count) = parsed.one("--messages") {
         json!(
-            lines
+            count
                 .parse::<u64>()
-                .context("invalid --screen line budget")?
+                .ok()
+                .filter(|count| *count > 0)
+                .context("invalid --messages count")?
         )
-    } else if parsed.flag("--screen") {
-        json!(true)
     } else {
         Value::Null
     };
@@ -341,18 +342,64 @@ fn command_fetch(args: &[String]) -> Result<()> {
         "session": session,
         "cursor": parsed.one("--cursor"),
         "wait_ms": parsed.one("--wait").map(parse_duration).transpose()?.map(duration_ms),
-        "screen": screen,
+        "messages": messages,
         "max_bytes": parsed.one("--max-bytes").map(str::parse::<u64>).transpose()
             .context("invalid --max-bytes")?,
     });
-    let route = session
-        .map(client::find_live_session)
-        .transpose()?
-        .flatten();
-    let result = if let Some(route) = &route {
-        client::call_socket(&route.socket, "session.fetch", params)?
-    } else {
-        client::call("session.fetch", params)?
+    let result = match client::find_live_session(session)? {
+        Some(route) => client::call_socket(&route.socket, "session.fetch", params)?,
+        None => client::call("session.fetch", params)?,
+    };
+    print_success(result, parsed.flag("--pretty"))
+}
+
+fn command_answer(args: &[String]) -> Result<()> {
+    let parsed = Args::parse(
+        "answer",
+        args,
+        &["--allow", "--deny", "--pretty"],
+        &["--message", "--text", "--choice"],
+    )?;
+    let [session, request] = parsed.positionals.as_slice() else {
+        bail!("expected a Session selector and a Request ID");
+    };
+    let choices = [
+        parsed.flag("--allow"),
+        parsed.flag("--deny"),
+        parsed.one("--text").is_some(),
+        parsed.one("--choice").is_some(),
+    ];
+    if choices.iter().filter(|chosen| **chosen).count() != 1 {
+        bail!("answer requires exactly one of --allow, --deny, --text, or --choice");
+    }
+    if parsed.one("--message").is_some() && !parsed.flag("--deny") {
+        bail!("--message is accepted only with --deny");
+    }
+    let mut params = json!({"session": session, "request": request});
+    if parsed.flag("--allow") {
+        params["decision"] = json!("allow");
+    } else if parsed.flag("--deny") {
+        params["decision"] = json!("deny");
+        params["message"] = json!(parsed.one("--message"));
+    } else if let Some(text) = parsed.one("--text") {
+        params["decision"] = json!("text");
+        params["text"] = json!(text);
+    } else if let Some(choice) = parsed.one("--choice") {
+        params["decision"] = json!("choice");
+        params["choice"] = json!(
+            choice
+                .parse::<u64>()
+                .ok()
+                .filter(|choice| *choice > 0)
+                .context("invalid --choice; use a 1-based number")?
+        );
+    }
+    let result = match client::find_live_session(session)? {
+        Some(route) => {
+            params["session"] = json!(route.session_id);
+            client::call_socket(&route.socket, "session.answer", params)?
+        }
+        None => client::call_existing("session.answer", params)?,
     };
     print_success(result, parsed.flag("--pretty"))
 }
@@ -395,32 +442,13 @@ fn command_show(args: &[String]) -> Result<()> {
     print_success(result, parsed.flag("--pretty"))
 }
 
-fn command_attach(args: &[String]) -> Result<()> {
-    let parsed = Args::parse("attach", args, &["--steal"], &[])?;
-    let selector = parsed.one_positional("Session selector")?;
-    // attach is an interactive terminal takeover. Without a TTY on both ends
-    // it would dump raw ANSI into a pipe and read input that no one is typing.
-    if !is_tty(libc::STDIN_FILENO) || !is_tty(libc::STDOUT_FILENO) {
-        return Err(client::RpcFailure {
-            code: "ATTACH_REQUIRES_TTY".to_owned(),
-            message: "attach requires an interactive terminal on stdin and stdout".to_owned(),
-            session_id: None,
-            launch_id: None,
-            correlation_id: None,
-            hint: Some(format!("dlgt fetch {selector}")),
-            session_state: None,
-            action: Some(format!("dlgt fetch {selector}")),
-            screen: None,
-        }
-        .into());
-    }
-    client::attach(selector, parsed.flag("--steal"))
-}
-
-fn is_tty(descriptor: i32) -> bool {
-    // SAFETY: isatty only inspects the descriptor and has no memory-safety
-    // preconditions.
-    unsafe { libc::isatty(descriptor) == 1 }
+fn command_watch(args: &[String]) -> Result<()> {
+    let parsed = Args::parse("watch", args, &["--from-start", "--until-idle"], &[])?;
+    watch::run(
+        parsed.one_positional("Session selector")?,
+        parsed.flag("--from-start"),
+        parsed.flag("--until-idle"),
+    )
 }
 
 fn command_stop(args: &[String]) -> Result<()> {
@@ -432,68 +460,6 @@ fn command_stop(args: &[String]) -> Result<()> {
         }),
     )?;
     print_success(result, parsed.flag("--pretty"))
-}
-
-fn command_scrollback(args: &[String]) -> Result<()> {
-    let parsed = Args::parse("scrollback", args, &["--pretty"], &["--lines", "--before"])?;
-    let session = parsed.one_positional("Session selector")?;
-    let lines = parsed
-        .one("--lines")
-        .map(str::parse::<u64>)
-        .transpose()
-        .context("invalid --lines")?
-        .unwrap_or(100);
-    let result = client::call(
-        "scrollback.read",
-        json!({"session":session,"lines":lines,"before":parsed.one("--before")}),
-    )?;
-    print_success(result, parsed.flag("--pretty"))
-}
-
-fn command_logs(args: &[String]) -> Result<()> {
-    let parsed = Args::parse("logs", args, &["--raw", "--json"], &[])?;
-    let session = parsed.one_positional("Session selector")?;
-    if !parsed.flag("--raw") {
-        bail!("logs requires the explicit --raw capability flag");
-    }
-    let mut after = 0_i64;
-    let mut all = Vec::new();
-    loop {
-        let value = client::call(
-            "transcript.read_raw",
-            json!({"session":session,"after":after}),
-        )?;
-        let bytes = base64::engine::general_purpose::STANDARD.decode(
-            value
-                .get("data_base64")
-                .and_then(Value::as_str)
-                .context("raw transcript has no data")?,
-        )?;
-        if parsed.flag("--json") {
-            all.extend(bytes);
-        } else {
-            io::stdout().write_all(&bytes)?;
-        }
-        if !value
-            .get("has_more")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            break;
-        }
-        after = value
-            .get("next_after")
-            .and_then(Value::as_i64)
-            .context("raw transcript cursor missing")?;
-    }
-    if parsed.flag("--json") {
-        print_success(
-            json!({"session_id":session,"data_base64":base64::engine::general_purpose::STANDARD.encode(all)}),
-            false,
-        )
-    } else {
-        io::stdout().flush().map_err(Into::into)
-    }
 }
 
 fn command_models(args: &[String]) -> Result<()> {
@@ -550,18 +516,6 @@ fn command_profiles(args: &[String]) -> Result<()> {
     print_success(result, parsed.flag("--pretty"))
 }
 
-fn command_harnesses(args: &[String]) -> Result<()> {
-    let parsed = Args::parse("harnesses", args, &["--pretty"], &[])?;
-    if parsed.positionals.len() > 1 {
-        bail!("harnesses accepts at most one Harness name");
-    }
-    let result = client::call(
-        "harness.list",
-        json!({"harness":parsed.positionals.first()}),
-    )?;
-    print_success(json!({"harnesses":result}), parsed.flag("--pretty"))
-}
-
 fn command_doctor(args: &[String]) -> Result<()> {
     let parsed = Args::parse("doctor", args, &["--json", "--probe"], &[])?;
     parsed.no_positionals()?;
@@ -589,20 +543,6 @@ fn command_update(args: &[String]) -> Result<()> {
     print_success(update::install_latest()?, parsed.flag("--pretty"))
 }
 
-fn command_hook(args: &[String]) -> Result<()> {
-    if args.len() != 3 || args[0] != "emit" {
-        bail!("invalid internal hook invocation");
-    }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    let payload = serde_json::from_str::<Value>(&input).unwrap_or(Value::Null);
-    let _ = client::call_existing(
-        "hook.event",
-        json!({"session":args[1],"agent":args[2],"payload":payload}),
-    );
-    Ok(())
-}
-
 /// Options accepted by the Session launch commands. `new` and `send` share
 /// this set so a Profile-driven launch and a `--resume` launch stay aligned.
 const LAUNCH_OPTIONS: &[&str] = &[
@@ -613,6 +553,7 @@ const LAUNCH_OPTIONS: &[&str] = &[
     "--model",
     "--effort",
     "--cwd",
+    "--approvals",
     "--harness-option",
     "--startup-timeout",
     "--request-id",
@@ -973,7 +914,7 @@ fn print_success(value: Value, pretty: bool) -> Result<()> {
 fn exit_status(code: &str) -> i32 {
     match code {
         "CANCEL_TIMEOUT" => 3,
-        "SESSION_BLOCKED" | "LAUNCH_BLOCKED" => 4,
+        "SESSION_BLOCKED" => 4,
         "SESSION_BUSY" => 5,
         _ => 1,
     }
@@ -981,7 +922,7 @@ fn exit_status(code: &str) -> i32 {
 
 fn print_usage() {
     println!(
-        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  restart      Restart a Session\n  send         Send work to an existing idle Session or --resume a provider conversation\n  fetch        Read new state, results, events, and screen from a cursor\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  attach       Attach to the Session screen\n  stop         Stop the Session\n\nOBSERVABILITY\n  scrollback   Read rendered terminal scrollback\n  logs         Read raw retained PTY bytes (requires --raw)\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  harnesses    List Harness capabilities\n  doctor       Diagnose the local dlgt installation\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
+        "dlgt - local subagent runtime\n\nUSAGE\n  dlgt <COMMAND> [OPTIONS]\n\nDELEGATION\n  new          Create a Session with its first prompt\n  send         Send work to an idle Session, --steer a busy one, or --resume\n  fetch        Read new state, results, events, and messages from a cursor\n  answer       Answer a pending approval or question\n  cancel       Interrupt the active execution\n\nSESSIONS\n  list, ls     List Sessions\n  show         Show Session state and latest result\n  watch        Follow a Session's messages as text (read-only)\n  restart      Restart a Session\n  stop         Stop the Session\n\nCONFIGURATION\n  models       Discover Harness models\n  profiles     List or inspect Profiles\n  doctor       Diagnose the local dlgt installation\n  skill        Print the embedded dlgt skill\n\nRUNTIME\n  server       Run or stop the daemon\n  update       Install the latest release and embedded Skills\n  rpc          Use JSONL RPC"
     );
 }
 
@@ -999,16 +940,16 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt update - install the latest release and embedded Skills\n\nUSAGE\n  dlgt update [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "new" => {
-            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>  Provider Harness (required without a Profile)\n  --model <MODEL>                 Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --harness-option <KEY[=VALUE]> Harness option (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --approvals <auto|ask|bypass>  Who approves what the worker does (default: auto)\n  --harness-option <KEY[=VALUE]> Harness option (repeatable)\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help\n\nAPPROVALS\n  auto     The provider's own reviewer decides; only what it does not settle is asked\n  ask      Every approval becomes a Request for `dlgt answer`\n  bypass   Nothing is asked and the provider sandbox is off"
         }
         "restart" => {
             "dlgt restart - replace a Session process and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "send" => {
-            "dlgt send - send work to an idle Session or explicitly resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                 Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --harness-option <KEY[=VALUE]> Harness option for resume (repeatable)\n  --no-auto-approve              Keep the Harness's own approval prompts on resume\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
+            "dlgt send - send work to an idle Session, steer a busy one, or resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt send <SESSION_ID|@ALIAS> --steer --request-id <ID> -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --steer                        Add the prompt to the execution that is already running\n  --resume                       Resume a stopped provider conversation\n  --model <MODEL>                Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --approvals <auto|ask|bypass>  Approvals mode for resume (default: the stored mode, else auto)\n  --harness-option <KEY[=VALUE]> Harness option for resume (repeatable)\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help\n\nA busy Session rejects a plain send with SESSION_BUSY; --steer needs a busy\nSession and never creates an execution. Launch options need --resume."
         }
         "fetch" => {
-            "dlgt fetch - read one Session since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --cursor <N>            Observation position from a previous response\n  --wait <DURATION>       Wait for the active/latest execution's terminal result (max 24h)\n  --screen[=<LINES>]      Include the screen delta (default: on, 128 stable lines)\n  --no-screen             Omit the screen delta\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline."
+            "dlgt fetch - read one Session since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --cursor <N>            Observation position from a previous response\n  --wait <DURATION>       Wait for the active/latest execution's terminal result (max 24h)\n  --messages[=<MAX>]      Messages per response (default: 64, max: 512)\n  --no-messages           Omit messages\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline.\nA pending Request returns at once with reason \"blocked\"; answer it with dlgt answer."
         }
         "cancel" => {
             "dlgt cancel - interrupt the active execution\n\nUSAGE\n  dlgt cancel <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --timeout <DURATION>   Cancellation timeout (default: 30s)\n  --pretty               Pretty-print JSON output\n  -h, --help             Print this help"
@@ -1017,28 +958,22 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt list - list Sessions\n\nUSAGE\n  dlgt list [--all] [--all-versions] [--pretty]\n  dlgt ls [--all] [--all-versions] [--pretty]\n\nOPTIONS\n  --all            Include terminal Sessions from live runtimes\n  --all-versions   Query every running dlgt version\n  --pretty         Pretty-print JSON output\n  -h, --help       Print this help"
         }
         "show" => {
-            "dlgt show - show Session state and latest result\n\nUSAGE\n  dlgt show <SESSION_ID|@ALIAS> [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
+            "dlgt show - show Session state, pending Requests, and latest result\n\nUSAGE\n  dlgt show <SESSION_ID|@ALIAS> [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help\n\nThe response carries resume_command, the provider's own command for opening\nthe conversation by hand after dlgt stop."
         }
-        "attach" => {
-            "dlgt attach - attach to the Session screen\n\nUSAGE\n  dlgt attach <SESSION_ID|@ALIAS> [--steal]\n\nOPTIONS\n  --steal      Transfer an existing attach lease\n  -h, --help   Print this help"
+        "answer" => {
+            "dlgt answer - answer a pending approval or question\n\nUSAGE\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --allow\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --deny [--message <TEXT>]\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --text <TEXT>\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --choice <N>\n\nOPTIONS\n  --allow            Allow this one approval Request\n  --deny             Deny this approval Request; the worker continues its turn\n  --message <TEXT>   Tell the worker why it was denied\n  --text <TEXT>      Answer a question in free text\n  --choice <N>       Answer a question with its Nth choice (1-based)\n  --pretty           Pretty-print JSON output\n  -h, --help         Print this help\n\nRequest IDs come from fetch's requests list. Repeating the same answer replays\nthe receipt; a different answer to a resolved Request is REQUEST_RESOLVED."
         }
         "stop" => {
             "dlgt stop - stop a Session and its process group\n\nUSAGE\n  dlgt stop <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --force      Force termination\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
-        "scrollback" => {
-            "dlgt scrollback - read rendered terminal scrollback\n\nUSAGE\n  dlgt scrollback <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --lines <COUNT>     Number of rendered lines (default: 100)\n  --before <CURSOR>   Read an older page before a cursor\n  --pretty            Pretty-print JSON output\n  -h, --help          Print this help"
-        }
-        "logs" => {
-            "dlgt logs - read raw retained PTY bytes for diagnosis\n\nUSAGE\n  dlgt logs <SESSION_ID|@ALIAS> --raw [--json]\n\nOPTIONS\n  --raw        Required capability flag; write raw bytes to stdout\n  --json       Return the bytes as base64 JSON\n  -h, --help   Print this help"
+        "watch" => {
+            "dlgt watch - follow a Session's messages as text\n\nUSAGE\n  dlgt watch <SESSION_ID|@ALIAS> [--from-start] [--until-idle]\n\nOPTIONS\n  --from-start   Replay the retained messages before following new ones\n  --until-idle   Exit when the current execution ends\n  -h, --help     Print this help\n\nRead-only: it sends nothing to the worker. The text is for humans and is not a\nstable format; agents use dlgt fetch."
         }
         "models" => {
             "dlgt models - discover models supported by a Harness\n\nUSAGE\n  dlgt models [OPTIONS]\n  dlgt models --harness <codex|claude> [OPTIONS]\n\nOPTIONS\n  --harness <codex|claude>   Query one Harness; omitted queries all\n  --include-hidden           Include hidden models\n  --pretty                   Pretty-print JSON output\n  -h, --help                 Print this help\n\nWithout --harness the response lists every Harness, and one that cannot be\nreached reports discovery: \"unavailable\" instead of failing the command."
         }
         "profiles" => {
             "dlgt profiles - list or inspect launch Profiles\n\nUSAGE\n  dlgt profiles list [--pretty]\n  dlgt profiles show <NAME> [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
-        }
-        "harnesses" => {
-            "dlgt harnesses - list Harness capabilities\n\nUSAGE\n  dlgt harnesses [codex|claude] [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "doctor" => {
             "dlgt doctor - diagnose the local dlgt installation\n\nUSAGE\n  dlgt doctor [OPTIONS]\n\nOPTIONS\n  --json      Emit the same checks as compact JSON\n  --probe     Initialize Codex app-server and check the published release\n  -h, --help  Print this help\n\nThe default checks are read-only and offline. --probe starts no model turn."

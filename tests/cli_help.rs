@@ -7,28 +7,8 @@ fn dlgt(args: &[&str]) -> std::io::Result<std::process::Output> {
 #[test]
 fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std::error::Error>> {
     let commands = [
-        "server",
-        "update",
-        "new",
-        "restart",
-        "send",
-        "fetch",
-        "cancel",
-        "list",
-        "ls",
-        "show",
-        "attach",
-        "stop",
-        "scrollback",
-        "logs",
-        "models",
-        "profiles",
-        "harnesses",
-        "doctor",
-        "skill",
-        "rpc",
-        "version",
-        "help",
+        "server", "update", "new", "restart", "send", "fetch", "answer", "cancel", "list", "ls",
+        "show", "watch", "stop", "models", "profiles", "doctor", "skill", "rpc", "version", "help",
     ];
 
     for command in commands {
@@ -355,5 +335,182 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
         "unexpected output: {stdout}"
     );
     assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+/// Run a command that must fail before it reaches a daemon.
+fn rejected(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        .env("DLGT_HOME", home.path())
+        .args(args)
+        .output()?;
+    assert!(!output.status.success(), "{args:?} was accepted");
+    assert!(
+        !home.path().join("run").exists(),
+        "{args:?} started a daemon before failing"
+    );
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+#[test]
+fn the_terminal_commands_and_options_are_gone() -> Result<(), Box<dyn std::error::Error>> {
+    let usage = String::from_utf8(dlgt(&["help"])?.stdout)?;
+    for command in ["attach", "scrollback", "logs", "harnesses"] {
+        assert!(
+            !usage.contains(command),
+            "top-level help still lists {command}"
+        );
+        let stdout = rejected(&[command, "codex:test-session"])?;
+        assert!(
+            stdout.contains("unknown command"),
+            "unexpected output for {command}: {stdout}"
+        );
+        assert!(!dlgt(&["help", command])?.status.success());
+    }
+    for command in ["answer", "watch"] {
+        assert!(usage.contains(command), "top-level help omits {command}");
+    }
+    assert!(!usage.to_lowercase().contains("screen"));
+
+    for args in [
+        &["fetch", "codex:test-session", "--screen"][..],
+        &["fetch", "codex:test-session", "--no-screen"],
+        &[
+            "new",
+            "--title",
+            "t",
+            "--harness",
+            "claude",
+            "--request-id",
+            "r1",
+            "--no-auto-approve",
+            "--",
+            "hello",
+        ],
+    ] {
+        let stdout = rejected(args)?;
+        assert!(
+            stdout.contains("unknown option"),
+            "unexpected output for {args:?}: {stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn approvals_are_documented_and_validated_before_launch() -> Result<(), Box<dyn std::error::Error>>
+{
+    for command in ["new", "send"] {
+        let help = String::from_utf8(dlgt(&[command, "--help"])?.stdout)?;
+        assert!(help.contains("--approvals <auto|ask|bypass>"));
+        assert!(!help.contains("auto-approve"));
+    }
+    let stdout = rejected(&[
+        "new",
+        "--title",
+        "t",
+        "--harness",
+        "claude",
+        "--approvals",
+        "yolo",
+        "--request-id",
+        "r1",
+        "--",
+        "hello",
+    ])?;
+    assert!(
+        stdout.contains("invalid approvals mode") && stdout.contains("INVALID_ARGUMENT"),
+        "unexpected output: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn steer_is_a_send_mode_that_cannot_launch() -> Result<(), Box<dyn std::error::Error>> {
+    let help = String::from_utf8(dlgt(&["send", "--help"])?.stdout)?;
+    assert!(help.contains("--steer"));
+
+    let stdout = rejected(&[
+        "send",
+        "claude:test-session",
+        "--steer",
+        "--resume",
+        "--request-id",
+        "r1",
+        "--",
+        "hello",
+    ])?;
+    assert!(
+        stdout.contains("--steer and --resume are mutually exclusive"),
+        "unexpected output: {stdout}"
+    );
+    for option in [["--model", "haiku"], ["--approvals", "ask"]] {
+        let stdout = rejected(&[
+            "send",
+            "claude:test-session",
+            option[0],
+            option[1],
+            "--request-id",
+            "r1",
+            "--",
+            "hello",
+        ])?;
+        assert!(
+            stdout.contains("accepted only with --resume"),
+            "unexpected output for {option:?}: {stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn answer_takes_exactly_one_kind_of_answer() -> Result<(), Box<dyn std::error::Error>> {
+    let help = String::from_utf8(dlgt(&["answer", "--help"])?.stdout)?;
+    for option in [
+        "--allow",
+        "--deny",
+        "--message <TEXT>",
+        "--text <TEXT>",
+        "--choice <N>",
+    ] {
+        assert!(help.contains(option), "answer help omits {option}");
+    }
+    for (args, expected) in [
+        (&["answer", "claude:s", "r1"][..], "exactly one of"),
+        (
+            &["answer", "claude:s", "r1", "--allow", "--deny"],
+            "exactly one of",
+        ),
+        (
+            &["answer", "claude:s", "r1", "--allow", "--message", "x"],
+            "only with --deny",
+        ),
+        (
+            &["answer", "claude:s", "r1", "--choice", "0"],
+            "invalid --choice",
+        ),
+        (&["answer", "claude:s", "--allow"], "Request ID"),
+    ] {
+        let stdout = rejected(args)?;
+        assert!(
+            stdout.contains(expected),
+            "unexpected output for {args:?}: {stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fetch_help_documents_messages_and_requests() -> Result<(), Box<dyn std::error::Error>> {
+    let help = String::from_utf8(dlgt(&["fetch", "--help"])?.stdout)?;
+    assert!(help.contains("--messages[=<MAX>]"));
+    assert!(help.contains("--no-messages"));
+    assert!(help.contains("dlgt answer"));
+    let stdout = rejected(&["fetch", "claude:s", "--messages", "--no-messages"])?;
+    assert!(
+        stdout.contains("mutually exclusive"),
+        "unexpected output: {stdout}"
+    );
     Ok(())
 }

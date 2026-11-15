@@ -1,0 +1,1211 @@
+//! Claude transport: one long-lived `claude -p` process per Session, driven
+//! over stream-json on stdin and stdout.
+//!
+//! User turns are JSON lines written to stdin. Lifecycle comes from the
+//! events Claude writes back: the replay of a user message is the proof the
+//! model read it, and a `result` ends a provider turn. Approvals and
+//! questions arrive as `can_use_tool` control requests on the same channel.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt as _;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
+
+use crate::messages::{Decider, Decision, MessageBody, one_line};
+use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnState};
+use crate::provider::CommandSpec;
+use crate::reaper::{Reaper, Registration};
+use crate::requests::{ProviderRequest, RequestDraft, RequestKind};
+use crate::store::Store;
+
+const STDERR_TAIL_LIMIT: usize = 4096;
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// Longest one-line outcome kept for a tool result.
+const RESULT_SUMMARY_LIMIT: usize = 240;
+
+pub type EventHandler = Arc<dyn Fn(Value) + Send + Sync>;
+pub type ExitHandler = Arc<dyn Fn(Option<i32>) + Send + Sync>;
+
+type ControlWaiters = Arc<Mutex<HashMap<String, Sender<Value>>>>;
+
+pub struct ClaudeProcess {
+    pid: u32,
+    stdin: Mutex<Option<ChildStdin>>,
+    controls: ControlWaiters,
+    next_control: AtomicU64,
+    stderr_tail: Arc<Mutex<String>>,
+    /// Closes when the stderr reader has seen end of file.
+    stderr_done: Mutex<mpsc::Receiver<()>>,
+    _reaper_registration: Registration,
+}
+
+impl ClaudeProcess {
+    pub fn spawn(
+        spec: &CommandSpec,
+        on_event: EventHandler,
+        on_exit: ExitHandler,
+        reaper: &Arc<Reaper>,
+    ) -> Result<Arc<Self>> {
+        let mut child = Command::new(&spec.program)
+            .args(&spec.args)
+            .current_dir(&spec.cwd)
+            .env_clear()
+            .envs(&spec.environment)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to start {}", spec.program.display()))?;
+        let pid = child.id();
+        let registration = reaper.watch(pid)?;
+        let stdin = child.stdin.take().context("Claude process had no stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Claude process had no stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Claude process had no stderr")?;
+        let controls: ControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+
+        let tail = Arc::clone(&stderr_tail);
+        let (stderr_closed, stderr_done) = mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("dlgt-claude-stderr".to_owned())
+            .spawn(move || {
+                retain_tail(stderr, &tail);
+                drop(stderr_closed);
+            })
+            .context("failed to start Claude stderr thread")?;
+
+        let waiters = Arc::clone(&controls);
+        std::thread::Builder::new()
+            .name("dlgt-claude-events".to_owned())
+            .spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if event.get("type").and_then(Value::as_str) == Some("control_response") {
+                        let response = event.get("response").cloned().unwrap_or(Value::Null);
+                        let waiter = response
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| waiters.lock().ok()?.remove(id));
+                        if let Some(waiter) = waiter {
+                            let _ = waiter.send(response);
+                        }
+                        continue;
+                    }
+                    on_event(event);
+                }
+                if let Ok(mut waiters) = waiters.lock() {
+                    waiters.clear();
+                }
+                on_exit(child.wait().ok().and_then(|status| status.code()));
+            })
+            .context("failed to start Claude event thread")?;
+
+        Ok(Arc::new(Self {
+            pid,
+            stdin: Mutex::new(Some(stdin)),
+            controls,
+            next_control: AtomicU64::new(1),
+            stderr_tail,
+            stderr_done: Mutex::new(stderr_done),
+            _reaper_registration: registration,
+        }))
+    }
+
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// The stderr tail of a process that has exited or is about to: waits
+    /// briefly for the reader to drain what the process wrote last.
+    pub fn final_stderr_tail(&self) -> String {
+        if let Ok(done) = self.stderr_done.lock() {
+            let _ = done.recv_timeout(STDERR_DRAIN_TIMEOUT);
+        }
+        self.stderr_tail()
+    }
+
+    /// Write one user message. `uuid` comes back on the replay, which is how
+    /// the message is matched when the model reads it.
+    pub fn send_user(&self, uuid: &str, text: &str) -> Result<()> {
+        self.write_line(&json!({
+            "type": "user",
+            "uuid": uuid,
+            "session_id": "",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": text},
+        }))
+    }
+
+    /// Send a control request and wait for Claude's response to it. Must not
+    /// be called from the event thread, which is what delivers the response.
+    pub fn control(&self, request: &Value, timeout: Duration) -> Result<Value> {
+        let id = format!("dlgt_{}", self.next_control.fetch_add(1, Ordering::Relaxed));
+        let (sender, receiver) = mpsc::channel();
+        self.controls
+            .lock()
+            .map_err(|_| anyhow!("Claude control lock poisoned"))?
+            .insert(id.clone(), sender);
+        let subtype = request
+            .get("subtype")
+            .and_then(Value::as_str)
+            .unwrap_or("control")
+            .to_owned();
+        self.write_line(&json!({"type": "control_request", "request_id": id, "request": request}))?;
+        let response = receiver.recv_timeout(timeout).map_err(|_| {
+            if let Ok(mut controls) = self.controls.lock() {
+                controls.remove(&id);
+            }
+            anyhow!("Claude did not answer the {subtype} control request")
+        })?;
+        if response.get("subtype").and_then(Value::as_str) != Some("success") {
+            bail!(
+                "Claude rejected the {subtype} control request: {}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(response.get("response").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Send a control request without waiting, for use on the event thread.
+    pub fn control_nowait(&self, request: &Value) -> Result<()> {
+        let id = format!("dlgt_{}", self.next_control.fetch_add(1, Ordering::Relaxed));
+        self.write_line(&json!({"type": "control_request", "request_id": id, "request": request}))
+    }
+
+    /// Answer a `can_use_tool` request.
+    pub fn respond(&self, request_id: &str, response: &Value) -> Result<()> {
+        self.write_line(&json!({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": request_id, "response": response},
+        }))
+    }
+
+    fn write_line(&self, value: &Value) -> Result<()> {
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| anyhow!("Claude stdin lock poisoned"))?;
+        let stdin = stdin.as_mut().context("Claude process stdin is closed")?;
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        stdin
+            .write_all(&line)
+            .and_then(|()| stdin.flush())
+            .context("failed to write to the Claude process")
+    }
+
+    pub fn stop(&self) {
+        if let Ok(mut stdin) = self.stdin.lock() {
+            stdin.take();
+        }
+        self.signal(libc::SIGTERM);
+    }
+
+    pub fn force_stop(&self) {
+        self.signal(libc::SIGKILL);
+    }
+
+    fn signal(&self, signal: i32) {
+        if let Ok(pid) = i32::try_from(self.pid) {
+            // SAFETY: kill has no memory-safety preconditions. The process is
+            // spawned as the leader of its own process group.
+            unsafe {
+                libc::kill(-pid, signal);
+            }
+        }
+    }
+}
+
+impl Drop for ClaudeProcess {
+    fn drop(&mut self) {
+        self.force_stop();
+    }
+}
+
+fn retain_tail(mut stream: impl Read, tail: &Mutex<String>) {
+    let mut buffer = [0_u8; 4096];
+    while let Ok(read) = stream.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let Ok(mut tail) = tail.lock() else { break };
+        tail.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        if tail.len() > STDERR_TAIL_LIMIT {
+            let mut cut = tail.len() - STDERR_TAIL_LIMIT;
+            while !tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            tail.drain(..cut);
+        }
+    }
+}
+
+/// A user message written to stdin that the model has not read yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unread {
+    pub uuid: String,
+    /// The text of a steer; `None` for the execution's own prompt.
+    pub steer: Option<String>,
+    /// Claude dequeued the message to run it as a provider turn.
+    started: bool,
+}
+
+/// What dlgt knows about the provider turns that make up one execution.
+///
+/// An execution is finished only when a `result` has arrived and every
+/// message written for it has been replayed: a steer written during text
+/// generation runs as a provider turn of its own after the current result,
+/// and that turn still belongs to the execution that accepted the steer.
+#[derive(Debug, Default)]
+pub struct ClaudeTurns {
+    unread: Vec<Unread>,
+    /// A provider turn is running and its `result` has not arrived.
+    turn_open: bool,
+    result_texts: Vec<String>,
+    last_assistant: Option<String>,
+    failure: Option<String>,
+    usage: Option<Value>,
+    denials: u32,
+    tools: HashMap<String, String>,
+}
+
+/// Something only the process owner can do in response to an event.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    /// The provider reports a different session ID than the one launched.
+    Rekey(String),
+    /// A canceled execution's leftover message started a provider turn.
+    Interrupt,
+}
+
+impl ClaudeTurns {
+    pub fn begin(&mut self, uuid: &str) {
+        *self = Self::default();
+        self.turn_open = true;
+        self.unread.push(Unread {
+            uuid: uuid.to_owned(),
+            steer: None,
+            started: false,
+        });
+    }
+
+    pub fn add_steer(&mut self, uuid: &str, text: &str) {
+        self.unread.push(Unread {
+            uuid: uuid.to_owned(),
+            steer: Some(text.to_owned()),
+            started: false,
+        });
+    }
+
+    pub fn unread(&self) -> Vec<Unread> {
+        self.unread.clone()
+    }
+
+    /// Drop a message the provider confirmed it will never read.
+    pub fn discard(&mut self, store: &Store, session_id: &str, uuid: &str) {
+        let Some(unread) = self.take(uuid) else {
+            return;
+        };
+        match unread.steer {
+            Some(text) => {
+                store.append_message(session_id, MessageBody::steer(&text, false, true));
+            }
+            // A prompt canceled while still queued never runs, so no result
+            // will follow it.
+            None if !unread.started => self.turn_open = false,
+            None => {}
+        }
+    }
+
+    fn take(&mut self, uuid: &str) -> Option<Unread> {
+        let index = self.unread.iter().position(|unread| unread.uuid == uuid)?;
+        Some(self.unread.remove(index))
+    }
+
+    /// Terminalize the active execution once nothing is left to wait for.
+    pub fn settle(&mut self, store: &Store, session_id: &str) -> Result<()> {
+        if self.turn_open || !self.unread.is_empty() {
+            return Ok(());
+        }
+        let Some(turn_id) = store
+            .get_session(session_id)
+            .and_then(|session| session.active_turn_id)
+        else {
+            return Ok(());
+        };
+        let Some(turn) = store.get_turn(&turn_id) else {
+            return Ok(());
+        };
+        if let Some(usage) = self.usage.take() {
+            store.set_turn_usage(&turn_id, usage);
+        }
+        store.raise_denied_requests(&turn_id, self.denials);
+        let text = self.result_texts.join("\n\n");
+        let recovered = text.is_empty() && self.last_assistant.is_some();
+        let text = if recovered {
+            self.last_assistant.clone().unwrap_or_default()
+        } else {
+            text
+        };
+        let kind = if turn.state == TurnState::Canceled {
+            if store.settle_canceled_turn(&turn_id, None)? {
+                "provider.quiesced"
+            } else {
+                "provider.stop_unmatched"
+            }
+        } else if let Some(failure) = self.failure.take() {
+            let error = json!({"code": "provider_error", "message": failure}).to_string();
+            if store.finish_turn_if_matching(
+                &turn_id,
+                None,
+                TurnState::Failed,
+                Some(&text),
+                Some(&error),
+            )? {
+                store.set_session_state(session_id, SessionState::Idle);
+                "turn.failed"
+            } else {
+                "provider.failure_unmatched"
+            }
+        } else if store.complete_turn_if_matching(&turn_id, None, Some(&text), recovered)? {
+            store.set_session_state(session_id, SessionState::Idle);
+            "turn.completed"
+        } else {
+            "provider.stop_unmatched"
+        };
+        store.record_event(Some(session_id), Some(&turn_id), kind);
+        *self = Self::default();
+        Ok(())
+    }
+}
+
+/// Apply one Claude stream-json event to the Session.
+#[allow(clippy::too_many_lines)]
+pub fn apply_event(
+    store: &Store,
+    session_id: &str,
+    turns: &mut ClaudeTurns,
+    event: &Value,
+) -> Result<Vec<Action>> {
+    let Some(session) = store.get_session(session_id) else {
+        return Ok(Vec::new());
+    };
+    store.touch_provider(session_id);
+    let text = |name: &str| event.get(name).and_then(Value::as_str);
+    let mut actions = Vec::new();
+    match (text("type"), text("subtype")) {
+        (Some("system"), Some("init")) => {
+            if let Some(provider_id) = text("session_id")
+                && session.id != format!("claude:{provider_id}")
+                && !session.id.starts_with("internal:")
+            {
+                actions.push(Action::Rekey(provider_id.to_owned()));
+            }
+            if let Some(model) = text("model") {
+                store.set_resolved_model(session_id, model);
+            }
+            if let Some(source) = text("apiKeySource") {
+                let auth = if source == "none" {
+                    Auth::Subscription
+                } else {
+                    Auth::ApiKey
+                };
+                if store.set_auth(session_id, auth) && auth == Auth::ApiKey {
+                    store.append_message(
+                        session_id,
+                        MessageBody::notice(&format!(
+                            "Claude authenticated with an API key ({source}), not the \
+                             subscription login; this Session is billed to that key"
+                        )),
+                    );
+                }
+            }
+            apply_permission_mode(store, session_id, text("permissionMode"));
+        }
+        (Some("system"), Some("status")) => {
+            apply_permission_mode(store, session_id, text("permissionMode"));
+        }
+        (Some("system"), Some("permission_denied")) => {
+            let by = if session.approvals.effective == ApprovalsMode::Auto {
+                Decider::ProviderReviewer
+            } else {
+                Decider::ProviderPolicy
+            };
+            store.append_message(
+                session_id,
+                MessageBody::approval(
+                    Decision::Denied,
+                    by,
+                    None,
+                    None,
+                    text("tool_name").unwrap_or("tool"),
+                    text("message").unwrap_or_default(),
+                ),
+            );
+        }
+        (Some("system"), Some("api_retry")) => {
+            let attempt = event.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+            store.record_provider_retry_event(
+                Some(session_id),
+                session.active_turn_id.as_deref(),
+                attempt,
+            );
+        }
+        (Some("assistant"), _) => apply_assistant(store, session_id, turns, event),
+        (Some("user"), _) if event.get("isReplay").and_then(Value::as_bool) == Some(true) => {
+            let Some(read) = text("uuid").and_then(|uuid| turns.take(uuid)) else {
+                return Ok(actions);
+            };
+            turns.turn_open = true;
+            let turn_id = session.active_turn_id.as_deref();
+            let canceled = turn_id
+                .and_then(|id| store.get_turn(id))
+                .is_some_and(|turn| turn.state == TurnState::Canceled);
+            if canceled {
+                actions.push(Action::Interrupt);
+            }
+            match read.steer {
+                Some(steer) => {
+                    store.append_message(session_id, MessageBody::steer(&steer, true, false));
+                }
+                None => confirm_started(store, session_id),
+            }
+        }
+        (Some("user"), _) => apply_tool_results(store, session_id, turns, event),
+        (Some("command_lifecycle"), _) => {
+            let Some(uuid) = text("command_uuid") else {
+                return Ok(actions);
+            };
+            match text("state") {
+                Some("started") => {
+                    if let Some(unread) = turns.unread.iter_mut().find(|u| u.uuid == uuid) {
+                        unread.started = true;
+                        turns.turn_open = true;
+                        // Claude dequeued the prompt and began the turn: that
+                        // is its acceptance, ahead of the model reading it.
+                        if unread.steer.is_none() {
+                            confirm_started(store, session_id);
+                        }
+                    }
+                }
+                Some("cancelled") => {
+                    turns.discard(store, session_id, uuid);
+                    turns.settle(store, session_id)?;
+                }
+                _ => {}
+            }
+        }
+        (Some("result"), subtype) => {
+            turns.turn_open = false;
+            if let Some(result) = text("result").filter(|result| !result.is_empty()) {
+                turns.result_texts.push(result.to_owned());
+            }
+            let failed = event.get("is_error").and_then(Value::as_bool) == Some(true)
+                || subtype.is_some_and(|subtype| subtype != "success");
+            if failed && turns.failure.is_none() {
+                turns.failure = Some(format!(
+                    "Claude turn ended with {}{}",
+                    subtype.unwrap_or("an error"),
+                    text("result")
+                        .filter(|result| !result.is_empty())
+                        .map(|result| format!(": {}", one_line(result).0))
+                        .unwrap_or_default()
+                ));
+            }
+            // Token counts only: the per-iteration breakdown is unbounded.
+            if let Some(usage) = event.get("usage").and_then(Value::as_object) {
+                turns.usage = Some(Value::Object(
+                    usage
+                        .iter()
+                        .filter(|(_, value)| value.is_number())
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ));
+            }
+            turns.denials += event
+                .get("permission_denials")
+                .and_then(Value::as_array)
+                .map_or(0, |denials| {
+                    u32::try_from(denials.len()).unwrap_or(u32::MAX)
+                });
+            turns.settle(store, session_id)?;
+        }
+        (Some("control_request"), _) => {
+            let request = event.get("request").unwrap_or(&Value::Null);
+            if request.get("subtype").and_then(Value::as_str) == Some("can_use_tool")
+                && let Some(provider_key) = text("request_id")
+            {
+                store.open_request(
+                    session_id,
+                    tool_request(&session.cwd, provider_key, request),
+                );
+            }
+        }
+        (Some("control_cancel_request"), _) => {
+            if let Some(provider_key) = text("request_id") {
+                store.cancel_requests(session_id, Some(provider_key));
+            }
+        }
+        _ => {}
+    }
+    Ok(actions)
+}
+
+fn confirm_started(store: &Store, session_id: &str) {
+    if let Some(turn_id) = store
+        .get_session(session_id)
+        .and_then(|session| session.active_turn_id)
+        && store.mark_turn_started(&turn_id, None)
+    {
+        store.record_event(Some(session_id), Some(&turn_id), "turn.started");
+    }
+}
+
+pub fn apply_permission_mode(store: &Store, session_id: &str, mode: Option<&str>) {
+    let Some(mode) = mode else { return };
+    let effective = match mode {
+        "auto" => ApprovalsMode::Auto,
+        "bypassPermissions" => ApprovalsMode::Bypass,
+        _ => ApprovalsMode::Ask,
+    };
+    let reason = format!("provider reported permission mode {mode}");
+    if store.set_effective_approvals(session_id, effective, &reason)
+        && store
+            .get_session(session_id)
+            .is_some_and(|session| session.approvals.requested != effective)
+    {
+        store.append_message(
+            session_id,
+            MessageBody::notice(&format!(
+                "approvals run as {}: {reason}",
+                effective.as_str()
+            )),
+        );
+    }
+}
+
+fn content_blocks(event: &Value) -> impl Iterator<Item = &Value> {
+    event
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn apply_assistant(store: &Store, session_id: &str, turns: &mut ClaudeTurns, event: &Value) {
+    let top_level = event.get("parent_tool_use_id").is_none_or(Value::is_null);
+    for block in content_blocks(event) {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if top_level {
+                    turns.last_assistant = Some(text.to_owned());
+                }
+                store.append_message(session_id, MessageBody::assistant(text));
+            }
+            Some("tool_use") => {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                if let Some(id) = block.get("id").and_then(Value::as_str) {
+                    turns.tools.insert(id.to_owned(), name.to_owned());
+                }
+                let input = block.get("input").unwrap_or(&Value::Null);
+                store.append_message(
+                    session_id,
+                    MessageBody::tool_call(name, &input_summary(input)),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_tool_results(store: &Store, session_id: &str, turns: &mut ClaudeTurns, event: &Value) {
+    for block in content_blocks(event) {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let tool = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .and_then(|id| turns.tools.remove(id))
+            .unwrap_or_else(|| "tool".to_owned());
+        let ok = block.get("is_error").and_then(Value::as_bool) != Some(true);
+        let output = match block.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        store.append_message(
+            session_id,
+            MessageBody::tool_result(&tool, ok, &brief(&output)),
+        );
+    }
+}
+
+/// The one field of a tool input that says what the call does.
+pub fn input_summary(input: &Value) -> String {
+    const KEYS: [&str; 8] = [
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "url",
+        "query",
+        "prompt",
+        "description",
+    ];
+    KEYS.iter()
+        .find_map(|key| input.get(key).and_then(Value::as_str))
+        .map_or_else(
+            || {
+                if input.is_null() {
+                    String::new()
+                } else {
+                    input.to_string()
+                }
+            },
+            str::to_owned,
+        )
+}
+
+/// First line of a tool's output, short enough to scan.
+pub fn brief(output: &str) -> String {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut end = line.len().min(RESULT_SUMMARY_LIMIT);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_owned()
+}
+
+fn tool_request(cwd: &str, provider_key: &str, request: &Value) -> RequestDraft {
+    let tool = request
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let input = request.get("input").cloned().unwrap_or(Value::Null);
+    let questions = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .filter(|_| tool == "AskUserQuestion")
+        .cloned()
+        .unwrap_or_default();
+    if !questions.is_empty() {
+        let texts = questions
+            .iter()
+            .filter_map(|question| question.get("question").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let choices = if let [question] = questions.as_slice() {
+            question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("label").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return RequestDraft {
+            kind: RequestKind::Question,
+            provider_key: provider_key.to_owned(),
+            provider: ProviderRequest::ClaudeQuestion {
+                input: input.clone(),
+                questions: texts.clone(),
+            },
+            tool: tool.to_owned(),
+            summary: String::new(),
+            input,
+            cwd: None,
+            reason: None,
+            text: Some(texts.join("\n")),
+            choices,
+        };
+    }
+    RequestDraft {
+        kind: RequestKind::Approval,
+        provider_key: provider_key.to_owned(),
+        provider: ProviderRequest::ClaudeTool {
+            input: input.clone(),
+        },
+        tool: tool.to_owned(),
+        summary: input_summary(&input),
+        input,
+        cwd: Some(cwd.to_owned()),
+        reason: ["decision_reason", "description"]
+            .iter()
+            .find_map(|key| request.get(key).and_then(Value::as_str))
+            .map(str::to_owned),
+        text: None,
+        choices: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{Action, ClaudeTurns, apply_event};
+    use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnRecord, TurnState};
+    use crate::store::{NewSession, Store};
+
+    const SESSION: &str = "claude:s1";
+
+    fn busy_session(approvals: ApprovalsMode) -> (Store, ClaudeTurns) {
+        let mut store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: SESSION,
+                alias: "@worker",
+                title: "worker",
+                agent: "claude",
+                cwd: "/work",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                approvals,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        assert!(store.set_session_running(SESSION, Some(42)));
+        assert!(store.set_session_state(SESSION, SessionState::Idle));
+        store
+            .insert_turn("turn_1", SESSION, "prompt")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.set_session_state(SESSION, SessionState::Busy));
+        let mut turns = ClaudeTurns::default();
+        turns.begin("u-prompt");
+        (store, turns)
+    }
+
+    fn apply(store: &Store, turns: &mut ClaudeTurns, event: &Value) -> Vec<Action> {
+        apply_event(store, SESSION, turns, event)
+            .unwrap_or_else(|error| panic!("failed to apply {event}: {error}"))
+    }
+
+    fn replay(uuid: &str) -> Value {
+        json!({"type": "user", "uuid": uuid, "isReplay": true,
+               "message": {"role": "user", "content": "x"}})
+    }
+
+    fn lifecycle(uuid: &str, state: &str) -> Value {
+        json!({"type": "command_lifecycle", "command_uuid": uuid, "state": state})
+    }
+
+    fn result(text: &str) -> Value {
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": text,
+               "usage": {"input_tokens": 1}, "permission_denials": []})
+    }
+
+    fn interrupted() -> Value {
+        json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+               "result": null, "permission_denials": []})
+    }
+
+    fn assistant(text: &str) -> Value {
+        json!({"type": "assistant", "parent_tool_use_id": null,
+               "message": {"content": [{"type": "text", "text": text}]}})
+    }
+
+    fn state(store: &Store) -> SessionState {
+        store
+            .get_session(SESSION)
+            .unwrap_or_else(|| panic!("session missing"))
+            .state
+    }
+
+    fn turn(store: &Store) -> TurnRecord {
+        store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"))
+    }
+
+    fn messages(store: &Store) -> Vec<Value> {
+        let uid = store
+            .session_uid(SESSION)
+            .unwrap_or_else(|| panic!("session uid missing"));
+        store
+            .messages_after(&uid, 0, 64)
+            .messages
+            .iter()
+            .map(|message| serde_json::to_value(message).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn a_turn_is_confirmed_when_claude_starts_it_and_ends_on_its_result() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &lifecycle("u-prompt", "queued"));
+        assert!(turn(&store).started_at_ms.is_none());
+        apply(&store, &mut turns, &lifecycle("u-prompt", "started"));
+        assert_eq!(turn(&store).state, TurnState::Running);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "assistant", "parent_tool_use_id": null, "message": {"content": [
+                {"type": "thinking", "thinking": "hidden"},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cargo test"}},
+            ]}}),
+        );
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "42 passed\nfinished"},
+            ]}}),
+        );
+        apply(&store, &mut turns, &assistant("Found one race."));
+        assert_eq!(state(&store), SessionState::Busy);
+        apply(&store, &mut turns, &result("Found one race."));
+
+        let turn = turn(&store);
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(turn.final_message.as_deref(), Some("Found one race."));
+        assert!(!turn.final_text_recovered);
+        assert_eq!(turn.usage, Some(json!({"input_tokens": 1})));
+        assert_eq!(state(&store), SessionState::Idle);
+        let messages = messages(&store);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["kind"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["tool_call", "tool_result", "assistant"],
+            "reasoning is never a message"
+        );
+        assert_eq!(messages[0]["tool"], "Bash");
+        assert_eq!(messages[0]["summary"], "cargo test");
+        assert_eq!(messages[1]["tool"], "Bash");
+        assert_eq!(messages[1]["ok"], true);
+        assert_eq!(messages[1]["summary"], "42 passed");
+    }
+
+    #[test]
+    fn a_steer_read_after_a_tool_call_stays_inside_the_same_provider_turn() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        turns.add_steer("u-steer", "also say BANANA");
+        apply(&store, &mut turns, &lifecycle("u-steer", "queued"));
+        apply(&store, &mut turns, &replay("u-steer"));
+        assert_eq!(state(&store), SessionState::Busy);
+        apply(&store, &mut turns, &result("DONE BANANA"));
+
+        assert_eq!(turn(&store).state, TurnState::Completed);
+        assert_eq!(turn(&store).final_message.as_deref(), Some("DONE BANANA"));
+        let messages = messages(&store);
+        assert_eq!(messages[0]["kind"], "steer");
+        assert_eq!(messages[0]["delivered"], true);
+        assert_eq!(messages[0]["text"], "also say BANANA");
+    }
+
+    #[test]
+    fn an_execution_stays_busy_until_every_accepted_steer_has_run() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        turns.add_steer("u-steer", "then say PAPAYA");
+        // The model was only generating text, so the steer is not read
+        // before this turn's result.
+        apply(&store, &mut turns, &result("STORY_END"));
+        assert_eq!(
+            state(&store),
+            SessionState::Busy,
+            "a result with an unread steer does not end the execution"
+        );
+        assert_eq!(turn(&store).state, TurnState::Running);
+
+        apply(&store, &mut turns, &lifecycle("u-steer", "started"));
+        apply(&store, &mut turns, &replay("u-steer"));
+        assert_eq!(state(&store), SessionState::Busy);
+        apply(&store, &mut turns, &result("PAPAYA"));
+
+        let turn = turn(&store);
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(
+            turn.final_message.as_deref(),
+            Some("STORY_END\n\nPAPAYA"),
+            "the continuation belongs to the execution that accepted the steer"
+        );
+        assert_eq!(state(&store), SessionState::Idle);
+        assert_eq!(turn.execution_seq, 1);
+    }
+
+    #[test]
+    fn a_canceled_execution_discards_its_unread_steer_and_settles_on_the_result() {
+        let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        turns.add_steer("u-steer", "extra");
+        assert!(
+            store
+                .cancel_turn("turn_1")
+                .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
+        );
+        // Claude confirms it dropped the queued message, then the interrupted
+        // turn reports its result.
+        apply(&store, &mut turns, &lifecycle("u-steer", "cancelled"));
+        assert_eq!(state(&store), SessionState::Quiescing);
+        assert!(turns.unread().is_empty());
+        apply(&store, &mut turns, &interrupted());
+
+        assert_eq!(turn(&store).state, TurnState::Canceled);
+        assert_eq!(state(&store), SessionState::Idle);
+        let messages = messages(&store);
+        assert_eq!(messages[0]["kind"], "steer");
+        assert_eq!(messages[0]["delivered"], false);
+        assert_eq!(messages[0]["expired"], true);
+    }
+
+    #[test]
+    fn a_leftover_message_that_starts_a_turn_after_a_cancel_is_interrupted_again() {
+        let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        turns.add_steer("u-steer", "extra");
+        assert!(
+            store
+                .cancel_turn("turn_1")
+                .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
+        );
+        apply(&store, &mut turns, &interrupted());
+        assert_eq!(
+            state(&store),
+            SessionState::Quiescing,
+            "the Session is not idle while a written message can still start a turn"
+        );
+        assert_eq!(
+            apply(&store, &mut turns, &replay("u-steer")),
+            [Action::Interrupt]
+        );
+        apply(&store, &mut turns, &interrupted());
+        assert_eq!(state(&store), SessionState::Idle);
+        assert_eq!(turn(&store).state, TurnState::Canceled);
+    }
+
+    #[test]
+    fn a_prompt_canceled_while_still_queued_settles_without_a_result() {
+        let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
+        assert!(
+            store
+                .cancel_turn("turn_1")
+                .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
+        );
+        apply(&store, &mut turns, &lifecycle("u-prompt", "cancelled"));
+        assert_eq!(state(&store), SessionState::Idle);
+        assert_eq!(turn(&store).state, TurnState::Canceled);
+    }
+
+    #[test]
+    fn an_error_result_fails_the_execution_and_keeps_the_session_usable() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "result", "subtype": "success", "is_error": true,
+                    "result": "API Error: overloaded"}),
+        );
+        let turn = turn(&store);
+        assert_eq!(turn.state, TurnState::Failed);
+        assert!(
+            turn.error
+                .as_deref()
+                .is_some_and(|error| error.contains("API Error: overloaded"))
+        );
+        assert_eq!(state(&store), SessionState::Idle);
+    }
+
+    #[test]
+    fn a_result_without_text_recovers_the_last_assistant_message() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(&store, &mut turns, &assistant("the streamed answer"));
+        apply(&store, &mut turns, &result(""));
+        let turn = turn(&store);
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(turn.final_message.as_deref(), Some("the streamed answer"));
+        assert!(turn.final_text_recovered);
+    }
+
+    #[test]
+    fn a_permission_request_blocks_until_answered_or_withdrawn() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "control_request", "request_id": "p1", "request": {
+                "subtype": "can_use_tool", "tool_name": "Bash",
+                "input": {"command": "touch probe.txt", "description": "Create a file"},
+                "description": "Create a file"}}),
+        );
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "control_request", "request_id": "p2", "request": {
+                "subtype": "can_use_tool", "tool_name": "AskUserQuestion",
+                "requires_user_interaction": true,
+                "input": {"questions": [{"question": "Which color?", "header": "Color",
+                    "options": [{"label": "Red"}, {"label": "Blue"}], "multiSelect": false}]}}}),
+        );
+        assert_eq!(state(&store), SessionState::Blocked);
+        let uid = store
+            .session_uid(SESSION)
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let pending = store.pending_requests(&uid);
+        let approval = pending[0].public();
+        assert_eq!(approval["kind"], "approval");
+        assert_eq!(approval["tool"], "Bash");
+        assert_eq!(approval["summary"], "touch probe.txt");
+        assert_eq!(approval["cwd"], "/work");
+        assert_eq!(approval["reason"], "Create a file");
+        let question = pending[1].public();
+        assert_eq!(question["kind"], "question");
+        assert_eq!(question["text"], "Which color?");
+        assert_eq!(question["choices"], json!(["Red", "Blue"]));
+
+        for withdrawn in ["p1", "p2"] {
+            apply(
+                &store,
+                &mut turns,
+                &json!({"type": "control_cancel_request", "request_id": withdrawn}),
+            );
+        }
+        assert!(store.pending_requests(&uid).is_empty());
+        assert_eq!(state(&store), SessionState::Busy);
+    }
+
+    #[test]
+    fn the_mode_and_login_claude_reports_are_recorded_and_announced() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Auto);
+        let actions = apply(
+            &store,
+            &mut turns,
+            &json!({"type": "system", "subtype": "init", "session_id": "s1",
+                    "model": "claude-haiku-4-5", "permissionMode": "auto",
+                    "apiKeySource": "ANTHROPIC_API_KEY"}),
+        );
+        assert!(actions.is_empty());
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "system", "subtype": "status", "permissionMode": "default"}),
+        );
+        let session = store
+            .get_session(SESSION)
+            .unwrap_or_else(|| panic!("session missing"));
+        assert_eq!(session.auth, Some(Auth::ApiKey));
+        assert_eq!(session.resolved_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(session.approvals.requested, ApprovalsMode::Auto);
+        assert_eq!(session.approvals.effective, ApprovalsMode::Ask);
+        assert_eq!(
+            session.approvals.reason.as_deref(),
+            Some("provider reported permission mode default")
+        );
+        let notices = messages(&store);
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|notice| notice["kind"] == "notice"));
+        assert!(
+            notices[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("API key"))
+        );
+    }
+
+    #[test]
+    fn a_subscription_login_is_reported_without_a_notice() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "system", "subtype": "init", "session_id": "s1",
+                    "permissionMode": "default", "apiKeySource": "none"}),
+        );
+        assert_eq!(
+            store.get_session(SESSION).and_then(|session| session.auth),
+            Some(Auth::Subscription)
+        );
+        assert!(messages(&store).is_empty());
+    }
+
+    #[test]
+    fn a_provider_side_denial_is_an_approval_message_and_is_counted() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "system", "subtype": "permission_denied", "tool_name": "Bash",
+                    "message": "touch needs approval"}),
+        );
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "result", "subtype": "success", "is_error": false, "result": "I could not.",
+                    "permission_denials": [{"tool_name": "Bash"}]}),
+        );
+        let denial = &messages(&store)[0];
+        assert_eq!(denial["kind"], "approval");
+        assert_eq!(denial["decision"], "denied");
+        assert_eq!(denial["by"], "provider_policy");
+        let turn = turn(&store);
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(
+            turn.denied_requests, 1,
+            "a completed result still says a needed tool was denied"
+        );
+    }
+
+    #[test]
+    fn a_rotated_provider_session_id_asks_for_a_rekey() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        assert_eq!(
+            apply(
+                &store,
+                &mut turns,
+                &json!({"type": "system", "subtype": "init", "session_id": "s2"}),
+            ),
+            [Action::Rekey("s2".to_owned())]
+        );
+    }
+}
