@@ -125,7 +125,6 @@ impl Store {
                     alias: session.alias.to_owned(),
                     title: session.title.to_owned(),
                     agent: session.agent.to_owned(),
-                    cursor_launch_id: (session.agent == "cursor").then(|| session.id.to_owned()),
                     cwd: session.cwd.to_owned(),
                     state: SessionState::Starting,
                     model: session.model.map(str::to_owned),
@@ -151,12 +150,10 @@ impl Store {
         let Some(session) = state.sessions.get_mut(id) else {
             return false;
         };
-        if !(matches!(
+        if !matches!(
             session.record.state,
             SessionState::Starting | SessionState::Idle
-        ) || matches!(session.record.agent.as_str(), "cursor" | "opencode")
-            && session.record.state == SessionState::Busy)
-        {
+        ) {
             return false;
         }
         if session.record.state == SessionState::Starting {
@@ -414,36 +411,6 @@ impl Store {
         sessions
     }
 
-    pub fn insert_cursor_initial_turn(
-        &mut self,
-        id: &str,
-        session_id: &str,
-        prompt: &str,
-        previous: Option<&str>,
-    ) -> Result<TurnRecord> {
-        let session = self
-            .get_session(session_id)
-            .context("Cursor launch missing")?;
-        if !matches!(session.agent.as_str(), "cursor" | "opencode")
-            || session.state != SessionState::Starting
-        {
-            bail!("invalid prepared launch state");
-        }
-        let next = previous
-            .and_then(|id| self.latest_turn(id))
-            .map_or(1, |turn| turn.execution_seq + 1);
-        self.set_session_state(session_id, SessionState::Idle);
-        let result = self.insert_turn(id, session_id, prompt);
-        self.set_session_state(session_id, SessionState::Starting);
-        let mut turn = result?;
-        turn.execution_seq = next;
-        self.state
-            .borrow_mut()
-            .turns
-            .insert(id.to_owned(), turn.clone());
-        Ok(turn)
-    }
-
     pub fn insert_turn(&mut self, id: &str, session_id: &str, prompt: &str) -> Result<TurnRecord> {
         let mut state = self.state.borrow_mut();
         if state.turns.contains_key(id) {
@@ -473,7 +440,6 @@ impl Store {
             provider_turn_id: None,
             final_message: None,
             final_text_recovered: false,
-            cursor_stop_status: None,
             transcript_path: None,
             transcript_offset: None,
             error: None,
@@ -523,25 +489,6 @@ impl Store {
             .filter(|turn| turn.session_id == session_id)
             .max_by_key(|turn| turn.execution_seq)
             .cloned()
-    }
-
-    pub fn provider_turn_seen(&self, session_id: &str, provider_turn_id: &str) -> bool {
-        self.state.borrow().turns.values().any(|turn| {
-            turn.session_id == session_id
-                && turn.provider_turn_id.as_deref() == Some(provider_turn_id)
-        })
-    }
-
-    pub fn record_cursor_response(&self, id: &str, text: &str) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.final_message = Some(text.to_owned());
-        }
-    }
-
-    pub fn record_cursor_stop(&self, id: &str, status: &str) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.cursor_stop_status = Some(status.to_owned());
-        }
     }
 
     pub fn mark_turn_started(&self, id: &str, provider_turn_id: Option<&str>) -> bool {
