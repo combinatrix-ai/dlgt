@@ -732,10 +732,19 @@ mod tests {
             let generation = state.generation();
             let provider_events = match state.active() {
                 Some(execution) => {
-                    let mut events = vec![Event::Finished {
-                        seq: execution.seq,
-                        outcome: Outcome::Interrupted,
-                    }];
+                    // The provider reports an execution's end once; a search
+                    // that could report it again would hide a cancel that
+                    // fails to settle after the real report.
+                    let mut events = Vec::new();
+                    if !execution
+                        .cancel
+                        .is_some_and(|cancel| cancel.provider_finished)
+                    {
+                        events.push(Event::Finished {
+                            seq: execution.seq,
+                            outcome: Outcome::Interrupted,
+                        });
+                    }
                     if execution
                         .cancel
                         .is_some_and(|cancel| cancel.pending_controls > 0)
