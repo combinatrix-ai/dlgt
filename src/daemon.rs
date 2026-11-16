@@ -678,6 +678,18 @@ impl Daemon {
             fail!(InvalidArgument, "initial prompt must not be empty");
         }
         let resume_provider_id = params.get("resume_provider_id").and_then(Value::as_str);
+        if let Some(id) = resume_provider_id
+            && (id.is_empty()
+                || id.len() > 128
+                || !id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_.".contains(character)
+                }))
+        {
+            fail!(
+                InvalidArgument,
+                "invalid Session ID: a provider conversation ID is at most 128 letters, digits, '-', '_', or '.'"
+            );
+        }
         let provider_ref = resume_provider_id.map(|id| format!("{}:{id}", agent.as_str()));
         let cwd = params
             .get("cwd")
@@ -1665,10 +1677,13 @@ impl Daemon {
             AgentRuntime::Codex {
                 control, thread_id, ..
             } => {
-                let started = control.start_turn(thread_id, prompt).and_then(|turn| {
-                    control.watch_turn(thread_id, &turn)?;
-                    Ok(turn)
-                });
+                let started = control
+                    .start_turn(thread_id, prompt)
+                    .and_then(|turn| {
+                        control.watch_turn(thread_id, &turn)?;
+                        Ok(turn)
+                    })
+                    .code(Code::SessionUnavailable);
                 match started {
                     Ok(provider_turn_id) => {
                         synchronously_confirmed = true;
@@ -1723,7 +1738,7 @@ impl Daemon {
                             &turn.id,
                             turn.execution_seq,
                         ) {
-                            return Err(error);
+                            return Err(crate::error::with_code(error, Code::SessionUnavailable));
                         }
                         let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
                         if store.finish_turn_if_matching(
@@ -1738,7 +1753,7 @@ impl Daemon {
                             store.record_event(Some(&session.id), None, "session.failed");
                         }
                     }
-                    return Err(error);
+                    return Err(crate::error::with_code(error, Code::SessionUnavailable));
                 }
             }
         }
@@ -1891,7 +1906,7 @@ impl Daemon {
             delivery.text,
             delivered.is_ok(),
         );
-        delivered?;
+        delivered.code(Code::SessionUnavailable)?;
         Ok(cursor)
     }
 
@@ -1947,7 +1962,7 @@ impl Daemon {
                 false,
             );
             turns.discard_without_record(delivery.attempt_id);
-            return Err(error);
+            return Err(crate::error::with_code(error, Code::SessionUnavailable));
         }
         Ok(cursor)
     }
@@ -2958,13 +2973,16 @@ impl Daemon {
                     &codex_discovery_args(),
                     Duration::from_mins(1),
                     &self.reaper,
-                )?;
-                let response = connection.list_models(
-                    params
-                        .get("include_hidden")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                )?;
+                )
+                .code(Code::LaunchFailed)?;
+                let response = connection
+                    .list_models(
+                        params
+                            .get("include_hidden")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    )
+                    .code(Code::LaunchFailed)?;
                 let models = response
                     .get("data")
                     .or_else(|| response.get("models"))

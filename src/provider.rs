@@ -276,11 +276,14 @@ fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
         }
     };
     let mut state = serde_json::from_str::<serde_json::Value>(&existing).map_err(|error| {
-        anyhow!(
-            "invalid JSON in {} at {}:{}: invalid JSON syntax",
-            state_path.display(),
-            error.line(),
-            error.column()
+        crate::error::coded(
+            Code::InvalidArgument,
+            format!(
+                "invalid JSON in {} at {}:{}: invalid JSON syntax",
+                state_path.display(),
+                error.line(),
+                error.column()
+            ),
         )
     })?;
     let Some(root) = state.as_object_mut() else {
@@ -364,7 +367,7 @@ fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
     if project_is_trusted(&document, cwd) {
         return Ok(());
     }
-    let offset = codex_workspace_error_offset(&document, cwd);
+    let offset = codex_workspace_error_offset(&existing, cwd);
     set_project_trusted(&mut document, cwd)
         .map_err(|_| provider_config_error(&config_path, &existing, offset))?;
     write_config_atomic(&config_path, &document.to_string())
@@ -372,20 +375,55 @@ fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
 
 fn provider_config_error(path: &Path, contents: &str, offset: usize) -> anyhow::Error {
     let (line, column) = crate::config::line_column(contents, offset);
-    anyhow!(
-        "invalid provider configuration at {}:{line}:{column}: invalid configuration entry",
-        path.display()
+    crate::error::coded(
+        Code::InvalidArgument,
+        format!(
+            "invalid provider configuration at {}:{line}:{column}: invalid configuration entry",
+            path.display()
+        ),
     )
 }
 
+/// Offset of `key` as a member of the top-level JSON object, found by
+/// walking the text so a same-named key nested deeper is never chosen.
 fn json_key_offset(contents: &str, key: &str) -> usize {
-    serde_json::to_string(key)
-        .ok()
-        .and_then(|quoted| contents.find(&quoted))
-        .unwrap_or_default()
+    let bytes = contents.as_bytes();
+    let mut depth = 0_usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                let text = contents
+                    .get(start + 1..index.min(bytes.len()))
+                    .unwrap_or_default();
+                let is_member = contents[index.min(bytes.len())..]
+                    .trim_start_matches('"')
+                    .trim_start()
+                    .starts_with(':');
+                if depth == 1 && is_member && text == key {
+                    return start;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    0
 }
 
-fn codex_workspace_error_offset(document: &DocumentMut, cwd: &str) -> usize {
+/// Where the offending `projects` entry is, read from a span-keeping parse
+/// of the same text (an editable document drops its spans).
+fn codex_workspace_error_offset(contents: &str, cwd: &str) -> usize {
+    let Ok(document) = toml_edit::Document::parse(contents) else {
+        return 0;
+    };
     let Some(projects) = document.get("projects") else {
         return 0;
     };

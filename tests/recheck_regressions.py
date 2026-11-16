@@ -706,6 +706,77 @@ class RecheckRegressions(unittest.TestCase):
         time.sleep(0.3)
         self.assertLessEqual(threads(), baseline + 1, "auth reader threads leaked")
 
+    def test_oversized_session_metadata_is_rejected_at_the_rpc_boundary(self) -> None:
+        h = self.harness
+        created = h.create("claude", "big title", title="t" * 300_000)
+        self.assertEqual(created.get("error", {}).get("code"), "INVALID_ARGUMENT", str(created)[:300])
+        resumed = h.rpc(
+            "session.send",
+            {
+                "session": "claude:" + "a" * 280_000,
+                "resume": True,
+                "request_id": "huge-resume",
+                "prompt": "hello",
+                "cwd": str(h.root),
+                "environment": h.provider_env(),
+            },
+        )
+        self.assertEqual(resumed.get("error", {}).get("code"), "INVALID_ARGUMENT", str(resumed)[:300])
+
+    def test_native_config_errors_are_invalid_arguments_at_their_own_location(self) -> None:
+        h = self.harness
+        claude_state = h.home / ".claude.json"
+        claude_state.write_text('{\n  "nested": {"projects": {}},\n  "projects": 3\n}\n')
+        response = h.create("claude", "bad claude projects")
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT", response)
+        self.assertIn(f"{claude_state}:3:", response["error"]["message"])
+        claude_state.write_text("{not json")
+        response = h.create("claude", "bad claude json")
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT", response)
+        claude_state.unlink()
+
+        codex_home = h.home / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text('model = "m"\n\n# note\n\nprojects = 3\n')
+        response = h.create("codex", "bad codex projects")
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT", response)
+        self.assertIn(f"{config}:5:", response["error"]["message"])
+
+    def test_a_codex_transport_lost_during_turn_start_is_session_unavailable(self) -> None:
+        h = self.harness
+        pid_file = h.root / "codex.pid"
+        session = h.create("codex", "first", {"DLGT_FAKE_CODEX_PID_FILE": str(pid_file)})["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        provider = int(pid_file.read_text())
+        os.kill(provider, signal.SIGSTOP)
+        send = h.pending("session.send", {"session": session, "request_id": "lost", "prompt": "second"})
+        time.sleep(0.3)
+        os.killpg(os.getpgid(provider), signal.SIGKILL)
+        response = h.receive(send)
+        self.assertEqual(response.get("error", {}).get("code"), "SESSION_UNAVAILABLE", response)
+
+    def test_unavailable_codex_discovery_is_a_launch_failure(self) -> None:
+        self.harness.close()
+        self.harness = Harness({"DLGT_CODEX_BIN": "/nonexistent/codex"})
+        response = self.harness.rpc("model.list", {"harness": "codex"})
+        self.assertEqual(response.get("error", {}).get("code"), "LAUNCH_FAILED", response)
+
+    def test_stdio_profile_list_keeps_a_config_error_code(self) -> None:
+        h = self.harness
+        config = h.root / "bad-config.toml"
+        config.write_text("[profiles\n")
+        proxy = subprocess.run(
+            [str(BIN), "rpc", "--stdio"],
+            input=json.dumps({"id": "p", "method": "profile.list", "params": {}}) + "\n",
+            env=dict(h.environment, DLGT_CONFIG=str(config)),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        line = next(line for line in proxy.stdout.splitlines() if line.strip())
+        self.assertEqual(json.loads(line).get("error", {}).get("code"), "INVALID_ARGUMENT", proxy.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

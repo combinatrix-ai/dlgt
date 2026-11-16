@@ -253,7 +253,11 @@ pub fn rpc_stdio() -> Result<()> {
         } {
             Ok(result) => Response::ok(request.id, result).with_info(take_info()),
             Err(error) => error.downcast_ref::<RpcFailure>().map_or_else(
-                || Response::error(&request.id, "RPC_UNAVAILABLE", error.to_string()),
+                || {
+                    let code = crate::error::code_of(&error)
+                        .map_or("RPC_UNAVAILABLE", |code| code.as_str());
+                    Response::error(&request.id, code, error.to_string())
+                },
                 |failure| {
                     let mut response = Response::session_error(
                         &request.id,
