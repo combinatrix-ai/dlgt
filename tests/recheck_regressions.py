@@ -939,6 +939,22 @@ class RecheckRegressions(unittest.TestCase):
         final = h.wait_state(session, "idle", timeout=10)["result"]
         self.assertEqual(final["final_text"], "fake:slow ack", final)
 
+    def test_settled_codex_turns_stop_reconciling(self) -> None:
+        h = self.harness
+        reads = h.root / "thread-reads"
+        session = h.create("codex", "one", {"DLGT_FAKE_THREAD_READ_LOG": str(reads)})["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        for index in range(5):
+            h.rpc("session.send", {"session": session, "request_id": f"quick-{index}", "prompt": f"quick {index}"})
+            h.wait_state(session, "idle")
+        h.rpc("session.send", {"session": session, "request_id": "holding", "prompt": "hold-reads"})
+        h.wait_state(session, "busy")
+        time.sleep(0.5)
+        before = len(reads.read_text().split()) if reads.exists() else 0
+        time.sleep(1.0)
+        after = len(reads.read_text().split()) if reads.exists() else 0
+        self.assertLessEqual(after - before, 6, "settled turns kept polling thread/read")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

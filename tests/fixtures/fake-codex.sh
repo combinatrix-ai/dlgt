@@ -76,6 +76,7 @@ while IFS= read -r line; do
       reply "{\"thread\":{\"id\":\"$thread\"},\"model\":\"fake-codex\"}"
       ;;
     *'"method":"thread/read"'*)
+      if [ -n "${DLGT_FAKE_THREAD_READ_LOG:-}" ]; then echo read >>"$DLGT_FAKE_THREAD_READ_LOG"; fi
       reply '{"thread":{"status":{"type":"active"},"turns":[]}}'
       ;;
     *'"method":"model/list"'*) reply '{"data":[{"id":"fake-codex"}],"nextCursor":null}' ;;

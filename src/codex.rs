@@ -326,6 +326,11 @@ impl CodexConnection {
                     let Some(connection) = connection.upgrade() else {
                         return;
                     };
+                    // The turn's own terminal notification already settled
+                    // it; reconciling it again is only load.
+                    if is_terminal(&connection.terminal_turns, &turn_id) {
+                        return;
+                    }
                     let response = connection.request(
                         "thread/read",
                         json!({"threadId": thread_id, "includeTurns": true}),
