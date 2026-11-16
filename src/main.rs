@@ -8,6 +8,7 @@ mod cursor;
 mod daemon;
 mod doctor;
 mod error;
+mod lifecycle;
 mod messages;
 mod paths;
 mod protocol;
