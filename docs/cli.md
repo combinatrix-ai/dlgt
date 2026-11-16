@@ -263,8 +263,9 @@ Rules:
     can carry permission rules, agent permission modes, or approving hooks.
   - Codex: any key with a segment named `profile`, `profiles`,
     `approval_policy`, `approvals_reviewer`, `sandbox`, `sandbox_mode`, or
-    `sandbox_workspace_write`, and any value that is an inline table or an
-    array of tables.
+    `sandbox_workspace_write`, and any value that parses as TOML holding a
+    table (an inline table, or an array containing one). Other values, string
+    arrays included, pass through.
 - `ask` forwards every request the provider raises. Configuration you own is
   your policy and dlgt leaves it alone: allow rules in your Claude
   `settings.json` or a `CLAUDE_CONFIG_DIR` you select, your
@@ -314,7 +315,9 @@ Rules:
 - `--title` is required and may be non-unique.
 - Every `fetch` repeats a Session's metadata, so it is bounded: `--title` at
   most 200 characters, `--alias` 64, `--model` 128, `--effort` 32, and the
-  working directory 4,096. A longer value is `INVALID_ARGUMENT`.
+  working directory 4,096. The provider conversation ID in a
+  `send --resume` Session ID is at most 128 letters, digits, `-`, `_`, or
+  `.`. A value outside these bounds is `INVALID_ARGUMENT`.
 - A Profile or Harness must resolve the Harness selection.
 - Model and effort are optional. Omission selects the provider default.
 - `--approvals` defaults to `auto`. See [Approvals](#approvals).

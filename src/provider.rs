@@ -1252,7 +1252,7 @@ harness_options = ["approval_policy=never"]
         }
         assert!(codex_harness_args(&["features.web_search=true".to_owned()]).is_ok());
         assert!(codex_harness_args(&[r#"example=["ordinary { text"]"#.to_owned()]).is_ok());
-        assert!(codex_harness_args(&[r#"example=[[{nested = 1}]]"#.to_owned()]).is_err());
+        assert!(codex_harness_args(&["example=[[{nested = 1}]]".to_owned()]).is_err());
         assert!(claude_harness_args(&["add-dir=/private/tmp".to_owned()]).is_ok());
     }
 
