@@ -18,7 +18,7 @@ BIN = REPO / "target/debug/dlgt"
 
 
 class Harness:
-    def __init__(self) -> None:
+    def __init__(self, daemon_env: dict | None = None) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="dlgt-recheck-"))
         self.home = self.root / "home"
         self.home.mkdir()
@@ -33,10 +33,11 @@ class Harness:
             "DLGT_CODEX_BIN": str(REPO / "tests/fixtures/fake-codex.sh"),
             "TMPDIR": str(self.root),
         }
+        self.daemon_env = dict(self.environment, **(daemon_env or {}))
         self.log = (self.root / "daemon.log").open("w")
         self.server = subprocess.Popen(
             [str(BIN), "server", "--foreground"],
-            env=self.environment,
+            env=self.daemon_env,
             stdout=self.log,
             stderr=self.log,
         )
@@ -405,6 +406,68 @@ class RecheckRegressions(unittest.TestCase):
         canceled = h.receive(cancel)
 
         self.assertEqual(canceled.get("result", {}).get("result", {}).get("execution_seq"), 1, canceled)
+
+    def test_a_steer_racing_claude_cancel_is_refused_or_canceled(self) -> None:
+        self.harness.close()
+        self.harness = Harness({"DLGT_TEST_PAUSE_AFTER_CANCEL_SNAPSHOT_MS": "400"})
+        h = self.harness
+        session = h.create("claude", "hold-queue", approvals="ask")["result"]["session"]["id"]
+        h.wait_state(session, "busy")
+        cancel = h.pending("session.cancel", {"session": session, "timeout_ms": 3_000})
+        time.sleep(0.1)
+        steer = h.rpc(
+            "session.send",
+            {"session": session, "request_id": "racing-steer", "prompt": "racing", "steer": True},
+        )
+        canceled = h.receive(cancel)
+        self.assertEqual(canceled.get("result", {}).get("result", {}).get("status"), "canceled", canceled)
+        if "result" in steer:
+            history = h.rpc("session.fetch", {"session": session, "from_start": True, "messages": 64})
+            racing = [
+                message
+                for bucket in history["result"]["sessions"]
+                for message in bucket.get("messages", [])
+                if message.get("kind") == "steer" and message.get("text") == "racing"
+            ]
+            self.assertTrue(racing and racing[-1].get("expired"), history)
+        else:
+            self.assertEqual(steer["error"]["code"], "NO_ACTIVE_EXECUTION", steer)
+
+    def test_a_claude_prompt_canceled_at_submission_never_runs(self) -> None:
+        self.harness.close()
+        self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_CLAUDE_RESERVATION_MS": "400"})
+        h = self.harness
+        session = h.create("claude", "first")["result"]["session"]["id"]
+        h.wait_state(session, "idle", timeout=10)
+        send = h.pending("session.send", {"session": session, "request_id": "second", "prompt": "second"})
+        time.sleep(0.1)
+        canceled = h.rpc("session.cancel", {"session": session, "timeout_ms": 3_000})
+        h.receive(send)
+        self.assertEqual(canceled.get("result", {}).get("result", {}).get("status"), "canceled", canceled)
+        h.wait_state(session, "idle")
+        h.rpc("session.send", {"session": session, "request_id": "third", "prompt": "third"})
+        final = h.wait_state(session, "idle", timeout=10)["result"]
+        self.assertEqual((final["execution_seq"], final["final_text"]), (3, "fake:third"), final)
+        history = h.rpc("session.fetch", {"session": session, "from_start": True, "messages": 64})
+        for bucket in history["result"]["sessions"]:
+            for message in bucket.get("messages", []):
+                if message.get("text") == "fake:second":
+                    self.assertEqual(message.get("execution_seq"), 2, history)
+
+    def test_a_duplicate_answer_during_delivery_replays_the_delivered_answer(self) -> None:
+        self.harness.close()
+        self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_ANSWER_DELIVERY_MS": "400"})
+        h = self.harness
+        session = h.create("claude", "ask", approvals="ask")["result"]["session"]["id"]
+        h.wait_state(session, "blocked")
+        answer = {"session": session, "request": "r1", "decision": "allow"}
+        first = h.pending("session.answer", answer)
+        time.sleep(0.1)
+        duplicate = h.rpc("session.answer", answer)
+        first = h.receive(first)
+        self.assertIn("result", first, first)
+        self.assertTrue(duplicate.get("result", {}).get("replayed"), duplicate)
+        self.assertEqual(h.wait_state(session, "idle")["result"]["final_text"], "allowed")
 
     def test_multiple_queued_claude_steers_are_canceled_before_followup(self) -> None:
         h = self.harness

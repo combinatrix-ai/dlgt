@@ -665,6 +665,7 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     fn create_session(&self, params: &Value) -> Result<Value> {
         let title = params_string(params, "title")?;
+        validate_session_metadata(params)?;
         let generated_alias = generate_alias(title);
         let alias = params
             .get("alias")
@@ -1650,6 +1651,7 @@ impl Daemon {
                 let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
                 store.set_session_state(&session.id, SessionState::Busy);
                 store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
+                test_pause("DLGT_TEST_PAUSE_BEFORE_CLAUDE_RESERVATION_MS");
                 turns.begin(claude_uuid.as_deref().unwrap_or_default());
                 (turn, acceptance_cursor)
             }
@@ -2148,6 +2150,7 @@ impl Daemon {
         codex_request_id: Option<&Value>,
     ) -> std::result::Result<serde_json::Map<String, Value>, crate::provider::DeliveryFailure> {
         let mut receipt_extra = serde_json::Map::new();
+        test_pause("DLGT_TEST_PAUSE_BEFORE_ANSWER_DELIVERY_MS");
         let provider_delivery = match runtime {
             AgentRuntime::Claude { process, .. } => {
                 process.respond_delivery(&record.draft.provider_key, payload)
@@ -2542,11 +2545,15 @@ impl Daemon {
         turns: Arc<Mutex<ClaudeTurns>>,
         runtime_generation: u64,
     ) -> Result<()> {
-        let unread = turns
-            .lock()
-            .map_err(|_| anyhow!("Claude turn lock poisoned"))?
-            .unread();
-        {
+        // The unread snapshot and the cancel record are one step under the
+        // turns-then-store locks, so a steer is either in the snapshot or
+        // refused because the execution is already canceling.
+        let unread = {
+            let turn_state = turns
+                .lock()
+                .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+            let unread = turn_state.unread();
+            test_pause("DLGT_TEST_PAUSE_AFTER_CANCEL_SNAPSHOT_MS");
             let mut store = self.lock_store()?;
             if turn.state == TurnState::Canceled && session.state == SessionState::Quiescing {
                 return Ok(());
@@ -2567,7 +2574,8 @@ impl Daemon {
                 );
             }
             store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
-        }
+            unread
+        };
         let store = Arc::clone(&self.store);
         let session_id = session.id.clone();
         let turn_id = turn_id.to_owned();
@@ -3265,12 +3273,49 @@ fn spawn_claude_cancel_control(
         });
 }
 
+/// A pause at a named race window, for the integration regressions only.
+/// Release builds compile it away.
+fn test_pause(name: &str) {
+    if cfg!(debug_assertions)
+        && let Some(milliseconds) = std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
 fn params_string<'a>(params: &'a Value, name: &str) -> Result<&'a str> {
     params
         .get(name)
         .and_then(Value::as_str)
         .with_context(|| format!("missing string parameter {name:?}"))
         .code(Code::InvalidArgument)
+}
+
+/// Bounds for caller strings that every `fetch` repeats in the Session
+/// bucket. With them the bucket stays small enough that a blocked Session's
+/// minimum Request still fits under the hard response limit.
+const SESSION_METADATA_LIMITS: [(&str, usize); 5] = [
+    ("title", 200),
+    ("alias", 64),
+    ("model", 128),
+    ("effort", 32),
+    ("cwd", 4096),
+];
+
+fn validate_session_metadata(params: &Value) -> Result<()> {
+    for (name, limit) in SESSION_METADATA_LIMITS {
+        if let Some(value) = params.get(name).and_then(Value::as_str)
+            && value.chars().count() > limit
+        {
+            fail!(
+                InvalidArgument,
+                "invalid {name}: at most {limit} characters"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_alias(alias: &str) -> Result<()> {
@@ -5605,6 +5650,70 @@ mod tests {
     }
 
     #[test]
+    fn a_maximal_session_and_request_fit_one_hard_limit_fetch() {
+        let worst = |limit: usize| "\u{1}".repeat(limit);
+        let [title, alias, model, effort, cwd] =
+            super::SESSION_METADATA_LIMITS.map(|(_, limit)| worst(limit));
+        assert!(
+            super::validate_session_metadata(&json!({
+                "title": title, "alias": alias, "model": model, "effort": effort, "cwd": cwd
+            }))
+            .is_ok()
+        );
+        assert!(super::validate_session_metadata(&json!({"title": "t".repeat(300_000)})).is_err());
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "claude:thread-1",
+                alias: &alias,
+                title: &title,
+                agent: "claude",
+                cwd: &cwd,
+                model: Some(&model),
+                effort: Some(&effort),
+                harness_options: &[],
+                approvals: ApprovalsMode::Ask,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        let session = store
+            .get_session("claude:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let request = crate::requests::RequestTable::default()
+            .open(
+                crate::requests::RequestDraft {
+                    kind: crate::requests::RequestKind::Approval,
+                    provider_key: "provider-1".to_owned(),
+                    provider: crate::requests::ProviderRequest::CodexCommand,
+                    tool: worst(300_000),
+                    summary: worst(300_000),
+                    input: json!({"command": worst(300_000)}),
+                    cwd: Some(worst(300_000)),
+                    reason: Some(worst(300_000)),
+                    text: None,
+                    choices: Vec::new(),
+                },
+                Some(1),
+                1,
+            )
+            .public();
+        let mut cut = test_cut(vec![
+            SourceSpec {
+                session: public_session(&session),
+                requests: vec![request],
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ]);
+        cut.state = Some(SessionState::Blocked);
+
+        let rendered = cut
+            .render(&fetch_options(FETCH_HARD_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("maximal Session and Request did not fit: {error}"));
+        assert_eq!(rendered.value["sessions"][0]["requests"][0]["id"], "r1");
+        assert!(line_length(&rendered.value) <= FETCH_HARD_MAX_BYTES);
+    }
+
+    #[test]
     fn a_request_at_the_reported_minimum_budget_succeeds() {
         let cut = || {
             test_cut(vec![
@@ -6018,50 +6127,5 @@ mod tests {
             ..crate::cursor::SessionCursor::default()
         };
         assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
-    }
-
-    #[test]
-    fn duplicate_answer_wait_does_not_miss_a_completion_notification() {
-        use std::sync::Barrier;
-
-        let pair = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let observed = Arc::new(Barrier::new(2));
-        let waiter_pair = Arc::clone(&pair);
-        let waiter_observed = Arc::clone(&observed);
-        let waiter = std::thread::spawn(move || {
-            let (state, condition) = &*waiter_pair;
-            let guard = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(
-                !*guard,
-                "attempt completed before the duplicate inspected it"
-            );
-            // Keep the predicate guard through wait_timeout. The notifier
-            // cannot pass the same mutex until the wait atomically releases it.
-            waiter_observed.wait();
-            let (guard, timeout) = condition
-                .wait_timeout(guard, Duration::from_millis(20))
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (timeout.timed_out(), *guard)
-        });
-
-        observed.wait();
-        {
-            let (state, condition) = &*pair;
-            *state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-            condition.notify_all();
-        }
-        let (timed_out, completed) = waiter
-            .join()
-            .unwrap_or_else(|_| panic!("duplicate waiter panicked"));
-
-        assert!(completed, "the answer attempt did complete");
-        assert!(
-            !timed_out,
-            "duplicate missed the notification and reported REQUEST_BUSY"
-        );
     }
 }

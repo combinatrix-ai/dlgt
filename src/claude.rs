@@ -1031,35 +1031,6 @@ mod tests {
         (store, turns)
     }
 
-    #[test]
-    fn cancel_counts_a_claude_prompt_reserved_before_transport_write() {
-        let (mut store, _) = busy_session(ApprovalsMode::Ask);
-        let mut turns = ClaudeTurns::default();
-        // Submission reserves the prompt while holding the turns lock before
-        // publishing the execution; cancellation takes the same lock first.
-        turns.begin("u-prompt");
-        let unread_at_cancel = turns.unread().len();
-        let generation = store
-            .runtime_generation(SESSION)
-            .unwrap_or_else(|| panic!("runtime generation missing"));
-        assert!(
-            store
-                .cancel_turn_with_controls("turn_1", generation, unread_at_cancel + 1)
-                .unwrap_or_else(|error| panic!("failed to mark execution canceled: {error}"))
-        );
-
-        assert!(
-            !store
-                .settle_canceled_turn("turn_1", None)
-                .unwrap_or_else(|error| panic!("failed to observe cancellation: {error}"))
-        );
-        assert!(
-            !store.finish_cancel_control("turn_1"),
-            "the prompt cancel control was not included in the execution's controls"
-        );
-        assert!(store.cancel_controls_pending("turn_1"));
-    }
-
     fn apply(store: &Store, turns: &mut ClaudeTurns, event: &Value) -> Vec<Action> {
         let generation = store
             .runtime_generation(SESSION)
