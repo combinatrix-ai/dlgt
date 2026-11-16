@@ -717,12 +717,17 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
             ) {
                 fail!(InvalidArgument, "harness option {key:?} is managed by dlgt");
             }
-            if key == "agents" {
-                validate_claude_agents_option(
-                    value
-                        .context("harness option \"agents\" requires a JSON object")
-                        .code(Code::InvalidArgument)?,
-                )?;
+            // Configuration blobs can carry permission rules, agent
+            // permission modes, or approving hooks. They belong in the
+            // user's own Claude configuration, never in dlgt-supplied options.
+            if matches!(
+                key,
+                "settings" | "setting-sources" | "agents" | "plugin-dir"
+            ) {
+                fail!(
+                    InvalidArgument,
+                    "harness option {key:?} is not accepted; put it in your own Claude configuration"
+                );
             }
             Ok(value.map_or_else(|| format!("--{key}"), |value| format!("--{key}={value}")))
         })
@@ -750,37 +755,35 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
             );
         }
         let segments = key.split('.').collect::<Vec<_>>();
-        let final_segment = segments.last().copied().unwrap_or_default();
         let protected = matches!(
             key,
             "check_for_update_on_startup" | "model" | "model_reasoning_effort"
-        ) || matches!(
-            final_segment,
-            "approval_policy" | "approvals_reviewer" | "sandbox_mode"
-        ) || segments.contains(&"sandbox_workspace_write");
+        ) || segments.iter().any(|segment| {
+            matches!(
+                *segment,
+                "profile"
+                    | "profiles"
+                    | "approval_policy"
+                    | "approvals_reviewer"
+                    | "sandbox"
+                    | "sandbox_mode"
+                    | "sandbox_workspace_write"
+            )
+        });
         if protected {
             fail!(InvalidArgument, "harness option {key:?} is managed by dlgt");
+        }
+        // An inline table can carry any protected key under an innocent name.
+        let value_start = value.trim_start();
+        if value_start.starts_with('{') || (value_start.starts_with('[') && value.contains('{')) {
+            fail!(
+                InvalidArgument,
+                "harness option {key:?} must not be a table; set nested keys with dotted names"
+            );
         }
         args.extend(["--config".to_owned(), option.clone()]);
     }
     Ok(args)
-}
-
-fn validate_claude_agents_option(value: &str) -> Result<()> {
-    let agents: serde_json::Map<String, serde_json::Value> = serde_json::from_str(value)
-        .context("harness option \"agents\" must be a JSON object")
-        .code(Code::InvalidArgument)?;
-    for (name, definition) in agents {
-        if let Some(mode) = definition.get("permissionMode")
-            && mode.as_str() != Some("default")
-        {
-            fail!(
-                InvalidArgument,
-                "harness option \"agents\" definition {name:?} has managed permissionMode; only \"default\" is allowed"
-            );
-        }
-    }
-    Ok(())
 }
 
 pub fn validate_harness_options(agent: Agent, options: &[String]) -> Result<()> {
@@ -1102,46 +1105,47 @@ harness_options = ["approval_policy=never"]
     }
 
     #[test]
-    fn permission_guards_reject_nested_overrides_and_claude_agents_modes() {
+    fn dlgt_options_cannot_carry_permission_configuration() {
+        for option in [
+            r#"settings={"permissions":{"allow":["Bash(*)"]}}"#,
+            "settings=/private/tmp/user-settings.json",
+            r#"agents={"worker":{"permissionMode":"default"}}"#,
+            r#"agents={"worker":{"permissionMode":"acceptEdits"}}"#,
+            "agents=DUMMY_SECRET_AGENT_VALUE",
+            "setting-sources=project",
+            "plugin-dir=/private/tmp/plugins",
+        ] {
+            let error = claude_harness_args(&[option.to_owned()])
+                .err()
+                .unwrap_or_else(|| panic!("accepted {option}"));
+            assert_eq!(
+                crate::error::code_of(&error),
+                Some(crate::error::Code::InvalidArgument),
+                "{option}"
+            );
+            assert!(!error.to_string().contains("DUMMY_SECRET"), "{error}");
+        }
         for option in [
             "profiles.x.approval_policy=never",
-            "profiles.x.approvals_reviewer=user",
-            "profiles.x.sandbox_mode=danger-full-access",
+            "profiles.launch.approval_policy=never",
+            r#"profiles.wide={approval_policy="never", sandbox_mode="danger-full-access"}"#,
+            "profile=wide",
+            "sandbox.mode=danger-full-access",
             "profiles.x.sandbox_workspace_write.network_access=true",
+            r#"innocent={approval_policy="never"}"#,
+            r#"innocent=[{approval_policy="never"}]"#,
         ] {
             let error = codex_harness_args(&[option.to_owned()])
                 .err()
-                .unwrap_or_else(|| panic!("accepted managed option {option}"));
-            assert!(
-                error
-                    .to_string()
-                    .contains(option.split('=').next().unwrap_or(option))
-            );
-        }
-        for (option, expected_ok) in [
-            (r#"agents={"worker":{"permissionMode":"default"}}"#, true),
-            (
-                r#"agents={"worker":{"permissionMode":"acceptEdits"}}"#,
-                false,
-            ),
-            (
-                r#"agents={"worker":{"permissionMode":"bypassPermissions"}}"#,
-                false,
-            ),
-        ] {
+                .unwrap_or_else(|| panic!("accepted {option}"));
             assert_eq!(
-                claude_harness_args(&[option.to_owned()]).is_ok(),
-                expected_ok,
+                crate::error::code_of(&error),
+                Some(crate::error::Code::InvalidArgument),
                 "{option}"
             );
         }
-    }
-
-    #[test]
-    fn provider_owned_claude_settings_are_not_rejected_as_dlgt_permission_overrides() {
-        let option = "settings=/private/tmp/user-settings.json".to_owned();
-        let args = claude_harness_args(&[option]).unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(args, ["--settings=/private/tmp/user-settings.json"]);
+        assert!(codex_harness_args(&["features.web_search=true".to_owned()]).is_ok());
+        assert!(claude_harness_args(&["add-dir=/private/tmp".to_owned()]).is_ok());
     }
 
     #[test]

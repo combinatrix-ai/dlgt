@@ -252,18 +252,24 @@ Rules:
   action the provider let through.
 - A request that nobody answers never times out into an approval. It stays
   pending and the Session stays `blocked` until `answer`, `cancel`, or `stop`.
-- Harness options that would change the mapping above or pre-approve tools
-  (`permission-mode`, `permission-prompt-tool`, `permission-prompts`,
-  `dangerously-skip-permissions`, `allow-dangerously-skip-permissions`,
-  `allowedTools`, `allowed-tools`, `settings`, `settings-file`, `bare`,
-  `approval_policy`, `sandbox_workspace_write`, `approvals_reviewer`,
-  `sandbox_mode`) are managed by dlgt and rejected with
-  `INVALID_ARGUMENT` under every mode before a provider process starts. The
-  error names the rejected option. The entire Claude `settings` option is
-  rejected because it can contain permission rules. Provider-native settings
-  remain the caller's policy, including allow rules in the caller's
-  `settings.json`, a selected `CLAUDE_CONFIG_DIR`, `~/.codex/config.toml`, and
-  provider options such as `--add-dir`.
+- dlgt-supplied Harness options (from `--harness-option`, a Profile, or
+  `[defaults]`) cannot change the mapping above or carry configuration. They
+  are rejected with `INVALID_ARGUMENT`, naming the option, under every mode
+  and before a provider process starts:
+  - Claude: `permission-mode`, `permission-prompt-tool`, `permission-prompts`,
+    `dangerously-skip-permissions`, `allow-dangerously-skip-permissions`,
+    `allowedTools`, `allowed-tools`, `bare`, and the configuration options
+    `settings`, `setting-sources`, `agents`, and `plugin-dir`, whose contents
+    can carry permission rules, agent permission modes, or approving hooks.
+  - Codex: any key with a segment named `profile`, `profiles`,
+    `approval_policy`, `approvals_reviewer`, `sandbox`, `sandbox_mode`, or
+    `sandbox_workspace_write`, and any value that is an inline table or an
+    array of tables.
+- `ask` forwards every request the provider raises. Configuration you own is
+  your policy and dlgt leaves it alone: allow rules in your Claude
+  `settings.json` or a `CLAUDE_CONFIG_DIR` you select, your
+  `~/.codex/config.toml`, and options such as `--add-dir`. A tool your own
+  configuration allows produces no request, so `ask` cannot show it.
 - Codex `workspace-write` still allows writes under the system temporary
   directories. Those writes produce no approval request in any mode.
 
