@@ -777,6 +777,16 @@ class RecheckRegressions(unittest.TestCase):
         line = next(line for line in proxy.stdout.splitlines() if line.strip())
         self.assertEqual(json.loads(line).get("error", {}).get("code"), "INVALID_ARGUMENT", proxy.stdout)
 
+    def test_codex_cancel_settles_when_the_terminal_event_precedes_the_interrupt_reply(self) -> None:
+        h = self.harness
+        session = h.create("codex", "hold-order", {"DLGT_FAKE_INTERRUPT_REPLY_LAST": "1"})["result"]["session"]["id"]
+        h.wait_state(session, "busy")
+        canceled = h.rpc("session.cancel", {"session": session, "timeout_ms": 3_000})
+        self.assertEqual(canceled.get("result", {}).get("result", {}).get("status"), "canceled", canceled)
+        h.wait_state(session, "idle")
+        followup = h.rpc("session.send", {"session": session, "request_id": "after-order", "prompt": "next"})
+        self.assertIn("result", followup, followup)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

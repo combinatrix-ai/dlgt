@@ -728,6 +728,18 @@ impl Store {
         if settled {
             state.cancel_controls.remove(id);
             state.cancel_terminal_seen.remove(id);
+            // The provider's terminal event came first; this last control
+            // completes the cancel, so the Session settles here and now.
+            let session_id = state.turns.get(id).map(|turn| turn.session_id.clone());
+            if let Some(session) =
+                session_id.and_then(|session_id| state.sessions.get_mut(&session_id))
+                && session.record.state == SessionState::Quiescing
+                && session.record.active_turn_id.as_deref() == Some(id)
+            {
+                session.record.active_turn_id = None;
+                session.record.state = SessionState::Idle;
+                session.record.updated_at_ms = now_ms();
+            }
         }
         settled
     }

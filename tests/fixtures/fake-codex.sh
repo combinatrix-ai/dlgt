@@ -115,13 +115,14 @@ while IFS= read -r line; do
       [ "$holding" = 1 ] && finish "fake:$(text_of)"
       ;;
     *'"method":"turn/interrupt"'*)
-      reply '{}'
+      [ -z "${DLGT_FAKE_INTERRUPT_REPLY_LAST:-}" ] && reply '{}'
       if [ "$asking" = 1 ]; then
         notify serverRequest/resolved "{\"threadId\":\"$thread\",\"requestId\":\"srv-$turns\"}"
       fi
       asking=0
       holding=0
       notify turn/completed "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"status\":\"interrupted\",\"items\":[]}}"
+      if [ -n "${DLGT_FAKE_INTERRUPT_REPLY_LAST:-}" ]; then sleep 0.2; reply '{}'; fi
       ;;
     *'"method":'*) [ -n "$id" ] && reply '{}' ;;
   esac
