@@ -373,30 +373,7 @@ impl RequestRecord {
                         "invalid answer: this form requires --json with a JSON object"
                     ),
                 };
-                for field in schema
-                    .get("required")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
-                    if content.get(field).is_none_or(Value::is_null) {
-                        fail!(
-                            InvalidArgument,
-                            "invalid answer: required form field {field:?} is missing"
-                        );
-                    }
-                }
-                if let (Some(properties), Some(object)) = (
-                    schema.get("properties").and_then(Value::as_object),
-                    content.as_object(),
-                ) && let Some(unknown) = object.keys().find(|key| !properties.contains_key(*key))
-                {
-                    fail!(
-                        InvalidArgument,
-                        "invalid answer: form has no field {unknown:?}"
-                    );
-                }
+                validate_form_answer(schema, &content)?;
                 json!({"action": "accept", "content": content})
             }
         };
@@ -456,6 +433,36 @@ fn public_summary(draft: &RequestDraft) -> String {
         return display_bounded(&draft.tool, SUMMARY_LIMIT);
     }
     "Caller input required".to_owned()
+}
+
+/// dlgt checks only the answer's shape against the provider's schema; the
+/// provider validates the values.
+fn validate_form_answer(schema: &Value, content: &Value) -> Result<()> {
+    for field in schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if content.get(field).is_none_or(Value::is_null) {
+            fail!(
+                InvalidArgument,
+                "invalid answer: required form field {field:?} is missing"
+            );
+        }
+    }
+    if let (Some(properties), Some(object)) = (
+        schema.get("properties").and_then(Value::as_object),
+        content.as_object(),
+    ) && let Some(unknown) = object.keys().find(|key| !properties.contains_key(*key))
+    {
+        fail!(
+            InvalidArgument,
+            "invalid answer: form has no field {unknown:?}"
+        );
+    }
+    Ok(())
 }
 
 impl RequestDraft {
