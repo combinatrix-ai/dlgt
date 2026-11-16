@@ -1066,6 +1066,36 @@ class RecheckRegressions(unittest.TestCase):
             followup = h.rpc("session.send", {"session": session, "request_id": "after-race", "prompt": "after"})
             self.assertIn("result", followup, (harness, followup))
 
+    def test_a_late_rotation_from_a_replaced_claude_never_renames_its_replacement(self) -> None:
+        self.harness.close()
+        self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_CLAUDE_REKEY_MS": "5000"})
+        h = self.harness
+        session = h.create("claude", "first")["result"]["session"]["id"]
+        h.wait_state(session, "idle", timeout=10)
+        rotating = h.rpc(
+            "session.restart",
+            {
+                "session": session,
+                "environment": h.provider_env({"DLGT_FAKE_ROTATE_AT_START": "1"}),
+                "startup_timeout_ms": 5_000,
+            },
+        )
+        self.assertIn("result", rotating, rotating)
+        # The prompt makes the rotating process report its new ID; its rekey
+        # is held past the next restart.
+        h.pending("session.send", {"session": session, "request_id": "rotate", "prompt": "rotate"})
+        time.sleep(0.3)
+        replaced = h.rpc(
+            "session.restart",
+            {"session": session, "environment": h.provider_env(), "startup_timeout_ms": 10_000},
+            timeout=20,
+        )
+        self.assertIn("result", replaced, replaced)
+        time.sleep(5.5)
+        h.wait_state(session, "idle")
+        h.rpc("session.send", {"session": session, "request_id": "after-rotation", "prompt": "next"})
+        final = h.wait_state(session, "idle", timeout=10)["result"]
+        self.assertEqual(final["final_text"], "fake:next", final)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

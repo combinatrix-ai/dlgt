@@ -861,6 +861,7 @@ impl Daemon {
             &id,
             &canonical_id,
             &runtime_session_id,
+            generation,
         ) {
             runtime.force_stop();
             self.fail_unpublished(&id, generation, "failed to publish provider Session ID");
@@ -1372,6 +1373,7 @@ impl Daemon {
                         }
                     }
                     claude::Action::Rekey(provider_id) => {
+                        test_pause("DLGT_TEST_PAUSE_BEFORE_CLAUDE_REKEY_MS");
                         let canonical = canonical_session_id("claude", &provider_id);
                         if let Err(error) = promote_session(
                             &event_store,
@@ -1379,6 +1381,7 @@ impl Daemon {
                             &session_id,
                             &canonical,
                             &event_session_id,
+                            event_generation,
                         ) {
                             eprintln!("dlgt failed to rekey a rotated Claude session: {error:#}");
                         }
@@ -3047,12 +3050,16 @@ impl Daemon {
 }
 
 /// Move a Session and its runtime to a new public ID.
+/// Move a Session and its runtime from `from` to `to`, provided the runtime
+/// of `generation` still owns it: a late rotation from a replaced process
+/// must not rename its replacement.
 fn promote_session(
     store: &Mutex<Store>,
     sessions: &SessionMap,
     from: &str,
     to: &str,
     runtime_session_id: &RwLock<String>,
+    generation: u64,
 ) -> Result<()> {
     let mut runtime_id = runtime_session_id
         .write()
@@ -3071,10 +3078,17 @@ fn promote_session(
     let store = store
         .lock()
         .map_err(|_| anyhow!("session store lock poisoned"))?;
-    store.rekey_session(from, to)?;
     let mut sessions = sessions
         .write()
         .map_err(|_| anyhow!("session map lock poisoned"))?;
+    let owned = store.runtime_generation(from) == Some(generation)
+        && sessions
+            .get(from)
+            .is_none_or(|runtime| runtime.generation() == generation);
+    if !owned {
+        bail!("Session {from} was replaced before its provider ID rotated");
+    }
+    store.rekey_session(from, to)?;
     if let Some(runtime) = sessions.remove(from)
         && sessions.insert(to.to_owned(), runtime).is_some()
     {
