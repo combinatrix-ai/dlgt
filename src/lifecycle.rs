@@ -615,12 +615,12 @@ mod tests {
     /// Every event worth trying from `state`: from the current generation and
     /// the one before it, naming the active execution, an earlier one, and the
     /// next one. `next_seq` is the sequence the next prompt gets.
-    fn alphabet(state: &Lifecycle, stale: u64, next_seq: i64) -> Vec<(u64, Event<'static>)> {
+    fn alphabet(state: &Lifecycle, replaced: u64, next_seq: i64) -> Vec<(u64, Event<'static>)> {
         let generation = state.generation();
         let mut seqs = vec![next_seq - 1, next_seq - 2, next_seq];
         seqs.retain(|seq| *seq > 0);
         let mut events = Vec::new();
-        for generation in [generation, stale] {
+        for generation in [generation, replaced] {
             events.push((generation, Event::Spawned));
             events.push((generation, Event::Ready));
             for acknowledged in [false, true] {
@@ -655,6 +655,50 @@ mod tests {
             events.push((generation, Event::RestartTimeout));
         }
         events
+    }
+
+    /// Whether an event from the current generation that names the active
+    /// execution, if it names one, must be accepted. This is the transition
+    /// table restated, so a change to `next` that accepts or refuses the
+    /// wrong event fails here.
+    fn must_accept(state: &Lifecycle, event: &Event<'_>) -> bool {
+        let phase = state.phase();
+        let active = state.active();
+        let canceling = active.and_then(|execution| execution.cancel);
+        match event {
+            Event::Spawned => matches!(phase, Phase::Starting { spawned: false }),
+            Event::Ready => matches!(phase, Phase::Starting { .. }),
+            Event::Submit { .. } => matches!(phase, Phase::Idle),
+            Event::Started { .. }
+            | Event::Unblocked { .. }
+            | Event::Finished { .. }
+            | Event::Cancel { .. } => active.is_some(),
+            Event::Blocked { .. } => active.is_some() && canceling.is_none(),
+            Event::ControlReserved { .. } => canceling.is_some(),
+            Event::ControlDone { .. } => {
+                canceling.is_some_and(|cancel| cancel.pending_controls > 0)
+            }
+            Event::Fail { .. } => matches!(
+                phase,
+                Phase::Starting { .. } | Phase::Idle | Phase::Active(_)
+            ),
+            Event::Exited => true,
+            Event::Stop { force } => {
+                matches!(
+                    phase,
+                    Phase::Starting { .. }
+                        | Phase::Idle
+                        | Phase::Active(_)
+                        | Phase::Restarting { .. }
+                ) || (*force && matches!(phase, Phase::Stopping))
+            }
+            Event::Restart => matches!(
+                phase,
+                Phase::Idle | Phase::Active(_) | Phase::Stopped | Phase::Failed
+            ),
+            Event::RestartLaunch => matches!(phase, Phase::Restarting { old_alive: false }),
+            Event::RestartTimeout => matches!(phase, Phase::Restarting { .. }),
+        }
     }
 
     /// The execution sequence an event names, if any.
@@ -741,6 +785,13 @@ mod tests {
                 let result = next.apply(generation, &event);
                 let names_other = named_seq(&event)
                     .is_some_and(|seq| state.active().is_none_or(|active| active.seq != seq));
+                if generation == state.generation() && !names_other {
+                    assert_eq!(
+                        result.is_ok(),
+                        must_accept(&state, &event),
+                        "{event:?} on {state:?} gave {result:?}"
+                    );
+                }
                 if generation != state.generation() || names_other {
                     assert!(
                         result.is_err(),
@@ -761,6 +812,11 @@ mod tests {
                 let before = state.public_state();
                 let after = next.public_state();
                 let published = recorded(&effects);
+                if let (Event::Started { .. }, Some(execution)) = (&event, state.active())
+                    && !execution.acknowledged
+                {
+                    assert_eq!(published, ["session.busy"], "{event:?} on {state:?}");
+                }
                 if before != after {
                     let expected = announces(after);
                     let silent_submit = matches!(
