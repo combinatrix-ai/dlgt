@@ -1189,6 +1189,38 @@ class RecheckRegressions(unittest.TestCase):
         time.sleep(1.5)
         self.assertLessEqual(threads(), baseline + 2, "provider output readers outlived their exit")
 
+    def test_a_create_never_submits_to_the_restart_that_replaced_it(self) -> None:
+        for harness in ("claude", "codex"):
+            self.harness.close()
+            self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_INITIAL_SUBMIT_MS": "1500"})
+            h = self.harness
+            create = h.pending(
+                "session.create",
+                {
+                    "title": "create submit race",
+                    "harness": harness,
+                    "cwd": str(h.root),
+                    "environment": h.provider_env(),
+                    "request_id": f"create-submit-{harness}",
+                    "prompt": "hold-old-create",
+                },
+            )
+            deadline = time.monotonic() + 5
+            session = None
+            while session is None and time.monotonic() < deadline:
+                listed = h.rpc("session.list", {}).get("result", [])
+                session = next((item["id"] for item in listed if item.get("state") == "idle"), None)
+                time.sleep(0.05)
+            self.assertIsNotNone(session)
+            restarted = h.rpc(
+                "session.restart",
+                {"session": session, "environment": h.provider_env(), "startup_timeout_ms": 5_000},
+            )
+            self.assertIn("result", restarted, restarted)
+            self.assertIn("error", h.receive(create))
+            followup = h.rpc("session.send", {"session": session, "request_id": "replacement", "prompt": "mine"})
+            self.assertIn("result", followup, (harness, followup))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

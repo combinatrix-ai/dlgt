@@ -884,11 +884,15 @@ impl Daemon {
             .get("correlation_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let mut response = match self.submit_turn(&json!({
-            "session": id,
-            "prompt": initial_prompt,
-            "correlation_id": correlation_id,
-        })) {
+        test_pause("DLGT_TEST_PAUSE_BEFORE_INITIAL_SUBMIT_MS");
+        let mut response = match self.submit_turn_to(
+            &json!({
+                "session": id,
+                "prompt": initial_prompt,
+                "correlation_id": correlation_id,
+            }),
+            Some(generation),
+        ) {
             Ok(result) => result,
             Err(error) => {
                 runtime.force_stop();
@@ -1659,7 +1663,17 @@ impl Daemon {
 
     #[allow(clippy::too_many_lines)]
     fn submit_turn(&self, params: &Value) -> Result<Value> {
+        self.submit_turn_to(params, None)
+    }
+
+    /// Accept a prompt for the live runtime, or only for `generation` when the
+    /// caller launched that runtime itself and must not reach a replacement.
+    #[allow(clippy::too_many_lines)]
+    fn submit_turn_to(&self, params: &Value, generation: Option<u64>) -> Result<Value> {
         let (session, runtime) = self.live_session(params_string(params, "session")?)?;
+        if generation.is_some_and(|generation| generation != runtime.generation()) {
+            return Err(crate::lifecycle::Refusal::Stale.into_error(&session.id));
+        }
         if session_is_auth_mismatch(&session) {
             return Err(AuthMismatch::default().into());
         }
