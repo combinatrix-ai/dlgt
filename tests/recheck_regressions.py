@@ -926,6 +926,19 @@ class RecheckRegressions(unittest.TestCase):
         )
         self.assertIn('"NOT_FOUND"', missing.stdout + missing.stderr)
 
+    def test_a_slow_codex_acknowledgement_returns_a_pending_receipt(self) -> None:
+        h = self.harness
+        release = h.root / "ack-release"
+        started = time.monotonic()
+        created = h.create("codex", "slow ack", {"DLGT_FAKE_DELAY_TURN_START_ACK": str(release)})
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 8, elapsed)
+        self.assertEqual(created.get("result", {}).get("submission"), "pending", created)
+        session = created["result"]["session"]["id"]
+        release.touch()
+        final = h.wait_state(session, "idle", timeout=10)["result"]
+        self.assertEqual(final["final_text"], "fake:slow ack", final)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

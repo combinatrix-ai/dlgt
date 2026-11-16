@@ -256,7 +256,7 @@ pub fn rpc_stdio() -> Result<()> {
                 || {
                     let code = crate::error::code_of(&error)
                         .map_or("RPC_UNAVAILABLE", |code| code.as_str());
-                    Response::error(&request.id, code, error.to_string())
+                    Response::error(&request.id, code, format!("{error:#}"))
                 },
                 |failure| {
                     let mut response = Response::session_error(

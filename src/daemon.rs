@@ -1702,58 +1702,36 @@ impl Daemon {
         // pending receipt rather than erase idempotency and invite a retry.
         let fallback_public_session = self.public_session(&session)?;
         let mut synchronously_confirmed = false;
+        let mut window_spent = false;
         match runtime.as_ref() {
             AgentRuntime::Codex {
                 control, thread_id, ..
             } => {
-                let started = control
-                    .start_turn(thread_id, prompt)
-                    .and_then(|turn| {
-                        control.watch_turn(thread_id, &turn)?;
-                        Ok(turn)
+                // turn/start is answered only when Codex acknowledges the turn,
+                // which can take longer than the receipt window. The request
+                // runs on its own thread; past the window the receipt is
+                // `pending` and that thread records the outcome when it comes.
+                let (sender, outcome) = mpsc::channel();
+                let starter = CodexStart {
+                    store: Arc::clone(&self.store),
+                    control: Arc::clone(control),
+                    thread_id: thread_id.clone(),
+                    session_id: session.id.clone(),
+                    turn_id: turn_id.clone(),
+                    execution_seq: turn.execution_seq,
+                    generation: runtime.generation(),
+                    prompt: prompt.to_owned(),
+                };
+                std::thread::Builder::new()
+                    .name("dlgt-codex-turn-start".to_owned())
+                    .spawn(move || {
+                        let _ = sender.send(starter.run());
                     })
-                    .code(Code::SessionUnavailable);
-                match started {
-                    Ok(provider_turn_id) => {
-                        synchronously_confirmed = true;
-                        if let Ok(store) = self.lock_store()
-                            && store.mark_turn_started(&turn_id, Some(&provider_turn_id))
-                        {
-                            store.record_event(Some(&session.id), Some(&turn_id), "turn.started");
-                        }
-                    }
-                    Err(error) => {
-                        if self.runtime_is_current(&session.id, &runtime) {
-                            let store = self.lock_store()?;
-                            if !store.execution_is_current(
-                                &session.id,
-                                runtime.generation(),
-                                &turn.id,
-                                turn.execution_seq,
-                            ) {
-                                return Err(error);
-                            }
-                            let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
-                            if store.finish_turn_if_matching(
-                                &turn_id,
-                                None,
-                                TurnState::Failed,
-                                None,
-                                Some(&message),
-                            )? {
-                                store.set_session_failed(&session.id);
-                                store.record_event(
-                                    Some(&session.id),
-                                    Some(&turn_id),
-                                    "turn.failed",
-                                );
-                                store.record_event(Some(&session.id), None, "session.failed");
-                                drop(store);
-                                runtime.force_stop();
-                            }
-                        }
-                        return Err(error);
-                    }
+                    .context("failed to start Codex turn/start worker")?;
+                match outcome.recv_timeout(SUBMISSION_CONFIRM_TIMEOUT) {
+                    Ok(Ok(())) => synchronously_confirmed = true,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => window_spent = true,
                 }
             }
             AgentRuntime::Claude { process, .. } => {
@@ -1787,9 +1765,10 @@ impl Daemon {
             }
         }
         let confirmed = synchronously_confirmed
-            || self
-                .wait_for_submission_confirmation(&turn_id)
-                .unwrap_or(false);
+            || (!window_spent
+                && self
+                    .wait_for_submission_confirmation(&turn_id)
+                    .unwrap_or(false));
         if !confirmed
             && self
                 .lock_store()?
@@ -3338,6 +3317,72 @@ fn spawn_claude_cancel_control(
                 let _ = turns.settle(&store, &session_id);
             }
         });
+}
+
+/// One `turn/start` request and the bookkeeping for its outcome, run off the
+/// RPC thread so a slow acknowledgement cannot hold the submit receipt.
+struct CodexStart {
+    store: Arc<Mutex<Store>>,
+    control: Arc<CodexConnection>,
+    thread_id: String,
+    session_id: String,
+    turn_id: String,
+    execution_seq: i64,
+    generation: u64,
+    prompt: String,
+}
+
+impl CodexStart {
+    fn run(self) -> Result<()> {
+        let started = self
+            .control
+            .start_turn(&self.thread_id, &self.prompt)
+            .and_then(|turn| {
+                self.control.watch_turn(&self.thread_id, &turn)?;
+                Ok(turn)
+            })
+            .code(Code::SessionUnavailable);
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("session store lock poisoned"))?;
+        match started {
+            Ok(provider_turn_id) => {
+                if store.mark_turn_started(&self.turn_id, Some(&provider_turn_id)) {
+                    store.record_event(Some(&self.session_id), Some(&self.turn_id), "turn.started");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if store.execution_is_current(
+                    &self.session_id,
+                    self.generation,
+                    &self.turn_id,
+                    self.execution_seq,
+                ) {
+                    let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
+                    if store.finish_turn_if_matching(
+                        &self.turn_id,
+                        None,
+                        TurnState::Failed,
+                        None,
+                        Some(&message),
+                    )? {
+                        store.set_session_failed(&self.session_id);
+                        store.record_event(
+                            Some(&self.session_id),
+                            Some(&self.turn_id),
+                            "turn.failed",
+                        );
+                        store.record_event(Some(&self.session_id), None, "session.failed");
+                        drop(store);
+                        self.control.force_stop();
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 /// A pause at a named race window, for the integration regressions only.
