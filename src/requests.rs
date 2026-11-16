@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn delivered_answers_are_trimmed_to_the_retention_limit_except_awaited_ones() {
         let mut table = RequestTable::default();
-        let mut awaited = None;
+        let mut awaited = Vec::new();
         for index in 0..300 {
             let record = table.open(approval(ProviderRequest::CodexCommand), Some(1), 1);
             let Some(AnswerClaim::Started(attempt)) =
@@ -1007,12 +1007,12 @@ mod tests {
             else {
                 panic!("answer was not started");
             };
-            if index == 0 {
+            if index < 260 {
                 assert_eq!(
                     table.begin_answer(&record.id, &Answer::Allow),
                     Some(AnswerClaim::Waiting(attempt))
                 );
-                awaited = Some((record.id.clone(), attempt));
+                awaited.push((record.id.clone(), attempt));
             }
             let resolution = Resolution {
                 outcome: Outcome::Allowed,
@@ -1030,13 +1030,15 @@ mod tests {
                     .is_some()
             );
         }
-        let Some((id, attempt)) = awaited else {
-            panic!("no awaited attempt");
-        };
-        assert!(table.get(&id).is_some(), "an awaited attempt was trimmed");
-        assert!(table.records.len() <= super::RESOLVED_RETENTION + 1);
-        table.release_answer_waiter(&id, attempt);
-        assert!(table.records.len() <= super::RESOLVED_RETENTION);
+        assert!(
+            awaited.iter().all(|(id, _)| table.get(id).is_some()),
+            "an awaited attempt was trimmed"
+        );
+        assert_eq!(table.records.len(), 260);
+        for (id, attempt) in &awaited {
+            table.release_answer_waiter(id, *attempt);
+        }
+        assert_eq!(table.records.len(), super::RESOLVED_RETENTION);
     }
 
     #[test]

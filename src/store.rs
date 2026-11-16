@@ -451,6 +451,8 @@ impl Store {
             final_message: None,
             final_text_recovered: false,
             denied_requests: 0,
+            recorded_denials: 0,
+            provider_denials: 0,
             error: None,
             created_at_ms: now,
             started_at_ms: None,
@@ -1079,7 +1081,10 @@ impl Store {
         let execution_seq = turn_id.and_then(|id| {
             let turn = state.turns.get_mut(&id)?;
             if refuses {
-                turn.denied_requests += 1;
+                turn.recorded_denials += 1;
+                turn.denied_requests = turn
+                    .denied_requests
+                    .max(turn.recorded_denials.max(turn.provider_denials));
             }
             Some(turn.execution_seq)
         });
@@ -1111,7 +1116,10 @@ impl Store {
                 .values_mut()
                 .find(|turn| turn.session_id == session_id && turn.execution_seq == execution_seq)
         {
-            turn.denied_requests += 1;
+            turn.recorded_denials += 1;
+            turn.denied_requests = turn
+                .denied_requests
+                .max(turn.recorded_denials.max(turn.provider_denials));
         }
         Some(
             state
@@ -1652,7 +1660,10 @@ impl Store {
     /// Raise an execution's denial count to what the provider itself counted.
     pub fn raise_denied_requests(&self, id: &str, count: u32) {
         if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.denied_requests = turn.denied_requests.max(count);
+            turn.provider_denials = turn.provider_denials.max(count);
+            turn.denied_requests = turn
+                .denied_requests
+                .max(turn.recorded_denials.max(turn.provider_denials));
         }
     }
 }

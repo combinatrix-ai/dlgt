@@ -1972,9 +1972,16 @@ impl Daemon {
         } else {
             None
         };
-        let claim = self.claim_request_answer(&session.id, &record, &answer)?;
+        let (claim, waited) = self.claim_request_answer(&session.id, &record, &answer)?;
         if let AnswerClaim::Replay(resolution) = claim {
-            return self.answer_receipt(&session.id, &record, resolution.outcome, None);
+            // Build the receipt while a waiter still pins the Request against
+            // retention trimming, then release it.
+            let receipt = self.answer_receipt(&session.id, &record, resolution.outcome, None);
+            if let Some(attempt_id) = waited {
+                self.lock_store()?
+                    .release_answer_waiter(&session.id, &record.id, attempt_id);
+            }
+            return receipt;
         }
         let AnswerClaim::Started(attempt_id) = claim else {
             fail!(RequestFailed, "answer attempt could not be claimed");
@@ -2039,14 +2046,14 @@ impl Daemon {
         session_id: &str,
         record: &RequestRecord,
         answer: &Answer,
-    ) -> Result<AnswerClaim> {
+    ) -> Result<(AnswerClaim, Option<u64>)> {
         let mut store = self.lock_store()?;
         let claim = store
             .begin_request_answer(session_id, &record.id, answer)
             .with_context(|| format!("Session {session_id} has no Request {}", record.id))
             .code(Code::RequestNotFound)?;
         match claim {
-            AnswerClaim::Started(_) | AnswerClaim::Replay(_) => Ok(claim),
+            AnswerClaim::Started(_) | AnswerClaim::Replay(_) => Ok((claim, None)),
             AnswerClaim::Conflict => fail!(
                 RequestResolved,
                 "Request {} was answered with a different decision",
@@ -2081,8 +2088,7 @@ impl Daemon {
                         }
                     }
                     Some((crate::requests::AnswerAttemptState::Delivered, Some(resolution))) => {
-                        store.release_answer_waiter(session_id, &record.id, attempt_id);
-                        return Ok(AnswerClaim::Replay(resolution));
+                        return Ok((AnswerClaim::Replay(resolution), Some(attempt_id)));
                     }
                     Some((
                         crate::requests::AnswerAttemptState::Retryable
@@ -5072,6 +5078,8 @@ mod tests {
             final_message: Some(text.to_owned()),
             final_text_recovered: false,
             denied_requests: 0,
+            recorded_denials: 0,
+            provider_denials: 0,
             error: None,
             created_at_ms: 0,
             started_at_ms: Some(0),

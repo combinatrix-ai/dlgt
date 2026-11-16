@@ -461,14 +461,23 @@ class RecheckRegressions(unittest.TestCase):
 
     def test_a_duplicate_answer_during_delivery_replays_the_delivered_answer(self) -> None:
         self.harness.close()
-        self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_ANSWER_DELIVERY_MS": "400"})
+        # The provider finishes while the receipt is held, so only dlgt's own
+        # completion notification can wake the waiting duplicate.
+        self.harness = Harness(
+            {
+                "DLGT_TEST_PAUSE_BEFORE_ANSWER_DELIVERY_MS": "400",
+                "DLGT_TEST_PAUSE_BEFORE_ANSWER_RECEIPT_MS": "1000",
+            }
+        )
         h = self.harness
         session = h.create("claude", "ask", approvals="ask")["result"]["session"]["id"]
         h.wait_state(session, "blocked")
         answer = {"session": session, "request": "r1", "decision": "allow"}
         first = h.pending("session.answer", answer)
         time.sleep(0.1)
+        duplicate_started = time.monotonic()
         duplicate = h.rpc("session.answer", answer)
+        self.assertLess(time.monotonic() - duplicate_started, 4, "duplicate missed the delivery notification")
         first = h.receive(first)
         self.assertIn("result", first, first)
         self.assertTrue(duplicate.get("result", {}).get("replayed"), duplicate)
@@ -493,6 +502,13 @@ class RecheckRegressions(unittest.TestCase):
             if message.get("kind") == "approval"
         ]
         self.assertEqual([message.get("execution_seq") for message in approvals], [1], history)
+        first = [
+            result
+            for bucket in history["result"]["sessions"]
+            for result in bucket.get("results", [])
+            if result.get("execution_seq") == 1
+        ]
+        self.assertEqual([result.get("denied_requests") for result in first], [1], history)
         h.rpc("session.cancel", {"session": session, "timeout_ms": 3_000})
         latest = h.wait_state(session, "idle")["result"]
         self.assertEqual((latest["execution_seq"], latest["denied_requests"]), (2, 0), latest)

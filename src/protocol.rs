@@ -355,6 +355,13 @@ pub struct TurnRecord {
     pub final_text_recovered: bool,
     /// Approvals denied during this execution, by any reviewer.
     pub denied_requests: u32,
+    /// Denials dlgt recorded as messages, and the provider's own total.
+    /// Claude's total includes the caller's denials, so the public count is
+    /// the larger of the two rather than their sum.
+    #[serde(skip)]
+    pub recorded_denials: u32,
+    #[serde(skip)]
+    pub provider_denials: u32,
     pub error: Option<Value>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
