@@ -21,6 +21,7 @@ use crate::reaper::{Reaper, Registration};
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 const RESUME_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
+const TURN_RECONCILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_TAIL_LIMIT: usize = 4096;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -335,9 +336,12 @@ impl CodexConnection {
                     if is_terminal(&connection.terminal_turns, &turn_id) {
                         return;
                     }
-                    let response = connection.request(
+                    // Bounded so a worker notices its turn settled soon after,
+                    // even when a read goes unanswered.
+                    let response = connection.request_within(
                         "thread/read",
                         json!({"threadId": thread_id, "includeTurns": true}),
+                        TURN_RECONCILE_READ_TIMEOUT,
                     );
                     match response {
                         Ok(response) => {
@@ -431,8 +435,14 @@ impl CodexConnection {
             }
             return Err(error);
         }
-        receiver
-            .recv_timeout(timeout)
+        let response = receiver.recv_timeout(timeout);
+        if response.is_err()
+            && let Ok(mut pending) = self.pending.lock()
+        {
+            // A reply that never came must not keep its slot forever.
+            pending.remove(&id);
+        }
+        response
             .with_context(|| format!("timed out waiting for Codex {method}"))?
             .map_err(|message| anyhow!("Codex {method} failed: {message}"))
     }

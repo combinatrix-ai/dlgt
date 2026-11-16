@@ -870,6 +870,9 @@ class RecheckRegressions(unittest.TestCase):
         self.assertIn("result", response, response)
         self.assertTrue((codex_home / "config.toml").exists())
         self.assertFalse((h.home / ".codex" / "config.toml").exists())
+        response = h.create("codex", "trust", {"CODEX_HOME": "relative-codex"})
+        self.assertIn("result", response, response)
+        self.assertTrue((h.root / "relative-codex" / "config.toml").exists())
 
     def test_answer_receipts_keep_their_fields_when_retention_trims_the_request(self) -> None:
         self.harness.close()

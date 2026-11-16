@@ -245,11 +245,12 @@ pub fn prepare_workspace(
     cwd: &Path,
     environment: &HashMap<String, String>,
 ) -> Result<()> {
+    // The provider runs in `cwd`, so a relative path names a place there.
     let variable = |name: &str| {
         environment
             .get(name)
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
+            .map(|value| cwd.join(value))
     };
     let home = || {
         variable("HOME")
@@ -409,6 +410,9 @@ fn json_member_offset(contents: &str, path: &[&str]) -> usize {
     // Object nesting from the root: for each level, the key being read.
     let mut keys: Vec<Option<String>> = Vec::new();
     let mut index = 0;
+    // A duplicated member takes its last value when parsed, so the last
+    // occurrence is the one to report.
+    let mut found = 0;
     while index < bytes.len() {
         match bytes[index] {
             b'{' => keys.push(None),
@@ -437,7 +441,7 @@ fn json_member_offset(contents: &str, path: &[&str]) -> usize {
                         .map(|key| key.as_deref().unwrap_or_default())
                         .collect::<Vec<_>>();
                     if current == path {
-                        return start;
+                        found = start;
                     }
                 }
             }
@@ -445,7 +449,7 @@ fn json_member_offset(contents: &str, path: &[&str]) -> usize {
         }
         index += 1;
     }
-    0
+    found
 }
 
 /// Where the offending `projects` entry is, read from a span-keeping parse
@@ -1357,6 +1361,9 @@ harness_options = ["approval_policy=never"]
             4
         );
         assert_eq!(super::json_member_offset(text, &["missing"]), 0);
+        let duplicated = "{\n  \"projects\": {},\n  \"projects\": 3\n}\n";
+        let offset = super::json_member_offset(duplicated, &["projects"]);
+        assert_eq!(duplicated[..offset].matches('\n').count() + 1, 3);
     }
 
     #[test]
