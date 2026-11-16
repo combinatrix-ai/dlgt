@@ -27,6 +27,18 @@ cleanup() {
   rm -rf "$state_dir"
 }
 trap cleanup EXIT INT TERM
+# Every fake provider this run starts records its PID here, so the final
+# leak check sees only this run's processes, not a concurrent suite's.
+DLGT_FAKE_PID_LOG="$state_dir/provider-pids"
+export DLGT_FAKE_PID_LOG
+: >"$DLGT_FAKE_PID_LOG"
+
+provider_alive() {
+  while read -r pid; do
+    if kill -0 "$pid" 2>/dev/null; then return 0; fi
+  done <"$DLGT_FAKE_PID_LOG"
+  return 1
+}
 
 export DLGT_HOME="$state_dir"
 export HOME="$state_dir/home"
@@ -902,20 +914,17 @@ codex_denied=$("$binary" fetch "$codex_id" --wait 5s)
 expect "$codex_denied" '"final_text":"denied"'
 expect "$codex_denied" '"denied_requests":1'
 
-# MCP elicitation forms expose every required field and accept one JSON object.
+# MCP elicitation forms publish the provider's schema and accept one JSON object.
 form_cursor=$("$binary" send "$codex_id" --request-id codex-form -- form-profile | field cursor)
 form_request=$("$binary" fetch "$codex_id" --cursor "$form_cursor" --wait 5s)
-expect "$form_request" '"name":"name"'
-expect "$form_request" '"type":"string"'
-expect "$form_request" '"name":"count"'
-expect "$form_request" '"type":"integer"'
-expect "$form_request" '"required":true'
-expect "$form_request" '"constraints":{"minLength":1}'
+expect "$form_request" '"schema":{"properties":{"count":{"minimum":1,"type":"integer"},"name":{"minLength":1,"type":"string"}},"required":\["name","count"\],"type":"object"}'
 rejected 4 "$binary" send "$codex_id" --request-id codex-form-blocked -- cannot-submit
 expect "$output" '"action":"dlgt answer codex:.* r3 --json <OBJECT>"'
 rejected 1 "$binary" answer "$codex_id" r3 --json '{"name":"Ada"}'
 expect "$output" '"code":"INVALID_ARGUMENT"'
 expect "$output" 'required form field.*count'
+rejected 1 "$binary" answer "$codex_id" r3 --json '{"name":"Ada","count":2,"extra":1}'
+expect "$output" 'form has no field.*extra'
 form_answer=$("$binary" answer "$codex_id" r3 --json '{"name":"Ada","count":2}')
 expect "$form_answer" '"resolution":"answered"'
 form_result=$("$binary" fetch "$codex_id" --cursor "$form_cursor" --wait 5s)
@@ -984,8 +993,12 @@ wait_until_gone @codex-preack
 wait "$server_pid"
 server_pid=
 attempt=0
-while pgrep -f "$repo_root/tests/fixtures/fake-" >/dev/null 2>&1; do
+while provider_alive; do
   attempt=$((attempt + 1)); test "$attempt" -lt 100 || fail "a provider process outlived the daemon"
   sleep 0.02
 done
+
+# Race-window and lifecycle regressions that need their own daemons.
+python3 -I "$repo_root/tests/recheck_regressions.py" \
+  || fail "lifecycle regressions failed"
 echo "dlgt smoke test passed"

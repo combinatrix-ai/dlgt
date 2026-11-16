@@ -4,6 +4,9 @@
 #   hold*   stay busy until interrupted or steered
 #   ask*    request approval for a command, then report the decision
 
+if [ -n "${DLGT_FAKE_PID_LOG:-}" ]; then
+  printf '%s\n' "$$" >>"$DLGT_FAKE_PID_LOG"
+fi
 if [ -n "${DLGT_FAKE_CODEX_LOG:-}" ]; then
   printf 'args: %s\n' "$*" >>"$DLGT_FAKE_CODEX_LOG"
 fi

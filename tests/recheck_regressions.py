@@ -291,7 +291,7 @@ class RecheckRegressions(unittest.TestCase):
             "session": session,
             "request": "r1",
             "decision": "json",
-            "json": {"name": "Ada", "count": 1, "extra": "x" * 300_000},
+            "json": {"name": "A" * 300_000, "count": 1},
         }
         first = h.pending("session.answer", answer)
         time.sleep(0.1)

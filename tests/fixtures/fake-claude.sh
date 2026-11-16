@@ -10,6 +10,9 @@
 # While holding, a steer starting with `queued` is left unread; any other
 # steer is read and ends the turn.
 
+if [ -n "${DLGT_FAKE_PID_LOG:-}" ]; then
+  printf '%s\n' "$$" >>"$DLGT_FAKE_PID_LOG"
+fi
 if [ -n "${DLGT_FAKE_ARGS_FILE:-}" ]; then
   printf '%s\n' "$@" >>"$DLGT_FAKE_ARGS_FILE"
 fi
