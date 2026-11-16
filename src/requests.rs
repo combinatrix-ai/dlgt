@@ -1003,7 +1003,11 @@ mod tests {
             .reply(&Answer::Json(Value::Object(answer.clone())))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(outcome, Outcome::Answered);
-        assert_eq!(reply["content"]["plan"], "opaque-b93");
+        assert_eq!(
+            reply,
+            json!({"action": "accept", "content": Value::Object(answer.clone())}),
+            "the answer must reach the provider exactly as submitted"
+        );
         answer.remove("field_16");
         assert!(
             record

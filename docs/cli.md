@@ -538,6 +538,8 @@ Rules:
 - If the Session is busy, canceling, blocked, stopping, or stopped, plain
   `send` fails immediately and has no side effects. Busy and canceling return
   `SESSION_BUSY`; blocked returns `SESSION_BLOCKED` with an `answer` action;
+  starting, stopping, stopped, or failed returns `SESSION_NOT_RUNNING`, which
+  names `--resume`;
   other non-idle states return `SESSION_UNAVAILABLE`.
 - `--request-id` is required and behaves exactly as it does for `new`,
   including with `--resume` and `--steer`: the same ID and payload replay the
