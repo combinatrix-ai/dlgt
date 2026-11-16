@@ -416,8 +416,9 @@ up to 512 per response (default 64).
 Bounds are part of the contract: 32 KiB serialized by default and 256 KiB
 hard, 64 events, 4 results, 64 messages (512 on request), and 16 pending
 Requests per response. `has_more: true` means data already exists beyond the
-returned cursor, that response uses `reason: "page_full"`, and the next
-request returns immediately even with `wait_ms`.
+returned cursor, and the next request returns immediately even with
+`wait_ms`. `reason` names the most important content of the response; it is
+`page_full` only when nothing more important applies.
 
 `max_bytes` bounds two things: the `result` document itself, and the complete
 compact response line the CLI prints, whose `{"ok":true,...}` wrapper and
@@ -465,9 +466,10 @@ identity, so a Claude provider-ID rotation keeps them valid.
 A position is meaningful only within one daemon lifetime. A number from a
 previous daemon is not rejected: it names this daemon's window of that
 position, or fails `CURSOR_EXPIRED` if this daemon has not minted that far.
-After `RPC_UNAVAILABLE`, `SESSION_NOT_RUNNING`, or any daemon restart,
-discard remembered positions and re-enter through a resume acceptance cursor
-or a cursorless baseline.
+After a daemon restart, or when `CURSOR_EXPIRED` or `CURSOR_INVALID` says
+the position is gone, re-enter through a resume acceptance cursor or a
+cursorless baseline. A connection error alone does not invalidate a
+position: retry the same cursor while the same daemon instance answers.
 
 The daemon retains the most recent 64 positions per Session, within a global
 cap of 4,096; beyond either bound the oldest are dropped.

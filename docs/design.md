@@ -111,7 +111,36 @@ A Request is closed by `answer`, by the provider withdrawing it, or by
 Provider death during an active execution creates a retained failure or
 interruption before the Session becomes terminal, and the provider's stderr
 tail is kept as a `notice` message. Explicit stop and restart own their
-process-exit transitions and are not misclassified as crashes.
+process-exit transitions and are not misclassified as crashes. Process exit is
+observed apart from the provider's output stream: dlgt waits at most two
+seconds for that stream to drain so the provider's final events apply first,
+then reports the exit, even if a process that left the provider's group still
+holds the stream open.
+
+### Lifecycle authority
+
+Every phase change is one call to a pure transition function
+(`src/lifecycle.rs`). An event names the provider generation it comes from;
+execution events also name their execution sequence. The function refuses an
+event from a replaced generation or a finished execution and changes nothing,
+so a stop, failure, exit, or late provider report from an old process can
+never act on the replacement. It returns the effects the store applies and the
+lifecycle events it records; callers never set a phase or record a lifecycle
+event themselves.
+
+The function guarantees, and a bounded exhaustive test checks over every
+interleaving of events from the current and previous generation:
+
+- a refused event changes nothing;
+- each public state change is announced by its event exactly once;
+- an execution that leaves the Session other than by the provider's own result
+  (restart, stop, exit, failure, including while canceling) gets a terminal
+  result;
+- no state is a dead end: provider events alone reach `idle`, `stopped`, or
+  `failed`.
+
+A stop already in progress may be forced. Restart claims the generation the
+caller observed and is refused if another restart replaced it first.
 
 ## State authority
 
@@ -250,7 +279,7 @@ reject  steer
 
 | Mode | Idle | Busy | Blocked | Canceling or other |
 | --- | --- | --- | --- | --- |
-| `reject` | Start a new execution. | `SESSION_BUSY`, no side effects. | `SESSION_BLOCKED` with the pending Request IDs. | `SESSION_BUSY` while canceling, `SESSION_UNAVAILABLE` otherwise. |
+| `reject` | Start a new execution. | `SESSION_BUSY`, no side effects. | `SESSION_BLOCKED` with the pending Request IDs. | `SESSION_BUSY` while canceling; `SESSION_NOT_RUNNING` when starting, stopping, stopped, or failed; `SESSION_UNAVAILABLE` while restarting. |
 | `steer` | `NO_ACTIVE_EXECUTION`. | Add the message to the running execution. | `SESSION_BLOCKED`; a steer cannot answer a Request. | `SESSION_UNAVAILABLE`. |
 
 Both modes are decided against current Session state under the store lock.
@@ -450,7 +479,9 @@ fetch        one composite forward-delta read from a cursor
 The submission receipt reports `confirmed` when provider evidence arrives
 within five seconds and `pending` otherwise. Codex confirms with the
 `turn/start` response; Claude confirms when it starts the prompt or replays
-it. Both receipts are successful: local delivery already occurred. Replaying
+it. Both receipts are successful: the execution is reserved. A `pending`
+receipt can precede the end of delivery; a delivery that then fails ends the
+execution with a failed result. Replaying
 the same idempotency key refreshes a pending receipt from live execution
 state; a new key would risk a duplicate execution.
 

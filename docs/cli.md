@@ -355,9 +355,11 @@ Rules:
   releases the Alias, and returns one structured launch failure. A failed audit
   record may remain addressable by its Session ID, but no live half-created
   Session is returned.
-- If local delivery succeeds but the provider does not confirm submission
-  within five seconds, the command still exits successfully with
-  `submission: "pending"`, the Session ID, and a bounded `fetch` action. The
+- If the provider does not confirm submission within five seconds, the
+  command still exits successfully with `submission: "pending"`, the Session
+  ID, and a bounded `fetch` action. `pending` means the execution is reserved
+  and delivery or acknowledgement is still in progress; if delivery then
+  fails, the execution ends with a failed result that `fetch` reports. The
   prompt may still start. Do not resend it with a new request ID; replaying the
   original request ID returns the same execution and can later report
   `submission: "confirmed"`.
@@ -817,8 +819,10 @@ Response size is part of the contract:
 | Pending Requests | 16 | 16 per response |
 
 `has_more: true` means requested data already exists beyond the returned
-cursor; that response uses `reason: "page_full"` and the next call returns
-immediately even with `--wait`.
+cursor, and the next call returns immediately even with `--wait`. `reason`
+names the most important thing the response carries, so a response with more
+data can still report `result`, `blocked`, or `gap`; `page_full` is used only
+when nothing more important applies.
 
 `--max-bytes` is a hard bound on the **complete compact response line**: the
 `{"ok":true,...}` wrapper and its trailing newline are reserved before any
@@ -944,7 +948,12 @@ a bucket that the response did not carry.
   so a lost foreground response costs nothing.
 - Codex callers: run the long `fetch` inside one exec cell and use a single
   long cell wait. Pre-yield output is retained and delivered at the next wait.
-- After any lost response, run a cursorless `fetch` to rebase.
+- A lost `fetch` response is recovered by its cursor: if no dlgt JSON arrived,
+  retry the same cursor, which replays the same window; if JSON arrived, adopt
+  its cursor even when the page was empty. Only a lost cursor,
+  `CURSOR_EXPIRED`, `CURSOR_INVALID`, or a daemon restart calls for a
+  cursorless `fetch`, which returns a bounded baseline rather than everything
+  since the old position.
 
 ## Blocked input and `answer`
 

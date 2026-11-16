@@ -57,9 +57,10 @@ Profile   A reusable client-side launch specification.
 Delegation is two phases. `new` and `send` SUBMIT work: after a short bounded
 confirmation window they return a successful submission receipt —
 `submission: "confirmed" | "pending"`, `session.id`, `execution_seq`, and a
-small `cursor` number — never the answer. `pending` means local delivery
-succeeded but the provider acknowledgement has not arrived; it is not a reason
-to send again. Codex confirms with its app-server turn lifecycle; Claude
+small `cursor` number — never the answer. `pending` means the execution is
+reserved and delivery or the provider acknowledgement is still in progress; it
+is not a reason to send again. If delivery then fails, `fetch` reports a
+failed result. Codex confirms with its app-server turn lifecycle; Claude
 confirms when it starts the submitted message. `fetch` is the command for
 forward cursor-based observation of later state, pending Requests, results,
 lifecycle events, and messages. What you must
