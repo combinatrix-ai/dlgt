@@ -312,6 +312,9 @@ dlgt new
 Rules:
 
 - `--title` is required and may be non-unique.
+- Every `fetch` repeats a Session's metadata, so it is bounded: `--title` at
+  most 200 characters, `--alias` 64, `--model` 128, `--effort` 32, and the
+  working directory 4,096. A longer value is `INVALID_ARGUMENT`.
 - A Profile or Harness must resolve the Harness selection.
 - Model and effort are optional. Omission selects the provider default.
 - `--approvals` defaults to `auto`. See [Approvals](#approvals).
@@ -1013,16 +1016,17 @@ Rules:
   the reason could not be sent, `reason_error` explains why.
 - `--choice <N>` is 1-based and answers with that choice's label. `--text`
   answers in free text. For an MCP form elicitation, use `--json
-  '{"name":"Ada","color":"blue"}'`; missing required fields are rejected
-  before dlgt sends an answer.
+  '{"name":"Ada","color":"blue"}'`; missing required fields and fields the
+  schema does not name are rejected before dlgt sends an answer.
 - The Session must be live: a stopped Session returns `SESSION_NOT_RUNNING`.
 - `answer` returns as soon as the provider accepted the answer. It does not
   wait for the execution; follow it with `fetch --wait`.
 - An answer moves through `pending`, `sending`, `delivered`, and `failed`.
-  While delivery is in progress, a duplicate answer waits for its outcome. A
-  failed write is never replayed as success: the Request stays pending when
-  the provider can still answer, otherwise the Session fails with a structured
-  error.
+  While delivery is in progress, a duplicate answer waits for that attempt's
+  outcome and never starts another one. The Request returns to `pending` only
+  when dlgt knows no bytes reached the provider. A write whose outcome is
+  unknown stops the provider transport and fails the Session with
+  `REQUEST_DELIVERY_FAILED`, so the answer can never arrive later.
 - Answering is idempotent by Request. Repeating the same answer returns the
   original receipt with `"replayed": true`. A different answer to a resolved
   Request is `REQUEST_RESOLVED`. An unknown ID is `REQUEST_NOT_FOUND`.
@@ -1072,7 +1076,9 @@ Cancellation is bounded and defaults to 30 seconds. On timeout, dlgt returns
 `CANCEL_TIMEOUT`, leaves the Session in `canceling`, and continues observing
 provider quiescence in the background. `fetch` reveals the eventual terminal
 state. A successful `cancel` returns the result for the execution it captured,
-even if another execution starts before the response is written.
+even if another execution starts before the response is written. If the
+provider process exits while a cancel waits, the cancel returns at once with
+that execution's result and the Session's `failed` state.
 
 The timeout includes dispatch and completion of all provider control messages.
 If cancellation begins before Codex acknowledges the active turn, dlgt keeps

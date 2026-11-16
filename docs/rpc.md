@@ -73,7 +73,7 @@ it as a `fetch` option.
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, optional `cwd`, optional `model`, optional `effort`, optional `approvals` (`auto`, `ask`, or `bypass`; default `auto`), optional `harness_options`, required non-empty `prompt`, required `request_id`, optional `startup_timeout_ms`, launch `environment` |
+| `session.create` | `title`, optional `alias`, `harness`, optional `cwd`, optional `model`, optional `effort`, optional `approvals` (`auto`, `ask`, or `bypass`; default `auto`), optional `harness_options`, required non-empty `prompt`, required `request_id`, optional `startup_timeout_ms`, launch `environment`; `title`, `alias`, `model`, `effort`, and `cwd` are at most 200, 64, 128, 32, and 4,096 characters |
 | `session.restart` | `session`, optional `startup_timeout_ms`, fresh launch `environment` |
 | `session.send` | `session`, required non-empty `prompt`, required `request_id`, optional `steer` boolean, optional `resume` boolean; with `resume:true`, the launch parameters of `session.create` except `title`, `alias`, and `harness` |
 | `session.answer` | `session`, `request` (a Request ID such as `r3`), `decision` (`allow`, `deny`, `text`, `choice`, or `json`), `message` with `deny`, `text` with `text`, `choice` (1-based) with `choice`, `json` object with `json` |
@@ -209,7 +209,9 @@ execution and applies the interrupt when the ID arrives. The cancellation
 timeout covers this wait and all provider controls; expiration returns
 `CANCEL_TIMEOUT` while the Session stays `canceling`. A successful response
 contains the result for the execution captured when cancellation began, even
-if another execution starts before the response is written.
+if another execution starts before the response is written. A provider exit
+during cancellation settles the cancel with the `failed` Session instead of a
+timeout.
 
 ## Session and result schemas
 
