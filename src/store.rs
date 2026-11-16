@@ -634,7 +634,9 @@ impl Store {
             if turn.provider_turn_id.is_none() {
                 turn.provider_turn_id = provider_turn_id.map(str::to_owned);
             }
-            turn.started_at_ms.get_or_insert_with(now_ms);
+            if !turn.state.is_terminal() {
+                turn.started_at_ms.get_or_insert_with(now_ms);
+            }
         }
         let _ = self.transition_turn(id, |seq| Event::Started { seq }, None);
         true
@@ -1104,7 +1106,7 @@ impl Store {
         let refuses = body.refuses();
         let execution_seq = turn_id.and_then(|id| {
             let turn = state.turns.get_mut(&id)?;
-            if refuses {
+            if refuses && !turn.state.is_terminal() {
                 turn.recorded_denials += 1;
                 turn.denied_requests = turn
                     .denied_requests
@@ -1135,10 +1137,11 @@ impl Store {
         let mut state = self.state.borrow_mut();
         let uid = state.sessions.get(session_id)?.uid.clone();
         if body.refuses()
-            && let Some(turn) = state
-                .turns
-                .values_mut()
-                .find(|turn| turn.session_id == session_id && turn.execution_seq == execution_seq)
+            && let Some(turn) = state.turns.values_mut().find(|turn| {
+                turn.session_id == session_id
+                    && turn.execution_seq == execution_seq
+                    && !turn.state.is_terminal()
+            })
         {
             turn.recorded_denials += 1;
             turn.denied_requests = turn
@@ -1653,15 +1656,23 @@ impl Store {
         }
     }
 
+    // A published result never changes. Reports that arrive after an
+    // execution became terminal (late usage, late denials, a late start
+    // acknowledgement for a canceled execution) are not applied to it.
+
     pub fn set_turn_usage(&self, id: &str, usage: Value) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id)
+            && !turn.state.is_terminal()
+        {
             turn.usage = Some(usage);
         }
     }
 
     /// Raise an execution's denial count to what the provider itself counted.
     pub fn raise_denied_requests(&self, id: &str, count: u32) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id)
+            && !turn.state.is_terminal()
+        {
             turn.provider_denials = turn.provider_denials.max(count);
             turn.denied_requests = turn
                 .denied_requests
@@ -2341,6 +2352,47 @@ mod tests {
             turn.error.as_ref().map(|error| error["message"].as_str()),
             Some(Some("agent exited"))
         );
+    }
+
+    #[test]
+    fn a_terminal_result_ignores_every_late_report() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_default();
+        assert!(
+            store
+                .cancel_turn_with_controls("turn_1", generation, 1)
+                .unwrap_or(false)
+        );
+        let published = store.get_turn("turn_1").map(|turn| format!("{turn:?}"));
+
+        store.set_turn_usage("turn_1", serde_json::json!({"output_tokens": 9}));
+        store.raise_denied_requests("turn_1", 3);
+        store.mark_turn_started("turn_1", Some("provider-late"));
+        store.append_execution_message(
+            "codex:thread-1",
+            Some(1),
+            MessageBody::approval(
+                Decision::Denied,
+                Decider::Caller,
+                None,
+                Some("r1"),
+                "Bash",
+                "x",
+            ),
+        );
+        store.exited("codex:thread-1", generation, "late exit");
+
+        let mut after = store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"));
+        // The provider's own turn ID is routing data, not part of the result.
+        after.provider_turn_id = None;
+        assert_eq!(Some(format!("{after:?}")), published);
     }
 
     #[test]

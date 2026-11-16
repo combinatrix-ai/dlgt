@@ -659,6 +659,11 @@ successful even when a tool it needed was denied, so a `completed` result with
 a non-zero count is not evidence that the work was done. The matching
 `approval` messages say what was denied.
 
+A result is immutable once published: every field stays as it was first
+reported. A report that arrives after the execution ended, such as a late
+usage figure or a denial whose receipt committed after the result, still
+appears as a message but does not change the result.
+
 `final_text_source` is a diagnostic:
 
 ```text
