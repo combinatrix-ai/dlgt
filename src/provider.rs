@@ -848,6 +848,12 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
                 "harness option {key:?} requires a non-empty value"
             );
         }
+        if value.contains(['\n', '\r']) {
+            fail!(
+                InvalidArgument,
+                "harness option {key:?} must be a single line"
+            );
+        }
         let segments = key.split('.').collect::<Vec<_>>();
         let protected = matches!(
             key,
@@ -868,10 +874,7 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
             fail!(InvalidArgument, "harness option {key:?} is managed by dlgt");
         }
         // An inline table can carry any protected key under an innocent name.
-        if value
-            .parse::<toml_edit::Value>()
-            .is_ok_and(|parsed| holds_table(&parsed))
-        {
+        if option_value_holds_table(value) {
             fail!(
                 InvalidArgument,
                 "harness option {key:?} must not be a table; set nested keys with dotted names"
@@ -882,8 +885,19 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
     Ok(args)
 }
 
-/// Whether a TOML value is, or contains, a table. A value that does not
-/// parse as TOML reaches Codex as a plain string.
+/// Whether an option value, read the way a TOML document reads the right
+/// side of an assignment (surrounding space and a trailing comment allowed),
+/// is or contains a table. A value that does not parse reaches Codex as a
+/// plain string.
+fn option_value_holds_table(value: &str) -> bool {
+    format!("value = {value}\n")
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|document| document.get("value").and_then(Item::as_value).cloned())
+        .is_some_and(|parsed| holds_table(&parsed))
+}
+
+/// Whether a TOML value is, or contains, a table.
 fn holds_table(value: &toml_edit::Value) -> bool {
     match value {
         toml_edit::Value::InlineTable(_) => true,
@@ -1253,6 +1267,18 @@ harness_options = ["approval_policy=never"]
         assert!(codex_harness_args(&["features.web_search=true".to_owned()]).is_ok());
         assert!(codex_harness_args(&[r#"example=["ordinary { text"]"#.to_owned()]).is_ok());
         assert!(codex_harness_args(&["example=[[{nested = 1}]]".to_owned()]).is_err());
+        for decorated in [
+            r#"innocent= {approval_policy="never"}"#,
+            r#"innocent={approval_policy="never"} "#,
+            r#"innocent={approval_policy="never"} # comment"#,
+            r#"innocent=[{sandbox_mode="danger-full-access"}] "#,
+            "innocent=1\nprofiles.x.approval_policy=\"never\"",
+        ] {
+            assert!(
+                codex_harness_args(&[decorated.to_owned()]).is_err(),
+                "{decorated}"
+            );
+        }
         assert!(claude_harness_args(&["add-dir=/private/tmp".to_owned()]).is_ok());
     }
 
