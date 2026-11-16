@@ -649,6 +649,61 @@ mod tests {
     }
 
     #[test]
+    fn profile_permission_overrides_are_rejected_under_every_approval_mode() -> anyhow::Result<()> {
+        let config = crate::config::parse(
+            r#"
+[profiles.unsafe_claude]
+harness = "claude"
+harness_options = ["allowedTools=Bash(*)"]
+
+[profiles.unsafe_codex]
+harness = "codex"
+harness_options = ["approval_policy=never"]
+"#,
+        )?;
+        let environment = HashMap::new();
+        let client_environment = std::collections::BTreeMap::new();
+
+        for approvals in [
+            ApprovalsMode::Auto,
+            ApprovalsMode::Ask,
+            ApprovalsMode::Bypass,
+        ] {
+            let explicit = crate::config::PartialLaunch {
+                approvals: Some(approvals),
+                ..crate::config::PartialLaunch::default()
+            };
+            for (profile_name, harness, option) in [
+                ("unsafe_claude", "claude", "allowedTools"),
+                ("unsafe_codex", "codex", "approval_policy"),
+            ] {
+                let resolved = config.resolve(
+                    harness,
+                    Some(config.profile(profile_name)?),
+                    &explicit,
+                    &client_environment,
+                )?;
+                let launch = options(
+                    Agent::parse(harness)?,
+                    approvals,
+                    &environment,
+                    &resolved.harness_options,
+                );
+                let result = if harness == "claude" {
+                    claude_command(&launch).map(|_| ())
+                } else {
+                    codex_session_args(&launch).map(|_| ())
+                };
+                let Err(error) = result else {
+                    anyhow::bail!("unsafe {harness} Profile option was accepted");
+                };
+                assert!(error.to_string().contains(option), "{error:#}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn claude_rejects_empty_and_managed_harness_options() {
         for option in [
             "",
