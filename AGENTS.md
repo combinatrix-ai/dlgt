@@ -5,8 +5,9 @@
   `cargo test`.
 - Keep the runtime as one Rust binary. Runtime assets such as the agent skill
   must be embedded and emitted by the binary.
-- Prefer Codex and Claude lifecycle hooks over terminal-screen inference. PTY
-  parsing is for presentation and fallback only.
+- Drive providers only through their structured interfaces: Codex app-server
+  JSON-RPC and Claude stream-json. Do not reintroduce a PTY, and never infer
+  Session state from provider output text or silence.
 - Backward compatibility is not required. Delete superseded paths instead of
   adding shims.
 - Keep commits small and in English. Push each logical commit.
@@ -124,7 +125,7 @@ Every run passes only when all of the following are true:
 Also verify one same-Session follow-up: `dlgt send <session.id> --request-id <ID> -- <PROMPT>`
 followed by `dlgt fetch <session.id> --wait 5m`. Lifecycle
 completion must come from provider events and the retained result, never from
-PTY silence or a `fetch` timeout.
+provider silence or a `fetch` timeout.
 
 ## Daemon ownership and memory lifetime
 
@@ -154,14 +155,16 @@ before cleanup:
 
 ```sh
 dlgt list --all --pretty
-dlgt fetch <SESSION_ID> --screen=200
-dlgt scrollback <SESSION_ID> --lines 200
-dlgt show <SESSION_ID>
+dlgt show <SESSION_ID> --pretty
+dlgt fetch <SESSION_ID> --messages=512 --pretty
+dlgt watch <SESSION_ID> --from-start
 ```
 
-Use `attach` only when a first-run or authentication screen needs human input.
-A timeout, blocked Session, missing lifecycle event, empty `final_text`, or
-provider process left running is a failed E2E. Fix the cause, rebuild the local
+A Harness that needs login or first-run setup fails with `LAUNCH_FAILED`;
+`detail` carries its stderr tail and `action` names the provider command to
+run once by hand in the container. A timeout, blocked Session, missing
+lifecycle event, empty `final_text`, or provider process left running is a
+failed E2E. Fix the cause, rebuild the local
 image, and repeat the fresh-container matrix.
 
 ## Post-release verification
