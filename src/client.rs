@@ -129,16 +129,39 @@ pub fn find_live_session(selector: &str) -> Result<Option<LiveSessionRoute>> {
         let Some(sessions) = result.as_array() else {
             continue;
         };
+        let mut matched = false;
         for session in sessions {
             let session_id = session.get("id").and_then(Value::as_str);
             if session_id == Some(selector)
                 && let Some(session_id) = session_id
             {
+                matched = true;
                 routes.push(LiveSessionRoute {
                     socket: socket.clone(),
                     session_id: session_id.to_owned(),
                 });
             }
+        }
+        // An ID from before a provider rotation is not listed; the daemon
+        // that issued it still resolves it to the live Session.
+        if !matched
+            && let Ok(read) = call_socket_with_timeout(
+                &socket,
+                "session.read",
+                json!({"session": selector}),
+                Some(Duration::from_secs(2)),
+            )
+            && let Some(session) = read.get("session")
+            && !matches!(
+                session.get("state").and_then(Value::as_str),
+                Some("stopped" | "failed")
+            )
+            && let Some(session_id) = session.get("id").and_then(Value::as_str)
+        {
+            routes.push(LiveSessionRoute {
+                socket: socket.clone(),
+                session_id: session_id.to_owned(),
+            });
         }
     }
     if routes.len() > 1 {

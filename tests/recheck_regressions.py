@@ -1032,6 +1032,15 @@ class RecheckRegressions(unittest.TestCase):
         h.wait_state(session, "idle")
         followup = h.rpc("session.send", {"session": session, "request_id": "after-rotate", "prompt": "next"})
         self.assertIn("result", followup, followup)
+        if session.endswith("-rotated"):
+            routed = subprocess.run(
+                [str(BIN), "show", session.removesuffix("-rotated")],
+                env=h.environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertIn(session, routed.stdout, routed.stdout + routed.stderr)
 
     def test_a_failed_create_never_fails_the_restart_that_replaced_it(self) -> None:
         for harness in ("claude", "codex"):
