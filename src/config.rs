@@ -240,7 +240,11 @@ impl Error for ItemSpan {}
 
 /// Record the innermost item that failed; outer items keep its location.
 fn at_item<T>(item: &Item, result: Result<T>) -> Result<T> {
-    match (result, item.span()) {
+    at_span(item.span(), result)
+}
+
+fn at_span<T>(span: Option<std::ops::Range<usize>>, result: Result<T>) -> Result<T> {
+    match (result, span) {
         (Err(error), Some(span)) if error.downcast_ref::<ItemSpan>().is_none() => {
             Err(error.context(ItemSpan(span.start)))
         }
@@ -267,9 +271,12 @@ fn parse_document(document: &toml_edit::Table) -> Result<Config> {
     let mut config = Config::default();
 
     if let Some(defaults) = document.get("defaults") {
-        let table = defaults
-            .as_table_like()
-            .context("[defaults] must be a table")?;
+        let table = at_item(
+            defaults,
+            defaults
+                .as_table_like()
+                .context("[defaults] must be a table"),
+        )?;
         for (key, item) in table.iter() {
             at_item(
                 item,
@@ -293,13 +300,18 @@ fn parse_document(document: &toml_edit::Table) -> Result<Config> {
     }
 
     if let Some(profiles) = document.get("profiles") {
-        let table = profiles
-            .as_table_like()
-            .context("[profiles] must be a table")?;
-        for (name, item) in table.iter() {
-            let profile_table = item
+        let table = at_item(
+            profiles,
+            profiles
                 .as_table_like()
-                .with_context(|| format!("profile {name:?} must be a table"))?;
+                .context("[profiles] must be a table"),
+        )?;
+        for (name, item) in table.iter() {
+            let profile_table = at_item(
+                item,
+                item.as_table_like()
+                    .with_context(|| format!("profile {name:?} must be a table")),
+            )?;
             let profile = at_item(item, parse_profile(name, profile_table))?;
             config.profiles.insert(name.to_owned(), profile);
         }
@@ -563,13 +575,19 @@ fn parse_profile(name: &str, table: &dyn TableLike) -> Result<Profile> {
     let settings = parse_settings(table, &profile_name, true, PROFILE_KEYS)?;
     let harness = table
         .get("harness")
-        .map(|item| required_string(item, &format!("{profile_name}.harness")))
+        .map(|item| {
+            at_item(
+                item,
+                required_string(item, &format!("{profile_name}.harness")).and_then(|harness| {
+                    if matches!(harness.as_str(), "claude" | "codex") {
+                        Ok(harness)
+                    } else {
+                        bail!("{profile_name}.harness must be \"claude\" or \"codex\"")
+                    }
+                }),
+            )
+        })
         .transpose()?;
-    if let Some(harness) = &harness
-        && !matches!(harness.as_str(), "claude" | "codex")
-    {
-        bail!("{profile_name}.harness must be \"claude\" or \"codex\"");
-    }
     if harness.as_deref() == Some("codex") && settings.auth.is_some() {
         bail!("auth is only valid for Claude Profiles");
     }
@@ -651,10 +669,13 @@ fn string_array(item: &Item, name: &str) -> Result<Vec<String>> {
         .with_context(|| format!("{name} must be an array of strings"))?
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .with_context(|| format!("{name} entries must be strings"))
+            at_span(
+                value.span(),
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("{name} entries must be strings")),
+            )
         })
         .collect()
 }
@@ -664,27 +685,35 @@ fn parse_env(item: &Item, name: &str) -> Result<BTreeMap<String, String>> {
         return table
             .iter()
             .map(|(key, value)| {
-                let value = value
-                    .as_str()
-                    .with_context(|| format!("{name}.{key} must be a string"))?;
-                Ok((key.to_owned(), value.to_owned()))
+                let text = at_item(
+                    value,
+                    value
+                        .as_str()
+                        .with_context(|| format!("{name}.{key} must be a string")),
+                )?;
+                Ok((key.to_owned(), text.to_owned()))
             })
             .collect();
     }
     if let Some(array) = item.as_array() {
         return array
             .iter()
-            .map(|value| {
-                let assignment = value
-                    .as_str()
-                    .with_context(|| format!("{name} entries must be KEY=VALUE strings"))?;
-                let (key, value) = assignment
-                    .split_once('=')
-                    .with_context(|| format!("{name} entries must use KEY=VALUE"))?;
-                if key.is_empty() {
-                    bail!("{name} keys must not be empty");
-                }
-                Ok((key.to_owned(), value.to_owned()))
+            .map(|entry| {
+                at_span(
+                    entry.span(),
+                    (|| {
+                        let assignment = entry
+                            .as_str()
+                            .with_context(|| format!("{name} entries must be KEY=VALUE strings"))?;
+                        let (key, value) = assignment
+                            .split_once('=')
+                            .with_context(|| format!("{name} entries must use KEY=VALUE"))?;
+                        if key.is_empty() {
+                            bail!("{name} keys must not be empty");
+                        }
+                        Ok((key.to_owned(), value.to_owned()))
+                    })(),
+                )
             })
             .collect();
     }
@@ -858,6 +887,22 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
             (
                 "[profiles.p]\nharness = \"claude\"\nmodel = \"m\"\nunknown = \"mystery\"",
                 "4:",
+            ),
+            ("# c\n\ndefaults = 3", "3:"),
+            ("# c\n\nprofiles = 3", "3:"),
+            ("[profiles]\n\nmystery = 3", "3:"),
+            ("[profiles.p]\nmodel = \"m\"\nharness = \"mystery\"", "3:"),
+            (
+                "[profiles.p]\nharness = \"claude\"\nenv = [\n  \"A=1\",\n  \"mystery\",\n]",
+                "5:",
+            ),
+            (
+                "[profiles.p]\nharness = \"claude\"\n[profiles.p.env]\nA = \"1\"\nB = 3",
+                "5:",
+            ),
+            (
+                "[profiles.p]\nharness = \"claude\"\nunset_env = [\n  \"A\",\n  3,\n]",
+                "5:",
             ),
         ] {
             let result = super::parse(text);
