@@ -1232,6 +1232,29 @@ class RecheckRegressions(unittest.TestCase):
             followup = h.rpc("session.send", {"session": session, "request_id": "replacement", "prompt": "mine"})
             self.assertIn("result", followup, (harness, followup))
 
+    def test_watch_prints_each_result_before_the_next_execution(self) -> None:
+        h = self.harness
+        session = h.create("codex", "one")["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        for index in range(2, 8):
+            h.rpc("session.send", {"session": session, "request_id": f"watch-{index}", "prompt": f"run {index}"})
+            h.wait_state(session, "idle")
+        watched = subprocess.run(
+            [str(BIN), "watch", session, "--from-start", "--until-idle"],
+            env=h.environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        executions = []
+        for line in watched.stdout.splitlines():
+            if line.startswith("[exec "):
+                executions.append((int(line.split("]")[0][6:]), " done " in line))
+        for (seq, done), (next_seq, _) in zip(executions, executions[1:]):
+            if next_seq != seq:
+                self.assertTrue(done, watched.stdout)
+        self.assertEqual(sum(done for _, done in executions), 7, watched.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

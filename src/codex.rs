@@ -124,7 +124,7 @@ impl CodexConnection {
                 retain_tail(
                     crate::reaper::StoppableOutput::new(stderr, stderr_stop),
                     &tail,
-                )
+                );
             })
             .context("failed to start Codex stderr thread")?;
 

@@ -33,6 +33,11 @@ pub fn run(selector: &str, from_start: bool, until_idle: bool) -> Result<()> {
     // Results wait here until their execution's messages are all printed,
     // which can take several pages.
     let mut held = Vec::new();
+    // Messages and results page independently, so a page can carry a later
+    // execution's messages before an earlier execution's result. Both are
+    // collected until the response has no more pages, then printed in order.
+    let mut collected_messages = Vec::new();
+    let mut collected_results = Vec::new();
     let mut history = !from_start;
     loop {
         let response = fetch(params)?;
@@ -44,8 +49,27 @@ pub fn run(selector: &str, from_start: bool, until_idle: bool) -> Result<()> {
             lines.push(format!("[gap]    {gap} retention_overrun"));
         }
         let more = response.get("has_more").and_then(Value::as_bool) == Some(true);
-        lines.extend(render(bucket, &mut asked, &mut held, history, !more));
-        history = false;
+        let list = |name: &str| {
+            bucket
+                .get(name)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        collected_messages.extend(list("messages"));
+        collected_results.extend(list("results"));
+        let mut page = bucket.clone();
+        if more {
+            page["messages"] = json!([]);
+            page["results"] = json!([]);
+        } else {
+            page["messages"] = Value::Array(std::mem::take(&mut collected_messages));
+            page["results"] = Value::Array(std::mem::take(&mut collected_results));
+        }
+        lines.extend(render(&page, &mut asked, &mut held, history, !more));
+        if !more {
+            history = false;
+        }
         let mut stdout = std::io::stdout().lock();
         for line in lines {
             writeln!(stdout, "{line}")?;
