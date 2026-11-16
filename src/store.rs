@@ -11,6 +11,8 @@ use crate::requests::{
     Answer, AnswerClaim, Outcome, RequestDraft, RequestRecord, RequestTable, Resolution,
 };
 use anyhow::{Context, Result, bail};
+
+use crate::error::{Code, WithCode, fail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -113,7 +115,7 @@ impl Store {
         if state.sessions.values().any(|existing| {
             existing.record.alias == session.alias && !existing.record.state.is_terminal()
         }) {
-            bail!("active session alias already exists");
+            fail!(AliasInUse, "active session alias already exists");
         }
         let now = now_ms();
         let uid = format!("su_{}", Uuid::new_v4().simple());
@@ -197,7 +199,7 @@ impl Store {
                 && candidate.record.alias == alias
                 && !candidate.record.state.is_terminal()
         }) {
-            bail!("active session alias already exists");
+            fail!(AliasInUse, "active session alias already exists");
         }
         // The old provider is about to be replaced. Withdraw its pending
         // Requests now so a delivery failure racing process shutdown can
@@ -298,7 +300,8 @@ impl Store {
                 .sessions
                 .contains_key(from)
                 .then_some(())
-                .context("session not found");
+                .context("session not found")
+                .code(Code::NotFound);
         }
 
         let mut state = self.state.borrow_mut();
@@ -313,7 +316,11 @@ impl Store {
         // internal launch ID stay exactly as they were written and are never
         // published; the canonical timeline is materialized at bind time.
         let replaced = state.sessions.remove(to);
-        let mut session = state.sessions.remove(from).context("session not found")?;
+        let mut session = state
+            .sessions
+            .remove(from)
+            .context("session not found")
+            .code(Code::NotFound)?;
         if let Some(replaced) = replaced {
             session.record.created_at_ms = session
                 .record
@@ -418,10 +425,13 @@ impl Store {
         }
         let now = now_ms();
         let Some(session) = state.sessions.get(session_id) else {
-            bail!("session not found");
+            fail!(NotFound, "session not found");
         };
         if session.record.active_turn_id.is_some() || session.record.state != SessionState::Idle {
-            bail!("session already has an active turn or is not ready");
+            fail!(
+                SessionBusy,
+                "session already has an active turn or is not ready"
+            );
         }
         let execution_seq = state
             .turns
@@ -553,10 +563,18 @@ impl Store {
             error,
         } = *finish;
         if !state.is_provider_terminal() {
-            bail!("invalid terminal turn state {:?}", state.as_str());
+            fail!(
+                InvalidArgument,
+                "invalid terminal turn state {:?}",
+                state.as_str()
+            );
         }
         let mut memory = self.state.borrow_mut();
-        let turn = memory.turns.get_mut(id).context("turn not found")?;
+        let turn = memory
+            .turns
+            .get_mut(id)
+            .context("turn not found")
+            .code(Code::NotFound)?;
         if !turn.state.is_active()
             || provider_turn_id.is_some()
                 && turn.provider_turn_id.is_some()
@@ -621,7 +639,7 @@ impl Store {
         let mut state = self.state.borrow_mut();
         let session_id = {
             let Some(turn) = state.turns.get(id) else {
-                bail!("turn not found");
+                fail!(NotFound, "turn not found");
             };
             if !turn.state.is_active() {
                 return Ok(false);
@@ -777,7 +795,11 @@ impl Store {
     pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
         let mut state = self.state.borrow_mut();
         let session_id = {
-            let turn = state.turns.get(id).context("turn not found")?;
+            let turn = state
+                .turns
+                .get(id)
+                .context("turn not found")
+                .code(Code::NotFound)?;
             if turn.state != TurnState::Canceled
                 || provider_turn_id.is_some()
                     && turn.provider_turn_id.is_some()
@@ -791,7 +813,8 @@ impl Store {
             .sessions
             .get(&session_id)
             .map(|session| session.runtime_generation)
-            .context("session not found")?;
+            .context("session not found")
+            .code(Code::NotFound)?;
         if state
             .cancel_controls
             .get(id)

@@ -1,3 +1,4 @@
+use crate::error::fail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -111,7 +112,10 @@ impl ApprovalsMode {
             "auto" => Ok(Self::Auto),
             "ask" => Ok(Self::Ask),
             "bypass" => Ok(Self::Bypass),
-            _ => anyhow::bail!("invalid approvals mode {value:?}; expected auto, ask, or bypass"),
+            _ => fail!(
+                InvalidArgument,
+                "invalid approvals mode {value:?}; expected auto, ask, or bypass"
+            ),
         }
     }
 
@@ -137,7 +141,10 @@ impl AuthPolicy {
         match value {
             "subscription" => Ok(Self::Subscription),
             "any" => Ok(Self::Any),
-            _ => anyhow::bail!("invalid auth policy {value:?}; expected subscription or any"),
+            _ => fail!(
+                InvalidArgument,
+                "invalid auth policy {value:?}; expected subscription or any"
+            ),
         }
     }
 

@@ -5,6 +5,8 @@ use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::error::{Code, coded};
 use serde_json::{Map, Value, json};
 use toml_edit::{DocumentMut, Item, TableLike};
 
@@ -205,8 +207,12 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
 
 pub fn parse(text: &str) -> Result<Config> {
     let document = parse_toml_document_as(text, "dlgt config")?;
-    parse_document(&document)
-        .map_err(|_| anyhow!("invalid dlgt config at 1:1: invalid configuration entry"))
+    parse_document(&document).map_err(|_| {
+        coded(
+            Code::InvalidArgument,
+            "invalid dlgt config at 1:1: invalid configuration entry",
+        )
+    })
 }
 
 pub fn parse_toml_document(text: &str, source: &str) -> Result<DocumentMut> {
@@ -217,7 +223,10 @@ fn parse_toml_document_as(text: &str, subject: &str) -> Result<DocumentMut> {
     text.parse::<DocumentMut>().map_err(|error| {
         let offset = error.span().map_or(0, |span| span.start);
         let (line, column) = line_column(text, offset);
-        anyhow!("invalid {subject} at {line}:{column}: invalid TOML syntax")
+        coded(
+            Code::InvalidArgument,
+            format!("invalid {subject} at {line}:{column}: invalid TOML syntax"),
+        )
     })
 }
 

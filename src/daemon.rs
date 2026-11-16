@@ -13,6 +13,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::error::{Code, WithCode, coded, fail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -637,7 +639,10 @@ impl Daemon {
                 validate_request_id(params)?;
                 let flag = |name: &str| params.get(name).and_then(Value::as_bool).unwrap_or(false);
                 if flag("resume") && flag("steer") {
-                    bail!("invalid send: --steer and --resume are mutually exclusive");
+                    fail!(
+                        InvalidArgument,
+                        "invalid send: --steer and --resume are mutually exclusive"
+                    );
                 }
                 self.accept_once(params, |params| {
                     if flag("resume") {
@@ -653,7 +658,7 @@ impl Daemon {
             "session.fetch" => self.fetch(params),
             "session.cancel" => self.cancel_session(params),
             "model.list" => self.list_models(params),
-            _ => bail!("unknown method {method:?}"),
+            _ => fail!(InvalidArgument, "unknown method {method:?}"),
         }
     }
 
@@ -669,7 +674,7 @@ impl Daemon {
         let agent = Agent::parse(params_string(params, "harness")?)?;
         let initial_prompt = params_string(params, "prompt")?;
         if initial_prompt.is_empty() {
-            bail!("initial prompt must not be empty");
+            fail!(InvalidArgument, "initial prompt must not be empty");
         }
         let resume_provider_id = params.get("resume_provider_id").and_then(Value::as_str);
         let provider_ref = resume_provider_id.map(|id| format!("{}:{id}", agent.as_str()));
@@ -678,9 +683,14 @@ impl Daemon {
             .and_then(Value::as_str)
             .map_or_else(std::env::current_dir, |value| Ok(PathBuf::from(value)))?
             .canonicalize()
-            .context("session cwd does not exist")?;
+            .context("session cwd does not exist")
+            .code(Code::InvalidArgument)?;
         if !cwd.is_dir() {
-            bail!("session cwd is not a directory: {}", cwd.display());
+            fail!(
+                InvalidArgument,
+                "session cwd is not a directory: {}",
+                cwd.display()
+            );
         }
         let model = params.get("model").and_then(Value::as_str);
         let effort = params.get("effort").and_then(Value::as_str);
@@ -696,7 +706,10 @@ impl Daemon {
                 .get("auth_policy")
                 .is_some_and(|value| !value.is_null())
             {
-                bail!("auth_policy is only valid for the Claude harness");
+                fail!(
+                    InvalidArgument,
+                    "auth_policy is only valid for the Claude harness"
+                );
             }
             AuthPolicy::default()
         };
@@ -712,10 +725,12 @@ impl Daemon {
                         .as_str()
                         .map(str::to_owned)
                         .context("harness option must be a string")
+                        .code(Code::InvalidArgument)
                 })
                 .collect::<Result<Vec<_>>>()
-                .context("invalid harness_options")?,
-            Some(_) => bail!("harness_options must be an array"),
+                .context("invalid harness_options")
+                .code(Code::InvalidArgument)?,
+            Some(_) => fail!(InvalidArgument, "harness_options must be an array"),
         };
         crate::provider::validate_harness_options(agent, &harness_options)?;
         let approvals = params
@@ -788,7 +803,10 @@ impl Daemon {
                 .reserve_provider_session(provider_ref, &id);
             if !reserved {
                 self.lock_store()?.set_session_failed(&id);
-                bail!("provider conversation is already reserved: {provider_ref}");
+                fail!(
+                    SessionBusy,
+                    "provider conversation is already reserved: {provider_ref}"
+                );
             }
             let reservation = ProviderReservation {
                 store: Arc::clone(&self.store),
@@ -886,7 +904,10 @@ impl Daemon {
             .context("Session runtime generation is missing")?;
         let timeout = startup_deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
-            let error = anyhow!("launch failed: provider startup deadline expired");
+            let error = coded(
+                Code::LaunchFailed,
+                "launch failed: provider startup deadline expired",
+            );
             {
                 let store = self.lock_store()?;
                 store.set_session_failed(id);
@@ -984,7 +1005,7 @@ impl Daemon {
         let selector = params_string(params, "session")?;
         let prompt = params_string(params, "prompt")?;
         if prompt.is_empty() {
-            bail!("prompt must not be empty");
+            fail!(InvalidArgument, "prompt must not be empty");
         }
         let correlation_id = params
             .get("correlation_id")
@@ -999,10 +1020,10 @@ impl Daemon {
                 .contains_key(&existing.id);
             if live {
                 if existing.state == SessionState::Blocked {
-                    bail!("session blocked on input");
+                    fail!(SessionBlocked, "session blocked on input");
                 }
                 if existing.state != SessionState::Idle || existing.active_turn_id.is_some() {
-                    bail!("session already has an active turn");
+                    fail!(SessionBusy, "session already has an active turn");
                 }
                 let mut result = self.submit_turn(params)?;
                 if !correlation_id.is_empty() {
@@ -1011,7 +1032,8 @@ impl Daemon {
                 return Ok(result);
             }
             let provider_id = provider_id_from_session(&existing)
-                .context("SESSION_NOT_RUNNING: Session has no provider conversation")?;
+                .context("Session has no provider conversation")
+                .code(Code::SessionNotRunning)?;
             return self.launch_resumed_session(
                 params,
                 &existing.agent,
@@ -1024,8 +1046,9 @@ impl Daemon {
             .split_once(':')
             .filter(|(agent, id)| provider_qualified(agent, id))
             .context(
-                "SESSION_NOT_RUNNING: no live Session matches selector; use codex:<id> or claude:<id> with --resume",
-            )?;
+                "no live Session matches selector; use codex:<id> or claude:<id> with --resume",
+            )
+            .code(Code::SessionNotRunning)?;
         self.launch_resumed_session(params, agent, provider_id, None)
     }
 
@@ -1039,7 +1062,8 @@ impl Daemon {
         let mut create = params.clone();
         let object = create
             .as_object_mut()
-            .context("resume parameters must be an object")?;
+            .context("resume parameters must be an object")
+            .code(Code::InvalidArgument)?;
         object.insert("harness".to_owned(), json!(agent));
         object.insert("resume_provider_id".to_owned(), json!(provider_id));
         object.insert(
@@ -1101,7 +1125,11 @@ impl Daemon {
             session.state,
             SessionState::Starting | SessionState::Stopping | SessionState::Restarting
         ) {
-            bail!("session is unavailable in state {}", session.state);
+            fail!(
+                SessionUnavailable,
+                "session is unavailable in state {}",
+                session.state
+            );
         }
         let previous_runtime = self
             .sessions
@@ -1110,15 +1138,21 @@ impl Daemon {
             .get(&session.id)
             .cloned();
         let provider_id = provider_id_from_session(&session)
-            .context("session is unavailable because it has no provider conversation to resume")?
+            .context("session is unavailable because it has no provider conversation to resume")
+            .code(Code::SessionUnavailable)?
             .to_owned();
         let agent = Agent::parse(&session.agent)?;
         crate::provider::validate_harness_options(agent, &session.harness_options)?;
         let cwd = PathBuf::from(&session.cwd)
             .canonicalize()
-            .context("session cwd does not exist")?;
+            .context("session cwd does not exist")
+            .code(Code::InvalidArgument)?;
         if !cwd.is_dir() {
-            bail!("session cwd is not a directory: {}", cwd.display());
+            fail!(
+                InvalidArgument,
+                "session cwd is not a directory: {}",
+                cwd.display()
+            );
         }
         let startup_deadline = Instant::now() + startup_timeout(params);
         let environment = launch_environment(params)?;
@@ -1153,7 +1187,11 @@ impl Daemon {
 
         prepare_workspace(agent, &cwd)?;
         if !self.lock_store()?.begin_session_restart(&session.id)? {
-            bail!("session is unavailable in state {}", session.state);
+            fail!(
+                SessionUnavailable,
+                "session is unavailable in state {}",
+                session.state
+            );
         }
         self.lock_store()?
             .record_event(Some(&session.id), None, "session.restarting");
@@ -1169,7 +1207,10 @@ impl Daemon {
                     break;
                 }
                 if Instant::now() >= startup_deadline {
-                    bail!("restart launch timed out while stopping the previous process");
+                    fail!(
+                        LaunchFailed,
+                        "restart launch timed out while stopping the previous process"
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1183,18 +1224,26 @@ impl Daemon {
             store.finish_session_restart_stop(&session.id);
         }
         if !self.lock_store()?.start_restarted_session(&session.id) {
-            bail!("session left restarting state before launch");
+            fail!(LaunchFailed, "session left restarting state before launch");
         }
         if Instant::now() >= startup_deadline {
             self.lock_store()?.set_session_failed(&session.id);
-            bail!("restart launch timed out before starting the replacement process");
+            fail!(
+                LaunchFailed,
+                "restart launch timed out before starting the replacement process"
+            );
         }
         // The replacement process reports its own effective mode.
         self.lock_store()?
             .set_requested_approvals(&session.id, session.approvals.requested);
         let runtime_session_id = Arc::new(RwLock::new(session.id.clone()));
         self.launch_runtime(&session.id, &runtime_session_id, &options, startup_deadline)
-            .map_err(|error| error.context("session restart launch failed"))?;
+            .map_err(|error| {
+                crate::error::with_code(
+                    error.context("session restart launch failed"),
+                    Code::LaunchFailed,
+                )
+            })?;
         let current = self.resolve_session(&session.id)?;
         Ok(json!({"session": self.public_session(&current)?}))
     }
@@ -1376,6 +1425,7 @@ impl Daemon {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_codex_runtime(
         &self,
         runtime_session_id: &Arc<RwLock<String>>,
@@ -1449,12 +1499,22 @@ impl Daemon {
         let (thread_id, thread) = if let Some(thread_id) = options.resume_provider_id {
             let thread = control
                 .resume_thread(&params, startup_timeout)
-                .map_err(|error| detailed(error.context("launch failed: Codex thread/resume")))?;
+                .map_err(|error| {
+                    detailed(crate::error::with_code(
+                        error.context("launch failed: Codex thread/resume"),
+                        Code::LaunchFailed,
+                    ))
+                })?;
             (thread_id.to_owned(), thread)
         } else {
             control
                 .start_thread(params, startup_timeout)
-                .map_err(|error| detailed(error.context("launch failed: Codex thread/start")))?
+                .map_err(|error| {
+                    detailed(crate::error::with_code(
+                        error.context("launch failed: Codex thread/start"),
+                        Code::LaunchFailed,
+                    ))
+                })?
         };
         if let Some(model) = thread.get("model").and_then(Value::as_str)
             && let Ok(session_id) = runtime_session_id.read()
@@ -1465,7 +1525,10 @@ impl Daemon {
         control
             .set_thread_name(&thread_id, &provider_display_name(options.title))
             .map_err(|error| {
-                detailed(error.context("launch failed: could not set the Codex thread name"))
+                detailed(crate::error::with_code(
+                    error.context("launch failed: could not set the Codex thread name"),
+                    Code::LaunchFailed,
+                ))
             })?;
         Ok(Arc::new(AgentRuntime::Codex {
             control,
@@ -1490,7 +1553,7 @@ impl Daemon {
             .lock_store()?
             .set_session_state(&session.id, SessionState::Stopping)
         {
-            bail!("session is already stopped or failed");
+            fail!(SessionUnavailable, "session is already stopped or failed");
         }
         self.lock_store()?
             .record_event(Some(&session.id), None, "session.stopping");
@@ -1505,8 +1568,11 @@ impl Daemon {
     /// Resolve a selector to a Session whose provider process is live.
     fn live_session(&self, selector: &str) -> Result<(SessionRecord, Arc<AgentRuntime>)> {
         let session = self.resolve_session(selector).map_err(|_| {
-            anyhow!(
-                "SESSION_NOT_RUNNING: no live Session matches {selector}; retry with --resume using the same Session ID"
+            coded(
+                Code::SessionNotRunning,
+                format!(
+                    "no live Session matches {selector}; retry with --resume using the same Session ID"
+                ),
             )
         })?;
         let runtime = self
@@ -1527,8 +1593,9 @@ impl Daemon {
             {
                 Ok((session, runtime))
             }
-            _ => bail!(
-                "SESSION_NOT_RUNNING: Session {} is not running; retry with --resume using the same Session ID",
+            _ => fail!(
+                SessionNotRunning,
+                "Session {} is not running; retry with --resume using the same Session ID",
                 session.id
             ),
         }
@@ -1541,19 +1608,23 @@ impl Daemon {
             return Err(AuthMismatch::default().into());
         }
         if session.state == SessionState::Blocked {
-            bail!("session blocked on input");
+            fail!(SessionBlocked, "session blocked on input");
         }
         if matches!(session.state, SessionState::Busy | SessionState::Quiescing)
             || session.active_turn_id.is_some()
         {
-            bail!("session already has an active turn");
+            fail!(SessionBusy, "session already has an active turn");
         }
         if session.state != SessionState::Idle {
-            bail!("session is unavailable in state {}", session.state);
+            fail!(
+                SessionUnavailable,
+                "session is unavailable in state {}",
+                session.state
+            );
         }
         let prompt = params_string(params, "prompt")?;
         if prompt.is_empty() {
-            bail!("prompt must not be empty");
+            fail!(InvalidArgument, "prompt must not be empty");
         }
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let claude_uuid = matches!(runtime.as_ref(), AgentRuntime::Claude { .. })
@@ -1712,27 +1783,28 @@ impl Daemon {
         let (session, runtime) = self.live_session(params_string(params, "session")?)?;
         let text = params_string(params, "prompt")?;
         if text.is_empty() {
-            bail!("prompt must not be empty");
+            fail!(InvalidArgument, "prompt must not be empty");
         }
         match session.state {
             SessionState::Busy => {}
-            SessionState::Blocked => bail!("session blocked on input"),
-            SessionState::Idle => bail!(
-                "NO_ACTIVE_EXECUTION: Session {} has no running execution to steer; send the prompt without --steer",
+            SessionState::Blocked => fail!(SessionBlocked, "session blocked on input"),
+            SessionState::Idle => fail!(
+                NoActiveExecution,
+                "Session {} has no running execution to steer; send the prompt without --steer",
                 session.id
             ),
-            other => bail!("session is unavailable in state {}", other.public_name()),
+            other => fail!(
+                SessionUnavailable,
+                "session is unavailable in state {}",
+                other.public_name()
+            ),
         }
         let turn = session
             .active_turn_id
             .as_deref()
             .and_then(|id| self.lock_store().ok()?.get_turn(id))
-            .with_context(|| {
-                format!(
-                    "NO_ACTIVE_EXECUTION: Session {} has no running execution to steer",
-                    session.id
-                )
-            })?;
+            .with_context(|| format!("Session {} has no running execution to steer", session.id))
+            .code(Code::NoActiveExecution)?;
         let runtime_generation = runtime.generation();
         let attempt_id = Uuid::new_v4().to_string();
         let delivery = SteerDelivery {
@@ -1767,12 +1839,17 @@ impl Daemon {
         control: &CodexConnection,
         thread_id: &str,
     ) -> Result<String> {
-        let provider_turn_id = delivery.turn.provider_turn_id.as_deref().with_context(|| {
-            format!(
-                "session is unavailable: Codex has not acknowledged execution {} yet",
-                delivery.turn.execution_seq
-            )
-        })?;
+        let provider_turn_id = delivery
+            .turn
+            .provider_turn_id
+            .as_deref()
+            .with_context(|| {
+                format!(
+                    "session is unavailable: Codex has not acknowledged execution {} yet",
+                    delivery.turn.execution_seq
+                )
+            })
+            .code(Code::SessionUnavailable)?;
         let cursor = {
             let store = self.lock_store()?;
             if !store.execution_is_current(
@@ -1781,8 +1858,9 @@ impl Daemon {
                 &delivery.turn.id,
                 delivery.turn.execution_seq,
             ) {
-                bail!(
-                    "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+                fail!(
+                    NoActiveExecution,
+                    "execution on Session {} ended before steer delivery",
                     delivery.session.id
                 );
             }
@@ -1795,8 +1873,9 @@ impl Daemon {
                 delivery.attempt_id,
                 delivery.text,
             ) {
-                bail!(
-                    "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+                fail!(
+                    NoActiveExecution,
+                    "execution on Session {} ended before steer delivery",
                     delivery.session.id
                 );
             }
@@ -1830,8 +1909,9 @@ impl Daemon {
             &delivery.turn.id,
             delivery.turn.execution_seq,
         ) {
-            bail!(
-                "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+            fail!(
+                NoActiveExecution,
+                "execution on Session {} ended before steer delivery",
                 delivery.session.id
             );
         }
@@ -1844,8 +1924,9 @@ impl Daemon {
             delivery.attempt_id,
             delivery.text,
         ) {
-            bail!(
-                "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+            fail!(
+                NoActiveExecution,
+                "execution on Session {} ended before steer delivery",
                 delivery.session.id
             );
         }
@@ -1878,12 +1959,8 @@ impl Daemon {
         let record = self
             .lock_store()?
             .request(&session.id, request_id)
-            .with_context(|| {
-                format!(
-                    "REQUEST_NOT_FOUND: Session {} has no Request {request_id}",
-                    session.id
-                )
-            })?;
+            .with_context(|| format!("Session {} has no Request {request_id}", session.id))
+            .code(Code::RequestNotFound)?;
         let (outcome, payload) = record.reply(&answer)?;
         let codex_request_id = if matches!(runtime.as_ref(), AgentRuntime::Codex { .. }) {
             Some(
@@ -1898,7 +1975,7 @@ impl Daemon {
             return self.answer_receipt(&session.id, &record, resolution.outcome, None);
         }
         let AnswerClaim::Started(attempt_id) = claim else {
-            bail!("REQUEST_FAILED: answer attempt could not be claimed");
+            fail!(RequestFailed, "answer attempt could not be claimed");
         };
         let cursor = match self
             .lock_store()
@@ -1936,8 +2013,9 @@ impl Daemon {
                 self.handle_answer_delivery_failure(
                     &session, &runtime, &record, &answer, attempt_id, &failure,
                 );
-                bail!(
-                    "REQUEST_DELIVERY_FAILED: delivery failed for Request {}",
+                fail!(
+                    RequestDeliveryFailed,
+                    "delivery failed for Request {}",
                     record.id
                 );
             }
@@ -1963,20 +2041,18 @@ impl Daemon {
         let mut store = self.lock_store()?;
         let claim = store
             .begin_request_answer(session_id, &record.id, answer)
-            .with_context(|| {
-                format!(
-                    "REQUEST_NOT_FOUND: Session {session_id} has no Request {}",
-                    record.id
-                )
-            })?;
+            .with_context(|| format!("Session {session_id} has no Request {}", record.id))
+            .code(Code::RequestNotFound)?;
         match claim {
             AnswerClaim::Started(_) | AnswerClaim::Replay(_) => Ok(claim),
-            AnswerClaim::Conflict => bail!(
-                "REQUEST_RESOLVED: Request {} was answered with a different decision",
+            AnswerClaim::Conflict => fail!(
+                RequestResolved,
+                "Request {} was answered with a different decision",
                 record.id
             ),
-            AnswerClaim::Failed => bail!(
-                "REQUEST_FAILED: Request {} failed or its execution ended before an answer was delivered",
+            AnswerClaim::Failed => fail!(
+                RequestFailed,
+                "Request {} failed or its execution ended before an answer was delivered",
                 record.id
             ),
             AnswerClaim::Waiting(attempt_id) => loop {
@@ -1995,8 +2071,9 @@ impl Daemon {
                                 })
                         {
                             store.release_answer_waiter(session_id, &record.id, attempt_id);
-                            bail!(
-                                "REQUEST_BUSY: answer delivery is still in progress for {}",
+                            fail!(
+                                RequestBusy,
+                                "answer delivery is still in progress for {}",
                                 record.id
                             );
                         }
@@ -2011,15 +2088,17 @@ impl Daemon {
                         _,
                     )) => {
                         store.release_answer_waiter(session_id, &record.id, attempt_id);
-                        bail!(
-                            "REQUEST_DELIVERY_FAILED: answer attempt failed for Request {}",
+                        fail!(
+                            RequestDeliveryFailed,
+                            "answer attempt failed for Request {}",
                             record.id
                         );
                     }
                     _ => {
                         store.release_answer_waiter(session_id, &record.id, attempt_id);
-                        bail!(
-                            "REQUEST_FAILED: answer attempt disappeared for {}",
+                        fail!(
+                            RequestFailed,
+                            "answer attempt disappeared for {}",
                             record.id
                         );
                     }
@@ -2204,8 +2283,9 @@ impl Daemon {
                 outcome,
                 extra,
             ) {
-                bail!(
-                    "REQUEST_RESOLVED: Request {} was withdrawn before delivery completed",
+                fail!(
+                    RequestResolved,
+                    "Request {} was withdrawn before delivery completed",
                     record.id
                 );
             }
@@ -2336,7 +2416,10 @@ impl Daemon {
                 }));
             }
             if Instant::now() >= deadline {
-                bail!("CANCEL_TIMEOUT: cancellation continues for execution {turn_id}");
+                fail!(
+                    CancelTimeout,
+                    "cancellation continues for execution {turn_id}"
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -2392,7 +2475,10 @@ impl Daemon {
                 turn.execution_seq,
             ) || !store.cancel_turn_with_controls(turn_id, runtime_generation, 1)?
             {
-                bail!("turn is already terminal or no longer active");
+                fail!(
+                    NoActiveExecution,
+                    "turn is already terminal or no longer active"
+                );
             }
             store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
         }
@@ -2475,7 +2561,10 @@ impl Daemon {
                 runtime_generation,
                 unread.len() + 1,
             )? {
-                bail!("turn is already terminal or no longer active");
+                fail!(
+                    NoActiveExecution,
+                    "turn is already terminal or no longer active"
+                );
             }
             store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
         }
@@ -2549,7 +2638,8 @@ impl Daemon {
     fn acceptance_cursor(store: &Store, session_id: &str) -> Result<String> {
         let uid = store
             .session_uid(session_id)
-            .with_context(|| format!("session not found: {session_id}"))?;
+            .with_context(|| format!("session not found: {session_id}"))
+            .code(Code::NotFound)?;
         let mut cursor = cursor::Cursor::new();
         cursor.e = store.latest_event_seq();
         cursor.set_session(cursor::SessionCursor {
@@ -2633,10 +2723,15 @@ impl Daemon {
 
     fn fetch_options(&self, params: &Value) -> Result<FetchOptions> {
         let selector = params.get("session").and_then(Value::as_str);
-        let selector = selector.context("fetch requires a Session selector")?;
+        let selector = selector
+            .context("fetch requires a Session selector")
+            .code(Code::InvalidArgument)?;
         let wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
         if wait_ms > FETCH_MAX_WAIT_MS {
-            bail!("invalid wait duration; the maximum long poll is 24h");
+            fail!(
+                InvalidArgument,
+                "invalid wait duration; the maximum long poll is 24h"
+            );
         }
         let max_bytes = usize::try_from(
             params
@@ -2647,7 +2742,10 @@ impl Daemon {
         .unwrap_or(FETCH_DEFAULT_MAX_BYTES)
         .min(FETCH_HARD_MAX_BYTES);
         if max_bytes == 0 {
-            bail!("invalid max_bytes; the response budget must be positive");
+            fail!(
+                InvalidArgument,
+                "invalid max_bytes; the response budget must be positive"
+            );
         }
         let message_limit = match params.get("messages").unwrap_or(&Value::Null) {
             Value::Bool(false) => 0,
@@ -2657,11 +2755,15 @@ impl Daemon {
                 count
                     .as_u64()
                     .filter(|count| *count > 0)
-                    .context("invalid message budget; use a positive count")?
+                    .context("invalid message budget; use a positive count")
+                    .code(Code::InvalidArgument)?
                     .min(FETCH_MESSAGE_MAX as u64),
             )
             .unwrap_or(FETCH_MESSAGE_PAGE),
-            _ => bail!("invalid messages selection; use a boolean or a count"),
+            _ => fail!(
+                InvalidArgument,
+                "invalid messages selection; use a boolean or a count"
+            ),
         };
         // Resolve through the UID index so a pre-rekey public ID, which a
         // UID-bound cursor implies is still valid, keeps addressing the same
@@ -2669,7 +2771,8 @@ impl Daemon {
         let scope = self
             .lock_store()?
             .session_uid(selector)
-            .with_context(|| format!("session not found: {selector}"))?;
+            .with_context(|| format!("session not found: {selector}"))
+            .code(Code::NotFound)?;
         // A position is a number, so accept it spelled either way. Anything
         // that is not a position at all is a malformed request rather than a
         // silent baseline.
@@ -2677,7 +2780,7 @@ impl Daemon {
             None | Some(Value::Null) => None,
             Some(Value::String(position)) => Some(position.clone()),
             Some(Value::Number(position)) => Some(position.to_string()),
-            Some(_) => bail!("CURSOR_INVALID: cursor must be a position number"),
+            Some(_) => fail!(CursorInvalid, "cursor must be a position number"),
         }
         // Canonicalize the spelling: "0001" names position 1 and must be
         // published back as "1", or the no-mint echo would replace the
@@ -2687,7 +2790,12 @@ impl Daemon {
             position
                 .parse::<u64>()
                 .map(|number| number.to_string())
-                .map_err(|_| anyhow!("CURSOR_INVALID: {position:?} is not a cursor position"))
+                .map_err(|_| {
+                    coded(
+                        Code::CursorInvalid,
+                        format!("{position:?} is not a cursor position"),
+                    )
+                })
         })
         .transpose()?;
         let from_start = params
@@ -2721,7 +2829,8 @@ impl Daemon {
         let store = self.lock_store()?;
         let session = store
             .session_for_uid(&uid)
-            .context("session not found: cursor no longer addresses a live Session")?;
+            .context("session not found: cursor no longer addresses a live Session")
+            .code(Code::NotFound)?;
         let baseline = options.baseline();
         let mut position = options.position();
         let mut scope_gaps = Vec::new();
@@ -2849,7 +2958,7 @@ impl Daemon {
                     json!({"harness":"codex","source":"app-server","discovery":"complete","models":models}),
                 )
             }
-            other => bail!("unsupported harness {other:?}"),
+            other => fail!(InvalidArgument, "unsupported harness {other:?}"),
         }
     }
 
@@ -2857,12 +2966,14 @@ impl Daemon {
         self.lock_store()?
             .get_session(selector)
             .with_context(|| format!("session not found: {selector}"))
+            .code(Code::NotFound)
     }
 
     fn resolve_turn(&self, id: &str) -> Result<TurnRecord> {
         self.lock_store()?
             .get_turn(id)
             .with_context(|| format!("turn not found: {id}"))
+            .code(Code::NotFound)
     }
 
     fn runtime(&self, id: &str) -> Result<Arc<AgentRuntime>> {
@@ -2872,6 +2983,7 @@ impl Daemon {
             .get(id)
             .cloned()
             .with_context(|| format!("session is not active: {id}"))
+            .code(Code::SessionUnavailable)
     }
 
     fn runtime_is_current(&self, id: &str, candidate: &Arc<AgentRuntime>) -> bool {
@@ -2933,13 +3045,15 @@ fn launch_environment(params: &Value) -> Result<HashMap<String, String>> {
     params
         .get("environment")
         .and_then(Value::as_object)
-        .context("missing launch environment snapshot")?
+        .context("missing launch environment snapshot")
+        .code(Code::InvalidArgument)?
         .iter()
         .map(|(key, value)| {
             value
                 .as_str()
                 .map(|value| (key.clone(), value.to_owned()))
                 .with_context(|| format!("environment value for {key:?} must be a string"))
+                .code(Code::InvalidArgument)
         })
         .collect()
 }
@@ -3156,14 +3270,18 @@ fn params_string<'a>(params: &'a Value, name: &str) -> Result<&'a str> {
         .get(name)
         .and_then(Value::as_str)
         .with_context(|| format!("missing string parameter {name:?}"))
+        .code(Code::InvalidArgument)
 }
 
 fn validate_alias(alias: &str) -> Result<()> {
     if !alias.starts_with('@') || alias.len() < 2 {
-        bail!("session alias must look like @name");
+        fail!(InvalidArgument, "session alias must look like @name");
     }
     if alias.contains('#') {
-        bail!("session alias must not contain reserved '#' characters");
+        fail!(
+            InvalidArgument,
+            "session alias must not contain reserved '#' characters"
+        );
     }
     Ok(())
 }
@@ -3176,63 +3294,7 @@ fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
 }
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
-    let message = format!("{error:#}");
-    if error.downcast_ref::<AuthMismatch>().is_some() || message.contains("AUTH_MISMATCH") {
-        "AUTH_MISMATCH"
-    } else if message.contains("REQUEST_DELIVERY_FAILED") {
-        "REQUEST_DELIVERY_FAILED"
-    } else if message.contains("REQUEST_BUSY") {
-        "REQUEST_BUSY"
-    } else if message.contains("REQUEST_FAILED") {
-        "REQUEST_FAILED"
-    } else if message.contains("SESSION_NOT_RUNNING") {
-        "SESSION_NOT_RUNNING"
-    } else if message.contains("CURSOR_EXPIRED") {
-        "CURSOR_EXPIRED"
-    } else if message.contains("CURSOR_INVALID") {
-        "CURSOR_INVALID"
-    } else if message.contains("NO_ACTIVE_EXECUTION") {
-        "NO_ACTIVE_EXECUTION"
-    } else if message.contains("REQUEST_NOT_FOUND") {
-        "REQUEST_NOT_FOUND"
-    } else if message.contains("REQUEST_RESOLVED") {
-        "REQUEST_RESOLVED"
-    } else if message.contains("CANCEL_TIMEOUT") || message.contains("cancel timed out") {
-        "CANCEL_TIMEOUT"
-    } else if message.contains("blocked on input") {
-        "SESSION_BLOCKED"
-    } else if message.contains("already has an active turn")
-        || message.contains("not ready")
-        || message.contains("provider conversation is already reserved")
-        || message.contains("provider conversation is already running")
-    {
-        "SESSION_BUSY"
-    } else if message.contains("active session alias already exists") {
-        "ALIAS_IN_USE"
-    } else if message.contains("launch")
-        || message.contains("failed to spawn")
-        || message.contains("failed to start")
-        || message.contains("app-server child was unavailable")
-    {
-        "LAUNCH_FAILED"
-    } else if message.contains("harness option") || message.contains("managed by dlgt") {
-        "INVALID_ARGUMENT"
-    } else if message.contains("not found") {
-        "NOT_FOUND"
-    } else if message.contains("not active")
-        || message.contains("already stopped")
-        || message.contains("is unavailable")
-    {
-        "SESSION_UNAVAILABLE"
-    } else if message.contains("unknown method")
-        || message.contains("missing")
-        || message.contains("must")
-        || message.contains("invalid")
-    {
-        "INVALID_ARGUMENT"
-    } else {
-        "INTERNAL"
-    }
+    crate::error::code_of(error).map_or("INTERNAL", Code::as_str)
 }
 
 fn answer_action(request: &RequestRecord) -> &'static str {
@@ -3580,7 +3642,8 @@ impl ReceiptLedger {
                 .find(|receipt| receipt.id == request_id)
             {
                 if receipt.digest != digest {
-                    bail!(
+                    fail!(
+                        InvalidArgument,
                         "invalid request_id reuse: {request_id:?} already accepted a different payload"
                     );
                 }
@@ -3590,7 +3653,8 @@ impl ReceiptLedger {
             }
             match state.inflight.get(request_id) {
                 Some(&reserved) if reserved != digest => {
-                    bail!(
+                    fail!(
+                        InvalidArgument,
                         "invalid request_id reuse: {request_id:?} is already accepting a different payload"
                     );
                 }
@@ -3644,9 +3708,11 @@ fn validate_request_id(params: &Value) -> Result<()> {
         .get("request_id")
         .and_then(Value::as_str)
         .filter(|request_id| !request_id.is_empty())
-        .context("missing request_id: every acceptance must carry an idempotency key")?;
+        .context("missing request_id: every acceptance must carry an idempotency key")
+        .code(Code::InvalidArgument)?;
     if request_id.len() > crate::protocol::MAX_ACCEPTANCE_REQUEST_ID_LEN {
-        bail!(
+        fail!(
+            InvalidArgument,
             "invalid request_id: must be at most {} bytes",
             crate::protocol::MAX_ACCEPTANCE_REQUEST_ID_LEN
         );
@@ -4315,12 +4381,14 @@ impl<'a> Builder<'a> {
             // Progress must come from chunking, never from oversizing. If not
             // even one chunk fits, the request itself is unsatisfiable.
             let Some(minimum) = self.workable_budget()? else {
-                bail!(
+                fail!(
+                    InvalidArgument,
                     "invalid max_bytes {}: too small to carry one unit of progress",
                     self.options.max_bytes,
                 );
             };
-            bail!(
+            fail!(
+                InvalidArgument,
                 "invalid max_bytes {}: too small to carry one unit of progress; --max-bytes {minimum} is verified to work for the current state",
                 self.options.max_bytes,
             );
@@ -4443,8 +4511,9 @@ fn validate_continuation(position: &cursor::SessionCursor, results: &[TurnRecord
         let text = turn.final_message.as_deref().unwrap_or_default();
         let offset = usize::try_from(position.po).unwrap_or(usize::MAX);
         if offset > text.len() || !text.is_char_boundary(offset) {
-            bail!(
-                "CURSOR_INVALID: continuation offset is not a character boundary in the retained result"
+            fail!(
+                CursorInvalid,
+                "continuation offset is not a character boundary in the retained result"
             );
         }
     }
@@ -4673,31 +4742,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_send_error_has_resume_code_and_hint_source() {
-        let error = anyhow::anyhow!(
-            "SESSION_NOT_RUNNING: Session codex:thread-1 is not running; retry with --resume"
-        );
-        assert_eq!(classify_error(&error), "SESSION_NOT_RUNNING");
-    }
-
-    #[test]
-    fn harness_startup_failures_are_launch_failures() {
-        for message in [
-            "launch failed: Claude did not answer the stream-json initialize request",
-            "launch failed: Codex thread/start: timed out waiting for Codex thread/start",
-            "Codex app-server child was unavailable",
-            "failed to start the managed Codex app-server",
-        ] {
-            let error = anyhow::anyhow!("{message}");
-            assert_eq!(
-                classify_error(&error),
-                "LAUNCH_FAILED",
-                "{message} must not be reported as an internal invariant failure"
-            );
-        }
-    }
-
-    #[test]
     fn a_launch_failure_names_the_provider_command_and_carries_its_stderr() {
         let failure = SessionLaunchFailure::new(
             "internal:ABC12345",
@@ -4728,7 +4772,10 @@ mod tests {
         let quiet = SessionLaunchFailure::new(
             "codex:thread-1",
             Some(Agent::Codex),
-            &anyhow::anyhow!("active session alias already exists"),
+            &crate::error::coded(
+                crate::error::Code::AliasInUse,
+                "active session alias already exists",
+            ),
             Some(String::new()),
         );
         assert_eq!(quiet.code, "ALIAS_IN_USE");
@@ -5971,21 +6018,6 @@ mod tests {
             ..crate::cursor::SessionCursor::default()
         };
         assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
-    }
-
-    #[test]
-    fn answer_delivery_errors_keep_their_request_codes() {
-        for (message, code) in [
-            (
-                "REQUEST_DELIVERY_FAILED: write failed for Request r1",
-                "REQUEST_DELIVERY_FAILED",
-            ),
-            ("REQUEST_BUSY: answer still sending", "REQUEST_BUSY"),
-            ("REQUEST_FAILED: provider is unavailable", "REQUEST_FAILED"),
-        ] {
-            let error = anyhow::anyhow!(message);
-            assert_eq!(classify_error(&error), code);
-        }
     }
 
     #[test]

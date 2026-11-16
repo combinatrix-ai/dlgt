@@ -7,6 +7,7 @@ mod config;
 mod cursor;
 mod daemon;
 mod doctor;
+mod error;
 mod messages;
 mod paths;
 mod protocol;

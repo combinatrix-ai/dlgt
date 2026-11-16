@@ -1,7 +1,9 @@
 //! Requests: input that only the caller can give. A Session is `blocked`
 //! while it has at least one pending Request.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+use crate::error::fail;
 use serde_json::{Map, Value, json};
 
 /// Pending Requests published per Session in one response.
@@ -66,7 +68,10 @@ impl Answer {
                 message: text("message"),
             }),
             Some("text") => text("text").map(Self::Text).ok_or_else(|| {
-                anyhow::anyhow!("invalid answer: a text answer must carry its text")
+                crate::error::coded(
+                    crate::error::Code::InvalidArgument,
+                    "invalid answer: a text answer must carry its text",
+                )
             }),
             Some("choice") => params
                 .get("choice")
@@ -74,14 +79,27 @@ impl Answer {
                 .and_then(|choice| usize::try_from(choice).ok())
                 .filter(|choice| *choice > 0)
                 .map(Self::Choice)
-                .ok_or_else(|| anyhow::anyhow!("invalid answer: --choice is a 1-based number")),
+                .ok_or_else(|| {
+                    crate::error::coded(
+                        crate::error::Code::InvalidArgument,
+                        "invalid answer: --choice is a 1-based number",
+                    )
+                }),
             Some("json") => params
                 .get("json")
                 .filter(|value| value.is_object())
                 .cloned()
                 .map(Self::Json)
-                .ok_or_else(|| anyhow::anyhow!("invalid answer: --json must be a JSON object")),
-            _ => bail!("invalid answer: use --allow, --deny, --text, --choice, or --json"),
+                .ok_or_else(|| {
+                    crate::error::coded(
+                        crate::error::Code::InvalidArgument,
+                        "invalid answer: --json must be a JSON object",
+                    )
+                }),
+            _ => fail!(
+                InvalidArgument,
+                "invalid answer: use --allow, --deny, --text, --choice, or --json"
+            ),
         }
     }
 }
@@ -313,13 +331,15 @@ impl RequestRecord {
             (RequestKind::Approval, Answer::Allow | Answer::Deny { .. })
             | (RequestKind::Question, Answer::Text(_) | Answer::Choice(_) | Answer::Json(_)) => {}
             (RequestKind::Approval, _) => {
-                bail!(
+                fail!(
+                    InvalidArgument,
                     "invalid answer: Request {} is an approval; use --allow or --deny",
                     self.id
                 )
             }
             (RequestKind::Question, _) => {
-                bail!(
+                fail!(
+                    InvalidArgument,
                     "invalid answer: Request {} is a question; use --text or --choice",
                     self.id
                 )
@@ -378,13 +398,22 @@ impl RequestRecord {
                     Answer::Json(Value::Object(object)) => Value::Object(object.clone()),
                     Answer::Text(text) => match serde_json::from_str::<Value>(text) {
                         Ok(Value::Object(object)) => Value::Object(object),
-                        _ => bail!("invalid answer: this form requires --json with a JSON object"),
+                        _ => fail!(
+                            InvalidArgument,
+                            "invalid answer: this form requires --json with a JSON object"
+                        ),
                     },
-                    _ => bail!("invalid answer: this form requires --json with a JSON object"),
+                    _ => fail!(
+                        InvalidArgument,
+                        "invalid answer: this form requires --json with a JSON object"
+                    ),
                 };
                 for field in required_fields {
                     if content.get(field).is_none_or(Value::is_null) {
-                        bail!("invalid answer: required form field {field:?} is missing");
+                        fail!(
+                            InvalidArgument,
+                            "invalid answer: required form field {field:?} is missing"
+                        );
                     }
                 }
                 json!({"action": "accept", "content": content})
@@ -398,15 +427,18 @@ impl RequestRecord {
             Answer::Text(text) => Ok(text.clone()),
             Answer::Choice(choice) => {
                 self.draft.choices.get(choice - 1).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid answer: Request {} has {} choices",
-                        self.id,
-                        self.draft.choices.len()
+                    crate::error::coded(
+                        crate::error::Code::InvalidArgument,
+                        format!(
+                            "invalid answer: Request {} has {} choices",
+                            self.id,
+                            self.draft.choices.len()
+                        ),
                     )
                 })
             }
             Answer::Json(_) | Answer::Allow | Answer::Deny { .. } => {
-                bail!("invalid answer for a question")
+                fail!(InvalidArgument, "invalid answer for a question")
             }
         }
     }

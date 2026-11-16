@@ -3,6 +3,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+use crate::error::fail;
 use serde_json::{Value, json};
 
 pub const SNAPSHOT_URL: &str =
@@ -151,7 +153,8 @@ fn validate_against_snapshot(snapshot: &Snapshot, model_id: &str, effort: &str) 
     } else {
         supported.join(", ")
     };
-    bail!(
+    fail!(
+        InvalidArgument,
         "invalid model/effort combination: effort {effort:?} is not supported by Claude model {model_id:?}; supported efforts: {supported}"
     )
 }

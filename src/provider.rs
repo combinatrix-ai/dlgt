@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
+
+use crate::error::{Code, WithCode, fail};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::ApprovalsMode;
@@ -91,7 +93,10 @@ impl Agent {
         match value {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
-            _ => bail!("unsupported agent {value:?}; expected codex or claude"),
+            _ => fail!(
+                InvalidArgument,
+                "unsupported agent {value:?}; expected codex or claude"
+            ),
         }
     }
 
@@ -514,6 +519,7 @@ pub fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
 /// Confirm subscription auth using the exact resolved command context that
 /// will launch the provider. Captured output is drained but retained only up
 /// to a fixed limit, and the process group is owned by the daemon reaper.
+#[allow(clippy::too_many_lines)]
 pub fn verify_claude_subscription_login(
     spec: &CommandSpec,
     deadline: Instant,
@@ -522,7 +528,10 @@ pub fn verify_claude_subscription_login(
     shutting_down: &AtomicBool,
 ) -> Result<()> {
     if shutting_down.load(Ordering::Acquire) {
-        bail!("launch failed: daemon is stopping before Claude auth status");
+        fail!(
+            LaunchFailed,
+            "launch failed: daemon is stopping before Claude auth status"
+        );
     }
     let mut command = Command::new(&spec.program);
     command
@@ -535,7 +544,8 @@ pub fn verify_claude_subscription_login(
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .context("launch failed: could not start Claude auth status")?;
+        .context("launch failed: could not start Claude auth status")
+        .code(Code::LaunchFailed)?;
     let pid = child.id();
     let group = i32::try_from(pid).context("Claude auth status pid is too large")?;
     let registration = match reaper.watch(pid) {
@@ -589,9 +599,15 @@ pub fn verify_claude_subscription_login(
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             if shutting_down.load(Ordering::Acquire) {
-                bail!("launch failed: daemon stopped during Claude auth status");
+                fail!(
+                    LaunchFailed,
+                    "launch failed: daemon stopped during Claude auth status"
+                );
             }
-            bail!("launch failed: Claude auth status exceeded the startup deadline");
+            fail!(
+                LaunchFailed,
+                "launch failed: Claude auth status exceeded the startup deadline"
+            );
         }
         match child
             .try_wait()
@@ -669,10 +685,13 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '-')
             {
-                bail!("invalid harness option key {key:?}");
+                fail!(InvalidArgument, "invalid harness option key {key:?}");
             }
             if value.is_some_and(str::is_empty) {
-                bail!("harness option {key:?} requires a non-empty value after '='");
+                fail!(
+                    InvalidArgument,
+                    "harness option {key:?} requires a non-empty value after '='"
+                );
             }
             if matches!(
                 key,
@@ -696,11 +715,13 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
                     | "allowed-tools"
                     | "bare"
             ) {
-                bail!("harness option {key:?} is managed by dlgt");
+                fail!(InvalidArgument, "harness option {key:?} is managed by dlgt");
             }
             if key == "agents" {
                 validate_claude_agents_option(
-                    value.context("harness option \"agents\" requires a JSON object")?,
+                    value
+                        .context("harness option \"agents\" requires a JSON object")
+                        .code(Code::InvalidArgument)?,
                 )?;
             }
             Ok(value.map_or_else(|| format!("--{key}"), |value| format!("--{key}={value}")))
@@ -713,16 +734,20 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
     for option in options {
         let (key, value) = option
             .split_once('=')
-            .context("harness option requires KEY=VALUE")?;
+            .context("harness option requires KEY=VALUE")
+            .code(Code::InvalidArgument)?;
         if key.is_empty()
             || !key.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
             })
         {
-            bail!("invalid harness option key {key:?}");
+            fail!(InvalidArgument, "invalid harness option key {key:?}");
         }
         if value.is_empty() {
-            bail!("harness option {key:?} requires a non-empty value");
+            fail!(
+                InvalidArgument,
+                "harness option {key:?} requires a non-empty value"
+            );
         }
         let segments = key.split('.').collect::<Vec<_>>();
         let final_segment = segments.last().copied().unwrap_or_default();
@@ -734,7 +759,7 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
             "approval_policy" | "approvals_reviewer" | "sandbox_mode"
         ) || segments.contains(&"sandbox_workspace_write");
         if protected {
-            bail!("harness option {key:?} is managed by dlgt");
+            fail!(InvalidArgument, "harness option {key:?} is managed by dlgt");
         }
         args.extend(["--config".to_owned(), option.clone()]);
     }
@@ -742,13 +767,15 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
 }
 
 fn validate_claude_agents_option(value: &str) -> Result<()> {
-    let agents: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(value).context("harness option \"agents\" must be a JSON object")?;
+    let agents: serde_json::Map<String, serde_json::Value> = serde_json::from_str(value)
+        .context("harness option \"agents\" must be a JSON object")
+        .code(Code::InvalidArgument)?;
     for (name, definition) in agents {
         if let Some(mode) = definition.get("permissionMode")
             && mode.as_str() != Some("default")
         {
-            bail!(
+            fail!(
+                InvalidArgument,
                 "harness option \"agents\" definition {name:?} has managed permissionMode; only \"default\" is allowed"
             );
         }
