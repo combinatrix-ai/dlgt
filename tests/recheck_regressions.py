@@ -851,6 +851,20 @@ class RecheckRegressions(unittest.TestCase):
             ).stdout.strip()
             self.assertTrue(not state or state.startswith("Z"), f"{harness} descendant survived: {state}")
 
+    def test_workspace_trust_is_written_where_the_launch_environment_points(self) -> None:
+        h = self.harness
+        selected = h.root / "selected-home"
+        selected.mkdir()
+        response = h.create("claude", "trust", {"HOME": str(selected)})
+        self.assertIn("result", response, response)
+        self.assertTrue((selected / ".claude.json").exists())
+        self.assertFalse((h.home / ".claude.json").exists())
+        codex_home = h.root / "selected-codex"
+        response = h.create("codex", "trust", {"CODEX_HOME": str(codex_home)})
+        self.assertIn("result", response, response)
+        self.assertTrue((codex_home / "config.toml").exists())
+        self.assertFalse((h.home / ".codex" / "config.toml").exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

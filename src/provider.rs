@@ -238,25 +238,38 @@ pub(crate) fn codex_thread_params(options: &LaunchOptions<'_>) -> serde_json::Va
     params
 }
 
-pub fn prepare_workspace(agent: Agent, cwd: &Path) -> Result<()> {
+/// Mark `cwd` trusted in the configuration the provider will actually read,
+/// which the launch environment selects, not the daemon's own.
+pub fn prepare_workspace(
+    agent: Agent,
+    cwd: &Path,
+    environment: &HashMap<String, String>,
+) -> Result<()> {
+    let variable = |name: &str| {
+        environment
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = || {
+        variable("HOME")
+            .context("HOME is not set in the launch environment")
+            .code(Code::InvalidArgument)
+    };
     match agent {
         Agent::Codex => {
-            let home = std::env::var_os("CODEX_HOME").map_or_else(
-                || {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .map(|home| home.join(".codex"))
-                        .context("HOME is not set")
-                },
-                |home| Ok(PathBuf::from(home)),
-            )?;
-            trust_codex_workspace(&home, cwd)?;
+            let codex_home = match variable("CODEX_HOME") {
+                Some(codex_home) => codex_home,
+                None => home()?.join(".codex"),
+            };
+            trust_codex_workspace(&codex_home, cwd)?;
         }
         Agent::Claude => {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .context("HOME is not set")?;
-            trust_claude_workspace(&home, cwd)?;
+            let config_dir = match variable("CLAUDE_CONFIG_DIR") {
+                Some(config_dir) => config_dir,
+                None => home()?,
+            };
+            trust_claude_workspace(&config_dir, cwd)?;
         }
     }
     Ok(())
