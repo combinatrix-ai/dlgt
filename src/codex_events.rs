@@ -195,13 +195,17 @@ impl CodexItems {
             }
             "mcpServer/elicitation/request" => {
                 let form = text("mode") != Some("url");
-                let fields = elicitation_fields(params);
+                let (fields, required_fields) = elicitation_fields(params);
                 let mut asked = text("message").unwrap_or_default().to_owned();
                 if let Some(url) = text("url") {
                     asked = format!("{asked}\n{url}");
                 }
                 question(
-                    ProviderRequest::CodexElicitation { fields, form },
+                    ProviderRequest::CodexElicitation {
+                        fields,
+                        required_fields,
+                        form,
+                    },
                     text("serverName").unwrap_or("mcp"),
                     asked,
                     Vec::new(),
@@ -212,24 +216,25 @@ impl CodexItems {
     }
 }
 
-fn elicitation_fields(params: &Value) -> Vec<FormField> {
-    const FIELD_LIMIT: usize = 16;
-    const ENUM_LIMIT: usize = 8;
-    const CONSTRAINTS: &[&str] = &["minimum", "maximum", "minLength", "maxLength", "pattern"];
+fn elicitation_fields(params: &Value) -> (Vec<FormField>, Vec<String>) {
     let schema = params.get("requestedSchema").unwrap_or(&Value::Null);
-    let required = schema
+    let required_fields = schema
         .get("required")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let required = required_fields
+        .iter()
+        .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
-    schema
+    let fields = schema
         .get("properties")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|properties| properties.iter())
-        .take(FIELD_LIMIT)
         .map(|(name, property)| {
             let field_type = property.get("type").map_or_else(
                 || "unknown".to_owned(),
@@ -248,10 +253,6 @@ fn elicitation_fields(params: &Value) -> Vec<FormField> {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .take(ENUM_LIMIT)
-                .filter(|value| {
-                    value.is_string() || value.is_number() || value.is_boolean() || value.is_null()
-                })
                 .cloned()
                 .collect();
             let constraints = Value::Object(
@@ -259,8 +260,12 @@ fn elicitation_fields(params: &Value) -> Vec<FormField> {
                     .as_object()
                     .into_iter()
                     .flat_map(|object| object.iter())
-                    .filter(|(key, _)| CONSTRAINTS.contains(&key.as_str()))
-                    .take(8)
+                    .filter(|(key, _)| {
+                        matches!(
+                            key.as_str(),
+                            "minimum" | "maximum" | "minLength" | "maxLength" | "pattern"
+                        )
+                    })
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             );
@@ -272,7 +277,8 @@ fn elicitation_fields(params: &Value) -> Vec<FormField> {
                 constraints,
             }
         })
-        .collect()
+        .collect();
+    (fields, required_fields)
 }
 
 fn review_action(action: &Value) -> (&'static str, String) {
@@ -465,6 +471,15 @@ pub fn apply_notification(
                 return Ok(false);
             };
             if !codex_server_request_matches(store, &session, params) {
+                return Ok(false);
+            }
+            if !draft.fits_minimum_request_budget() {
+                store.append_message(
+                    session_id,
+                    MessageBody::notice(
+                        "Codex form was declined because its exact schema exceeds dlgt's Request size limit",
+                    ),
+                );
                 return Ok(false);
             }
             return Ok(store.open_request(session_id, draft).is_some());

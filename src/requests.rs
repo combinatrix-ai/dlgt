@@ -4,17 +4,24 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::messages::bounded;
-
 /// Pending Requests published per Session in one response.
 pub const PUBLISHED_REQUEST_LIMIT: usize = 16;
 /// Resolved Requests kept per Session so a repeated answer can be replayed.
 const RESOLVED_RETENTION: usize = 256;
+/// Leave room for the rest of a `fetch` response when publishing the minimum
+/// answerable Request.
+pub const MINIMUM_REQUEST_LIMIT: usize = 200 * 1024;
+/// Hard compact-response limit documented by the CLI and RPC contracts.
+pub const REQUEST_HARD_LIMIT: usize = 256 * 1024;
 /// Largest provider tool input published verbatim.
 const INPUT_LIMIT: usize = 2048;
-const FIELD_LIMIT: usize = 16;
 const CHOICE_LIMIT: usize = 32;
-const LABEL_LIMIT: usize = 160;
+const TOOL_LIMIT: usize = 1024;
+const PATH_LIMIT: usize = 4096;
+const SUMMARY_LIMIT: usize = 8192;
+const TEXT_LIMIT: usize = 8192;
+const REASON_LIMIT: usize = 8192;
+const LABEL_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormField {
@@ -127,6 +134,7 @@ pub enum ProviderRequest {
     },
     CodexElicitation {
         fields: Vec<FormField>,
+        required_fields: Vec<String>,
         form: bool,
     },
 }
@@ -208,19 +216,28 @@ impl RequestRecord {
         }
         match draft.kind {
             RequestKind::Approval => {
-                value.insert("tool".to_owned(), json!(draft.tool));
+                value.insert(
+                    "tool".to_owned(),
+                    json!(display_bounded(&draft.tool, TOOL_LIMIT)),
+                );
                 value.insert("summary".to_owned(), json!(public_summary(draft)));
                 value.insert("input".to_owned(), bounded_input(&draft.input));
                 if let Some(cwd) = &draft.cwd {
-                    value.insert("cwd".to_owned(), json!(cwd));
+                    value.insert("cwd".to_owned(), json!(display_bounded(cwd, PATH_LIMIT)));
                 }
                 if let Some(reason) = &draft.reason {
-                    value.insert("reason".to_owned(), json!(bounded(reason).0));
+                    value.insert(
+                        "reason".to_owned(),
+                        json!(display_bounded(reason, REASON_LIMIT)),
+                    );
                 }
             }
             RequestKind::Question => {
-                value.insert("tool".to_owned(), json!(bounded(&draft.tool).0));
-                let text = bounded(draft.text.as_deref().unwrap_or_default()).0;
+                value.insert(
+                    "tool".to_owned(),
+                    json!(display_bounded(&draft.tool, TOOL_LIMIT)),
+                );
+                let text = display_bounded(draft.text.as_deref().unwrap_or_default(), TEXT_LIMIT);
                 value.insert("summary".to_owned(), json!(public_summary(draft)));
                 value.insert("text".to_owned(), json!(text));
                 if !draft.choices.is_empty() {
@@ -239,16 +256,30 @@ impl RequestRecord {
                         ),
                     );
                 }
-                if let ProviderRequest::CodexElicitation { fields, form: true } = &draft.provider {
-                    value.insert("fields".to_owned(), json!(fields.iter().take(FIELD_LIMIT).map(|field| {
-                        json!({
-                            "name": bounded_label(&field.name),
-                            "type": bounded_label(&field.field_type),
-                            "required": field.required,
-                            "enum": field.enum_values.iter().take(8).map(bound_json_scalar).collect::<Vec<_>>(),
-                            "constraints": bounded_constraints(&field.constraints),
-                        })
-                    }).collect::<Vec<_>>()));
+                if let ProviderRequest::CodexElicitation {
+                    fields,
+                    required_fields,
+                    form: true,
+                } = &draft.provider
+                {
+                    value.insert("required".to_owned(), json!(required_fields));
+                    value.insert(
+                        "fields".to_owned(),
+                        json!(
+                            fields
+                                .iter()
+                                .map(|field| {
+                                    json!({
+                                        "name": field.name,
+                                        "type": field.field_type,
+                                        "required": field.required,
+                                        "enum": field.enum_values,
+                                        "constraints": field.constraints,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        ),
+                    );
                 }
             }
         }
@@ -316,7 +347,11 @@ impl RequestRecord {
                     .collect::<Map<_, _>>();
                 json!({"answers": answers})
             }
-            ProviderRequest::CodexElicitation { fields, form } => {
+            ProviderRequest::CodexElicitation {
+                required_fields,
+                form,
+                ..
+            } => {
                 if !form {
                     return Ok((outcome, json!({"action": "accept"})));
                 }
@@ -328,12 +363,9 @@ impl RequestRecord {
                     },
                     _ => bail!("invalid answer: this form requires --json with a JSON object"),
                 };
-                for field in fields.iter().filter(|field| field.required) {
-                    if content.get(&field.name).is_none_or(Value::is_null) {
-                        bail!(
-                            "invalid answer: required form field {:?} is missing",
-                            field.name
-                        );
+                for field in required_fields {
+                    if content.get(field).is_none_or(Value::is_null) {
+                        bail!("invalid answer: required form field {:?} is missing", field);
                     }
                 }
                 json!({"action": "accept", "content": content})
@@ -364,7 +396,20 @@ impl RequestRecord {
 fn bounded_label(value: &str) -> String {
     let value = crate::messages::one_line(value).0;
     let value = crate::messages::bounded(&value).0;
-    value.chars().take(LABEL_LIMIT).collect()
+    display_bounded(&value, LABEL_LIMIT)
+}
+
+fn display_bounded(value: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "… [truncated]";
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let prefix_limit = max_bytes.saturating_sub(MARKER.len());
+    let mut end = prefix_limit.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &value[..end])
 }
 
 fn public_summary(draft: &RequestDraft) -> String {
@@ -373,35 +418,31 @@ fn public_summary(draft: &RequestDraft) -> String {
         RequestKind::Question => draft.text.as_deref().unwrap_or_default(),
     };
     if !source.trim().is_empty() {
-        return bounded(source).0;
+        return display_bounded(source, SUMMARY_LIMIT);
     }
     if !draft.tool.trim().is_empty() {
-        return bounded(&draft.tool).0;
+        return display_bounded(&draft.tool, SUMMARY_LIMIT);
     }
     "Caller input required".to_owned()
 }
 
-fn bound_json_scalar(value: &Value) -> Value {
-    match value {
-        Value::String(text) => json!(bounded_label(text)),
-        Value::Number(_) | Value::Bool(_) | Value::Null => value.clone(),
-        Value::Array(_) | Value::Object(_) => json!("<complex value>"),
+impl RequestDraft {
+    /// Whether the exact minimum answerable Request can be published without
+    /// changing its schema or exceeding the reserved response budget.
+    pub fn fits_minimum_request_budget(&self) -> bool {
+        let record = RequestRecord {
+            id: "r999999999999".to_owned(),
+            execution_seq: Some(i64::MAX),
+            created_at_ms: i64::MAX,
+            draft: self.clone(),
+            resolution: None,
+            answer_state: AnswerState::Pending,
+            answer_attempt: None,
+            answer_receipt: None,
+        };
+        serde_json::to_vec(&record.public())
+            .is_ok_and(|encoded| encoded.len() <= MINIMUM_REQUEST_LIMIT)
     }
-}
-
-fn bounded_constraints(value: &Value) -> Value {
-    let Some(object) = value.as_object() else {
-        return Value::Null;
-    };
-    let allowed = ["minimum", "maximum", "minLength", "maxLength", "pattern"];
-    Value::Object(
-        object
-            .iter()
-            .filter(|(key, _)| allowed.contains(&key.as_str()))
-            .take(8)
-            .map(|(key, value)| (key.clone(), bound_json_scalar(value)))
-            .collect(),
-    )
 }
 
 fn bounded_input(input: &Value) -> Value {
@@ -642,6 +683,7 @@ mod tests {
     fn answerable_requests_always_have_a_short_public_summary() {
         let mut draft = question(ProviderRequest::CodexElicitation {
             fields: Vec::new(),
+            required_fields: Vec::new(),
             form: true,
         });
         draft.text = Some(String::new());
@@ -773,12 +815,14 @@ mod tests {
         ];
         let mut draft = question(ProviderRequest::CodexElicitation {
             fields: fields.clone(),
+            required_fields: vec!["name".to_owned(), "color".to_owned()],
             form: true,
         });
         draft.choices.clear();
         let record = RequestTable::default().open(draft, Some(4), 1);
         let public = record.public();
         assert_eq!(public["fields"][0]["name"], "name");
+        assert_eq!(public["required"], json!(["name", "color"]));
         assert_eq!(public["fields"][0]["type"], "string");
         assert_eq!(public["fields"][0]["required"], true);
         assert_eq!(public["fields"][0]["constraints"]["maxLength"], 40);
@@ -813,6 +857,11 @@ mod tests {
             .collect::<Vec<_>>();
         let draft = question(ProviderRequest::CodexElicitation {
             fields: fields.clone(),
+            required_fields: fields
+                .iter()
+                .filter(|field| field.required)
+                .map(|field| field.name.clone())
+                .collect(),
             form: true,
         });
         let record = RequestTable::default().open(draft, Some(4), 1);
@@ -847,6 +896,7 @@ mod tests {
         let record = RequestTable::default().open(
             question(ProviderRequest::CodexElicitation {
                 fields: vec![field],
+                required_fields: vec![name.clone()],
                 form: true,
             }),
             Some(4),
@@ -871,7 +921,11 @@ mod tests {
         let public = record.public();
         let encoded = serde_json::to_vec(&public).unwrap_or_default();
 
-        assert!(encoded.len() <= 256 * 1024, "{} bytes", encoded.len());
+        assert!(
+            encoded.len() <= super::REQUEST_HARD_LIMIT,
+            "{} bytes",
+            encoded.len()
+        );
         for field in ["tool", "cwd", "summary", "reason"] {
             assert!(
                 public[field]
