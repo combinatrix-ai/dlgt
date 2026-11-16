@@ -440,8 +440,9 @@ impl RequestDraft {
             answer_attempt: None,
             answer_receipt: None,
         };
-        serde_json::to_vec(&record.public())
-            .is_ok_and(|encoded| encoded.len() <= MINIMUM_REQUEST_LIMIT)
+        serde_json::to_vec(&record.public()).is_ok_and(|encoded| {
+            encoded.len() <= MINIMUM_REQUEST_LIMIT && encoded.len() <= REQUEST_HARD_LIMIT
+        })
     }
 }
 
