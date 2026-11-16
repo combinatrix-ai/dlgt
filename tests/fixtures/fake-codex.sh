@@ -29,6 +29,10 @@ finish() {
   notify turn/completed "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"status\":\"completed\",\"items\":[$item]}}"
   holding=0
 }
+finish_empty() {
+  notify turn/completed "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"status\":\"completed\",\"items\":[]}}"
+  holding=0
+}
 
 while IFS= read -r line; do
   if [ -n "${DLGT_FAKE_CODEX_LOG:-}" ]; then
@@ -36,15 +40,23 @@ while IFS= read -r line; do
       *'"method":"thread/start"'* | *'"method":"thread/resume"'*)
         printf '%s\n' "$line" >>"$DLGT_FAKE_CODEX_LOG"
         ;;
+      *'"method":"turn/steer"'* | *'"id":"srv-'*'"result"'*)
+        printf '%s\n' "$line" >>"$DLGT_FAKE_CODEX_LOG"
+        ;;
     esac
   fi
   id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
   case "$line" in
-    *'"result":{"decision":'*)
+    *'"result":{"decision":'* | *'"result":{"action":"accept"'*)
       asking=0
       notify serverRequest/resolved "{\"threadId\":\"$thread\",\"requestId\":\"srv-$turns\"}"
       case "$line" in
         *'"decision":"accept"'*) finish allowed ;;
+        *'"action":"accept"'*)
+          name=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+          count=$(printf '%s' "$line" | sed -n 's/.*"count":\([0-9][0-9]*\).*/\1/p')
+          finish "form:$name:$count"
+          ;;
         *) finish denied ;;
       esac
       ;;
@@ -69,6 +81,13 @@ while IFS= read -r line; do
       notify turn/started "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"items\":[]}}"
       case "$text" in
         hold*) holding=1 ;;
+        empty*) finish_empty ;;
+        form*)
+          asking=1
+          notify item/started "{\"threadId\":\"$thread\",\"turnId\":\"$turn\",\"item\":{\"type\":\"mcpElicitation\",\"id\":\"form-$turns\"}}"
+          printf '{"id":"srv-%s","method":"mcpServer/elicitation/request","params":{"threadId":"%s","turnId":"%s","serverName":"profile","mode":"form","message":"Complete the profile","requestedSchema":{"type":"object","properties":{"name":{"type":"string","minLength":1},"count":{"type":"integer","minimum":1}},"required":["name","count"]}}}\n' \
+            "$turns" "$thread" "$turn"
+          ;;
         ask*)
           asking=1
           notify item/started "{\"threadId\":\"$thread\",\"turnId\":\"$turn\",\"item\":{\"type\":\"commandExecution\",\"id\":\"cmd-$turns\",\"command\":\"touch outside.txt\"}}"

@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt as _;
-use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -30,6 +30,8 @@ const STDERR_TAIL_LIMIT: usize = 4096;
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// Longest one-line outcome kept for a tool result.
 const RESULT_SUMMARY_LIMIT: usize = 240;
+const WRITER_QUEUE_CAPACITY: usize = 32;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type EventHandler = Arc<dyn Fn(Value) + Send + Sync>;
 pub type ExitHandler = Arc<dyn Fn(Option<i32>) + Send + Sync>;
@@ -38,13 +40,19 @@ type ControlWaiters = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 
 pub struct ClaudeProcess {
     pid: u32,
-    stdin: Mutex<Option<ChildStdin>>,
+    writer: SyncSender<WriteCommand>,
+    closed: Arc<AtomicBool>,
     controls: ControlWaiters,
     next_control: AtomicU64,
     stderr_tail: Arc<Mutex<String>>,
     /// Closes when the stderr reader has seen end of file.
     stderr_done: Mutex<mpsc::Receiver<()>>,
     _reaper_registration: Registration,
+}
+
+struct WriteCommand {
+    line: Vec<u8>,
+    written: Sender<std::result::Result<(), String>>,
 }
 
 impl ClaudeProcess {
@@ -67,7 +75,7 @@ impl ClaudeProcess {
             .with_context(|| format!("failed to start {}", spec.program.display()))?;
         let pid = child.id();
         let registration = reaper.watch(pid)?;
-        let stdin = child.stdin.take().context("Claude process had no stdin")?;
+        let mut stdin = child.stdin.take().context("Claude process had no stdin")?;
         let stdout = child
             .stdout
             .take()
@@ -78,6 +86,31 @@ impl ClaudeProcess {
             .context("Claude process had no stderr")?;
         let controls: ControlWaiters = Arc::new(Mutex::new(HashMap::new()));
         let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let (writer, write_rx) = mpsc::sync_channel::<WriteCommand>(WRITER_QUEUE_CAPACITY);
+        let writer_closed = Arc::clone(&closed);
+        std::thread::Builder::new()
+            .name("dlgt-claude-stdin".to_owned())
+            .spawn(move || {
+                for command in write_rx {
+                    let result = stdin
+                        .write_all(&command.line)
+                        .and_then(|()| stdin.flush())
+                        .map_err(|_| "failed to write to the Claude process".to_owned());
+                    let failed = result.is_err();
+                    let _ = command.written.send(result);
+                    if failed {
+                        writer_closed.store(true, Ordering::Release);
+                        if let Ok(pid) = i32::try_from(pid) {
+                            // SAFETY: the provider owns a process group led by this pid.
+                            unsafe { libc::kill(-pid, libc::SIGKILL) };
+                        }
+                        break;
+                    }
+                }
+            })
+            .context("failed to start Claude stdin writer thread")?;
 
         let tail = Arc::clone(&stderr_tail);
         let (stderr_closed, stderr_done) = mpsc::channel::<()>();
@@ -90,6 +123,7 @@ impl ClaudeProcess {
             .context("failed to start Claude stderr thread")?;
 
         let waiters = Arc::clone(&controls);
+        let event_closed = Arc::clone(&closed);
         std::thread::Builder::new()
             .name("dlgt-claude-events".to_owned())
             .spawn(move || {
@@ -114,13 +148,15 @@ impl ClaudeProcess {
                 if let Ok(mut waiters) = waiters.lock() {
                     waiters.clear();
                 }
+                event_closed.store(true, Ordering::Release);
                 on_exit(child.wait().ok().and_then(|status| status.code()));
             })
             .context("failed to start Claude event thread")?;
 
         Ok(Arc::new(Self {
             pid,
-            stdin: Mutex::new(Some(stdin)),
+            writer,
+            closed,
             controls,
             next_control: AtomicU64::new(1),
             stderr_tail,
@@ -131,6 +167,10 @@ impl ClaudeProcess {
 
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub fn is_open(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
     }
 
     pub fn stderr_tail(&self) -> String {
@@ -175,13 +215,24 @@ impl ClaudeProcess {
             .and_then(Value::as_str)
             .unwrap_or("control")
             .to_owned();
-        self.write_line(&json!({"type": "control_request", "request_id": id, "request": request}))?;
-        let response = receiver.recv_timeout(timeout).map_err(|_| {
+        let deadline = Instant::now() + timeout;
+        if let Err(error) = self.write_line_until(
+            &json!({"type": "control_request", "request_id": id, "request": request}),
+            deadline,
+        ) {
             if let Ok(mut controls) = self.controls.lock() {
                 controls.remove(&id);
             }
-            anyhow!("Claude did not answer the {subtype} control request")
-        })?;
+            return Err(error);
+        }
+        let response = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| {
+                if let Ok(mut controls) = self.controls.lock() {
+                    controls.remove(&id);
+                }
+                anyhow!("Claude did not answer the {subtype} control request")
+            })?;
         if response.get("subtype").and_then(Value::as_str) != Some("success") {
             bail!(
                 "Claude rejected the {subtype} control request: {}",
@@ -197,12 +248,14 @@ impl ClaudeProcess {
     /// Send a control request without waiting, for use on the event thread.
     pub fn control_nowait(&self, request: &Value) -> Result<()> {
         let id = format!("dlgt_{}", self.next_control.fetch_add(1, Ordering::Relaxed));
-        self.write_line(&json!({"type": "control_request", "request_id": id, "request": request}))
+        self.write_line_nowait(
+            &json!({"type": "control_request", "request_id": id, "request": request}),
+        )
     }
 
     /// Tell Claude a control request will not be answered.
     pub fn refuse(&self, request_id: &str, reason: &str) -> Result<()> {
-        self.write_line(&json!({
+        self.write_line_nowait(&json!({
             "type": "control_response",
             "response": {"subtype": "error", "request_id": request_id, "error": reason},
         }))
@@ -217,23 +270,46 @@ impl ClaudeProcess {
     }
 
     fn write_line(&self, value: &Value) -> Result<()> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| anyhow!("Claude stdin lock poisoned"))?;
-        let stdin = stdin.as_mut().context("Claude process stdin is closed")?;
+        self.write_line_until(value, Instant::now() + WRITE_TIMEOUT)
+    }
+
+    fn write_line_until(&self, value: &Value, deadline: Instant) -> Result<()> {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
-        stdin
-            .write_all(&line)
-            .and_then(|()| stdin.flush())
-            .context("failed to write to the Claude process")
+        let (written, result) = mpsc::channel();
+        self.enqueue(WriteCommand { line, written })?;
+        match result.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(anyhow!(message)),
+            Err(_) => {
+                self.force_stop();
+                Err(anyhow!("timed out writing to the Claude process"))
+            }
+        }
+    }
+
+    fn write_line_nowait(&self, value: &Value) -> Result<()> {
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        let (written, _result) = mpsc::channel();
+        self.enqueue(WriteCommand { line, written })
+    }
+
+    fn enqueue(&self, command: WriteCommand) -> Result<()> {
+        match self.writer.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.force_stop();
+                Err(anyhow!("Claude stdin writer queue is full"))
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.force_stop();
+                Err(anyhow!("Claude process stdin is closed"))
+            }
+        }
     }
 
     pub fn stop(&self) {
-        if let Ok(mut stdin) = self.stdin.lock() {
-            stdin.take();
-        }
         self.signal(libc::SIGTERM);
     }
 
@@ -318,7 +394,7 @@ pub enum Action {
     /// Claude reported API-key authentication under the subscription policy.
     AuthMismatch,
     /// A canceled execution's leftover message started a provider turn.
-    Interrupt,
+    Interrupt { turn_id: String },
     /// A control request nobody can answer: an unsupported kind, or a
     /// permission request from a turn no execution owns. Left unanswered it
     /// would hold the provider forever.
@@ -390,6 +466,9 @@ impl ClaudeTurns {
         let Some(turn) = store.get_turn(&turn_id) else {
             return Ok(());
         };
+        if store.cancel_controls_pending(&turn_id) {
+            return Ok(());
+        }
         if let Some(usage) = self.usage.take() {
             store.set_turn_usage(&turn_id, usage);
         }
@@ -408,7 +487,7 @@ impl ClaudeTurns {
                 "provider.stop_unmatched"
             }
         } else if let Some(failure) = self.failure.take() {
-            let error = json!({"code": "provider_error", "message": failure}).to_string();
+            let error = json!({"code": "provider_error", "message": failure});
             if store.finish_turn_if_matching(
                 &turn_id,
                 None,
@@ -428,7 +507,9 @@ impl ClaudeTurns {
             "provider.stop_unmatched"
         };
         store.record_event(Some(session_id), Some(&turn_id), kind);
+        let auth_checked = self.auth_checked;
         *self = Self::default();
+        self.auth_checked = auth_checked;
         Ok(())
     }
 }
@@ -477,9 +558,9 @@ pub fn apply_event(
             apply_permission_mode(store, session_id, text("permissionMode"));
             turns.auth_checked = true;
             let auth_mismatch = session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription
-                && text("apiKeySource").is_some_and(|source| source != "none");
+                && text("apiKeySource") != Some("none");
             if auth_mismatch {
-                let error = format!("AUTH_MISMATCH: {AuthMismatch}");
+                let error = json!({"code": "AUTH_MISMATCH", "message": AuthMismatch.to_string()});
                 if let Some(turn_id) = session.active_turn_id.as_deref() {
                     store.finish_turn_if_matching(
                         turn_id,
@@ -539,8 +620,13 @@ pub fn apply_event(
             let canceled = turn_id
                 .and_then(|id| store.get_turn(id))
                 .is_some_and(|turn| turn.state == TurnState::Canceled);
-            if canceled {
-                actions.push(Action::Interrupt);
+            if canceled
+                && let Some(turn_id) = turn_id
+                && store.reserve_cancel_control(turn_id)
+            {
+                actions.push(Action::Interrupt {
+                    turn_id: turn_id.to_owned(),
+                });
             }
             match read.steer {
                 Some(steer) => {
@@ -630,7 +716,13 @@ pub fn apply_event(
             };
             if request.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
                 actions.push(refuse("dlgt does not handle this control request"));
-            } else if session.active_turn_id.is_none() {
+            } else if !matches!(session.state, SessionState::Busy | SessionState::Blocked)
+                || session
+                    .active_turn_id
+                    .as_deref()
+                    .and_then(|turn_id| store.get_turn(turn_id))
+                    .is_none_or(|turn| turn.state != TurnState::Running)
+            {
                 store.append_message(
                     session_id,
                     MessageBody::notice(
@@ -1093,7 +1185,7 @@ mod tests {
         turns.add_steer("u-steer", "extra");
         assert!(
             store
-                .cancel_turn("turn_1")
+                .cancel_turn_with_controls("turn_1", 1)
                 .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
         );
         apply(&store, &mut turns, &interrupted());
@@ -1104,9 +1196,17 @@ mod tests {
         );
         assert_eq!(
             apply(&store, &mut turns, &replay("u-steer")),
-            [Action::Interrupt]
+            [Action::Interrupt {
+                turn_id: "turn_1".to_owned()
+            }]
         );
         apply(&store, &mut turns, &interrupted());
+        assert_eq!(state(&store), SessionState::Quiescing);
+        assert!(!store.finish_cancel_control("turn_1"));
+        assert!(!store.finish_cancel_control("turn_1"));
+        turns
+            .settle(&store, SESSION)
+            .unwrap_or_else(|error| panic!("failed to settle cancel: {error}"));
         assert_eq!(state(&store), SessionState::Idle);
         assert_eq!(turn(&store).state, TurnState::Canceled);
     }
@@ -1156,11 +1256,11 @@ mod tests {
         );
         let turn = turn(&store);
         assert_eq!(turn.state, TurnState::Failed);
-        assert!(
-            turn.error
-                .as_deref()
-                .is_some_and(|error| error.contains("API Error: overloaded"))
-        );
+        assert!(turn.error.as_ref().is_some_and(|error| {
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("API Error: overloaded"))
+        }));
         assert_eq!(state(&store), SessionState::Idle);
     }
 
@@ -1211,7 +1311,13 @@ mod tests {
         let question = pending[1].public();
         assert_eq!(question["kind"], "question");
         assert_eq!(question["text"], "Which color?");
-        assert_eq!(question["choices"], json!(["Red", "Blue"]));
+        assert_eq!(
+            question["choices"],
+            json!([
+                {"index": 1, "label": "Red"},
+                {"index": 2, "label": "Blue"},
+            ])
+        );
 
         for withdrawn in ["p1", "p2"] {
             apply(
@@ -1311,11 +1417,12 @@ mod tests {
         );
         assert_eq!(actions, [Action::AuthMismatch]);
         assert_eq!(turn(&store).state, TurnState::Failed);
-        assert!(
+        assert_eq!(
             turn(&store)
                 .error
-                .as_deref()
-                .is_some_and(|error| error.starts_with("AUTH_MISMATCH:"))
+                .as_ref()
+                .map(|error| error["code"].as_str()),
+            Some(Some("AUTH_MISMATCH"))
         );
         let session = store
             .get_session(SESSION)
@@ -1328,6 +1435,65 @@ mod tests {
                 .iter()
                 .any(|message| message["kind"] == "notice")
         );
+    }
+
+    #[test]
+    fn subscription_auth_mismatch_when_init_omits_api_key_source() {
+        let (store, mut turns) = busy_session(ApprovalsMode::Auto);
+        store.set_auth_policy(SESSION, AuthPolicy::Subscription);
+        let actions = apply(
+            &store,
+            &mut turns,
+            &json!({"type": "system", "subtype": "init", "session_id": "s1",
+                    "model": "claude-test", "permissionMode": "auto"}),
+        );
+        assert_eq!(actions, [Action::AuthMismatch]);
+        assert_eq!(
+            turn(&store)
+                .error
+                .as_ref()
+                .map(|error| error["code"].as_str()),
+            Some(Some("AUTH_MISMATCH"))
+        );
+        assert_eq!(
+            store.get_session(SESSION).and_then(|session| session.auth),
+            None
+        );
+    }
+
+    #[test]
+    fn process_auth_mode_and_model_survive_turn_settlement() {
+        let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
+        apply(
+            &store,
+            &mut turns,
+            &json!({"type": "system", "subtype": "init", "session_id": "s1",
+                    "model": "claude-test", "permissionMode": "auto", "apiKeySource": "none"}),
+        );
+        apply(&store, &mut turns, &replay("u-prompt"));
+        apply(&store, &mut turns, &result("first"));
+        assert!(turns.auth_checked);
+        let session = store
+            .get_session(SESSION)
+            .unwrap_or_else(|| panic!("session missing"));
+        assert_eq!(session.auth, Some(Auth::Subscription));
+        assert_eq!(session.resolved_model.as_deref(), Some("claude-test"));
+        assert_eq!(session.approvals.effective, ApprovalsMode::Auto);
+
+        store
+            .insert_turn("turn_2", SESSION, "second")
+            .unwrap_or_else(|error| panic!("failed to insert second turn: {error}"));
+        assert!(store.set_session_state(SESSION, SessionState::Busy));
+        turns.begin("u-second");
+        assert!(turns.auth_checked);
+        apply(&store, &mut turns, &replay("u-second"));
+        apply(&store, &mut turns, &result("second"));
+        let session = store
+            .get_session(SESSION)
+            .unwrap_or_else(|| panic!("session missing"));
+        assert_eq!(session.auth, Some(Auth::Subscription));
+        assert_eq!(session.resolved_model.as_deref(), Some("claude-test"));
+        assert_eq!(session.approvals.effective, ApprovalsMode::Auto);
     }
 
     #[test]
@@ -1377,6 +1543,7 @@ mod tests {
     #[test]
     fn a_rotated_provider_session_id_asks_for_a_rekey() {
         let (store, mut turns) = busy_session(ApprovalsMode::Ask);
+        store.set_auth_policy(SESSION, AuthPolicy::Any);
         assert_eq!(
             apply(
                 &store,

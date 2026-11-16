@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cursor::{Cursor, CursorTable};
@@ -7,9 +7,11 @@ use crate::messages::{MessageBody, MessageLog, MessagePage};
 use crate::protocol::{
     Approvals, ApprovalsMode, Auth, EventRecord, SessionRecord, SessionState, TurnRecord, TurnState,
 };
-use crate::requests::{RequestDraft, RequestRecord, RequestTable, Resolution};
+use crate::requests::{
+    Answer, AnswerClaim, Outcome, RequestDraft, RequestRecord, RequestTable, Resolution,
+};
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub struct Store {
@@ -31,6 +33,8 @@ struct MemoryState {
     uid_index: HashMap<String, String>,
     provider_reservations: HashMap<String, String>,
     turns: HashMap<String, TurnRecord>,
+    cancel_controls: HashMap<String, usize>,
+    cancel_terminal_seen: HashSet<String>,
     events: VecDeque<EventRecord>,
     /// Highest lifecycle sequence already evicted by retention.
     evicted_event_seq: i64,
@@ -62,7 +66,7 @@ struct FinishTurn<'a> {
     state: TurnState,
     final_message: Option<&'a str>,
     recovered: bool,
-    error: Option<&'a str>,
+    error: Option<&'a Value>,
 }
 
 pub struct NewSession<'a> {
@@ -444,10 +448,12 @@ impl Store {
         let Some(turn) = state.turns.get_mut(id) else {
             return false;
         };
-        if turn.state != TurnState::Submitted {
+        if !matches!(turn.state, TurnState::Submitted | TurnState::Canceled) {
             return false;
         }
-        turn.state = TurnState::Running;
+        if turn.state == TurnState::Submitted {
+            turn.state = TurnState::Running;
+        }
         if turn.provider_turn_id.is_none() {
             turn.provider_turn_id = provider_turn_id.map(str::to_owned);
         }
@@ -478,7 +484,7 @@ impl Store {
         provider_turn_id: Option<&str>,
         state: TurnState,
         final_message: Option<&str>,
-        error: Option<&str>,
+        error: Option<&Value>,
     ) -> Result<bool> {
         self.finish_turn(&FinishTurn {
             id,
@@ -518,7 +524,7 @@ impl Store {
         }
         turn.final_message = final_message.map(str::to_owned);
         turn.final_text_recovered = recovered;
-        turn.error = error.map(str::to_owned);
+        turn.error = error.cloned();
         turn.completed_at_ms = Some(now_ms());
         if let Some(session) = memory.sessions.get_mut(&session_id)
             && session.record.active_turn_id.as_deref() == Some(id)
@@ -540,7 +546,7 @@ impl Store {
             return None;
         }
         turn.state = TurnState::Interrupted;
-        turn.error = Some(error.to_owned());
+        turn.error = Some(json!({"code": "interrupted", "message": error}));
         turn.completed_at_ms = Some(now_ms());
         if let Some(session) = state.sessions.get_mut(session_id) {
             session.record.active_turn_id = None;
@@ -551,17 +557,26 @@ impl Store {
         Some(turn_id)
     }
 
+    #[cfg(test)]
     pub fn cancel_turn(&mut self, id: &str) -> Result<bool> {
+        self.cancel_turn_with_controls(id, 0)
+    }
+
+    pub fn cancel_turn_with_controls(&mut self, id: &str, controls: usize) -> Result<bool> {
         let mut state = self.state.borrow_mut();
-        let Some(turn) = state.turns.get_mut(id) else {
-            bail!("turn not found");
+        let session_id = {
+            let Some(turn) = state.turns.get_mut(id) else {
+                bail!("turn not found");
+            };
+            if !turn.state.is_active() {
+                return Ok(false);
+            }
+            turn.state = TurnState::Canceled;
+            turn.completed_at_ms = Some(now_ms());
+            turn.session_id.clone()
         };
-        if !turn.state.is_active() {
-            return Ok(false);
-        }
-        turn.state = TurnState::Canceled;
-        turn.completed_at_ms = Some(now_ms());
-        let session_id = turn.session_id.clone();
+        state.cancel_controls.insert(id.to_owned(), controls);
+        state.cancel_terminal_seen.remove(id);
         if let Some(session) = state.sessions.get_mut(&session_id)
             && session.record.active_turn_id.as_deref() == Some(id)
         {
@@ -573,17 +588,93 @@ impl Store {
         Ok(true)
     }
 
-    pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
+    pub fn reserve_cancel_control(&self, id: &str) -> bool {
         let mut state = self.state.borrow_mut();
-        let turn = state.turns.get(id).context("turn not found")?;
-        if turn.state != TurnState::Canceled
-            || provider_turn_id.is_some()
-                && turn.provider_turn_id.is_some()
-                && turn.provider_turn_id.as_deref() != provider_turn_id
-        {
-            return Ok(false);
+        let Some(turn) = state
+            .turns
+            .get(id)
+            .filter(|turn| turn.state == TurnState::Canceled)
+        else {
+            return false;
+        };
+        let session_id = turn.session_id.clone();
+        if !state.sessions.get(&session_id).is_some_and(|session| {
+            session.record.state == SessionState::Quiescing
+                && session.record.active_turn_id.as_deref() == Some(id)
+        }) {
+            return false;
+        }
+        *state.cancel_controls.entry(id.to_owned()).or_default() += 1;
+        true
+    }
+
+    /// Settle one dispatched cancel control and report whether the provider
+    /// has already terminalized the execution and all controls are complete.
+    pub fn finish_cancel_control(&self, id: &str) -> bool {
+        let mut state = self.state.borrow_mut();
+        if let Some(pending) = state.cancel_controls.get_mut(id) {
+            *pending = pending.saturating_sub(1);
+        }
+        let settled = state.cancel_controls.get(id).copied().unwrap_or(0) == 0
+            && state.cancel_terminal_seen.contains(id);
+        if settled {
+            state.cancel_controls.remove(id);
+            state.cancel_terminal_seen.remove(id);
+        }
+        settled
+    }
+
+    pub fn cancel_controls_pending(&self, id: &str) -> bool {
+        self.state
+            .borrow()
+            .cancel_controls
+            .get(id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    pub fn fail_canceled_turn(&self, id: &str, code: &str, message: &str) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(turn) = state.turns.get_mut(id) else {
+            return false;
+        };
+        if turn.state != TurnState::Canceled {
+            return false;
         }
         let session_id = turn.session_id.clone();
+        turn.state = TurnState::Failed;
+        turn.error = Some(json!({"code": code, "message": message}));
+        turn.completed_at_ms = Some(now_ms());
+        state.cancel_controls.remove(id);
+        state.cancel_terminal_seen.remove(id);
+        if let Some(session) = state.sessions.get_mut(&session_id) {
+            session.record.active_turn_id = None;
+            session.record.state = SessionState::Failed;
+            session.record.updated_at_ms = now_ms();
+        }
+        close_requests(&mut state, &session_id);
+        enforce_result_retention(&mut state, &session_id);
+        true
+    }
+
+    pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
+        let mut state = self.state.borrow_mut();
+        let session_id = {
+            let turn = state.turns.get(id).context("turn not found")?;
+            if turn.state != TurnState::Canceled
+                || provider_turn_id.is_some()
+                    && turn.provider_turn_id.is_some()
+                    && turn.provider_turn_id.as_deref() != provider_turn_id
+            {
+                return Ok(false);
+            }
+            turn.session_id.clone()
+        };
+        state.cancel_terminal_seen.insert(id.to_owned());
+        if state.cancel_controls.get(id).copied().unwrap_or(0) > 0 {
+            return Ok(false);
+        }
+        state.cancel_controls.remove(id);
+        state.cancel_terminal_seen.remove(id);
         let Some(session) = state.sessions.get_mut(&session_id) else {
             return Ok(false);
         };
@@ -905,24 +996,83 @@ impl Store {
             .unwrap_or_default()
     }
 
-    /// Record the caller's answer. The Session leaves `blocked` once its last
-    /// pending Request is resolved.
-    pub fn resolve_request(&self, session_id: &str, id: &str, resolution: Resolution) -> bool {
+    pub fn begin_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        answer: &Answer,
+    ) -> Option<AnswerClaim> {
+        let mut state = self.state.borrow_mut();
+        let uid = state.sessions.get(session_id)?.uid.clone();
+        state.requests.get_mut(&uid)?.begin_answer(id, answer)
+    }
+
+    pub fn finish_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        answer: Answer,
+        outcome: Outcome,
+        receipt: Value,
+    ) -> bool {
         let resolved = {
             let mut state = self.state.borrow_mut();
-            let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+            let Some(uid) = state
+                .sessions
+                .get(session_id)
+                .map(|session| session.uid.clone())
+            else {
                 return false;
             };
             state
                 .requests
                 .get_mut(&uid)
-                .and_then(|table| table.resolve(id, resolution))
+                .and_then(|table| {
+                    table.resolve_with_receipt(
+                        id,
+                        Resolution {
+                            outcome,
+                            answer: Some(answer),
+                        },
+                        receipt,
+                    )
+                })
                 .is_some()
         };
         if resolved {
             self.unblock_if_settled(session_id);
         }
         resolved
+    }
+
+    pub fn retry_request_answer(&self, session_id: &str, id: &str, answer: &Answer) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return false;
+        };
+        state
+            .requests
+            .get_mut(&uid)
+            .is_some_and(|table| table.retry_answer(id, answer))
+    }
+
+    pub fn fail_request_answer(&self, session_id: &str, id: &str, answer: &Answer) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return false;
+        };
+        state
+            .requests
+            .get_mut(&uid)
+            .is_some_and(|table| table.fail_answer(id, answer))
     }
 
     /// Close pending Requests as canceled: all of them, or the one the
@@ -1103,9 +1253,7 @@ mod tests {
     use super::{NewSession, Store};
     use crate::messages::{Decider, Decision, MessageBody};
     use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnState};
-    use crate::requests::{
-        Answer, Outcome, ProviderRequest, RequestDraft, RequestKind, Resolution,
-    };
+    use crate::requests::{Answer, Outcome, ProviderRequest, RequestDraft, RequestKind};
 
     fn ready_store() -> Store {
         let store = Store::new();
@@ -1566,7 +1714,10 @@ mod tests {
             .get_turn("turn_1")
             .unwrap_or_else(|| panic!("turn missing"));
         assert_eq!(turn.state, TurnState::Interrupted);
-        assert_eq!(turn.error.as_deref(), Some("agent exited"));
+        assert_eq!(
+            turn.error.as_ref().map(|error| error["message"].as_str()),
+            Some(Some("agent exited"))
+        );
     }
 
     #[test]
@@ -1909,17 +2060,40 @@ mod tests {
         assert_eq!(first.execution_seq, Some(1));
         assert_eq!(state(&store), SessionState::Blocked);
 
-        let allowed = Resolution {
-            outcome: Outcome::Allowed,
-            answer: Some(Answer::Allow),
-        };
-        assert!(store.resolve_request("codex:thread-1", "r1", allowed.clone()));
+        let allowed = Answer::Allow;
+        assert_eq!(
+            store.begin_request_answer("codex:thread-1", "r1", &allowed),
+            Some(crate::requests::AnswerClaim::Started)
+        );
+        assert!(store.finish_request_answer(
+            "codex:thread-1",
+            "r1",
+            allowed.clone(),
+            Outcome::Allowed,
+            serde_json::json!({"resolution": "allowed"}),
+        ));
         assert_eq!(state(&store), SessionState::Blocked, "r2 is still pending");
         assert!(
-            !store.resolve_request("codex:thread-1", "r1", allowed.clone()),
+            !store.finish_request_answer(
+                "codex:thread-1",
+                "r1",
+                allowed.clone(),
+                Outcome::Allowed,
+                serde_json::json!({"resolution": "allowed"}),
+            ),
             "a Request is resolved once"
         );
-        assert!(store.resolve_request("codex:thread-1", "r2", allowed));
+        assert_eq!(
+            store.begin_request_answer("codex:thread-1", "r2", &allowed),
+            Some(crate::requests::AnswerClaim::Started)
+        );
+        assert!(store.finish_request_answer(
+            "codex:thread-1",
+            "r2",
+            allowed,
+            Outcome::Allowed,
+            serde_json::json!({"resolution": "allowed"}),
+        ));
         assert_eq!(state(&store), SessionState::Busy);
 
         let uid = store

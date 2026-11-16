@@ -287,51 +287,7 @@ fn command_send(args: &[String]) -> Result<()> {
             .split_once(':')
             .filter(|(harness, id)| matches!(*harness, "claude" | "codex") && !id.is_empty())
             .context("--resume requires a provider-qualified codex:<id> or claude:<id> selector")?;
-        let configuration = config::load()?;
-        let profile = parsed
-            .one("--profile")
-            .map(|name| configuration.profile(name).cloned())
-            .transpose()?;
-        if let Some(profile_harness) = profile
-            .as_ref()
-            .and_then(|profile| profile.harness.as_deref())
-            && profile_harness != harness
-        {
-            bail!(
-                "Profile harness {profile_harness:?} does not match resume Session harness {harness:?}"
-            );
-        }
-        let explicit = explicit_launch(&parsed)?;
-        let client_environment = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
-        let launch =
-            configuration.resolve(harness, profile.as_ref(), &explicit, &client_environment)?;
-        if harness == "claude" {
-            config::validate_auth_environment(launch.auth, launch.environment.iter())?;
-        }
-        let prompt = prompt_from(&parsed, 1)?
-            .context("missing prompt; use --prompt-file, --stdin, or -- PROMPT")?;
-        let object = params.as_object_mut().context("invalid send parameters")?;
-        object.insert("cwd".to_owned(), json!(launch_cwd(&parsed)?));
-        object.insert("prompt".to_owned(), json!(prompt));
-        object.insert("model".to_owned(), json!(launch.model));
-        object.insert("effort".to_owned(), json!(launch.effort));
-        object.insert("harness_options".to_owned(), json!(launch.harness_options));
-        object.insert("approvals".to_owned(), json!(launch.approvals.as_str()));
-        if harness == "claude" {
-            object.insert("auth_policy".to_owned(), json!(launch.auth.as_str()));
-        }
-        object.insert(
-            "startup_timeout_ms".to_owned(),
-            json!(
-                parsed
-                    .one("--startup-timeout")
-                    .map(parse_duration)
-                    .transpose()?
-                    .unwrap_or(Duration::from_mins(1))
-                    .as_millis()
-            ),
-        );
-        object.insert("environment".to_owned(), json!(launch.environment));
+        apply_resume_launch_options(&parsed, &mut params, harness)?;
     } else {
         let prompt = prompt_from(&parsed, 1)?
             .context("missing prompt; use --prompt-file, --stdin, or -- PROMPT")?;
@@ -347,6 +303,78 @@ fn command_send(args: &[String]) -> Result<()> {
         client::call("session.send", params)?
     };
     print_success(result, parsed.flag("--pretty"))
+}
+
+fn apply_resume_launch_options(parsed: &Args, params: &mut Value, harness: &str) -> Result<()> {
+    let configuration = config::load()?;
+    let profile = parsed
+        .one("--profile")
+        .map(|name| configuration.profile(name).cloned())
+        .transpose()?;
+    let profile_values = parsed
+        .one("--profile")
+        .map(|name| configuration.profile_value(name))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if let Some(profile_harness) = profile
+        .as_ref()
+        .and_then(|profile| profile.harness.as_deref())
+        && profile_harness != harness
+    {
+        bail!(
+            "Profile harness {profile_harness:?} does not match resume Session harness {harness:?}"
+        );
+    }
+    let explicit = explicit_launch(parsed)?;
+    let client_environment = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+    let launch =
+        configuration.resolve(harness, profile.as_ref(), &explicit, &client_environment)?;
+    let prompt = prompt_from(parsed, 1)?
+        .context("missing prompt; use --prompt-file, --stdin, or -- PROMPT")?;
+    let object = params.as_object_mut().context("invalid send parameters")?;
+    if parsed.one("--cwd").is_some() {
+        object.insert("cwd".to_owned(), json!(launch_cwd(parsed)?));
+    }
+    object.insert("prompt".to_owned(), json!(prompt));
+    let profile_has = |name: &str| profile_values.get(name).is_some();
+    if parsed.one("--model").is_some() || profile_has("model") {
+        object.insert("model".to_owned(), json!(launch.model));
+    }
+    if parsed.one("--effort").is_some() || profile_has("effort") {
+        object.insert("effort".to_owned(), json!(launch.effort));
+    }
+    if parsed.many("--harness-option").next().is_some() || profile_has("harness_options") {
+        let profile_options = profile_values
+            .get("harness_options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned);
+        let options = profile_options
+            .chain(parsed.many("--harness-option").map(str::to_owned))
+            .collect::<Vec<_>>();
+        object.insert("harness_options".to_owned(), json!(options));
+    }
+    if approvals_option(parsed)?.is_some() || profile_has("approvals") {
+        object.insert("approvals".to_owned(), json!(launch.approvals.as_str()));
+    }
+    if harness == "claude" && (auth_option(parsed)?.is_some() || profile_has("auth")) {
+        object.insert("auth_policy".to_owned(), json!(launch.auth.as_str()));
+    }
+    object.insert(
+        "startup_timeout_ms".to_owned(),
+        json!(
+            parsed
+                .one("--startup-timeout")
+                .map(parse_duration)
+                .transpose()?
+                .unwrap_or(Duration::from_mins(1))
+                .as_millis()
+        ),
+    );
+    object.insert("environment".to_owned(), json!(launch.environment));
+    Ok(())
 }
 
 fn command_restart(args: &[String]) -> Result<()> {
@@ -417,7 +445,7 @@ fn command_answer(args: &[String]) -> Result<()> {
         "answer",
         args,
         &["--allow", "--deny", "--pretty"],
-        &["--message", "--text", "--choice"],
+        &["--message", "--text", "--choice", "--json"],
     )?;
     let [session, request] = parsed.positionals.as_slice() else {
         bail!("expected a Session selector and a Request ID");
@@ -427,9 +455,10 @@ fn command_answer(args: &[String]) -> Result<()> {
         parsed.flag("--deny"),
         parsed.one("--text").is_some(),
         parsed.one("--choice").is_some(),
+        parsed.one("--json").is_some(),
     ];
     if choices.iter().filter(|chosen| **chosen).count() != 1 {
-        bail!("answer requires exactly one of --allow, --deny, --text, or --choice");
+        bail!("answer requires exactly one of --allow, --deny, --text, --choice, or --json");
     }
     if parsed.one("--message").is_some() && !parsed.flag("--deny") {
         bail!("--message is accepted only with --deny");
@@ -452,6 +481,13 @@ fn command_answer(args: &[String]) -> Result<()> {
                 .filter(|choice| *choice > 0)
                 .context("invalid --choice; use a 1-based number")?
         );
+    } else if let Some(json_text) = parsed.one("--json") {
+        let value: Value = serde_json::from_str(json_text).context("invalid --json value")?;
+        if !value.is_object() {
+            bail!("--json requires a JSON object");
+        }
+        params["decision"] = json!("json");
+        params["json"] = value;
     }
     let result = match client::find_live_session(session)? {
         Some(route) => {
@@ -934,7 +970,7 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt show - show Session state, pending Requests, and latest result\n\nUSAGE\n  dlgt show <SESSION_ID|@ALIAS> [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help\n\nThe response carries resume_command, the provider's own command for opening\nthe conversation by hand after dlgt stop."
         }
         "answer" => {
-            "dlgt answer - answer a pending approval or question\n\nUSAGE\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --allow\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --deny [--message <TEXT>]\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --text <TEXT>\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --choice <N>\n\nOPTIONS\n  --allow            Allow this one approval Request\n  --deny             Deny this approval Request; the worker continues its turn\n  --message <TEXT>   Tell the worker why it was denied\n  --text <TEXT>      Answer a question in free text\n  --choice <N>       Answer a question with its Nth choice (1-based)\n  --pretty           Pretty-print JSON output\n  -h, --help         Print this help\n\nRequest IDs come from fetch's requests list. Repeating the same answer replays\nthe receipt; a different answer to a resolved Request is REQUEST_RESOLVED."
+            "dlgt answer - answer a pending approval or question\n\nUSAGE\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --allow\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --deny [--message <TEXT>]\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --text <TEXT>\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --choice <N>\n  dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID> --json <OBJECT>\n\nOPTIONS\n  --allow            Allow this one approval Request\n  --deny             Deny this approval Request; the worker continues its turn\n  --message <TEXT>   Tell the worker why it was denied\n  --text <TEXT>      Answer a question in free text\n  --choice <N>       Answer a question with its Nth choice (1-based)\n  --json <OBJECT>    Answer an MCP form elicitation with a JSON object\n  --pretty           Pretty-print JSON output\n  -h, --help         Print this help\n\nRequest IDs come from fetch's requests list. Repeating the same answer replays\nthe receipt; a different answer to a resolved Request is REQUEST_RESOLVED."
         }
         "stop" => {
             "dlgt stop - stop a Session and its process group\n\nUSAGE\n  dlgt stop <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --force      Force termination\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"

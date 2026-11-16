@@ -6,8 +6,12 @@ binary="$repo_root/target/debug/dlgt"
 state_dir=$(mktemp -d "${TMPDIR:-/tmp}/dlgt-smoke.XXXXXX")
 server_pid=
 old_server_pid=
+blocked_provider_pid=
+blocked_client_pid=
 
 cleanup() {
+  if [ -n "$blocked_client_pid" ]; then kill -KILL "$blocked_client_pid" 2>/dev/null || true; fi
+  if [ -n "$blocked_provider_pid" ]; then kill -KILL "$blocked_provider_pid" 2>/dev/null || true; fi
   if [ -n "$server_pid" ]; then
     DLGT_HOME="$state_dir" "$binary" server stop >/dev/null 2>&1 || true
     wait "$server_pid" 2>/dev/null || true
@@ -28,7 +32,24 @@ export DLGT_CODEX_BIN="$repo_root/tests/fixtures/fake-codex.sh"
 export DLGT_FAKE_ARGS_FILE="$state_dir/fake-args.log"
 export DLGT_FAKE_CODEX_LOG="$state_dir/fake-codex.log"
 export DLGT_FAKE_ROTATE_FILE="$state_dir/rotate"
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN DLGT_FAKE_NO_INIT DLGT_FAKE_API_KEY_SOURCE DLGT_FAKE_INIT_ON_START 2>/dev/null || true
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_AWS_API_KEY ANTHROPIC_BASE_URL \
+  ANTHROPIC_AWS_BASE_URL ANTHROPIC_AWS_WORKSPACE_ID ANTHROPIC_BEDROCK_BASE_URL \
+  ANTHROPIC_BEDROCK_MANTLE_BASE_URL ANTHROPIC_BEDROCK_REGION_PREFIX \
+  ANTHROPIC_BEDROCK_SERVICE_TIER ANTHROPIC_CUSTOM_HEADERS ANTHROPIC_FEDERATION_RULE_ID \
+  ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_AUTH_TOKEN ANTHROPIC_FOUNDRY_BASE_URL \
+  ANTHROPIC_FOUNDRY_RESOURCE ANTHROPIC_GOOGLE_CLOUD_BASE_URL \
+  ANTHROPIC_GOOGLE_CLOUD_LOCATION ANTHROPIC_GOOGLE_CLOUD_PROJECT \
+  ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_PROFILE \
+  ANTHROPIC_VERTEX_BASE_URL ANTHROPIC_VERTEX_PROJECT_ID ANTHROPIC_WORKSPACE_ID \
+  AWS_BEARER_TOKEN_BEDROCK CLAUDE_CODE_USE_ANTHROPIC_AWS \
+  CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD CLAUDE_CODE_USE_BEDROCK \
+  CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_VERTEX \
+  CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST CLAUDE_CODE_SIMPLE \
+  CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH \
+  CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_FOUNDRY_AUTH \
+  CLAUDE_CODE_SKIP_MANTLE_AUTH CLAUDE_CODE_SKIP_VERTEX_AUTH \
+  DLGT_FAKE_NO_INIT DLGT_FAKE_API_KEY_SOURCE DLGT_FAKE_INIT_ON_START 2>/dev/null || true
+export DLGT_FAKE_INIT_ONCE=1
 mkdir -p "$HOME"
 touch "$DLGT_FAKE_ARGS_FILE" "$DLGT_FAKE_CODEX_LOG"
 old_socket="$state_dir/run/old/dlgt.sock"
@@ -72,6 +93,14 @@ wait_until_gone() {
     attempt=$((attempt + 1)); test "$attempt" -lt 200 || fail "$1 never stopped"; sleep 0.02
   done
 }
+wait_until_state() {
+  selector=$1
+  wanted=$2
+  attempt=0
+  while ! "$binary" show "$selector" 2>/dev/null | grep -q "\"state\":\"$wanted\""; do
+    attempt=$((attempt + 1)); test "$attempt" -lt 200 || fail "$selector did not reach $wanted"; sleep 0.02
+  done
+}
 
 version=$("$binary" --version | field version)
 test -n "$version" || exit 1
@@ -88,8 +117,40 @@ expect "$defaults_json" '"codex".*"approvals":"auto"'
 printf '[defaults]\nunknown = true\n' >"$DLGT_CONFIG"
 doctor_json=$("$binary" doctor --json)
 expect "$doctor_json" '"id":"config","status":"fail"'
-expect "$doctor_json" 'unknown key.*defaults'
+expect "$doctor_json" 'invalid configuration entry'
 rm -f "$DLGT_CONFIG"
+
+# Configuration diagnostics retain path and location without echoing malformed
+# secret-bearing source to either output stream.
+cat >"$DLGT_CONFIG" <<'TOML'
+[profiles.secret]
+harness = "claude"
+env = { TOKEN = "DUMMY_SECRET_CONFIG_VALUE" ]
+TOML
+set +e
+"$binary" profiles defaults >"$state_dir/config.stdout" 2>"$state_dir/config.stderr"
+config_status=$?
+set -e
+test "$config_status" -eq 1 || fail "malformed config exited $config_status"
+config_stdout=$(cat "$state_dir/config.stdout")
+config_stderr=$(cat "$state_dir/config.stderr")
+expect "$config_stdout" '"code":"INVALID_ARGUMENT"'
+case "$config_stdout" in
+  *"$DLGT_CONFIG: invalid dlgt config at 3:"*) ;;
+  *) fail "config diagnostic omitted its path and location: $config_stdout" ;;
+esac
+refute "$config_stdout$config_stderr" 'DUMMY_SECRET_CONFIG_VALUE'
+rm -f "$DLGT_CONFIG"
+
+# Subscription launches require auth status to positively report a Claude.ai
+# login; diagnostic contents from the provider are never copied into the error.
+printf '%s\n' '{"loggedIn":true,"authMethod":"third_party","secret":"AUTH_STATUS_SECRET"}' \
+  >"$HOME/.fake-auth-status"
+rejected 1 "$binary" new --title auth-status-mismatch --harness claude --cwd "$repo_root" \
+  --request-id auth-status-mismatch-1 -- blocked
+expect "$output" '"code":"AUTH_MISMATCH"'
+refute "$output" 'AUTH_STATUS_SECRET\|third_party'
+rm -f "$HOME/.fake-auth-status"
 
 # A subscription launch refuses inherited API keys before the provider runs.
 claude_args_before=$(wc -c <"$DLGT_FAKE_ARGS_FILE" | tr -d ' ')
@@ -149,6 +210,28 @@ rejected 1 env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" restart "$unset_id"
 expect "$output" '"code":"AUTH_MISMATCH"'
 expect "$("$binary" show "$unset_id")" '"state":"stopped"'
 expect "$("$binary" show "$unset_id")" '"auth_policy":"subscription"'
+
+# Resume without policy flags keeps the Session's ask/subscription settings
+# even when mutable defaults now say auto/any.
+policy_json=$("$binary" new --title retained-policy --alias @retained-policy \
+  --harness claude --approvals ask --cwd "$repo_root" \
+  --request-id retained-policy-1 -- policy-initial)
+policy_id=$(printf '%s\n' "$policy_json" | field id)
+"$binary" fetch "$policy_id" --wait 5s >/dev/null
+"$binary" stop "$policy_id" --force >/dev/null
+wait_until_gone @retained-policy
+cat >"$DLGT_CONFIG" <<'TOML'
+[defaults.claude]
+approvals = "auto"
+auth = "any"
+TOML
+policy_resume=$("$binary" send "$policy_id" --resume --request-id retained-policy-2 -- policy-resumed)
+expect "$policy_resume" '"approvals":{"effective":"ask","requested":"ask"}'
+expect "$("$binary" show "$policy_id")" '"auth_policy":"subscription"'
+expect "$("$binary" fetch "$policy_id" --wait 5s)" '"final_text":"fake:policy-resumed"'
+"$binary" stop "$policy_id" --force >/dev/null
+wait_until_gone @retained-policy
+rm -f "$DLGT_CONFIG"
 
 # Claude system/init is a backstop for API-key helpers and settings. It fails
 # the launch, retains the auth report, and stops the provider before acceptance.
@@ -243,6 +326,94 @@ expect "$empty_json" "\"cursor\":\"$baseline_cursor\""
 # caller-chosen spelling past the measured byte bound.
 expect "$("$binary" fetch "$session_id" --cursor "000000000$baseline_cursor")" \
   "\"cursor\":\"$baseline_cursor\""
+
+# A large steer can fill Claude's stdin while its process is not reading. A
+# different Session must remain responsive while that write is pending.
+healthy_writer_id=$("$binary" new --title healthy-writer --alias @healthy-writer \
+  --harness claude --cwd "$repo_root" \
+  --request-id healthy-writer-1 -- healthy-writer | field id)
+expect "$("$binary" fetch "$healthy_writer_id" --wait 5s)" '"status":"completed"'
+writer_pid_file="$state_dir/blocked-writer.pid"
+blocked_writer_id=$("$binary" new --title blocked-writer --alias @blocked-writer \
+  --harness claude --cwd "$repo_root" \
+  --env "DLGT_FAKE_PID_FILE=$writer_pid_file" --request-id blocked-writer-1 -- hold-writer | field id)
+attempt=0
+while [ ! -s "$writer_pid_file" ]; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 200 || fail "fake Claude did not publish its PID"; sleep 0.02
+done
+blocked_provider_pid=$(cat "$writer_pid_file")
+kill -STOP "$blocked_provider_pid"
+awk 'BEGIN { for (i = 0; i < 300000; i++) printf "x" }' >"$state_dir/large-steer.txt"
+"$binary" send "$blocked_writer_id" --steer --request-id blocked-writer-steer \
+  --prompt-file "$state_dir/large-steer.txt" >"$state_dir/blocked-writer-send.json" 2>&1 &
+blocked_client_pid=$!
+sleep 0.2
+"$binary" show "$healthy_writer_id" >"$state_dir/healthy-writer-show.json" 2>&1 &
+healthy_show_pid=$!
+attempt=0
+while kill -0 "$healthy_show_pid" 2>/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 40 ]; then
+    kill -KILL "$healthy_show_pid" 2>/dev/null || true
+    fail "blocked Claude stdin write stalled an unrelated Session read"
+  fi
+  sleep 0.05
+done
+wait "$healthy_show_pid" || fail "unrelated Session read failed during a blocked write"
+expect "$(cat "$state_dir/healthy-writer-show.json")" '"state":"idle"'
+kill -KILL "$blocked_provider_pid" 2>/dev/null || true
+blocked_provider_pid=
+set +e
+wait "$blocked_client_pid"
+blocked_writer_status=$?
+set -e
+blocked_client_pid=
+test "$blocked_writer_status" -ne 0 || fail "large steer unexpectedly succeeded after provider exit"
+"$binary" stop "$blocked_writer_id" --force >/dev/null 2>&1 || true
+wait_until_gone @blocked-writer
+"$binary" stop "$healthy_writer_id" --force >/dev/null
+wait_until_gone @healthy-writer
+
+# Duplicate answers wait for the provider write outcome. Killing the stopped
+# provider must fail both callers instead of replaying an undelivered answer.
+answer_pid_file="$state_dir/blocked-answer.pid"
+blocked_answer_id=$("$binary" new --title blocked-answer --alias @blocked-answer \
+  --harness claude --approvals ask \
+  --cwd "$repo_root" --env "DLGT_FAKE_PID_FILE=$answer_pid_file" \
+  --request-id blocked-answer-1 -- ask-blocked-answer | field id)
+blocked_answer_request=$("$binary" fetch "$blocked_answer_id" --wait 5s)
+expect "$blocked_answer_request" '"id":"r1"'
+blocked_provider_pid=$(cat "$answer_pid_file")
+kill -STOP "$blocked_provider_pid"
+awk 'BEGIN { for (i = 0; i < 90000; i++) printf "x" }' >"$state_dir/large-answer.txt"
+large_answer=$(cat "$state_dir/large-answer.txt")
+"$binary" answer "$blocked_answer_id" r1 --deny --message "$large_answer" \
+  >"$state_dir/blocked-answer-first.json" 2>&1 &
+first_answer_pid=$!
+sleep 0.2
+"$binary" answer "$blocked_answer_id" r1 --deny --message "$large_answer" \
+  >"$state_dir/blocked-answer-duplicate.json" 2>&1 &
+blocked_client_pid=$!
+sleep 0.2
+expect "$("$binary" show "$blocked_answer_id")" '"answer_state":"sending"'
+test ! -s "$state_dir/blocked-answer-duplicate.json" \
+  || fail "duplicate answer returned before provider delivery settled"
+kill -KILL "$blocked_provider_pid" 2>/dev/null || true
+blocked_provider_pid=
+set +e
+wait "$first_answer_pid"
+first_answer_status=$?
+wait "$blocked_client_pid"
+duplicate_answer_status=$?
+set -e
+blocked_client_pid=
+test "$first_answer_status" -ne 0 || fail "failed provider answer delivery returned success"
+test "$duplicate_answer_status" -ne 0 || fail "duplicate replayed an undelivered answer"
+expect "$(cat "$state_dir/blocked-answer-first.json")" '"code":"REQUEST_DELIVERY_FAILED"'
+expect "$(cat "$state_dir/blocked-answer-duplicate.json")" '"code":"REQUEST_FAILED"'
+expect "$("$binary" show "$blocked_answer_id")" '"state":"failed"'
+"$binary" stop "$blocked_answer_id" --force >/dev/null 2>&1 || true
+wait_until_gone @blocked-answer
 
 # A current client routes provider-qualified selectors to a live daemon on a
 # different versioned socket instead of launching a duplicate locally.
@@ -446,8 +617,8 @@ expect "$denied_json" '"by":"caller","decision":"denied"'
 # A question is answered with text or one of its choices.
 question_cursor=$("$binary" send "$ask_id" --request-id ask-3 -- question-color | field cursor)
 question_json=$("$binary" fetch "$ask_id" --cursor "$question_cursor" --wait 5s)
-expect "$question_json" '"choices":\["Red","Blue"\]'
-expect "$question_json" '"kind":"question","text":"Which color?"'
+expect "$question_json" '"choices":\[{"index":1,"label":"Red"},{"index":2,"label":"Blue"}\]'
+expect "$question_json" '"kind":"question".*"text":"Which color?"'
 rejected 1 "$binary" answer "$ask_id" r3 --allow
 expect "$output" '"code":"INVALID_ARGUMENT"'
 expect "$("$binary" answer "$ask_id" r3 --choice 2)" '"resolution":"answered"'
@@ -474,7 +645,7 @@ expect "$("$binary" fetch "$ask_id" --wait 5s)" '"reason":"blocked"'
 expect "$("$binary" cancel "$ask_id")" '"status":"canceled"'
 expect "$("$binary" show "$ask_id")" '"requests":\[\]'
 rejected 1 "$binary" answer "$ask_id" r4 --allow
-expect "$output" '"code":"REQUEST_RESOLVED"'
+expect "$output" '"code":"REQUEST_FAILED"'
 # The Session is usable again, and the discarded steer never ran.
 after_cancel=$("$binary" send "$ask_id" --request-id cancel-3 -- after-cancel | field cursor)
 expect "$("$binary" fetch "$ask_id" --cursor "$after_cancel" --wait 5s)" \
@@ -489,6 +660,23 @@ expect "$watch_text" '^\[exec 1\] done   completed$'
 expect "$watch_text" '^\[exec 4\] done   canceled$'
 "$binary" stop "$ask_id" --force >/dev/null
 wait_until_gone @asker
+
+# The cancel timeout includes a Claude control response that is still pending.
+slow_cancel_json=$("$binary" new --title slow-cancel --alias @slow-cancel \
+  --harness claude --cwd "$repo_root" --request-id slow-cancel-1 \
+  --env DLGT_FAKE_INTERRUPT_DELAY=0.2 -- hold-cancel)
+slow_cancel_id=$(printf '%s\n' "$slow_cancel_json" | field id)
+rejected 3 "$binary" cancel "$slow_cancel_id" --timeout 1ms
+expect "$output" '"code":"CANCEL_TIMEOUT"'
+expect "$("$binary" show "$slow_cancel_id")" '"state":"canceling"'
+slow_cancel_result=$("$binary" fetch "$slow_cancel_id" --wait 5s)
+expect "$slow_cancel_result" '"status":"canceled"'
+wait_until_state "$slow_cancel_id" idle
+slow_after=$("$binary" send "$slow_cancel_id" --request-id slow-cancel-2 -- after-slow-cancel | field cursor)
+expect "$("$binary" fetch "$slow_cancel_id" --cursor "$slow_after" --wait 5s)" \
+  '"final_text":"fake:after-slow-cancel"'
+"$binary" stop "$slow_cancel_id" --force >/dev/null
+wait_until_gone @slow-cancel
 
 # A provider that does not honor the requested mode is reported, not hidden,
 # and so is a login that bills an API key.
@@ -677,6 +865,15 @@ grep -q '"sandbox":"workspace-write"' "$DLGT_FAKE_CODEX_LOG"
 grep -q 'model_reasoning_effort="high" app-server$' "$DLGT_FAKE_CODEX_LOG"
 if grep -q -- '--remote\|bypass' "$DLGT_FAKE_CODEX_LOG"; then fail "codex was given a terminal or bypass argument"; fi
 
+# A provider-confirmed completion with no agent text is still terminal and
+# publishes an empty result with an explicit source diagnostic.
+empty_codex_cursor=$("$binary" send "$codex_id" --request-id codex-empty -- empty-result | field cursor)
+empty_codex=$("$binary" fetch "$codex_id" --cursor "$empty_codex_cursor" --wait 5s)
+expect "$empty_codex" '"status":"completed"'
+expect "$empty_codex" '"final_text":""'
+expect "$empty_codex" '"final_text_source":"missing"'
+expect "$empty_codex" '"error":null'
+
 codex_cursor=$("$binary" send "$codex_id" --request-id codex-2 -- ask-codex | field cursor)
 codex_blocked=$("$binary" fetch "$codex_id" --cursor "$codex_cursor" --wait 5s)
 expect "$codex_blocked" '"reason":"blocked"'
@@ -689,10 +886,36 @@ expect "$codex_allowed" '"final_text":"allowed"'
 expect "$codex_allowed" '"by":"caller","decision":"approved"'
 "$binary" send "$codex_id" --request-id codex-3 -- ask-again >/dev/null
 expect "$("$binary" fetch "$codex_id" --wait 5s)" '"id":"r2"'
-"$binary" answer "$codex_id" r2 --deny >/dev/null
+codex_deny_receipt=$("$binary" answer "$codex_id" r2 --deny --message 'Do not run this command')
+expect "$codex_deny_receipt" '"resolution":"denied"'
+expect "$codex_deny_receipt" '"reason_delivered":true'
+steer_line=$(grep -n '"method":"turn/steer"' "$DLGT_FAKE_CODEX_LOG" | tail -n 1 | cut -d: -f1)
+decline_line=$(grep -n '"id":"srv-4".*"decision":"decline"' "$DLGT_FAKE_CODEX_LOG" | tail -n 1 | cut -d: -f1)
+test -n "$steer_line" && test -n "$decline_line" \
+  || fail "Codex did not record the denial reason and decline"
+test "$steer_line" -lt "$decline_line" || fail "Codex denial reason followed the decline"
 codex_denied=$("$binary" fetch "$codex_id" --wait 5s)
 expect "$codex_denied" '"final_text":"denied"'
 expect "$codex_denied" '"denied_requests":1'
+
+# MCP elicitation forms expose every required field and accept one JSON object.
+form_cursor=$("$binary" send "$codex_id" --request-id codex-form -- form-profile | field cursor)
+form_request=$("$binary" fetch "$codex_id" --cursor "$form_cursor" --wait 5s)
+expect "$form_request" '"name":"name"'
+expect "$form_request" '"type":"string"'
+expect "$form_request" '"name":"count"'
+expect "$form_request" '"type":"integer"'
+expect "$form_request" '"required":true'
+expect "$form_request" '"constraints":{"minLength":1}'
+rejected 4 "$binary" send "$codex_id" --request-id codex-form-blocked -- cannot-submit
+expect "$output" '"action":"dlgt answer codex:.* r3 --json <OBJECT>"'
+rejected 1 "$binary" answer "$codex_id" r3 --json '{"name":"Ada"}'
+expect "$output" '"code":"INVALID_ARGUMENT"'
+expect "$output" 'required form field.*count'
+form_answer=$("$binary" answer "$codex_id" r3 --json '{"name":"Ada","count":2}')
+expect "$form_answer" '"resolution":"answered"'
+form_result=$("$binary" fetch "$codex_id" --cursor "$form_cursor" --wait 5s)
+expect "$form_result" '"final_text":"form:Ada:2"'
 
 "$binary" send "$codex_id" --request-id codex-4 -- hold-codex >/dev/null
 expect "$("$binary" send "$codex_id" --steer --request-id codex-4-steer -- codex-steered)" \

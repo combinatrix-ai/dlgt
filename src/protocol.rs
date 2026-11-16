@@ -348,7 +348,7 @@ pub struct TurnRecord {
     pub final_text_recovered: bool,
     /// Approvals denied during this execution, by any reviewer.
     pub denied_requests: u32,
-    pub error: Option<String>,
+    pub error: Option<Value>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,

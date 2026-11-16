@@ -14,6 +14,19 @@ if [ -n "${DLGT_FAKE_ARGS_FILE:-}" ]; then
   printf '%s\n' "$@" >>"$DLGT_FAKE_ARGS_FILE"
 fi
 
+if [ "$1" = auth ] && [ "${2:-}" = status ]; then
+  if [ -f "$HOME/.fake-auth-status" ]; then
+    cat "$HOME/.fake-auth-status"
+  else
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+  fi
+  exit 0
+fi
+
+if [ -n "${DLGT_FAKE_PID_FILE:-}" ]; then
+  printf '%s\n' "$$" >"$DLGT_FAKE_PID_FILE"
+fi
+
 session=
 mode=default
 model=fake-model
@@ -41,10 +54,13 @@ if [ -n "${DLGT_FAKE_NO_INIT:-}" ]; then
   exit 1
 fi
 
-if [ -n "$DLGT_FAKE_INIT_ON_START" ]; then
+init_sent=0
+emit_init() {
   printf '{"type":"system","subtype":"init","session_id":"%s","model":"%s","permissionMode":"%s","apiKeySource":"%s"}\n' \
     "$session" "$model" "$mode" "$key_source"
-fi
+  init_sent=1
+}
+[ -n "${DLGT_FAKE_INIT_ON_START:-}" ] && emit_init
 
 holding=0
 asking=
@@ -89,6 +105,7 @@ while IFS= read -r line; do
           fi
           ;;
         *'"subtype":"interrupt"'*)
+          if [ -n "${DLGT_FAKE_INTERRUPT_DELAY:-}" ]; then sleep "$DLGT_FAKE_INTERRUPT_DELAY"; fi
           if [ -n "$asking" ]; then
             printf '{"type":"control_cancel_request","request_id":"ask-%s"}\n' "$ask_id"
           fi
@@ -133,8 +150,7 @@ while IFS= read -r line; do
       fi
       case "$content" in late*) sleep 6 ;; esac
       lifecycle "$uuid" started
-      printf '{"type":"system","subtype":"init","session_id":"%s","model":"%s","permissionMode":"%s","apiKeySource":"%s"}\n' \
-        "$session" "$model" "$mode" "$key_source"
+      if [ -z "${DLGT_FAKE_INIT_ONCE:-}" ] || [ "$init_sent" -eq 0 ]; then emit_init; fi
       replay "$uuid" "$content"
       case "$content" in
         hold*) holding=1 ;;

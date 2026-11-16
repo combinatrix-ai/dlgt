@@ -11,7 +11,7 @@ use crate::claude::{brief, input_summary};
 use crate::codex::final_agent_message_text;
 use crate::messages::{Decider, Decision, MessageBody};
 use crate::protocol::{SessionRecord, SessionState, TurnState};
-use crate::requests::{ProviderRequest, RequestDraft, RequestKind};
+use crate::requests::{FormField, ProviderRequest, RequestDraft, RequestKind};
 use crate::store::Store;
 
 /// What dlgt remembers about thread items, so a later approval request or
@@ -195,17 +195,13 @@ impl CodexItems {
             }
             "mcpServer/elicitation/request" => {
                 let form = text("mode") != Some("url");
-                let property = params
-                    .pointer("/requestedSchema/properties")
-                    .and_then(Value::as_object)
-                    .filter(|properties| properties.len() == 1)
-                    .and_then(|properties| properties.keys().next().cloned());
+                let fields = elicitation_fields(params);
                 let mut asked = text("message").unwrap_or_default().to_owned();
                 if let Some(url) = text("url") {
                     asked = format!("{asked}\n{url}");
                 }
                 question(
-                    ProviderRequest::CodexElicitation { property, form },
+                    ProviderRequest::CodexElicitation { fields, form },
                     text("serverName").unwrap_or("mcp"),
                     asked,
                     Vec::new(),
@@ -214,6 +210,69 @@ impl CodexItems {
             _ => return None,
         })
     }
+}
+
+fn elicitation_fields(params: &Value) -> Vec<FormField> {
+    const FIELD_LIMIT: usize = 16;
+    const ENUM_LIMIT: usize = 8;
+    const CONSTRAINTS: &[&str] = &["minimum", "maximum", "minLength", "maxLength", "pattern"];
+    let schema = params.get("requestedSchema").unwrap_or(&Value::Null);
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.iter())
+        .take(FIELD_LIMIT)
+        .map(|(name, property)| {
+            let field_type = property.get("type").map_or_else(
+                || "unknown".to_owned(),
+                |value| match value {
+                    Value::String(value) => value.clone(),
+                    Value::Array(values) => values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    _ => "unknown".to_owned(),
+                },
+            );
+            let enum_values = property
+                .get("enum")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(ENUM_LIMIT)
+                .filter(|value| {
+                    value.is_string() || value.is_number() || value.is_boolean() || value.is_null()
+                })
+                .cloned()
+                .collect();
+            let constraints = Value::Object(
+                property
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|object| object.iter())
+                    .filter(|(key, _)| CONSTRAINTS.contains(&key.as_str()))
+                    .take(8)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            );
+            FormField {
+                name: name.clone(),
+                field_type,
+                required: required.contains(name.as_str()),
+                enum_values,
+                constraints,
+            }
+        })
+        .collect()
 }
 
 fn review_action(action: &Value) -> (&'static str, String) {
@@ -250,7 +309,7 @@ pub fn apply_notification(
     session_id: &str,
     items: &mut CodexItems,
     message: &Value,
-) -> Result<()> {
+) -> Result<bool> {
     let method = message
         .get("method")
         .and_then(Value::as_str)
@@ -270,7 +329,7 @@ pub fn apply_notification(
         }
         "turn/started" => {
             if !codex_thread_matches(&session, params)? {
-                return Ok(());
+                return Ok(true);
             }
             let provider_turn_id = params
                 .pointer("/turn/id")
@@ -289,13 +348,18 @@ pub fn apply_notification(
                 turn_id
             };
             if store.mark_turn_started(&turn_id, Some(provider_turn_id)) {
-                store.set_session_state(session_id, SessionState::Busy);
+                if store
+                    .get_turn(&turn_id)
+                    .is_some_and(|turn| turn.state != TurnState::Canceled)
+                {
+                    store.set_session_state(session_id, SessionState::Busy);
+                }
                 store.record_event(Some(session_id), Some(&turn_id), "turn.started");
             }
         }
         "error" => {
             if !codex_thread_matches(&session, params)? {
-                return Ok(());
+                return Ok(true);
             }
             let provider_turn_id = params.get("turnId").and_then(Value::as_str);
             let turn_id = local_turn_for_provider(store, session_id, provider_turn_id)?;
@@ -313,7 +377,7 @@ pub fn apply_notification(
         }
         "turn/completed" => {
             if !codex_thread_matches(&session, params)? {
-                return Ok(());
+                return Ok(true);
             }
             let provider_turn_id = params
                 .pointer("/turn/id")
@@ -332,17 +396,17 @@ pub fn apply_notification(
             let Some(turn_id) = local_turn_for_provider(store, session_id, Some(provider_turn_id))?
             else {
                 store.record_event(Some(session_id), None, "provider.completion_unmatched");
-                return Ok(());
+                return Ok(true);
             };
             let final_message = codex_final_message(params);
-            let error_value = sanitize_codex_error(params.pointer("/turn/error"));
-            let error = (turn_state != TurnState::Completed).then(|| error_value.to_string());
+            let error = (turn_state != TurnState::Completed)
+                .then(|| sanitize_codex_error(params.pointer("/turn/error")));
             let completed = store.finish_turn_if_matching(
                 &turn_id,
                 Some(provider_turn_id),
                 turn_state,
                 final_message.as_deref(),
-                error.as_deref(),
+                error.as_ref(),
             )?;
             if completed {
                 store.set_session_state(session_id, SessionState::Idle);
@@ -373,14 +437,14 @@ pub fn apply_notification(
         }
         "item/autoApprovalReview/completed" => {
             if !codex_thread_matches(&session, params)? {
-                return Ok(());
+                return Ok(true);
             }
             let decision = match params.pointer("/review/status").and_then(Value::as_str) {
                 Some("approved") => Decision::Approved,
                 Some("denied") => Decision::Denied,
                 Some("timedOut") => Decision::TimedOut,
                 Some("aborted") => Decision::Aborted,
-                _ => return Ok(()),
+                _ => return Ok(true),
             };
             let action = params.get("action").unwrap_or(&Value::Null);
             let (tool, summary) = review_action(action);
@@ -397,9 +461,13 @@ pub fn apply_notification(
             );
         }
         "dlgt/server/request" => {
-            if let Some(draft) = items.request(&session.cwd, params) {
-                store.open_request(session_id, draft);
+            let Some(draft) = items.request(&session.cwd, params) else {
+                return Ok(false);
+            };
+            if !codex_server_request_matches(store, &session, params) {
+                return Ok(false);
             }
+            return Ok(store.open_request(session_id, draft).is_some());
         }
         "serverRequest/resolved" => {
             if let Some(id) = params.get("requestId") {
@@ -431,7 +499,32 @@ pub fn apply_notification(
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
+}
+
+fn codex_server_request_matches(store: &Store, session: &SessionRecord, params: &Value) -> bool {
+    let Some(provider_turn_id) = params
+        .get("params")
+        .and_then(|params| params.get("turnId"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(inner) = params.get("params") else {
+        return false;
+    };
+    if !codex_thread_matches(session, inner).is_ok_and(|matches| matches)
+        || !matches!(session.state, SessionState::Busy | SessionState::Blocked)
+    {
+        return false;
+    }
+    let Some(turn_id) = session.active_turn_id.as_deref() else {
+        return false;
+    };
+    store.get_turn(turn_id).is_some_and(|turn| {
+        turn.state == TurnState::Running
+            && turn.provider_turn_id.as_deref() == Some(provider_turn_id)
+    })
 }
 
 fn codex_thread_matches(session: &SessionRecord, params: &Value) -> Result<bool> {
@@ -495,8 +588,8 @@ fn sanitize_codex_error(error: Option<&Value>) -> Value {
         return Value::Null;
     };
     json!({
+        "code": error.get("codexErrorInfo").and_then(Value::as_str).unwrap_or("provider_error"),
         "message": sanitize_message(error.get("message").and_then(Value::as_str).unwrap_or("Codex turn failed")),
-        "code": error.get("codexErrorInfo").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -537,7 +630,7 @@ mod tests {
         session_id: &str,
         message: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        apply_notification(store, session_id, &mut CodexItems::default(), message)
+        apply_notification(store, session_id, &mut CodexItems::default(), message).map(|_| ())
     }
 
     fn busy_store() -> (Store, CodexItems) {
@@ -669,6 +762,34 @@ mod tests {
     }
 
     #[test]
+    fn idle_canceling_and_stale_codex_requests_are_refused() {
+        let mut idle = ready_store("codex");
+        let mut items = CodexItems::default();
+        let request = json!({
+            "method": "dlgt/server/request",
+            "params": {"method": "item/commandExecution/requestApproval", "id": 1,
+                "params": {"threadId": "thread-1", "turnId": "provider-turn", "command": "echo x"}}
+        });
+        assert!(
+            !apply_notification(&mut idle, "codex:thread-1", &mut items, &request)
+                .unwrap_or_else(|error| panic!("failed to apply idle request: {error}"))
+        );
+
+        let (mut busy, mut items) = busy_store();
+        let mut stale = request.clone();
+        stale["params"]["params"]["turnId"] = json!("other-turn");
+        assert!(
+            !apply_notification(&mut busy, "codex:thread-1", &mut items, &stale)
+                .unwrap_or_else(|error| panic!("failed to apply stale request: {error}"))
+        );
+        assert!(busy.cancel_turn("turn_1").unwrap_or(false));
+        assert!(
+            !apply_notification(&mut busy, "codex:thread-1", &mut items, &request)
+                .unwrap_or_else(|error| panic!("failed to apply canceling request: {error}"))
+        );
+    }
+
+    #[test]
     fn a_user_input_request_is_a_question_with_choices() {
         let (mut store, mut items) = busy_store();
         apply_notification(
@@ -695,8 +816,53 @@ mod tests {
             .unwrap_or_else(|| panic!("session uid missing"));
         let public = store.pending_requests(&uid)[0].public();
         assert_eq!(public["kind"], "question");
-        assert_eq!(public["text"], "Red or blue?");
-        assert_eq!(public["choices"], json!(["Red", "Blue"]));
+        assert_eq!(public["summary"], "Red or blue?");
+        assert_eq!(public["tool"], "request_user_input");
+        assert_eq!(
+            public["choices"],
+            json!([
+                {"index": 1, "label": "Red"},
+                {"index": 2, "label": "Blue"},
+            ])
+        );
+    }
+
+    #[test]
+    fn mcp_elicitation_publishes_bounded_multi_field_schema() {
+        let (mut store, mut items) = busy_store();
+        apply_notification(
+            &mut store,
+            "codex:thread-1",
+            &mut items,
+            &json!({
+                "method": "dlgt/server/request",
+                "params": {
+                    "method": "mcpServer/elicitation/request",
+                    "id": "form-1",
+                    "params": {
+                        "threadId": "thread-1", "turnId": "provider-turn",
+                        "mode": "form", "serverName": "profile", "message": "Create profile",
+                        "requestedSchema": {
+                            "type": "object", "required": ["name", "color"],
+                            "properties": {
+                                "name": {"type": "string", "maxLength": 40},
+                                "color": {"type": "string", "enum": ["red", "blue"]}
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply form request: {error}"));
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let public = store.pending_requests(&uid)[0].public();
+        assert_eq!(public["fields"].as_array().map(Vec::len), Some(2));
+        assert_eq!(public["fields"][0]["name"], "color");
+        assert_eq!(public["fields"][0]["enum"], json!(["red", "blue"]));
+        assert_eq!(public["fields"][1]["name"], "name");
+        assert_eq!(public["fields"][1]["required"], true);
     }
 
     #[test]
@@ -795,8 +961,9 @@ mod tests {
             .unwrap_or_else(|| panic!("turn missing"));
         assert_eq!(turn.state, TurnState::Failed);
         let error = turn.error.unwrap_or_else(|| panic!("turn error missing"));
-        assert!(error.contains("badRequest"));
-        assert!(!error.contains("secret"));
+        assert_eq!(error["code"], "badRequest");
+        assert_eq!(error["message"], "bad request");
+        assert!(!error.to_string().contains("secret"));
         let uid = store
             .session_uid("codex:thread-1")
             .unwrap_or_else(|| panic!("session uid missing"));

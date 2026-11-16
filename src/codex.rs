@@ -6,8 +6,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 const RESUME_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
 const STDERR_TAIL_LIMIT: usize = 4096;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Server requests that become Requests for the caller to answer. Anything
 /// else is refused on the spot, because nobody would ever answer it.
@@ -32,12 +34,19 @@ const CALLER_REQUESTS: [&str; 5] = [
     "mcpServer/elicitation/request",
 ];
 
-type NotificationHandler = Arc<dyn Fn(Value) + Send + Sync>;
+type NotificationHandler = Arc<dyn Fn(Value) -> bool + Send + Sync>;
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
+
+#[derive(Debug)]
+enum WriteCommand {
+    Message(Vec<u8>, Option<Sender<Result<(), String>>>),
+    Close,
+}
 
 pub struct CodexConnection {
     pid: u32,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    writer: Sender<WriteCommand>,
+    closed: Arc<AtomicBool>,
     pending: Pending,
     next_id: AtomicU64,
     handler: NotificationHandler,
@@ -72,7 +81,10 @@ impl CodexConnection {
             .context("failed to start the managed Codex app-server")?;
         let pid = child.id();
         let reaper_registration = reaper.watch(pid)?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let stdin = child
+            .stdin
+            .take()
+            .context("Codex app-server stdin was unavailable")?;
         let stdout = child
             .stdout
             .take()
@@ -84,6 +96,8 @@ impl CodexConnection {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let writer = spawn_writer(stdin, Arc::clone(&closed), pid)?;
 
         let tail = Arc::clone(&stderr_tail);
         std::thread::Builder::new()
@@ -94,7 +108,8 @@ impl CodexConnection {
         let io_handler = Arc::clone(&handler);
         let io_pending = Arc::clone(&pending);
         let io_terminal_turns = Arc::clone(&terminal_turns);
-        let io_stdin = Arc::clone(&stdin);
+        let io_writer = writer.clone();
+        let io_closed = Arc::clone(&closed);
         std::thread::Builder::new()
             .name("dlgt-codex-app-server".to_owned())
             .spawn(move || {
@@ -105,16 +120,18 @@ impl CodexConnection {
                     }
                     match serde_json::from_str::<Value>(&line) {
                         Ok(message) => dispatch_message(
-                            &io_stdin,
+                            &io_writer,
                             &io_pending,
                             &io_handler,
                             &io_terminal_turns,
                             message,
                         ),
-                        Err(error) => io_handler(json!({
-                            "method": "dlgt/protocol/error",
-                            "params": {"message": error.to_string()},
-                        })),
+                        Err(error) => {
+                            io_handler(json!({
+                                "method": "dlgt/protocol/error",
+                                "params": {"message": error.to_string()},
+                            }));
+                        }
                     }
                 }
                 let status = child.wait().ok();
@@ -123,13 +140,15 @@ impl CodexConnection {
                     |status| format!("Codex app-server exited: {status}"),
                 );
                 fail_pending(&io_pending, &reason);
+                io_closed.store(true, Ordering::Release);
                 io_handler(transport_closed(&reason));
             })
             .context("failed to start Codex app-server I/O thread")?;
 
         let connection = Arc::new(Self {
             pid,
-            stdin,
+            writer,
+            closed,
             pending,
             next_id: AtomicU64::new(1),
             handler,
@@ -137,7 +156,12 @@ impl CodexConnection {
             stderr_tail,
             _reaper_registration: reaper_registration,
         });
-        connection.request_within(
+        connection.initialize(startup_timeout)?;
+        Ok(connection)
+    }
+
+    fn initialize(&self, startup_timeout: Duration) -> Result<()> {
+        self.request_within(
             "initialize",
             json!({
                 "clientInfo": {
@@ -152,8 +176,7 @@ impl CodexConnection {
             }),
             startup_timeout,
         )?;
-        connection.notify("initialized", json!({}))?;
-        Ok(connection)
+        self.notify("initialized", json!({}))
     }
 
     pub const fn pid(&self) -> u32 {
@@ -259,7 +282,7 @@ impl CodexConnection {
 
     /// Answer a server request the caller decided.
     pub fn respond(&self, id: &Value, result: &Value) -> Result<()> {
-        write_message(&self.stdin, &json!({"id": id, "result": result}))
+        write_message(&self.writer, &json!({"id": id, "result": result}))
     }
 
     pub fn watch_turn(self: &Arc<Self>, thread_id: &str, turn_id: &str) -> Result<()> {
@@ -315,23 +338,26 @@ impl CodexConnection {
     }
 
     pub fn stop(&self) {
-        self.close_stdin();
+        self.close_writer();
         self.signal(libc::SIGTERM);
     }
 
     pub fn force_stop(&self) {
-        self.close_stdin();
+        self.close_writer();
         self.signal(libc::SIGKILL);
     }
 
-    fn close_stdin(&self) {
-        if let Ok(mut stdin) = self.stdin.lock() {
-            stdin.take();
-        }
+    fn close_writer(&self) {
+        let _ = self.writer.send(WriteCommand::Close);
+        self.closed.store(true, Ordering::Release);
     }
 
     fn closed(&self) -> bool {
-        self.stdin.lock().map_or(true, |stdin| stdin.is_none())
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub fn is_open(&self) -> bool {
+        !self.closed()
     }
 
     fn signal(&self, signal: i32) {
@@ -365,7 +391,7 @@ impl CodexConnection {
             ("method".to_owned(), json!(method)),
             ("params".to_owned(), params),
         ]));
-        if let Err(error) = write_message(&self.stdin, &message) {
+        if let Err(error) = write_message(&self.writer, &message) {
             if let Ok(mut pending) = self.pending.lock() {
                 pending.remove(&id);
             }
@@ -379,7 +405,7 @@ impl CodexConnection {
 
     fn notify(&self, method: &'static str, params: Value) -> Result<()> {
         write_message(
-            &self.stdin,
+            &self.writer,
             &Value::Object(Map::from_iter([
                 ("method".to_owned(), json!(method)),
                 ("params".to_owned(), params),
@@ -398,19 +424,73 @@ fn text_input(text: &str) -> Value {
     json!({"type": "text", "text": text, "text_elements": []})
 }
 
-fn write_message(stdin: &Mutex<Option<ChildStdin>>, message: &Value) -> Result<()> {
-    let mut stdin = stdin
-        .lock()
-        .map_err(|_| anyhow!("Codex stdin lock poisoned"))?;
-    let stdin = stdin
-        .as_mut()
-        .context("Codex app-server connection closed")?;
+fn serialize_message(message: &Value) -> Result<Vec<u8>> {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
-    stdin
-        .write_all(&line)
-        .and_then(|()| stdin.flush())
-        .context("Codex app-server connection closed")
+    Ok(line)
+}
+
+fn queue_message(writer: &Sender<WriteCommand>, message: &Value) -> Result<()> {
+    writer
+        .send(WriteCommand::Message(serialize_message(message)?, None))
+        .context("Codex app-server writer closed")
+}
+
+fn write_message(writer: &Sender<WriteCommand>, message: &Value) -> Result<()> {
+    let line = serialize_message(message)?;
+    let (sender, receiver) = mpsc::channel();
+    writer
+        .send(WriteCommand::Message(line, Some(sender)))
+        .context("Codex app-server writer closed")?;
+    receiver
+        .recv_timeout(WRITE_TIMEOUT)
+        .context("timed out writing to the Codex app-server")?
+        .map_err(|message| anyhow!(message))
+}
+
+fn spawn_writer(
+    stdin: ChildStdin,
+    closed: Arc<AtomicBool>,
+    pid: u32,
+) -> Result<Sender<WriteCommand>> {
+    let (writer, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("dlgt-codex-writer".to_owned())
+        .spawn(move || writer_loop(stdin, receiver, &closed, pid))
+        .context("failed to start Codex writer thread")?;
+    Ok(writer)
+}
+
+fn writer_loop(
+    mut stdin: ChildStdin,
+    receiver: Receiver<WriteCommand>,
+    closed: &AtomicBool,
+    pid: u32,
+) {
+    for command in receiver {
+        match command {
+            WriteCommand::Close => break,
+            WriteCommand::Message(line, acknowledgment) => {
+                let result = stdin
+                    .write_all(&line)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| format!("Codex app-server connection closed: {error}"));
+                if let Some(acknowledgment) = acknowledgment {
+                    let _ = acknowledgment.send(result.clone());
+                }
+                if result.is_err() {
+                    closed.store(true, Ordering::Release);
+                    if let Ok(pid) = i32::try_from(pid) {
+                        // SAFETY: kill has no memory-safety preconditions; the
+                        // app-server owns a dedicated process group.
+                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    closed.store(true, Ordering::Release);
 }
 
 fn retain_tail(mut stream: impl Read, tail: &Mutex<String>) {
@@ -441,7 +521,7 @@ fn is_rollout_not_ready(message: &str) -> bool {
 }
 
 fn dispatch_message(
-    stdin: &Mutex<Option<ChildStdin>>,
+    writer: &Sender<WriteCommand>,
     pending: &Pending,
     handler: &NotificationHandler,
     terminal_turns: &Arc<Mutex<HashSet<String>>>,
@@ -451,17 +531,26 @@ fn dispatch_message(
         && let Some(id) = message.get("id").cloned()
     {
         if CALLER_REQUESTS.contains(&method) {
-            handler(json!({
+            let accepted = handler(json!({
                 "method": "dlgt/server/request",
                 "params": {
                     "method": method,
-                    "id": id,
+                    "id": id.clone(),
                     "params": message.get("params"),
                 },
             }));
+            if !accepted {
+                let _ = queue_message(
+                    writer,
+                    &json!({
+                        "id": id,
+                        "error": {"code": -32000, "message": "dlgt refused the request"},
+                    }),
+                );
+            }
         } else {
-            let _ = write_message(
-                stdin,
+            let _ = queue_message(
+                writer,
                 &json!({
                     "id": id,
                     "error": {"code": -32601, "message": "dlgt does not handle this server request"},
@@ -511,16 +600,6 @@ fn dispatch_notification(
     }
     if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
         let turn = message.pointer("/params/turn");
-        if turn
-            .and_then(|turn| turn.get("status"))
-            .and_then(Value::as_str)
-            == Some("completed")
-            && turn
-                .and_then(final_agent_message_text)
-                .is_none_or(str::is_empty)
-        {
-            return;
-        }
         if let Some(turn_id) = turn.and_then(|turn| turn.get("id")).and_then(Value::as_str)
             && !mark_terminal_once(terminal_turns, turn_id)
         {
@@ -559,13 +638,10 @@ fn terminal_turn(response: &Value, turn_id: &str) -> Option<Value> {
             if turn.get("id").and_then(Value::as_str) != Some(turn_id) {
                 return false;
             }
-            match turn.get("status").and_then(Value::as_str) {
-                Some("failed" | "interrupted") => true,
-                Some("completed") => {
-                    final_agent_message_text(turn).is_some_and(|text| !text.is_empty())
-                }
-                _ => false,
-            }
+            matches!(
+                turn.get("status").and_then(Value::as_str),
+                Some("failed" | "interrupted" | "completed")
+            )
         })
         .cloned()
 }
@@ -657,7 +733,10 @@ mod tests {
                 "turns": [{"id": "done", "status": "completed", "items": []}],
             },
         });
-        assert!(terminal_turn(&empty_completion, "done").is_none());
+        assert_eq!(
+            terminal_turn(&empty_completion, "done").and_then(|turn| turn.get("status").cloned()),
+            Some(json!("completed"))
+        );
         let successful_completion = json!({
             "thread": {
                 "status": {"type": "idle"},
@@ -690,6 +769,7 @@ mod tests {
         let handler_calls = Arc::clone(&calls);
         let handler: NotificationHandler = Arc::new(move |_message| {
             handler_calls.fetch_add(1, Ordering::Relaxed);
+            true
         });
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let notification = json!({
@@ -714,6 +794,7 @@ mod tests {
         let handler_calls = Arc::clone(&calls);
         let handler: NotificationHandler = Arc::new(move |_message| {
             handler_calls.fetch_add(1, Ordering::Relaxed);
+            true
         });
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let completed = json!({
@@ -740,11 +821,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_success_waits_for_reconciled_turn() {
+    fn completed_empty_turn_is_terminal() {
         let calls = Arc::new(AtomicUsize::new(0));
         let handler_calls = Arc::clone(&calls);
         let handler: NotificationHandler = Arc::new(move |_message| {
             handler_calls.fetch_add(1, Ordering::Relaxed);
+            true
         });
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let incomplete = json!({
@@ -755,7 +837,7 @@ mod tests {
             },
         });
         dispatch_notification(&handler, &terminal_turns, incomplete);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let empty_message = json!({
             "method": "turn/completed",
@@ -769,7 +851,7 @@ mod tests {
             },
         });
         dispatch_notification(&handler, &terminal_turns, empty_message);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let unfinished_final_message = json!({
             "method": "turn/completed",
@@ -786,7 +868,7 @@ mod tests {
             },
         });
         dispatch_notification(&handler, &terminal_turns, unfinished_final_message);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let reconciled = json!({
             "method": "turn/completed",

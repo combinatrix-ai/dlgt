@@ -33,7 +33,8 @@ use crate::provider::{
 };
 use crate::reaper::Reaper;
 use crate::requests::{
-    Answer, Outcome, PUBLISHED_REQUEST_LIMIT, ProviderRequest, RequestKind, Resolution,
+    Answer, AnswerClaim, Outcome, PUBLISHED_REQUEST_LIMIT, ProviderRequest, RequestKind,
+    RequestRecord,
 };
 use crate::store::{NewSession, Store, now_ms};
 use crate::update;
@@ -477,7 +478,7 @@ impl Daemon {
         let Some(line) = read_rpc_line(&stream)? else {
             // A probe may connect only to check whether the socket is live and
             // close before sending a frame. This is normal EOF, not malformed
-            // JSON, and must not produce an INVALID_REQUEST/Broken pipe log.
+            // JSON, and must not produce a malformed-frame/Broken pipe log.
             return Ok(());
         };
         let request = match serde_json::from_str::<Request>(&line) {
@@ -485,7 +486,7 @@ impl Daemon {
             Err(error) => {
                 write_response(
                     &mut stream,
-                    &Response::error("unknown", "INVALID_REQUEST", error.to_string()),
+                    &Response::error("unknown", "INVALID_ARGUMENT", error.to_string()),
                 )?;
                 return Ok(());
             }
@@ -571,10 +572,7 @@ impl Daemon {
             .unwrap_or_default();
         drop(store);
         let Some(first) = pending.first() else { return };
-        let answer = match first.draft.kind {
-            RequestKind::Approval => "--allow|--deny",
-            RequestKind::Question => "--text <TEXT>|--choice <N>",
-        };
+        let answer = answer_action(first);
         error.action = Some(format!("dlgt answer {} {} {answer}", session.id, first.id));
         error.request_ids = Some(pending.iter().map(|request| request.id.clone()).collect());
     }
@@ -705,6 +703,9 @@ impl Daemon {
         let environment = launch_environment(params)?;
         if agent == Agent::Claude {
             config::validate_auth_environment(auth_policy, environment.iter())?;
+            if auth_policy == AuthPolicy::Subscription {
+                crate::provider::verify_claude_subscription_login()?;
+            }
         }
         let mut id = generate_internal_id();
         let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
@@ -997,6 +998,21 @@ impl Daemon {
         );
         if let Some(retained) = retained {
             object.insert("alias".to_owned(), json!(retained.alias));
+            if object.get("cwd").is_none_or(Value::is_null) {
+                object.insert("cwd".to_owned(), json!(retained.cwd));
+            }
+            if object.get("model").is_none_or(Value::is_null) {
+                object.insert("model".to_owned(), json!(retained.model));
+            }
+            if object.get("effort").is_none_or(Value::is_null) {
+                object.insert("effort".to_owned(), json!(retained.effort));
+            }
+            if object.get("harness_options").is_none_or(Value::is_null) {
+                object.insert(
+                    "harness_options".to_owned(),
+                    json!(retained.harness_options),
+                );
+            }
             // The approvals mode is stored with the Session and reused
             // unless this command supplies a new one.
             if object.get("approvals").is_none_or(Value::is_null) {
@@ -1059,6 +1075,9 @@ impl Daemon {
                 session.auth_policy.unwrap_or_default(),
                 environment.iter(),
             )?;
+            if session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription {
+                crate::provider::verify_claude_subscription_login()?;
+            }
         }
         let startup_deadline = Instant::now() + startup_timeout(params);
 
@@ -1179,9 +1198,15 @@ impl Daemon {
                             process.stop();
                         }
                     }
-                    claude::Action::Interrupt => {
+                    claude::Action::Interrupt { turn_id } => {
                         if let Some(process) = event_process.get().and_then(Weak::upgrade) {
-                            let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
+                            spawn_claude_cancel_control(
+                                Arc::clone(&event_store),
+                                Arc::clone(&event_turns),
+                                process,
+                                session_id.clone(),
+                                turn_id,
+                            );
                         }
                     }
                     claude::Action::Refuse { request_id, reason } => {
@@ -1301,9 +1326,12 @@ impl Daemon {
         let event_changed = Arc::clone(&self.submission_changed);
         let items = Mutex::new(CodexItems::default());
         let handler = Arc::new(move |message: Value| {
+            let request =
+                message.get("method").and_then(Value::as_str) == Some("dlgt/server/request");
             let Ok(session_id) = event_session_id.read().map(|id| id.clone()) else {
-                return;
+                return !request;
             };
+            let mut accepted = true;
             if message.get("method").and_then(Value::as_str) == Some("dlgt/transport/closed") {
                 let reason = message
                     .pointer("/params/message")
@@ -1312,12 +1340,24 @@ impl Daemon {
                 record_session_exit(&event_store, &event_sessions, &session_id, reason, None);
             } else if let Ok(mut store) = event_store.lock()
                 && let Ok(mut items) = items.lock()
-                && let Err(error) =
-                    codex_events::apply_notification(&mut store, &session_id, &mut items, &message)
             {
-                eprintln!("dlgt failed to apply Codex notification: {error:#}");
+                match codex_events::apply_notification(
+                    &mut store,
+                    &session_id,
+                    &mut items,
+                    &message,
+                ) {
+                    Ok(result) => accepted = result,
+                    Err(error) => {
+                        eprintln!("dlgt failed to apply Codex notification: {error:#}");
+                        accepted = !request;
+                    }
+                }
+            } else if request {
+                accepted = false;
             }
             event_changed.notify_all();
+            accepted
         });
         let control = CodexConnection::connect(
             handler,
@@ -1473,7 +1513,7 @@ impl Daemon {
                     }
                     Err(error) => {
                         let store = self.lock_store()?;
-                        let message = sanitize_message(&error.to_string());
+                        let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
                         let _ = store.finish_turn_if_matching(
                             &turn_id,
                             None,
@@ -1492,16 +1532,13 @@ impl Daemon {
             }
             AgentRuntime::Claude { process, turns } => {
                 let uuid = Uuid::new_v4().to_string();
-                let written = turns
+                turns
                     .lock()
-                    .map_err(|_| anyhow!("Claude turn lock poisoned"))
-                    .and_then(|mut turns| {
-                        turns.begin(&uuid);
-                        process.send_user(&uuid, prompt)
-                    });
-                if let Err(error) = written {
+                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?
+                    .begin(&uuid);
+                if let Err(error) = process.send_user(&uuid, prompt) {
                     let store = self.lock_store()?;
-                    let message = sanitize_message(&error.to_string());
+                    let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
                     let _ = store.finish_turn_if_matching(
                         &turn_id,
                         None,
@@ -1509,8 +1546,9 @@ impl Daemon {
                         None,
                         Some(&message),
                     )?;
-                    store.set_session_state(&session.id, SessionState::Idle);
+                    store.set_session_failed(&session.id);
                     store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
+                    store.record_event(Some(&session.id), None, "session.failed");
                     return Err(error);
                 }
             }
@@ -1524,7 +1562,7 @@ impl Daemon {
                 .lock_store()?
                 .get_turn(&turn_id)
                 .and_then(|turn| turn.error)
-                .is_some_and(|error| error.starts_with("AUTH_MISMATCH:"))
+                .is_some_and(|error| error["code"] == "AUTH_MISMATCH")
         {
             return Err(AuthMismatch.into());
         }
@@ -1619,11 +1657,12 @@ impl Daemon {
                 delivered?;
                 cursor
             }
-            AgentRuntime::Claude { process, turns } => {
+            AgentRuntime::Claude {
+                process,
+                turns: turn_state,
+            } => {
                 let uuid = Uuid::new_v4().to_string();
-                // Held across the check and the write: the event thread takes
-                // this lock before it can end the execution on a `result`.
-                let mut turns = turns
+                let mut turns = turn_state
                     .lock()
                     .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
                 let store = self.lock_store()?;
@@ -1631,12 +1670,18 @@ impl Daemon {
                     return Err(gone());
                 }
                 let cursor = Self::acceptance_cursor(&store, &session.id)?;
+                store.append_message(&session.id, MessageBody::steer(text, false, false));
                 turns.add_steer(&uuid, text);
+                drop(store);
+                drop(turns);
                 if let Err(error) = process.send_user(&uuid, text) {
+                    let mut turns = turn_state
+                        .lock()
+                        .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+                    let store = self.lock_store()?;
                     turns.discard(&store, &session.id, &uuid);
                     return Err(error);
                 }
-                store.append_message(&session.id, MessageBody::steer(text, false, false));
                 cursor
             }
         };
@@ -1664,41 +1709,233 @@ impl Daemon {
                     session.id
                 )
             })?;
-        let receipt = |outcome: Outcome, cursor: Option<String>| -> Result<Value> {
-            let current = self.resolve_session(&session.id)?;
-            let mut value = json!({
-                "session": self.public_session(&current)?,
-                "request": {"id": record.id, "resolution": outcome.as_str()},
-            });
-            match cursor {
-                Some(cursor) => value["cursor"] = json!(cursor),
-                None => value["replayed"] = json!(true),
-            }
-            Ok(value)
-        };
-        if let Some(resolution) = &record.resolution {
-            if resolution.answer.as_ref() == Some(&answer) {
-                return receipt(resolution.outcome, None);
-            }
-            bail!(
-                "REQUEST_RESOLVED: Request {} was already {}",
-                record.id,
-                resolution.outcome.as_str()
-            );
-        }
         let (outcome, payload) = record.reply(&answer)?;
-        let cursor = {
-            let store = self.lock_store()?;
-            let cursor = Self::acceptance_cursor(&store, &session.id)?;
-            // Claim the Request before talking to the provider, so two
-            // concurrent answers cannot both be sent.
-            let resolution = Resolution {
-                outcome,
-                answer: Some(answer.clone()),
+        let codex_request_id = if matches!(runtime.as_ref(), AgentRuntime::Codex { .. }) {
+            Some(
+                serde_json::from_str::<Value>(&record.draft.provider_key)
+                    .context("retained Codex request ID is not valid JSON")?,
+            )
+        } else {
+            None
+        };
+        let claim = self.claim_request_answer(&session.id, &record, &answer)?;
+        if let AnswerClaim::Replay(resolution) = claim {
+            return self.answer_receipt(&session.id, &record, resolution.outcome, None);
+        }
+        let cursor = match self
+            .lock_store()
+            .and_then(|store| Self::acceptance_cursor(&store, &session.id))
+        {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                if let Ok(store) = self.lock_store() {
+                    store.retry_request_answer(&session.id, &record.id, &answer);
+                }
+                self.submission_changed.notify_all();
+                return Err(error);
+            }
+        };
+        let receipt_extra = self.deliver_answer(
+            &session,
+            runtime.as_ref(),
+            &record,
+            &answer,
+            &payload,
+            codex_request_id.as_ref(),
+        )?;
+        self.finish_answer(&session, &record, &answer, outcome, &receipt_extra)?;
+        self.submission_changed.notify_all();
+        self.answer_receipt(&session.id, &record, outcome, Some(cursor))
+    }
+
+    fn claim_request_answer(
+        &self,
+        session_id: &str,
+        record: &RequestRecord,
+        answer: &Answer,
+    ) -> Result<AnswerClaim> {
+        let mut waited_for_attempt = false;
+        loop {
+            let (claim, state) = {
+                let store = self.lock_store()?;
+                let claim = store.begin_request_answer(session_id, &record.id, answer);
+                let state = store
+                    .request(session_id, &record.id)
+                    .map(|request| request.answer_state);
+                (claim, state)
             };
-            if !store.resolve_request(&session.id, &record.id, resolution) {
+            let claim = claim.with_context(|| {
+                format!(
+                    "REQUEST_NOT_FOUND: Session {session_id} has no Request {}",
+                    record.id
+                )
+            })?;
+            if waited_for_attempt && state == Some(crate::requests::AnswerState::Pending) {
                 bail!(
-                    "REQUEST_RESOLVED: Request {} was resolved while this answer was in flight",
+                    "REQUEST_DELIVERY_FAILED: delivery failed for Request {}; it remains pending and can be answered again",
+                    record.id
+                );
+            }
+            match claim {
+                AnswerClaim::Started | AnswerClaim::Replay(_) => return Ok(claim),
+                AnswerClaim::Waiting => {
+                    let store = self.lock_store()?;
+                    let (store, timeout) = self
+                        .submission_changed
+                        .wait_timeout(store, Duration::from_mins(1))
+                        .map_err(|_| anyhow!("session store lock poisoned"))?;
+                    drop(store);
+                    if timeout.timed_out() {
+                        bail!(
+                            "REQUEST_BUSY: answer delivery is still in progress for {}",
+                            record.id
+                        );
+                    }
+                    waited_for_attempt = true;
+                }
+                AnswerClaim::Conflict => bail!(
+                    "REQUEST_RESOLVED: Request {} was answered with a different decision",
+                    record.id
+                ),
+                AnswerClaim::Failed => bail!(
+                    "REQUEST_FAILED: Request {} failed or its execution ended before an answer was delivered",
+                    record.id
+                ),
+            }
+        }
+    }
+
+    fn answer_receipt(
+        &self,
+        session_id: &str,
+        record: &RequestRecord,
+        outcome: Outcome,
+        cursor: Option<String>,
+    ) -> Result<Value> {
+        let current = self.resolve_session(session_id)?;
+        let latest = self
+            .lock_store()?
+            .request(session_id, &record.id)
+            .unwrap_or(record.clone());
+        let mut value = json!({
+            "session": self.public_session(&current)?,
+            "request": {"id": record.id, "resolution": outcome.as_str()},
+        });
+        if let Some(extra) = latest.answer_receipt
+            && let Some(object) = extra.as_object()
+        {
+            for (key, field) in object {
+                value["request"][key] = field.clone();
+            }
+        }
+        if let Some(cursor) = cursor {
+            value["cursor"] = json!(cursor);
+        } else {
+            value["replayed"] = json!(true);
+        }
+        Ok(value)
+    }
+
+    fn deliver_answer(
+        &self,
+        session: &SessionRecord,
+        runtime: &AgentRuntime,
+        record: &RequestRecord,
+        answer: &Answer,
+        payload: &Value,
+        codex_request_id: Option<&Value>,
+    ) -> Result<serde_json::Map<String, Value>> {
+        let mut receipt_extra = serde_json::Map::new();
+        let provider_delivery = match runtime {
+            AgentRuntime::Claude { process, .. } => {
+                process.respond(&record.draft.provider_key, payload)
+            }
+            AgentRuntime::Codex { control, thread_id } => {
+                let id = codex_request_id.context("Codex request ID is missing")?;
+                let reason_delivery = if let Answer::Deny {
+                    message: Some(message),
+                } = &answer
+                    && matches!(
+                        &record.draft.provider,
+                        ProviderRequest::CodexCommand
+                            | ProviderRequest::CodexFileChange
+                            | ProviderRequest::CodexPermissions { .. }
+                    ) {
+                    let provider_turn_id = session
+                        .active_turn_id
+                        .as_deref()
+                        .and_then(|id| self.lock_store().ok()?.get_turn(id))
+                        .and_then(|turn| turn.provider_turn_id);
+                    Some(match provider_turn_id {
+                        Some(turn_id) => control
+                            .steer_turn(thread_id, &turn_id, message)
+                            .map_err(|error| sanitize_message(&error.to_string())),
+                        None => Err("Codex has not acknowledged the active turn".to_owned()),
+                    })
+                } else {
+                    None
+                };
+                if let Some(reason_delivery) = reason_delivery {
+                    receipt_extra.insert(
+                        "reason_delivered".to_owned(),
+                        json!(reason_delivery.is_ok()),
+                    );
+                    if let Err(error) = reason_delivery {
+                        receipt_extra.insert("reason_error".to_owned(), json!(error));
+                    }
+                }
+                control.respond(id, payload)
+            }
+        };
+        if let Err(error) = provider_delivery {
+            let available = match runtime {
+                AgentRuntime::Claude { process, .. } => process.is_open(),
+                AgentRuntime::Codex { control, .. } => control.is_open(),
+            };
+            if available {
+                if let Ok(store) = self.lock_store() {
+                    store.retry_request_answer(&session.id, &record.id, answer);
+                }
+            } else if let Ok(store) = self.lock_store() {
+                store.fail_request_answer(&session.id, &record.id, answer);
+                if let Some(turn_id) = session.active_turn_id.as_deref() {
+                    let structured = json!({"code": "answer_delivery_failed", "message": sanitize_message(&error.to_string())});
+                    let _ = store.finish_turn_if_matching(
+                        turn_id,
+                        None,
+                        TurnState::Failed,
+                        None,
+                        Some(&structured),
+                    );
+                    store.set_session_failed(&session.id);
+                    store.record_event(Some(&session.id), Some(turn_id), "turn.failed");
+                    store.record_event(Some(&session.id), None, "session.failed");
+                }
+            }
+            self.submission_changed.notify_all();
+            return Err(error.context(format!(
+                "REQUEST_DELIVERY_FAILED: delivery failed for Request {}",
+                record.id
+            )));
+        }
+        Ok(receipt_extra)
+    }
+
+    fn finish_answer(
+        &self,
+        session: &SessionRecord,
+        record: &RequestRecord,
+        answer: &Answer,
+        outcome: Outcome,
+        receipt_extra: &serde_json::Map<String, Value>,
+    ) -> Result<()> {
+        let extra = Value::Object(receipt_extra.clone());
+        {
+            let store = self.lock_store()?;
+            if !store.finish_request_answer(&session.id, &record.id, answer.clone(), outcome, extra)
+            {
+                bail!(
+                    "REQUEST_RESOLVED: Request {} was withdrawn before delivery completed",
                     record.id
                 );
             }
@@ -1719,38 +1956,8 @@ impl Daemon {
                     ),
                 );
             }
-            cursor
-        };
-        match runtime.as_ref() {
-            AgentRuntime::Claude { process, .. } => {
-                process.respond(&record.draft.provider_key, &payload)?;
-            }
-            AgentRuntime::Codex { control, thread_id } => {
-                let id = serde_json::from_str::<Value>(&record.draft.provider_key)
-                    .context("retained Codex request ID is not valid JSON")?;
-                control.respond(&id, &payload)?;
-                // Codex's decline carries no text, so the caller's reason
-                // reaches the worker as input to the same turn.
-                if let Answer::Deny {
-                    message: Some(message),
-                } = &answer
-                    && matches!(
-                        record.draft.provider,
-                        ProviderRequest::CodexCommand
-                            | ProviderRequest::CodexFileChange
-                            | ProviderRequest::CodexPermissions { .. }
-                    )
-                    && let Some(turn_id) = session
-                        .active_turn_id
-                        .as_deref()
-                        .and_then(|id| self.lock_store().ok()?.get_turn(id))
-                        .and_then(|turn| turn.provider_turn_id)
-                {
-                    let _ = control.steer_turn(thread_id, &turn_id, message);
-                }
-            }
         }
-        receipt(outcome, Some(cursor))
+        Ok(())
     }
 
     fn wait_for_submission_confirmation(&self, turn_id: &str) -> Result<bool> {
@@ -1832,10 +2039,13 @@ impl Daemon {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000);
-        self.interrupt_turn(&session, &turn_id)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        self.interrupt_turn(&session, &turn_id)?;
         loop {
             let current = self.resolve_session(&session.id)?;
+            if current.state == SessionState::Failed {
+                bail!("SESSION_UNAVAILABLE: Session failed while cancellation was in progress");
+            }
             if current.state == SessionState::Idle || current.active_turn_id.is_none() {
                 let result = self.lock_store()?.latest_turn(&session.id);
                 return Ok(json!({
@@ -1845,7 +2055,7 @@ impl Daemon {
                 }));
             }
             if Instant::now() >= deadline {
-                bail!("cancel timed out; cancellation continues");
+                bail!("CANCEL_TIMEOUT: cancellation continues for execution {turn_id}");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1857,54 +2067,163 @@ impl Daemon {
     fn interrupt_turn(&self, session: &SessionRecord, turn_id: &str) -> Result<()> {
         let runtime = self.runtime(&session.id)?;
         let turn = self.resolve_turn(turn_id)?;
-        if let AgentRuntime::Codex { .. } = runtime.as_ref()
-            && turn.provider_turn_id.is_none()
-        {
-            bail!("session is unavailable: Codex has not acknowledged the execution yet");
+        match runtime.as_ref() {
+            AgentRuntime::Codex { control, thread_id } => self.interrupt_codex_turn(
+                session,
+                turn_id,
+                &turn,
+                Arc::clone(control),
+                thread_id.clone(),
+            ),
+            AgentRuntime::Claude { process, turns } => self.interrupt_claude_turn(
+                session,
+                turn_id,
+                &turn,
+                Arc::clone(process),
+                Arc::clone(turns),
+            ),
         }
+    }
+
+    fn interrupt_codex_turn(
+        &self,
+        session: &SessionRecord,
+        turn_id: &str,
+        turn: &TurnRecord,
+        control: Arc<CodexConnection>,
+        thread_id: String,
+    ) -> Result<()> {
         {
             let mut store = self.lock_store()?;
-            if !store.cancel_turn(turn_id)? {
+            if turn.state == TurnState::Canceled && session.state == SessionState::Quiescing {
+                return Ok(());
+            }
+            if !store.cancel_turn_with_controls(turn_id, 1)? {
                 bail!("turn is already terminal or no longer active");
             }
             store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
         }
-        match runtime.as_ref() {
-            AgentRuntime::Codex { control, thread_id } => {
-                control.interrupt_turn(thread_id, turn.provider_turn_id.as_deref().unwrap_or(""))
+        let store = Arc::clone(&self.store);
+        let session_id = session.id.clone();
+        let turn_id = turn_id.to_owned();
+        std::thread::Builder::new()
+            .name("dlgt-codex-cancel".to_owned())
+            .spawn(move || {
+                loop {
+                    let current = store.lock().ok().and_then(|store| {
+                        let session = store.get_session(&session_id)?;
+                        let turn = store.get_turn(&turn_id)?;
+                        Some((session, turn))
+                    });
+                    let Some((session, turn)) = current else {
+                        return;
+                    };
+                    if session.state != SessionState::Quiescing
+                        || session.active_turn_id.as_deref() != Some(turn_id.as_str())
+                    {
+                        return;
+                    }
+                    if let Some(provider_turn_id) = turn.provider_turn_id {
+                        if let Err(error) = control.interrupt_turn(&thread_id, &provider_turn_id) {
+                            fail_cancelled_turn(&store, &session_id, &turn_id, &error.to_string());
+                            control.force_stop();
+                            return;
+                        }
+                        if let Ok(store) = store.lock()
+                            && store.finish_cancel_control(&turn_id)
+                        {
+                            let _ = store.settle_canceled_turn(&turn_id, Some(&provider_turn_id));
+                        }
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            })
+            .context("failed to start Codex cancellation worker")?;
+        Ok(())
+    }
+
+    fn interrupt_claude_turn(
+        &self,
+        session: &SessionRecord,
+        turn_id: &str,
+        turn: &TurnRecord,
+        process: Arc<ClaudeProcess>,
+        turns: Arc<Mutex<ClaudeTurns>>,
+    ) -> Result<()> {
+        let unread = turns
+            .lock()
+            .map_err(|_| anyhow!("Claude turn lock poisoned"))?
+            .unread();
+        {
+            let mut store = self.lock_store()?;
+            if turn.state == TurnState::Canceled && session.state == SessionState::Quiescing {
+                return Ok(());
             }
-            AgentRuntime::Claude { process, turns } => {
-                // A message the model has not read yet would otherwise run as
-                // a turn of its own after the interrupt.
-                let unread = turns
-                    .lock()
-                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?
-                    .unread();
+            if !store.cancel_turn_with_controls(turn_id, unread.len() + 1)? {
+                bail!("turn is already terminal or no longer active");
+            }
+            store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
+        }
+        let store = Arc::clone(&self.store);
+        let session_id = session.id.clone();
+        let turn_id = turn_id.to_owned();
+        std::thread::Builder::new()
+            .name("dlgt-claude-cancel".to_owned())
+            .spawn(move || {
                 for message in unread {
-                    let canceled = process
-                        .control(
-                            &json!({"subtype": "cancel_async_message", "message_uuid": message.uuid}),
-                            CLAUDE_CONTROL_TIMEOUT,
-                        )
-                        .is_ok_and(|response| {
-                            response.get("cancelled").and_then(Value::as_bool) == Some(true)
-                        });
-                    if canceled {
-                        let mut turns = turns
-                            .lock()
-                            .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
-                        let store = self.lock_store()?;
-                        turns.discard(&store, &session.id, &message.uuid);
+                    if !cancel_target_is_current(&store, &session_id, &turn_id) {
+                        return;
+                    }
+                    let request = json!({
+                        "subtype": "cancel_async_message",
+                        "message_uuid": message.uuid,
+                    });
+                    let response = process.control(&request, CLAUDE_CONTROL_TIMEOUT);
+                    let Ok(response) = response else {
+                        fail_cancelled_turn(
+                            &store,
+                            &session_id,
+                            &turn_id,
+                            "Claude rejected or timed out a cancel control",
+                        );
+                        process.force_stop();
+                        return;
+                    };
+                    if response.get("cancelled").and_then(Value::as_bool) == Some(true)
+                        && let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock())
+                    {
+                        turns.discard(&store, &session_id, &message.uuid);
+                    }
+                    if let Ok(store) = store.lock() {
+                        store.finish_cancel_control(&turn_id);
                     }
                 }
-                process.control(&json!({"subtype": "interrupt"}), CLAUDE_CONTROL_TIMEOUT)?;
-                let mut turns = turns
-                    .lock()
-                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
-                let store = self.lock_store()?;
-                turns.settle(&store, &session.id)
-            }
-        }
+                if !cancel_target_is_current(&store, &session_id, &turn_id) {
+                    return;
+                }
+                if process
+                    .control(&json!({"subtype": "interrupt"}), CLAUDE_CONTROL_TIMEOUT)
+                    .is_err()
+                {
+                    fail_cancelled_turn(
+                        &store,
+                        &session_id,
+                        &turn_id,
+                        "Claude rejected or timed out the interrupt control",
+                    );
+                    process.force_stop();
+                    return;
+                }
+                if let Ok(store) = store.lock() {
+                    store.finish_cancel_control(&turn_id);
+                }
+                if let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock()) {
+                    let _ = turns.settle(&store, &session_id);
+                }
+            })
+            .context("failed to start Claude cancellation worker")?;
+        Ok(())
     }
 
     /// Position an observation cursor immediately before an acceptance.
@@ -2189,7 +2508,7 @@ impl Daemon {
             "claude" => Ok(crate::claude_models::list_models()),
             "codex" => {
                 let connection = CodexConnection::connect(
-                    Arc::new(|_| {}),
+                    Arc::new(|_| true),
                     None,
                     None,
                     &codex_discovery_args(),
@@ -2399,7 +2718,8 @@ fn record_exit_result(
     } else {
         TurnState::Failed
     };
-    match store.finish_turn_if_matching(turn_id, None, state, None, Some(reason)) {
+    let error = json!({"code": "provider_exit", "message": reason});
+    match store.finish_turn_if_matching(turn_id, None, state, None, Some(&error)) {
         Ok(true) => {
             let _ = store.record_event(
                 Some(&session.id),
@@ -2414,6 +2734,56 @@ fn record_exit_result(
         Ok(false) => {}
         Err(error) => eprintln!("dlgt failed to record provider exit result: {error:#}"),
     }
+}
+
+fn cancel_target_is_current(store: &Arc<Mutex<Store>>, session_id: &str, turn_id: &str) -> bool {
+    store.lock().is_ok_and(|store| {
+        store.get_session(session_id).is_some_and(|session| {
+            session.state == SessionState::Quiescing
+                && session.active_turn_id.as_deref() == Some(turn_id)
+        })
+    })
+}
+
+fn fail_cancelled_turn(store: &Arc<Mutex<Store>>, session_id: &str, turn_id: &str, message: &str) {
+    if let Ok(store) = store.lock()
+        && store.fail_canceled_turn(turn_id, "cancel_failed", &sanitize_message(message))
+    {
+        store.record_event(Some(session_id), Some(turn_id), "turn.failed");
+        store.record_event(Some(session_id), None, "session.failed");
+    }
+}
+
+fn spawn_claude_cancel_control(
+    store: Arc<Mutex<Store>>,
+    turns: Arc<Mutex<ClaudeTurns>>,
+    process: Arc<ClaudeProcess>,
+    session_id: String,
+    turn_id: String,
+) {
+    let _ = std::thread::Builder::new()
+        .name("dlgt-claude-late-cancel".to_owned())
+        .spawn(move || {
+            if !cancel_target_is_current(&store, &session_id, &turn_id) {
+                if let Ok(store) = store.lock() {
+                    store.finish_cancel_control(&turn_id);
+                }
+                return;
+            }
+            if let Err(error) =
+                process.control(&json!({"subtype": "interrupt"}), CLAUDE_CONTROL_TIMEOUT)
+            {
+                fail_cancelled_turn(&store, &session_id, &turn_id, &error.to_string());
+                process.force_stop();
+                return;
+            }
+            if let Ok(store) = store.lock() {
+                store.finish_cancel_control(&turn_id);
+            }
+            if let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock()) {
+                let _ = turns.settle(&store, &session_id);
+            }
+        });
 }
 
 fn params_string<'a>(params: &'a Value, name: &str) -> Result<&'a str> {
@@ -2444,6 +2814,12 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
     let message = format!("{error:#}");
     if error.downcast_ref::<AuthMismatch>().is_some() || message.contains("AUTH_MISMATCH") {
         "AUTH_MISMATCH"
+    } else if message.contains("REQUEST_DELIVERY_FAILED") {
+        "REQUEST_DELIVERY_FAILED"
+    } else if message.contains("REQUEST_BUSY") {
+        "REQUEST_BUSY"
+    } else if message.contains("REQUEST_FAILED") {
+        "REQUEST_FAILED"
     } else if message.contains("SESSION_NOT_RUNNING") {
         "SESSION_NOT_RUNNING"
     } else if message.contains("CURSOR_EXPIRED") {
@@ -2456,7 +2832,7 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "REQUEST_NOT_FOUND"
     } else if message.contains("REQUEST_RESOLVED") {
         "REQUEST_RESOLVED"
-    } else if message.contains("cancel timed out") {
+    } else if message.contains("CANCEL_TIMEOUT") || message.contains("cancel timed out") {
         "CANCEL_TIMEOUT"
     } else if message.contains("blocked on input") {
         "SESSION_BLOCKED"
@@ -2466,8 +2842,6 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         || message.contains("provider conversation is already running")
     {
         "SESSION_BUSY"
-    } else if message.contains("has no result") {
-        "NO_RESULT"
     } else if message.contains("active session alias already exists") {
         "ALIAS_IN_USE"
     } else if message.contains("launch")
@@ -2483,11 +2857,22 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         || message.contains("is unavailable")
     {
         "SESSION_UNAVAILABLE"
-    } else if message.contains("missing") || message.contains("must") || message.contains("invalid")
+    } else if message.contains("unknown method")
+        || message.contains("missing")
+        || message.contains("must")
+        || message.contains("invalid")
     {
         "INVALID_ARGUMENT"
     } else {
         "INTERNAL"
+    }
+}
+
+fn answer_action(request: &RequestRecord) -> &'static str {
+    match (&request.draft.kind, &request.draft.provider) {
+        (_, ProviderRequest::CodexElicitation { form: true, .. }) => "--json <OBJECT>",
+        (RequestKind::Approval, _) => "--allow|--deny",
+        (RequestKind::Question, _) => "--text <TEXT>|--choice <N>",
     }
 }
 
@@ -3363,6 +3748,19 @@ impl<'a> Builder<'a> {
         self.delivered()
     }
 
+    fn blocked_request_missing(&self) -> bool {
+        self.cut.state == Some(SessionState::Blocked)
+            && self
+                .cut
+                .sources
+                .iter()
+                .any(|source| !source.requests.is_empty())
+            && !self
+                .buckets
+                .iter()
+                .any(|bucket| !bucket.requests.is_empty())
+    }
+
     /// Derive the cursor from the committed set only.
     fn cursor(&self) -> cursor::Cursor {
         let mut next = cursor::Cursor::new();
@@ -3489,7 +3887,9 @@ impl<'a> Builder<'a> {
         let mut trial = Builder::new(self.cut, &options);
         trial.commit_all()?;
         let value = trial.settle()?;
-        Ok(serialized_len(&value)? <= trial.budget() && (!trial.pending() || trial.progress()))
+        Ok(serialized_len(&value)? <= trial.budget()
+            && (!trial.pending() || trial.progress())
+            && !trial.blocked_request_missing())
     }
 
     /// Commit one bucket and one unit of progress, ignoring the budget.
@@ -3499,7 +3899,13 @@ impl<'a> Builder<'a> {
         };
         self.buckets.push(Self::empty_bucket(source));
         self.units.push(Unit::Bucket);
-        if let Some(turn) = source.results.first() {
+        if self.cut.state == Some(SessionState::Blocked)
+            && let Some(request) = source.requests.first()
+        {
+            self.buckets[0].requests.push(request.clone());
+            self.buckets[0].requests_truncated = source.requests_more || source.requests.len() > 1;
+            self.units.push(Unit::Request { bucket: 0 });
+        } else if let Some(turn) = source.results.first() {
             self.buckets[0].results.push(minimum_result_value(turn));
         } else if let Some(event) = source.events.first() {
             self.buckets[0].events.push(event.clone());
@@ -3533,7 +3939,10 @@ impl<'a> Builder<'a> {
     fn finish(mut self) -> Result<Rendered> {
         let value = self.settle()?;
         let length = serialized_len(&value)?;
-        if length > self.budget() || (self.pending() && !self.progress()) {
+        if length > self.budget()
+            || (self.pending() && !self.progress())
+            || self.blocked_request_missing()
+        {
             // Progress must come from chunking, never from oversizing. If not
             // even one chunk fits, the request itself is unsatisfiable.
             let Some(minimum) = self.workable_budget()? else {
@@ -4113,6 +4522,31 @@ mod tests {
     }
 
     #[test]
+    fn restart_interrupt_result_uses_a_structured_error_object() {
+        let mut store = ready_store("codex");
+        store
+            .insert_turn("turn_restart", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert_eq!(
+            store.interrupt_active_turn(
+                "codex:thread-1",
+                "session restarted before execution completed"
+            ),
+            Some("turn_restart".to_owned())
+        );
+        let turn = store
+            .get_turn("turn_restart")
+            .unwrap_or_else(|| panic!("interrupted turn missing"));
+        assert_eq!(
+            public_result(&turn)["error"],
+            json!({
+                "code": "interrupted",
+                "message": "session restarted before execution completed"
+            })
+        );
+    }
+
+    #[test]
     fn pending_submission_receipt_upgrades_across_session_rekey() {
         let mut store = ready_store("claude");
         store
@@ -4676,6 +5110,47 @@ mod tests {
     }
 
     #[test]
+    fn blocked_fetch_never_reports_an_empty_complete_request_set() {
+        let cut = || {
+            let mut cut = test_cut(vec![
+                SourceSpec {
+                    requests: vec![json!({
+                        "id": "r1", "kind": "question", "tool": "elicitation",
+                        "summary": "Complete the profile", "fields": [
+                            {"name": "name", "type": "string", "required": true}
+                        ]
+                    })],
+                    ..SourceSpec::new("su_test")
+                }
+                .build(),
+            ]);
+            cut.state = Some(SessionState::Blocked);
+            cut
+        };
+        let rendered = cut()
+            .render(&fetch_options(700, None))
+            .unwrap_or_else(|error| panic!("700-byte answerable Request should fit: {error}"));
+        assert_eq!(rendered.value["sessions"][0]["requests"][0]["id"], "r1");
+
+        let error = cut()
+            .render(&fetch_options(200, None))
+            .err()
+            .unwrap_or_else(|| panic!("blocked fetch accepted a budget too small for its Request"));
+        let message = error.to_string();
+        let minimum = message
+            .rsplit("--max-bytes ")
+            .next()
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|number| number.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("missing verified budget in {message}"));
+        let rendered = cut()
+            .render(&fetch_options(minimum, None))
+            .unwrap_or_else(|error| panic!("reported budget {minimum} failed: {error}"));
+        assert_eq!(rendered.value["sessions"][0]["requests"][0]["id"], "r1");
+        assert_eq!(rendered.value["reason"], "blocked");
+    }
+
+    #[test]
     fn a_request_at_the_reported_minimum_budget_succeeds() {
         let cut = || {
             test_cut(vec![
@@ -5089,5 +5564,20 @@ mod tests {
             ..crate::cursor::SessionCursor::default()
         };
         assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
+    }
+
+    #[test]
+    fn answer_delivery_errors_keep_their_request_codes() {
+        for (message, code) in [
+            (
+                "REQUEST_DELIVERY_FAILED: write failed for Request r1",
+                "REQUEST_DELIVERY_FAILED",
+            ),
+            ("REQUEST_BUSY: answer still sending", "REQUEST_BUSY"),
+            ("REQUEST_FAILED: provider is unavailable", "REQUEST_FAILED"),
+        ] {
+            let error = anyhow::anyhow!(message);
+            assert_eq!(classify_error(&error), code);
+        }
     }
 }

@@ -4,7 +4,7 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::messages::{bounded, one_line};
+use crate::messages::bounded;
 
 /// Pending Requests published per Session in one response.
 pub const PUBLISHED_REQUEST_LIMIT: usize = 16;
@@ -12,6 +12,18 @@ pub const PUBLISHED_REQUEST_LIMIT: usize = 16;
 const RESOLVED_RETENTION: usize = 256;
 /// Largest provider tool input published verbatim.
 const INPUT_LIMIT: usize = 2048;
+const FIELD_LIMIT: usize = 16;
+const CHOICE_LIMIT: usize = 32;
+const LABEL_LIMIT: usize = 160;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormField {
+    pub name: String,
+    pub field_type: String,
+    pub required: bool,
+    pub enum_values: Vec<Value>,
+    pub constraints: Value,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -35,6 +47,7 @@ pub enum Answer {
     Deny { message: Option<String> },
     Text(String),
     Choice(usize),
+    Json(Value),
 }
 
 impl Answer {
@@ -55,7 +68,13 @@ impl Answer {
                 .filter(|choice| *choice > 0)
                 .map(Self::Choice)
                 .ok_or_else(|| anyhow::anyhow!("invalid answer: --choice is a 1-based number")),
-            _ => bail!("invalid answer: use --allow, --deny, --text, or --choice"),
+            Some("json") => params
+                .get("json")
+                .filter(|value| value.is_object())
+                .cloned()
+                .map(Self::Json)
+                .ok_or_else(|| anyhow::anyhow!("invalid answer: --json must be a JSON object")),
+            _ => bail!("invalid answer: use --allow, --deny, --text, --choice, or --json"),
         }
     }
 }
@@ -107,7 +126,7 @@ pub enum ProviderRequest {
         question_ids: Vec<String>,
     },
     CodexElicitation {
-        property: Option<String>,
+        fields: Vec<FormField>,
         form: bool,
     },
 }
@@ -137,11 +156,45 @@ pub struct RequestRecord {
     pub created_at_ms: i64,
     pub draft: RequestDraft,
     pub resolution: Option<Resolution>,
+    pub answer_state: AnswerState,
+    pub answer_attempt: Option<Answer>,
+    pub answer_receipt: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerState {
+    Pending,
+    Sending,
+    Delivered,
+    Failed,
+}
+
+impl AnswerState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sending => "sending",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerClaim {
+    Started,
+    Waiting,
+    Replay(Resolution),
+    Conflict,
+    Failed,
 }
 
 impl RequestRecord {
     pub const fn pending(&self) -> bool {
-        self.resolution.is_none()
+        matches!(
+            self.answer_state,
+            AnswerState::Pending | AnswerState::Sending
+        )
     }
 
     pub fn public(&self) -> Value {
@@ -149,13 +202,14 @@ impl RequestRecord {
         let mut value = Map::new();
         value.insert("id".to_owned(), json!(self.id));
         value.insert("kind".to_owned(), json!(draft.kind.as_str()));
+        value.insert("answer_state".to_owned(), json!(self.answer_state.as_str()));
         if let Some(execution_seq) = self.execution_seq {
             value.insert("execution_seq".to_owned(), json!(execution_seq));
         }
         match draft.kind {
             RequestKind::Approval => {
                 value.insert("tool".to_owned(), json!(draft.tool));
-                value.insert("summary".to_owned(), json!(one_line(&draft.summary).0));
+                value.insert("summary".to_owned(), json!(public_summary(draft)));
                 value.insert("input".to_owned(), bounded_input(&draft.input));
                 if let Some(cwd) = &draft.cwd {
                     value.insert("cwd".to_owned(), json!(cwd));
@@ -165,12 +219,36 @@ impl RequestRecord {
                 }
             }
             RequestKind::Question => {
-                value.insert(
-                    "text".to_owned(),
-                    json!(bounded(draft.text.as_deref().unwrap_or_default()).0),
-                );
+                value.insert("tool".to_owned(), json!(bounded(&draft.tool).0));
+                let text = bounded(draft.text.as_deref().unwrap_or_default()).0;
+                value.insert("summary".to_owned(), json!(public_summary(draft)));
+                value.insert("text".to_owned(), json!(text));
                 if !draft.choices.is_empty() {
-                    value.insert("choices".to_owned(), json!(draft.choices));
+                    value.insert(
+                        "choices".to_owned(),
+                        json!(
+                            draft
+                                .choices
+                                .iter()
+                                .take(CHOICE_LIMIT)
+                                .enumerate()
+                                .map(|(index, choice)| {
+                                    json!({"index": index + 1, "label": bounded_label(choice)})
+                                })
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
+                if let ProviderRequest::CodexElicitation { fields, form: true } = &draft.provider {
+                    value.insert("fields".to_owned(), json!(fields.iter().take(FIELD_LIMIT).map(|field| {
+                        json!({
+                            "name": bounded_label(&field.name),
+                            "type": bounded_label(&field.field_type),
+                            "required": field.required,
+                            "enum": field.enum_values.iter().take(8).map(bound_json_scalar).collect::<Vec<_>>(),
+                            "constraints": bounded_constraints(&field.constraints),
+                        })
+                    }).collect::<Vec<_>>()));
                 }
             }
         }
@@ -183,7 +261,7 @@ impl RequestRecord {
         let draft = &self.draft;
         match (draft.kind, answer) {
             (RequestKind::Approval, Answer::Allow | Answer::Deny { .. })
-            | (RequestKind::Question, Answer::Text(_) | Answer::Choice(_)) => {}
+            | (RequestKind::Question, Answer::Text(_) | Answer::Choice(_) | Answer::Json(_)) => {}
             (RequestKind::Approval, _) => {
                 bail!(
                     "invalid answer: Request {} is an approval; use --allow or --deny",
@@ -201,7 +279,7 @@ impl RequestRecord {
         let outcome = match answer {
             Answer::Allow => Outcome::Allowed,
             Answer::Deny { .. } => Outcome::Denied,
-            Answer::Text(_) | Answer::Choice(_) => Outcome::Answered,
+            Answer::Text(_) | Answer::Choice(_) | Answer::Json(_) => Outcome::Answered,
         };
         let payload = match &draft.provider {
             ProviderRequest::ClaudeTool { input } => match answer {
@@ -238,20 +316,26 @@ impl RequestRecord {
                     .collect::<Map<_, _>>();
                 json!({"answers": answers})
             }
-            ProviderRequest::CodexElicitation { property, form } => {
-                let reply = self.answer_text(answer)?;
+            ProviderRequest::CodexElicitation { fields, form } => {
                 if !form {
                     return Ok((outcome, json!({"action": "accept"})));
                 }
-                let content = match serde_json::from_str::<Value>(&reply) {
-                    Ok(Value::Object(object)) => Value::Object(object),
-                    _ => match property {
-                        Some(property) => json!({property.as_str(): reply}),
-                        None => bail!(
-                            "invalid answer: this form has several fields; pass --text as a JSON object"
-                        ),
+                let content = match answer {
+                    Answer::Json(Value::Object(object)) => Value::Object(object.clone()),
+                    Answer::Text(text) => match serde_json::from_str::<Value>(text) {
+                        Ok(Value::Object(object)) => Value::Object(object),
+                        _ => bail!("invalid answer: this form requires --json with a JSON object"),
                     },
+                    _ => bail!("invalid answer: this form requires --json with a JSON object"),
                 };
+                for field in fields.iter().filter(|field| field.required) {
+                    if content.get(&field.name).is_none_or(Value::is_null) {
+                        bail!(
+                            "invalid answer: required form field {:?} is missing",
+                            field.name
+                        );
+                    }
+                }
                 json!({"action": "accept", "content": content})
             }
         };
@@ -270,9 +354,54 @@ impl RequestRecord {
                     )
                 })
             }
-            Answer::Allow | Answer::Deny { .. } => bail!("invalid answer for a question"),
+            Answer::Json(_) | Answer::Allow | Answer::Deny { .. } => {
+                bail!("invalid answer for a question")
+            }
         }
     }
+}
+
+fn bounded_label(value: &str) -> String {
+    let value = crate::messages::one_line(value).0;
+    let value = crate::messages::bounded(&value).0;
+    value.chars().take(LABEL_LIMIT).collect()
+}
+
+fn public_summary(draft: &RequestDraft) -> String {
+    let source = match draft.kind {
+        RequestKind::Approval => &draft.summary,
+        RequestKind::Question => draft.text.as_deref().unwrap_or_default(),
+    };
+    if !source.trim().is_empty() {
+        return bounded(source).0;
+    }
+    if !draft.tool.trim().is_empty() {
+        return bounded(&draft.tool).0;
+    }
+    "Caller input required".to_owned()
+}
+
+fn bound_json_scalar(value: &Value) -> Value {
+    match value {
+        Value::String(text) => json!(bounded_label(text)),
+        Value::Number(_) | Value::Bool(_) | Value::Null => value.clone(),
+        Value::Array(_) | Value::Object(_) => json!("<complex value>"),
+    }
+}
+
+fn bounded_constraints(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return Value::Null;
+    };
+    let allowed = ["minimum", "maximum", "minLength", "maxLength", "pattern"];
+    Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| allowed.contains(&key.as_str()))
+            .take(8)
+            .map(|(key, value)| (key.clone(), bound_json_scalar(value)))
+            .collect(),
+    )
 }
 
 fn bounded_input(input: &Value) -> Value {
@@ -307,6 +436,9 @@ impl RequestTable {
             created_at_ms: now_ms,
             draft,
             resolution: None,
+            answer_state: AnswerState::Pending,
+            answer_attempt: None,
+            answer_receipt: None,
         };
         self.records.push(record.clone());
         record
@@ -336,8 +468,70 @@ impl RequestTable {
             .find(|record| record.id == id && record.pending())?;
         let before = record.clone();
         record.resolution = Some(resolution);
+        record.answer_state = AnswerState::Delivered;
+        record.answer_attempt = None;
         self.trim();
         Some(before)
+    }
+
+    pub fn resolve_with_receipt(
+        &mut self,
+        id: &str,
+        resolution: Resolution,
+        receipt: Value,
+    ) -> Option<RequestRecord> {
+        let before = self.resolve(id, resolution)?;
+        if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+            record.answer_receipt = Some(receipt);
+        }
+        Some(before)
+    }
+
+    pub fn begin_answer(&mut self, id: &str, answer: &Answer) -> Option<AnswerClaim> {
+        let record = self.records.iter_mut().find(|record| record.id == id)?;
+        Some(match record.answer_state {
+            AnswerState::Pending => {
+                record.answer_state = AnswerState::Sending;
+                record.answer_attempt = Some(answer.clone());
+                AnswerClaim::Started
+            }
+            AnswerState::Sending if record.answer_attempt.as_ref() == Some(answer) => {
+                AnswerClaim::Waiting
+            }
+            AnswerState::Delivered => record
+                .resolution
+                .as_ref()
+                .filter(|resolution| resolution.answer.as_ref() == Some(answer))
+                .cloned()
+                .map_or(AnswerClaim::Conflict, AnswerClaim::Replay),
+            AnswerState::Failed => AnswerClaim::Failed,
+            AnswerState::Sending => AnswerClaim::Conflict,
+        })
+    }
+
+    pub fn retry_answer(&mut self, id: &str, answer: &Answer) -> bool {
+        let Some(record) = self.records.iter_mut().find(|record| {
+            record.id == id
+                && record.answer_state == AnswerState::Sending
+                && record.answer_attempt.as_ref() == Some(answer)
+        }) else {
+            return false;
+        };
+        record.answer_state = AnswerState::Pending;
+        record.answer_attempt = None;
+        true
+    }
+
+    pub fn fail_answer(&mut self, id: &str, answer: &Answer) -> bool {
+        let Some(record) = self.records.iter_mut().find(|record| {
+            record.id == id
+                && record.answer_state == AnswerState::Sending
+                && record.answer_attempt.as_ref() == Some(answer)
+        }) else {
+            return false;
+        };
+        record.answer_state = AnswerState::Failed;
+        true
     }
 
     /// Close pending Requests as canceled: every one, or only the one the
@@ -351,6 +545,8 @@ impl RequestTable {
                     outcome: Outcome::Canceled,
                     answer: None,
                 });
+                record.answer_state = AnswerState::Failed;
+                record.answer_attempt = None;
             }
         }
         self.trim();
@@ -376,10 +572,11 @@ impl RequestTable {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        Answer, Outcome, ProviderRequest, RequestDraft, RequestKind, RequestTable, Resolution,
+        Answer, AnswerClaim, Outcome, ProviderRequest, RequestDraft, RequestKind, RequestRecord,
+        RequestTable, Resolution,
     };
 
     fn approval(provider: ProviderRequest) -> RequestDraft {
@@ -430,9 +627,27 @@ mod tests {
         assert_eq!(public["input"]["command"], "git push --force origin main");
         assert_eq!(public["execution_seq"], 7);
         let public = second.public();
-        assert_eq!(public["text"], "Which color?");
-        assert_eq!(public["choices"], json!(["Red", "Blue"]));
-        assert!(public.get("tool").is_none());
+        assert_eq!(public["summary"], "Which color?");
+        assert_eq!(public["tool"], "AskUserQuestion");
+        assert_eq!(
+            public["choices"],
+            json!([
+                {"index": 1, "label": "Red"},
+                {"index": 2, "label": "Blue"},
+            ])
+        );
+    }
+
+    #[test]
+    fn answerable_requests_always_have_a_short_public_summary() {
+        let mut draft = question(ProviderRequest::CodexElicitation {
+            fields: Vec::new(),
+            form: true,
+        });
+        draft.text = Some(String::new());
+        let record = RequestTable::default().open(draft, Some(1), 1);
+        assert_eq!(record.public()["summary"], "AskUserQuestion");
+        assert_eq!(record.public()["text"], "");
     }
 
     #[test]
@@ -536,6 +751,107 @@ mod tests {
                 .1,
             json!({"answers": {"color": {"answers": ["green"]}}})
         );
+    }
+
+    #[test]
+    fn multi_field_elicitation_publishes_schema_and_requires_required_fields() {
+        let fields = vec![
+            super::FormField {
+                name: "name".to_owned(),
+                field_type: "string".to_owned(),
+                required: true,
+                enum_values: Vec::new(),
+                constraints: json!({"maxLength": 40}),
+            },
+            super::FormField {
+                name: "color".to_owned(),
+                field_type: "string".to_owned(),
+                required: true,
+                enum_values: vec![json!("red"), json!("blue")],
+                constraints: Value::Null,
+            },
+        ];
+        let mut draft = question(ProviderRequest::CodexElicitation {
+            fields: fields.clone(),
+            form: true,
+        });
+        draft.choices.clear();
+        let record = RequestTable::default().open(draft, Some(4), 1);
+        let public = record.public();
+        assert_eq!(public["fields"][0]["name"], "name");
+        assert_eq!(public["fields"][0]["type"], "string");
+        assert_eq!(public["fields"][0]["required"], true);
+        assert_eq!(public["fields"][0]["constraints"]["maxLength"], 40);
+        assert_eq!(public["fields"][1]["enum"], json!(["red", "blue"]));
+        assert!(record.reply(&Answer::Json(json!({"name": "Ada"}))).is_err());
+        let (outcome, reply) = record
+            .reply(&Answer::Json(json!({"name": "Ada", "color": "blue"})))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(outcome, Outcome::Answered);
+        assert_eq!(
+            reply,
+            json!({"action": "accept", "content": {
+                "name": "Ada", "color": "blue"
+            }})
+        );
+    }
+
+    #[test]
+    fn json_answer_parsing_requires_an_object() {
+        assert_eq!(
+            Answer::parse(&json!({"decision": "json", "json": {"x": 1}}))
+                .unwrap_or_else(|error| panic!("{error}")),
+            Answer::Json(json!({"x": 1}))
+        );
+        assert!(Answer::parse(&json!({"decision": "json", "json": []})).is_err());
+    }
+
+    #[test]
+    fn an_answer_is_replayable_only_after_provider_delivery() {
+        let answer = Answer::Deny {
+            message: Some("reason".to_owned()),
+        };
+        let mut table = RequestTable::default();
+        table.open(approval(ProviderRequest::CodexCommand), None, 1);
+
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Started)
+        );
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Waiting)
+        );
+        assert_eq!(
+            table.begin_answer("r1", &Answer::Allow),
+            Some(AnswerClaim::Conflict)
+        );
+        assert!(table.get("r1").is_some_and(RequestRecord::pending));
+
+        assert!(table.retry_answer("r1", &answer));
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Started)
+        );
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Waiting)
+        );
+
+        let resolution = Resolution {
+            outcome: Outcome::Denied,
+            answer: Some(answer.clone()),
+        };
+        assert!(
+            table
+                .resolve_with_receipt("r1", resolution.clone(), json!({"delivered": true}))
+                .is_some()
+        );
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Replay(resolution))
+        );
+        assert!(table.get("r1").is_some_and(|record| !record.pending()));
     }
 
     #[test]
