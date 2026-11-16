@@ -807,6 +807,35 @@ class RecheckRegressions(unittest.TestCase):
             followup = h.rpc("session.send", {"session": session, "request_id": "later", "prompt": "later"})
             self.assertIn("result", followup, (harness, followup))
 
+    def test_a_stale_restart_cannot_strand_a_completed_restart(self) -> None:
+        h = self.harness
+        session = h.create("claude", "hello")["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        slow_home = h.root / "slow-home"
+        slow_home.mkdir()
+        (slow_home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
+        (slow_home / ".fake-auth-delay").write_text("1.5")
+        stale = h.pending(
+            "session.restart",
+            {
+                "session": session,
+                "environment": h.provider_env({"HOME": str(slow_home)}),
+                "startup_timeout_ms": 10_000,
+            },
+            timeout=20,
+        )
+        time.sleep(0.2)
+        completed = h.rpc(
+            "session.restart",
+            {"session": session, "environment": h.provider_env(), "startup_timeout_ms": 5_000},
+        )
+        self.assertIn("result", completed, completed)
+        stale_response = h.receive(stale)
+        self.assertEqual(stale_response.get("error", {}).get("code"), "SESSION_UNAVAILABLE", stale_response)
+        h.wait_state(session, "idle")
+        followup = h.rpc("session.send", {"session": session, "request_id": "after-restarts", "prompt": "after"})
+        self.assertIn("result", followup, followup)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -182,11 +182,16 @@ impl Store {
         self.runtime_generation(id) == Some(generation)
     }
 
-    pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
+    /// Claim a restart for the runtime generation the caller observed. A
+    /// restart that another one already completed meanwhile is refused.
+    pub fn begin_session_restart(&self, id: &str, expected_generation: u64) -> Result<bool> {
         let mut state = self.state.borrow_mut();
         let Some(session) = state.sessions.get(id) else {
             return Ok(false);
         };
+        if session.runtime_generation != expected_generation {
+            return Ok(false);
+        }
         if matches!(
             session.record.state,
             SessionState::Starting | SessionState::Stopping | SessionState::Restarting
@@ -1822,7 +1827,12 @@ mod tests {
         );
         assert!(
             store
-                .begin_session_restart("codex:thread-1")
+                .begin_session_restart(
+                    "codex:thread-1",
+                    store
+                        .runtime_generation("codex:thread-1")
+                        .unwrap_or_default()
+                )
                 .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
         );
         assert!(store.start_restarted_session("codex:thread-1"));
@@ -2139,7 +2149,12 @@ mod tests {
 
         assert!(
             store
-                .begin_session_restart("claude:provider-thread")
+                .begin_session_restart(
+                    "claude:provider-thread",
+                    store
+                        .runtime_generation("claude:provider-thread")
+                        .unwrap_or_default()
+                )
                 .unwrap_or_else(|error| panic!("failed to restart session: {error}"))
         );
         let session = store
@@ -2151,7 +2166,12 @@ mod tests {
         assert_eq!(session.harness_options, harness_options);
         assert!(
             !store
-                .begin_session_restart("claude:provider-thread")
+                .begin_session_restart(
+                    "claude:provider-thread",
+                    store
+                        .runtime_generation("claude:provider-thread")
+                        .unwrap_or_default()
+                )
                 .unwrap_or(false)
         );
         assert!(store.start_restarted_session("claude:provider-thread"));
@@ -2187,7 +2207,12 @@ mod tests {
             }
         }
         let error = store
-            .begin_session_restart("codex:old-session")
+            .begin_session_restart(
+                "codex:old-session",
+                store
+                    .runtime_generation("codex:old-session")
+                    .unwrap_or_default(),
+            )
             .err()
             .unwrap_or_else(|| panic!("alias-conflicting restart unexpectedly succeeded"));
         assert!(
@@ -2217,7 +2242,12 @@ mod tests {
 
         assert!(
             store
-                .begin_session_restart("codex:thread-1")
+                .begin_session_restart(
+                    "codex:thread-1",
+                    store
+                        .runtime_generation("codex:thread-1")
+                        .unwrap_or_default()
+                )
                 .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
         );
         assert_eq!(

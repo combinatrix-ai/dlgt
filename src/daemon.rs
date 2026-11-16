@@ -1144,6 +1144,10 @@ impl Daemon {
                 session.state
             );
         }
+        let expected_generation = self
+            .lock_store()?
+            .runtime_generation(&session.id)
+            .context("Session runtime generation is missing")?;
         let previous_runtime = self
             .sessions
             .read()
@@ -1199,11 +1203,14 @@ impl Daemon {
         }
 
         prepare_workspace(agent, &cwd)?;
-        if !self.lock_store()?.begin_session_restart(&session.id)? {
+        if !self
+            .lock_store()?
+            .begin_session_restart(&session.id, expected_generation)?
+        {
             fail!(
                 SessionUnavailable,
-                "session is unavailable in state {}",
-                session.state
+                "Session {} changed state or was restarted by another request; check it before retrying",
+                session.id
             );
         }
         self.lock_store()?
@@ -1220,6 +1227,9 @@ impl Daemon {
                     break;
                 }
                 if Instant::now() >= startup_deadline {
+                    // Fail rather than stay `restarting`: a failed Session
+                    // can be resumed, a stuck one cannot.
+                    self.lock_store()?.set_session_failed(&session.id);
                     fail!(
                         LaunchFailed,
                         "restart launch timed out while stopping the previous process"
