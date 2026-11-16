@@ -163,12 +163,12 @@ mutation. A wrong thread, wrong turn, or duplicate terminal notification is
 retained as an unmatched diagnostic event and otherwise ignored. Each provider
 turn is terminalized at most once.
 
-A `turn/completed` notification that reports `completed` without an agent
-message is not trusted on its own, because the app-server can send it before
-the turn's items are complete. After `turn/start`, dlgt also polls
-`thread/read` every 250 ms. When the thread is idle and the turn is terminal,
-it applies that turn as the completion, including an empty result. A
-non-completed status must be read twice in a row before it is applied.
+A `turn/completed` notification with status `completed` terminalizes the
+matching execution even when it carries no agent message. Dlgt records an
+empty `final_text` with `final_text_source: "missing"`; later completion
+notifications cannot replace that result. After `turn/start`, dlgt also polls
+`thread/read` every 250 ms to reconcile terminal turns whose notifications
+were missed. It requires two consecutive reads for a non-completed status.
 
 ## Claude lifecycle observation
 
@@ -341,7 +341,7 @@ parameters are in [CLI](cli.md#approvals).
 | Mode | Codex reviewer | Claude permission mode | Who decides |
 | --- | --- | --- | --- |
 | `auto` | `approvalsReviewer=auto_review` | `--permission-mode auto` | The provider's own reviewer; only what it does not settle reaches the caller. |
-| `ask` | `approvalsReviewer=user` | `--permission-mode manual` | The caller, through `answer`, for every approval. |
+| `ask` | `approvalsReviewer=user` | `--permission-mode manual` | Every approval request raised by the provider reaches the caller. |
 | `bypass` | `approvalPolicy=never`, `sandbox=danger-full-access` | `--dangerously-skip-permissions` | Nobody is asked. |
 
 Provider requests reach dlgt on the structured channel:
@@ -357,6 +357,12 @@ Provider requests reach dlgt on the structured channel:
 | unsupported, stale, idle, or canceling Codex server request | explicit JSON-RPC refusal; never attach it to another execution |
 | Claude `can_use_tool` in an active execution | approval Request, or a question Request for `AskUserQuestion` |
 | Claude `can_use_tool` with no active or canceling execution | refused, with a `notice` message |
+
+Dlgt bounds every field in a published Request so its minimum form fits under
+the 256 KiB response limit. Form field names, required lists, enum values, and
+constraints remain exact; dlgt truncates display-only text with a marker. If
+the exact schema cannot fit, dlgt declines the request to the provider and
+records a `notice` instead of publishing a changed form.
 
 Codex `auto_review` decisions arrive as `item/autoApprovalReview/completed`
 and are recorded as `approval` messages; they do not become Requests. Claude
@@ -375,12 +381,16 @@ Answers map back onto the provider's own channel:
 | Codex elicitation | `{"action":"accept","content":...}` | not applicable |
 
 The Request moves through `pending`, `sending`, `delivered`, and `failed`. It
-leaves `blocked` only after provider delivery succeeds. A duplicate answer
-waits while the same attempt is sending and replays only a delivered receipt.
-If delivery fails while the provider remains open, the Request stays pending;
-if the provider cannot receive it, dlgt fails the Session with a structured
-error. Every reviewer decision
-dlgt can observe is an `approval` message whose `by` is `provider_reviewer`,
+leaves `blocked` only after provider delivery succeeds or the provider
+withdraws it. A duplicate answer waits for the same attempt and replays only a
+delivered receipt. Dlgt returns a Request to `pending` only when it knows that
+no bytes reached the transport and the same execution still owns the Request.
+An ambiguous write stops the provider transport and fails the Session with
+`REQUEST_DELIVERY_FAILED`; dlgt does not permit a retry. Provider withdrawal
+closes only an undelivered Request. A successful delivery remains replayable
+if withdrawal or execution completion arrives before dlgt commits its receipt.
+Every reviewer decision dlgt can observe is an `approval` message whose `by`
+is `provider_reviewer`,
 `caller`, or `provider_policy`. Denials and reviewer timeouts count toward the
 result's `denied_requests`, because a provider reports a turn as successful
 even when a tool it needed was refused.
@@ -397,9 +407,11 @@ answers stays pending and the Session stays `blocked` until `answer`,
 `cancel`, or `stop`. It never times out into an approval.
 
 Harness options that would override the approval mapping are rejected with
-`INVALID_ARGUMENT`, so the selected mode is what the provider runs. When
-Claude reports a different permission mode than the one requested, for example
-because auto mode is unavailable for the model, the Session snapshot reports
+`INVALID_ARGUMENT` before dlgt starts the provider process, so the selected
+mode is what dlgt passes. User-owned provider configuration remains the
+caller's policy. When Claude reports a different permission mode than the one
+requested, for example because auto mode is unavailable for the model, the
+Session snapshot reports
 `approvals.effective` with a reason, a `notice` message records it, and the
 Session behaves as the effective mode.
 

@@ -218,6 +218,10 @@ supplies a replacement; built-in and `[defaults]` values do not replace it.
 | `ask` | `--permission-mode manual` | `sandbox=workspace-write`, `approvalPolicy=on-request`, `approvalsReviewer=user` | Every approval request |
 | `bypass` | `--dangerously-skip-permissions` | `sandbox=danger-full-access`, `approvalPolicy=never` | Nothing |
 
+In `ask`, dlgt forwards every approval request the provider raises. Allow rules
+in your own provider configuration, such as Claude's `settings.json`, can mean
+the provider raises no requests for those tools.
+
 The Codex column is the `thread/start` and `thread/resume` parameters. The
 app-server has no `--dangerously-bypass-approvals-and-sandbox` flag, so
 `bypass` is the pair of thread parameters that flag stands for. Claude always
@@ -254,8 +258,12 @@ Rules:
   `allowedTools`, `allowed-tools`, `settings`, `settings-file`, `bare`,
   `approval_policy`, `sandbox_workspace_write`, `approvals_reviewer`,
   `sandbox_mode`) are managed by dlgt and rejected with
-  `INVALID_ARGUMENT` under every mode. The entire Claude `settings` option is
-  rejected because it can contain permission rules.
+  `INVALID_ARGUMENT` under every mode before a provider process starts. The
+  error names the rejected option. The entire Claude `settings` option is
+  rejected because it can contain permission rules. Provider-native settings
+  remain the caller's policy, including allow rules in the caller's
+  `settings.json`, a selected `CLAUDE_CONFIG_DIR`, `~/.codex/config.toml`, and
+  provider options such as `--add-dir`.
 - Codex `workspace-write` still allows writes under the system temporary
   directories. Those writes produce no approval request in any mode.
 
@@ -812,12 +820,13 @@ are answered. A Request's `input` larger than 2 KiB is replaced by
 
 While a Session is blocked, `fetch` always includes an answerable minimum
 Request with its ID, kind, tool, short summary, and the data required to answer
-it. Choices retain their 1-based indexes; form fields include their names,
-types, and required flags. These fields and choice labels are bounded so a
-Request fits under the 256 KiB hard limit. If a smaller `--max-bytes` cannot
-hold one, `fetch` fails with `INVALID_ARGUMENT` and names a measured working
-budget; retry at that value. A blocked response never reports an empty Request
-list as complete.
+it. Every published field is bounded so the minimum Request fits under the
+256 KiB hard limit. Choice indexes and form schema identities remain exact;
+dlgt truncates display text with a marker. If an exact form schema cannot fit,
+dlgt declines it to the provider and records a `notice` instead of publishing a
+changed schema. If a smaller `--max-bytes` cannot hold a Request, `fetch` fails
+with `INVALID_ARGUMENT` and names a measured working budget; retry at that
+value. A blocked response never reports an empty Request list as complete.
 
 Three things are outside the bound, all deliberately:
 
@@ -956,8 +965,11 @@ question   the worker asked the user something and is waiting for the reply
 
 A question carries a short `summary` and `text`, plus either numbered choices
 or form `fields`. Choice objects keep their 1-based `index` when labels are
-truncated. MCP form fields expose bounded `name`, `type`, `required`, enum, and
-constraint data. `id` is a short per-Session ordinal, so it survives an agent's
+truncated. MCP form fields expose their exact `name`, `type`, `required` list,
+enum values, and constraints. Display-only text is truncated with a marker.
+JSON answers must include all required form fields. If the complete schema
+cannot fit in a minimum Request, dlgt declines the provider request and records
+a `notice`. `id` is a short per-Session ordinal, so it survives an agent's
 context. When a provider asks several questions in one request, `text` lists
 them one per line, there are no `choices`, and one `--text` answer is given to
 all of them.
@@ -1051,7 +1063,8 @@ interrupts. The discarded steer is reported as a `steer` message with
 Cancellation is bounded and defaults to 30 seconds. On timeout, dlgt returns
 `CANCEL_TIMEOUT`, leaves the Session in `canceling`, and continues observing
 provider quiescence in the background. `fetch` reveals the eventual terminal
-state.
+state. A successful `cancel` returns the result for the execution it captured,
+even if another execution starts before the response is written.
 
 The timeout includes dispatch and completion of all provider control messages.
 If cancellation begins before Codex acknowledges the active turn, dlgt keeps
@@ -1385,7 +1398,7 @@ ALIAS_IN_USE           Exact Alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
 SESSION_BLOCKED        A Request is pending; answer it
 REQUEST_BUSY           An identical answer is still being delivered
-REQUEST_DELIVERY_FAILED Provider did not accept the answer; inspect the Request state
+REQUEST_DELIVERY_FAILED Answer delivery failed; an ambiguous write fails the Session
 REQUEST_FAILED         Request delivery failed and the provider Session is unavailable
 SESSION_UNAVAILABLE    Session state cannot accept the requested operation
 REQUEST_NOT_FOUND      No such Request on this Session
@@ -1394,7 +1407,7 @@ CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-AUTH_MISMATCH          Claude's subscription authentication was not established
+AUTH_MISMATCH          Claude subscription auth failed; blocking variables are named when present
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```

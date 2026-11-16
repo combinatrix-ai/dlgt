@@ -177,13 +177,18 @@ otherwise the call fails with `SESSION_NOT_RUNNING`. An unknown Request is
 `REQUEST_NOT_FOUND`, and a different answer to a resolved Request is
 `REQUEST_RESOLVED`. The answer returns as soon as the provider accepted it.
 While delivery is in progress the Request has `answer_state: "sending"`; a
-duplicate of that same answer waits for the outcome and replays only a
-delivered receipt. If delivery fails while the provider remains available,
-the Request returns to `pending` and can be answered again. If the provider
-cannot receive the answer, dlgt fails the Session with a structured error.
-Codex denial receipts include `reason_delivered`; when false they also include
-`reason_error`. dlgt sends the denial reason through `turn/steer` before the
-decline when the provider turn is available.
+duplicate of that same answer waits for that attempt's outcome. It replays a
+delivered receipt and never starts another attempt. If dlgt knows that no
+bytes reached the transport and the same execution still owns the Request, it
+returns the Request to `pending`. If a write times out or its delivery is
+otherwise ambiguous, dlgt stops that provider transport and fails the Session
+with `REQUEST_DELIVERY_FAILED`. The answer may or may not have reached the
+provider, so dlgt does not allow a retry. Provider withdrawal closes only a
+Request that has not been delivered; a successful delivery remains replayable
+even if withdrawal or execution completion arrives before dlgt commits its
+receipt. Codex denial receipts include `reason_delivered`; when false they also
+include `reason_error`. dlgt sends the denial reason through `turn/steer`
+before the decline when the provider turn is available.
 
 ### Other results
 
@@ -202,7 +207,9 @@ in its interactive UI, such as `claude --resume <id>` or `codex resume <id>`.
 before Codex acknowledges its provider turn ID, dlgt holds it for that same
 execution and applies the interrupt when the ID arrives. The cancellation
 timeout covers this wait and all provider controls; expiration returns
-`CANCEL_TIMEOUT` while the Session stays `canceling`.
+`CANCEL_TIMEOUT` while the Session stays `canceling`. A successful response
+contains the result for the execution captured when cancellation began, even
+if another execution starts before the response is written.
 
 ## Session and result schemas
 
@@ -305,16 +312,20 @@ A pending Request has this shape:
 }
 ```
 
-`kind` is `approval` or `question`. An approval carries `tool`, `summary`,
-`input`, and, when the provider supplied them, `cwd` and `reason`. An `input`
-larger than 2 KiB is replaced by `{"truncated": true, "preview": "..."}`. A
-question carries `summary`, `text`, and, when supplied, numbered choices or
-MCP form `fields`. Choices carry `index` and a bounded `label`; form fields
-carry bounded `name`, `type`, `required`, `enum`, and `constraints`. The public
-field and choice limits keep an answerable Request below the 256 KiB hard
-response limit. When a provider asks several questions in one request, `text`
-lists them one per line and there are no `choices`. `answer_state` is
-`pending`, `sending`, `delivered`, or `failed`.
+`kind` is `approval` or `question`. An approval carries bounded `tool`,
+`summary`, `input`, and, when the provider supplied them, `cwd` and `reason`. An
+`input` larger than 2 KiB is replaced by
+`{"truncated": true, "preview": "..."}`. A question carries `summary`,
+`text`, and, when supplied, numbered choices or MCP form `fields`. Choice
+indexes remain exact, and display labels are bounded. Form fields preserve the
+exact `name`, `type`, `required` list, enum values, and constraints. Dlgt
+truncates display-only text with a marker. If an exact form schema cannot fit
+in the minimum Request, dlgt declines it to the provider and records a `notice`
+instead of publishing a changed schema. Every published field is bounded so
+the minimum Request fits under the 256 KiB hard response limit. When a provider
+asks several questions in one request, `text` lists them one per line and there
+are no `choices`. `answer_state` is `pending`, `sending`, `delivered`, or
+`failed`.
 
 `id` is a short per-Session ordinal. At most 16 pending Requests are published
 per response; when more are pending, the bucket carries
@@ -530,7 +541,7 @@ ALIAS_IN_USE           Exact alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
 SESSION_BLOCKED        A Request is pending; answer it
 REQUEST_BUSY           An identical answer is still being delivered
-REQUEST_DELIVERY_FAILED Provider did not accept the answer; inspect the Request state
+REQUEST_DELIVERY_FAILED Answer delivery failed; an ambiguous write fails the Session
 REQUEST_FAILED         Request delivery failed and the provider Session is unavailable
 SESSION_UNAVAILABLE    Session state cannot accept the operation
 REQUEST_NOT_FOUND      No such Request on this Session
@@ -539,9 +550,14 @@ CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
+AUTH_MISMATCH          Claude subscription auth failed; blocking variables are named when present
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```
+
+Managed provider options and permission-guard rejections return
+`INVALID_ARGUMENT` before a provider process starts. The error names the
+rejected option.
 
 Methods may add contextual error fields but must not overload a code with a
 different retry or human-action policy. The contextual fields are:

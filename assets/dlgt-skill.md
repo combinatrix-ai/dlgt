@@ -451,8 +451,9 @@ anything:
 
 - `auto` (default): the provider's own reviewer decides. Only what it does not
   settle becomes a Request for you.
-- `ask`: every approval becomes a Request. The Session is `blocked` until you
-  `answer` it.
+- `ask`: dlgt forwards every approval request the provider raises. The Session
+  is `blocked` until you `answer` it. Allow rules in your own provider
+  configuration can mean the provider raises no requests for those tools.
 - `bypass`: nothing is asked and the provider sandbox is off. Use it only when
   the user asked for it.
 
@@ -511,15 +512,27 @@ uses an API key from the environment instead of the subscription.
   form elicitation. JSON answers are objects; required form fields must be
   present. Choices are numbered from 1. An unanswered Request never times out
   into an approval. If the decision is not yours to make, ask the user.
+- Answer delivery is bound to one attempt. Duplicate answers wait for that
+  attempt and never start another one. Dlgt restores `pending` only when it
+  knows that no bytes reached the transport and the same execution still owns
+  the Request. An ambiguous write stops the provider transport and fails the
+  Session with `REQUEST_DELIVERY_FAILED`; dlgt does not allow a retry. A
+  successful delivery stays replayable if provider withdrawal or execution
+  completion arrives before dlgt commits its receipt.
 - A blocked `fetch` includes the bounded fields needed to answer its Request.
-  If a small `--max-bytes` cannot fit that minimum, retry at the budget named
-  by `INVALID_ARGUMENT`; an empty `requests` list is never a complete blocked
-  observation.
+  Form field names, required lists, enum values, and constraints remain exact.
+  Dlgt truncates display-only text with a marker. If an exact form schema
+  cannot fit the minimum Request, dlgt declines it to the provider and records
+  a `notice`. If a small `--max-bytes` cannot fit the minimum, retry at the
+  budget named by `INVALID_ARGUMENT`; an empty `requests` list is never a
+  complete blocked observation.
 - A Codex `send --steer` before its provider turn ID is acknowledged returns
   `SESSION_UNAVAILABLE`; retry only after observing the active execution. A
   `cancel` issued before that acknowledgement remains bound to the same
-  execution and is applied when the ID arrives. `CANCEL_TIMEOUT` includes
-  provider control dispatch; cancellation continues after it expires.
+  execution and is applied when the ID arrives. A successful `cancel` returns
+  the result for its captured execution, even if a later execution starts
+  before the response is written. `CANCEL_TIMEOUT` includes provider control
+  dispatch; cancellation continues after it expires.
 - If a Session stays `busy` without the expected result, `fetch` it and read
   `quiet_for_ms`, the latest messages, and any `notice`. There is no terminal
   to attach to: a human who wants to take the conversation over runs
@@ -549,7 +562,7 @@ uses an API key from the environment instead of the subscription.
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address by ID. |
 | `LAUNCH_FAILED` | The provider process could not be launched or never became ready. Read `error.detail`: it is the provider's own stderr tail. `show <launch_id or session_id>` keeps the same `launch_failure`. If the provider needs a login, a trust decision, or first-run setup, tell the user to run `error.action` (`claude` or `codex`) once by hand in that directory, then retry with a new `--request-id`. This differs from a process that launched and later failed: that execution failure appears in `results[].status`. |
-| `AUTH_MISMATCH` | Claude subscription auth could not be positively established, or an API-key, custom endpoint, or provider-routing variable is set. Remove the named variables with matching `--unset-env <NAME>` options, or explicitly choose `--auth any`. |
+| `AUTH_MISMATCH` | Claude subscription auth could not be positively established. The error names blocking variables when present; remove only those variables with matching `--unset-env <NAME>` options. If no variable is named, confirm subscription login in the selected launch environment or choose `--auth any` for another provider source. |
 
 ## Observation and control reference
 
