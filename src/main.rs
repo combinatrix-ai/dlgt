@@ -295,10 +295,10 @@ fn command_send(args: &[String]) -> Result<()> {
             .context("missing prompt; use --prompt-file, --stdin, or -- PROMPT")?;
         params["prompt"] = json!(prompt);
     }
+    // Route to the daemon that owns the Session but send the selector as the
+    // caller wrote it: the daemon resolves a rotated ID itself, and the
+    // request ID's payload must stay identical across retries.
     let route = client::find_live_session(session)?;
-    if let Some(route) = &route {
-        params["session"] = json!(route.session_id);
-    }
     let result = if let Some(route) = &route {
         client::call_socket(&route.socket, "session.send", params)?
     } else {
@@ -492,10 +492,7 @@ fn command_answer(args: &[String]) -> Result<()> {
         params["json"] = value;
     }
     let result = match client::find_live_session(session)? {
-        Some(route) => {
-            params["session"] = json!(route.session_id);
-            client::call_socket(&route.socket, "session.answer", params)?
-        }
+        Some(route) => client::call_socket(&route.socket, "session.answer", params)?,
         None => client::call_existing("session.answer", params)?,
     };
     print_success(result, parsed.flag("--pretty"))

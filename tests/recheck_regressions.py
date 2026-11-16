@@ -1041,6 +1041,13 @@ class RecheckRegressions(unittest.TestCase):
                 timeout=20,
             )
             self.assertIn(session, routed.stdout, routed.stdout + routed.stderr)
+            retry = [str(BIN), "send", session.removesuffix("-rotated"), "--request-id", "cli-retry", "--", "again"]
+            h.wait_state(session, "idle")
+            first = subprocess.run(retry, env=h.environment, capture_output=True, text=True, timeout=30)
+            second = subprocess.run(retry, env=h.environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn('"replayed":true', second.stdout)
 
     def test_a_failed_create_never_fails_the_restart_that_replaced_it(self) -> None:
         for harness in ("claude", "codex"):
