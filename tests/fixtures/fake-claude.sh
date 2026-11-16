@@ -15,6 +15,14 @@ if [ -n "${DLGT_FAKE_ARGS_FILE:-}" ]; then
 fi
 
 if [ "$1" = auth ] && [ "${2:-}" = status ]; then
+  if [ -f "$HOME/.fake-auth-delay" ]; then
+    delay=$(cat "$HOME/.fake-auth-delay")
+    printf '%s\n' "$$" >"$HOME/.fake-auth-parent-pid"
+    sleep "$delay" &
+    auth_child=$!
+    printf '%s\n' "$auth_child" >"$HOME/.fake-auth-child-pid"
+    wait "$auth_child"
+  fi
   if [ -f "$HOME/.fake-auth-status" ]; then
     cat "$HOME/.fake-auth-status"
   else
@@ -70,6 +78,12 @@ ask_id=0
 field() {
   printf '%s' "$line" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
 }
+queued_contains() {
+  for queued_uuid in $queued; do
+    [ "$queued_uuid" = "$1" ] && return 0
+  done
+  return 1
+}
 lifecycle() {
   printf '{"type":"command_lifecycle","command_uuid":"%s","state":"%s"}\n' "$1" "$2"
 }
@@ -96,9 +110,14 @@ while IFS= read -r line; do
           control_ok "$request" "{\"current_permission_mode\":\"$mode\",\"session_state\":\"idle\"}"
           ;;
         *'"subtype":"cancel_async_message"'*)
-          if [ -n "$queued" ] && [ "$(field message_uuid)" = "$queued" ]; then
-            lifecycle "$queued" cancelled
-            queued=
+          target=$(field message_uuid)
+          if [ -n "$queued" ] && queued_contains "$target"; then
+            lifecycle "$target" cancelled
+            remaining=
+            for queued_uuid in $queued; do
+              [ "$queued_uuid" = "$target" ] || remaining="$remaining $queued_uuid"
+            done
+            queued=$remaining
             control_ok "$request" '{"cancelled":true}'
           else
             control_ok "$request" '{"cancelled":false}'
@@ -112,6 +131,10 @@ while IFS= read -r line; do
           control_ok "$request" '{"still_queued":[]}'
           if [ "$holding" = 1 ] || [ -n "$asking" ]; then
             printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":null,"permission_denials":[]}'
+            if [ -n "${DLGT_FAKE_INTERRUPT_RESULT_FILE:-}" ]; then
+              : >"$DLGT_FAKE_INTERRUPT_RESULT_FILE"
+              while [ ! -e "${DLGT_FAKE_INTERRUPT_RELEASE_FILE:-/nonexistent}" ]; do sleep 0.002; done
+            fi
           fi
           holding=0
           asking=
@@ -139,7 +162,7 @@ while IFS= read -r line; do
       lifecycle "$uuid" queued
       if [ "$holding" = 1 ]; then
         case "$content" in
-          queued*) queued=$uuid ;;
+          queued*) queued="$queued $uuid" ;;
           *)
             replay "$uuid" "$content"
             holding=0

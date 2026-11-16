@@ -575,8 +575,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Answer, AnswerClaim, Outcome, ProviderRequest, RequestDraft, RequestKind, RequestRecord,
-        RequestTable, Resolution,
+        Answer, AnswerClaim, AnswerState, Outcome, ProviderRequest, RequestDraft, RequestKind,
+        RequestRecord, RequestTable, Resolution,
     };
 
     fn approval(provider: ProviderRequest) -> RequestDraft {
@@ -794,6 +794,152 @@ mod tests {
                 "name": "Ada", "color": "blue"
             }})
         );
+    }
+
+    #[test]
+    fn form_publication_preserves_every_schema_identity() {
+        let fields = (0..17)
+            .map(|index| super::FormField {
+                name: format!("field_{index}_{}", "n".repeat(180)),
+                field_type: "string".to_owned(),
+                required: index == 16,
+                enum_values: if index == 16 {
+                    vec![json!(format!("choice_{}", "v".repeat(180)))]
+                } else {
+                    Vec::new()
+                },
+                constraints: json!({"pattern": format!("^{}$", "p".repeat(180))}),
+            })
+            .collect::<Vec<_>>();
+        let draft = question(ProviderRequest::CodexElicitation {
+            fields: fields.clone(),
+            form: true,
+        });
+        let record = RequestTable::default().open(draft, Some(4), 1);
+        let public = record.public();
+
+        assert_eq!(public["fields"].as_array().map(Vec::len), Some(17));
+        for (published, original) in public["fields"].as_array().unwrap().iter().zip(fields) {
+            assert_eq!(published["name"], original.name);
+            assert_eq!(published["required"], original.required);
+            assert_eq!(
+                published["enum"][0],
+                original.enum_values.first().cloned().unwrap_or(Value::Null)
+            );
+            assert_eq!(published["constraints"], original.constraints);
+        }
+    }
+
+    #[test]
+    fn form_publication_preserves_long_names_enums_and_patterns() {
+        let name = "required_".to_owned() + &"n".repeat(180);
+        let enum_values = (0..9)
+            .map(|index| json!(format!("choice_{index}_{}", "v".repeat(180))))
+            .collect::<Vec<_>>();
+        let pattern = format!("^{}$", "p".repeat(240));
+        let field = super::FormField {
+            name: name.clone(),
+            field_type: "string".to_owned(),
+            required: true,
+            enum_values: enum_values.clone(),
+            constraints: json!({"pattern": pattern}),
+        };
+        let record = RequestTable::default().open(
+            question(ProviderRequest::CodexElicitation {
+                fields: vec![field],
+                form: true,
+            }),
+            Some(4),
+            1,
+        );
+        let public = record.public();
+
+        assert_eq!(public["fields"][0]["name"], name);
+        assert_eq!(public["fields"][0]["enum"], json!(enum_values));
+        assert_eq!(public["fields"][0]["constraints"]["pattern"], pattern);
+    }
+
+    #[test]
+    fn every_public_request_fits_the_hard_budget_with_huge_tool_and_cwd() {
+        let mut draft = approval(ProviderRequest::CodexCommand);
+        draft.tool = "T".repeat(300_000);
+        draft.cwd = Some("/".to_owned() + &"c".repeat(300_000));
+        draft.summary = "S".repeat(300_000);
+        draft.reason = Some("R".repeat(300_000));
+        draft.input = json!({"command": "C".repeat(300_000)});
+        let record = RequestTable::default().open(draft, Some(1), 1);
+        let public = record.public();
+        let encoded = serde_json::to_vec(&public).unwrap_or_default();
+
+        assert!(encoded.len() <= 256 * 1024, "{} bytes", encoded.len());
+        for field in ["tool", "cwd", "summary", "reason"] {
+            assert!(
+                public[field]
+                    .as_str()
+                    .is_some_and(|value| value.len() < 300_000)
+            );
+            assert!(
+                public[field].to_string().contains("truncated"),
+                "{field} lacks a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_answer_delivery_does_not_make_the_request_retryable() {
+        let answer = Answer::Allow;
+        let mut table = RequestTable::default();
+        table.open(approval(ProviderRequest::CodexCommand), None, 1);
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Started)
+        );
+
+        assert!(!table.retry_answer("r1", &answer));
+        assert_eq!(
+            table.get("r1").map(|record| record.answer_state),
+            Some(AnswerState::Failed)
+        );
+    }
+
+    #[test]
+    fn delivered_answer_receipt_survives_provider_resolution_race() {
+        let answer = Answer::Allow;
+        let mut table = RequestTable::default();
+        table.open(approval(ProviderRequest::CodexCommand), None, 1);
+        assert_eq!(
+            table.begin_answer("r1", &answer),
+            Some(AnswerClaim::Started)
+        );
+
+        assert!(
+            table
+                .resolve(
+                    "r1",
+                    Resolution {
+                        outcome: Outcome::Canceled,
+                        answer: None
+                    },
+                )
+                .is_none()
+        );
+        assert!(
+            table
+                .resolve_with_receipt(
+                    "r1",
+                    Resolution {
+                        outcome: Outcome::Allowed,
+                        answer: Some(answer.clone())
+                    },
+                    json!({"delivered": true}),
+                )
+                .is_some()
+        );
+        let record = table
+            .get("r1")
+            .unwrap_or_else(|| panic!("request was removed"));
+        assert_eq!(record.answer_state, AnswerState::Delivered);
+        assert_eq!(record.answer_receipt, Some(json!({"delivered": true})));
     }
 
     #[test]

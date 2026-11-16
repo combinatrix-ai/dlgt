@@ -1305,6 +1305,40 @@ mod tests {
     }
 
     #[test]
+    fn stale_delivery_failure_cannot_fail_a_replaced_execution() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "first")
+            .unwrap_or_else(|error| panic!("failed to insert first turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-1")));
+        assert!(
+            store
+                .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"), false)
+                .unwrap_or_else(|error| panic!("failed to complete first turn: {error}"))
+        );
+        store
+            .insert_turn("turn_2", "codex:thread-1", "second")
+            .unwrap_or_else(|error| panic!("failed to insert second turn: {error}"));
+        assert!(store.mark_turn_started("turn_2", Some("provider-2")));
+        assert!(store.set_session_state("codex:thread-1", SessionState::Busy));
+
+        // This represents a delivery callback from the replaced execution.
+        store.set_session_failed("codex:thread-1");
+
+        assert_eq!(
+            store
+                .get_session("codex:thread-1")
+                .map(|session| session.state),
+            Some(SessionState::Busy),
+            "a stale callback changed the newer execution"
+        );
+        assert_eq!(
+            store.get_turn("turn_2").map(|turn| turn.state),
+            Some(TurnState::Running)
+        );
+    }
+
+    #[test]
     fn retains_session_turn_and_event() {
         let mut store = Store::new();
         store

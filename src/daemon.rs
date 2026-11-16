@@ -5151,6 +5151,33 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_fetch_with_300kb_tool_and_cwd_fits_the_hard_request_budget() {
+        let request = json!({
+            "id": "r1",
+            "kind": "approval",
+            "tool": "T".repeat(300_000),
+            "cwd": format!("/{}", "c".repeat(300_000)),
+            "summary": "A short command",
+            "input": {"command": "echo hello"}
+        });
+        let mut cut = test_cut(vec![
+            SourceSpec {
+                requests: vec![request],
+                ..SourceSpec::new("su_test")
+            }
+            .build(),
+        ]);
+        cut.state = Some(SessionState::Blocked);
+
+        let rendered = cut
+            .render(&fetch_options(FETCH_HARD_MAX_BYTES, None))
+            .unwrap_or_else(|error| panic!("hard-limit Request failed: {error}"));
+        let bucket = &rendered.value["sessions"][0];
+        assert_eq!(bucket["requests"][0]["id"], "r1");
+        assert!(line_length(&rendered.value) <= FETCH_HARD_MAX_BYTES);
+    }
+
+    #[test]
     fn a_request_at_the_reported_minimum_budget_succeeds() {
         let cut = || {
             test_cut(vec![
@@ -5579,5 +5606,52 @@ mod tests {
             let error = anyhow::anyhow!(message);
             assert_eq!(classify_error(&error), code);
         }
+    }
+
+    #[test]
+    fn duplicate_answer_wait_does_not_miss_a_completion_notification() {
+        use std::sync::Barrier;
+
+        let pair = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let observed = Arc::new(Barrier::new(2));
+        let notified = Arc::new(Barrier::new(2));
+        let waiter_pair = Arc::clone(&pair);
+        let waiter_observed = Arc::clone(&observed);
+        let waiter_notified = Arc::clone(&notified);
+        let waiter = std::thread::spawn(move || {
+            let (state, condition) = &*waiter_pair;
+            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(
+                !*guard,
+                "attempt completed before the duplicate inspected it"
+            );
+            drop(guard);
+            // This is the gap in claim_request_answer: the predicate guard is
+            // released before the condition-variable wait reacquires it.
+            waiter_observed.wait();
+            waiter_notified.wait();
+            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            let (guard, timeout) = condition
+                .wait_timeout(guard, Duration::from_millis(20))
+                .unwrap_or_else(|error| error.into_inner());
+            (timeout.timed_out(), *guard)
+        });
+
+        observed.wait();
+        {
+            let (state, condition) = &*pair;
+            *state.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            condition.notify_all();
+        }
+        notified.wait();
+        let (timed_out, completed) = waiter
+            .join()
+            .unwrap_or_else(|_| panic!("duplicate waiter panicked"));
+
+        assert!(completed, "the answer attempt did complete");
+        assert!(
+            !timed_out,
+            "duplicate missed the notification and reported REQUEST_BUSY"
+        );
     }
 }

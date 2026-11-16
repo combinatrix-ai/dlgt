@@ -855,4 +855,26 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
         let empty = client_environment(&[("ANTHROPIC_API_KEY", "")]);
         assert!(validate_auth_environment(AuthPolicy::Subscription, empty.iter()).is_ok());
     }
+
+    #[test]
+    fn auth_mismatch_names_only_the_blocking_environment_variables() {
+        let entries = std::collections::BTreeMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "https://private.invalid".to_owned(),
+            ),
+            ("UNRELATED".to_owned(), "unrelated-secret".to_owned()),
+        ]);
+        let error = super::validate_auth_environment(AuthPolicy::Subscription, entries.iter())
+            .err()
+            .unwrap_or_else(|| panic!("blocked auth override was accepted"));
+        let message = format!("{error:#}");
+        assert!(message.contains("ANTHROPIC_BASE_URL"), "{message}");
+        assert!(!message.contains("https://private.invalid"), "{message}");
+        assert!(!message.contains("unrelated-secret"), "{message}");
+        assert!(
+            !message.contains("ANTHROPIC_API_KEY"),
+            "unrelated remedy: {message}"
+        );
+    }
 }

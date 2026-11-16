@@ -994,6 +994,33 @@ mod tests {
         (store, turns)
     }
 
+    #[test]
+    fn cancel_counts_a_claude_prompt_reserved_before_transport_write() {
+        let (mut store, _) = busy_session(ApprovalsMode::Ask);
+        // Recreate the window between publishing the execution and reserving
+        // the prompt in ClaudeTurns. A cancel in this window must still see
+        // the prompt that will be handed to the provider.
+        let mut turns = ClaudeTurns::default();
+        let unread_before_submit_reservation = turns.unread().len();
+        assert!(
+            store
+                .cancel_turn_with_controls("turn_1", unread_before_submit_reservation + 1)
+                .unwrap_or_else(|error| panic!("failed to mark execution canceled: {error}"))
+        );
+        turns.begin("u-prompt");
+
+        assert!(
+            !store
+                .settle_canceled_turn("turn_1", None)
+                .unwrap_or_else(|error| panic!("failed to observe cancellation: {error}"))
+        );
+        assert!(
+            !store.finish_cancel_control("turn_1"),
+            "the prompt cancel control was not included in the execution's controls"
+        );
+        assert!(store.cancel_controls_pending("turn_1"));
+    }
+
     fn apply(store: &Store, turns: &mut ClaudeTurns, event: &Value) -> Vec<Action> {
         apply_event(store, SESSION, turns, event)
             .unwrap_or_else(|error| panic!("failed to apply {event}: {error}"))

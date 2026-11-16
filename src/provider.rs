@@ -807,6 +807,49 @@ harness_options = ["approval_policy=never"]
     }
 
     #[test]
+    fn permission_guards_reject_nested_overrides_and_claude_agents_modes() {
+        for option in [
+            "profiles.x.approval_policy=never",
+            "profiles.x.approvals_reviewer=user",
+            "profiles.x.sandbox_mode=danger-full-access",
+            "profiles.x.sandbox_workspace_write.network_access=true",
+        ] {
+            let error = codex_harness_args(&[option.to_owned()])
+                .err()
+                .unwrap_or_else(|| panic!("accepted managed option {option}"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(option.split('=').next().unwrap_or(option))
+            );
+        }
+        for (option, expected_ok) in [
+            (r#"agents={"worker":{"permissionMode":"default"}}"#, true),
+            (
+                r#"agents={"worker":{"permissionMode":"acceptEdits"}}"#,
+                false,
+            ),
+            (
+                r#"agents={"worker":{"permissionMode":"bypassPermissions"}}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                claude_harness_args(&[option.to_owned()]).is_ok(),
+                expected_ok,
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_owned_claude_settings_are_not_rejected_as_dlgt_permission_overrides() {
+        let option = "settings=/private/tmp/user-settings.json".to_owned();
+        let args = claude_harness_args(&[option]).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(args, ["--settings=/private/tmp/user-settings.json"]);
+    }
+
+    #[test]
     fn resume_commands_are_the_providers_own() {
         assert_eq!(Agent::Claude.resume_command("abc"), "claude --resume abc");
         assert_eq!(Agent::Codex.resume_command("abc"), "codex resume abc");
@@ -920,5 +963,36 @@ harness_options = ["approval_policy=never"]
             .err()
             .unwrap_or_else(|| panic!("malformed projects table should fail"));
         assert!(error.to_string().contains("must be a table"));
+    }
+
+    #[test]
+    fn provider_config_parse_errors_include_location_without_source_text() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
+        let codex_home = directory.path().join("codex-home");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&codex_home)
+            .unwrap_or_else(|error| panic!("failed to create Codex home: {error}"));
+        fs::create_dir_all(&workspace)
+            .unwrap_or_else(|error| panic!("failed to create workspace: {error}"));
+        let config = codex_home.join("config.toml");
+        let secret = "provider-config-secret-value";
+        fs::write(&config, format!("token = \"{secret}\"\nthis is not TOML\n"))
+            .unwrap_or_else(|error| panic!("failed to seed malformed config: {error}"));
+
+        let error = trust_codex_workspace(&codex_home, &workspace)
+            .err()
+            .unwrap_or_else(|| panic!("malformed config should fail"));
+        let message = format!("{error:#}");
+        assert!(message.contains(&config.display().to_string()), "{message}");
+        assert!(
+            message.contains("line 2, column") || message.contains("2:"),
+            "missing line and column: {message}"
+        );
+        assert!(!message.contains(secret), "secret leaked: {message}");
+        assert!(
+            !message.contains("this is not TOML"),
+            "source leaked: {message}"
+        );
     }
 }

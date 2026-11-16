@@ -866,6 +866,40 @@ mod tests {
     }
 
     #[test]
+    fn an_unpublishable_form_is_declined_with_a_notice_instead_of_changed_schema() {
+        let (mut store, mut items) = busy_store();
+        let field_name = "required_field_".to_owned() + &"x".repeat(300_000);
+        let mut properties = serde_json::Map::new();
+        properties.insert(field_name.clone(), json!({"type": "string"}));
+        let notification = json!({
+            "method": "dlgt/server/request",
+            "params": {
+                "method": "mcpServer/elicitation/request",
+                "id": "too-large-form",
+                "params": {
+                    "threadId": "thread-1", "turnId": "provider-turn",
+                    "mode": "form", "serverName": "profile", "message": "Create profile",
+                    "requestedSchema": {
+                        "type": "object", "required": [field_name], "properties": properties
+                    }
+                }
+            }
+        });
+
+        let accepted = apply_notification(&mut store, "codex:thread-1", &mut items, &notification)
+            .unwrap_or_else(|error| panic!("failed to handle oversized form: {error}"));
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+
+        assert!(!accepted, "provider was told dlgt accepted a changed form");
+        assert!(store.pending_requests(&uid).is_empty());
+        assert!(messages(&store).iter().any(|message| {
+            message["kind"] == "notice" && message.to_string().contains("form")
+        }));
+    }
+
+    #[test]
     fn an_auto_review_is_the_providers_decision_and_a_denial_is_counted() {
         let (mut store, mut items) = busy_store();
         for (status, risk) in [("approved", "low"), ("denied", "high")] {

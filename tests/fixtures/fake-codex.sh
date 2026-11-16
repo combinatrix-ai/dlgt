@@ -7,6 +7,9 @@
 if [ -n "${DLGT_FAKE_CODEX_LOG:-}" ]; then
   printf 'args: %s\n' "$*" >>"$DLGT_FAKE_CODEX_LOG"
 fi
+if [ -n "${DLGT_FAKE_CODEX_PID_FILE:-}" ]; then
+  printf '%s\n' "$$" >"$DLGT_FAKE_CODEX_PID_FILE"
+fi
 
 thread=thread-$$
 turn=
