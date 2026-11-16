@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -148,6 +149,42 @@ pub struct CommandSpec {
     pub environment: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryCertainty {
+    NotHandedToTransport,
+    Ambiguous,
+}
+
+#[derive(Debug)]
+pub struct DeliveryFailure {
+    pub certainty: DeliveryCertainty,
+    message: String,
+}
+
+impl DeliveryFailure {
+    pub fn not_handed(message: impl Into<String>) -> Self {
+        Self {
+            certainty: DeliveryCertainty::NotHandedToTransport,
+            message: message.into(),
+        }
+    }
+
+    pub fn ambiguous(message: impl Into<String>) -> Self {
+        Self {
+            certainty: DeliveryCertainty::Ambiguous,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for DeliveryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DeliveryFailure {}
+
 pub fn codex_program() -> PathBuf {
     std::env::var_os("DLGT_CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from)
 }
@@ -242,22 +279,38 @@ fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
             error.column()
         )
     })?;
-    let root = state
-        .as_object_mut()
-        .context("Claude state root must be an object")?;
-    let projects = root
+    let Some(root) = state.as_object_mut() else {
+        return Err(provider_config_error(&state_path, &existing, 0));
+    };
+    let projects_entry = root
         .entry("projects")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .context("Claude state `projects` must be an object")?;
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !projects_entry.is_object() {
+        return Err(provider_config_error(
+            &state_path,
+            &existing,
+            json_key_offset(&existing, "projects"),
+        ));
+    }
+    let Some(projects) = projects_entry.as_object_mut() else {
+        return Err(provider_config_error(&state_path, &existing, 0));
+    };
     let cwd = cwd
         .to_str()
         .context("Claude workspace path is not valid UTF-8")?;
-    let project = projects
+    let cwd_entry = projects
         .entry(cwd)
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .with_context(|| format!("Claude state project {cwd:?} must be an object"))?;
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !cwd_entry.is_object() {
+        return Err(provider_config_error(
+            &state_path,
+            &existing,
+            json_key_offset(&existing, cwd),
+        ));
+    }
+    let Some(project) = cwd_entry.as_object_mut() else {
+        return Err(provider_config_error(&state_path, &existing, 0));
+    };
     let is_trusted = project
         .get("hasTrustDialogAccepted")
         .and_then(serde_json::Value::as_bool)
@@ -307,8 +360,45 @@ fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
     if project_is_trusted(&document, cwd) {
         return Ok(());
     }
-    set_project_trusted(&mut document, cwd)?;
+    let offset = codex_workspace_error_offset(&document, cwd);
+    set_project_trusted(&mut document, cwd)
+        .map_err(|_| provider_config_error(&config_path, &existing, offset))?;
     write_config_atomic(&config_path, &document.to_string())
+}
+
+fn provider_config_error(path: &Path, contents: &str, offset: usize) -> anyhow::Error {
+    let (line, column) = crate::config::line_column(contents, offset);
+    anyhow!(
+        "invalid provider configuration at {}:{line}:{column}: invalid configuration entry",
+        path.display()
+    )
+}
+
+fn json_key_offset(contents: &str, key: &str) -> usize {
+    serde_json::to_string(key)
+        .ok()
+        .and_then(|quoted| contents.find(&quoted))
+        .unwrap_or_default()
+}
+
+fn codex_workspace_error_offset(document: &DocumentMut, cwd: &str) -> usize {
+    let Some(projects) = document.get("projects") else {
+        return 0;
+    };
+    if projects.as_table_like().is_none() {
+        return projects.span().map_or(0, |span| span.start);
+    }
+    let Some(project) = projects
+        .as_table_like()
+        .and_then(|projects| projects.get(cwd))
+    else {
+        return 0;
+    };
+    if project.as_table_like().is_none() {
+        project.span().map_or(0, |span| span.start)
+    } else {
+        0
+    }
 }
 
 fn set_project_trusted(document: &mut DocumentMut, cwd: &str) -> Result<()> {
@@ -475,7 +565,7 @@ pub fn verify_claude_subscription_login(
         .take()
         .context("Claude auth status stderr was unavailable")?;
     let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout) {
-        Ok(reader) => reader,
+        Ok(output_task) => output_task,
         Err(error) => {
             kill_process_group(group);
             let _ = child.wait();
@@ -483,7 +573,7 @@ pub fn verify_claude_subscription_login(
         }
     };
     let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr) {
-        Ok(reader) => reader,
+        Ok(output_task) => output_task,
         Err(error) => {
             kill_process_group(group);
             let _ = child.wait();
@@ -642,9 +732,7 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
         ) || matches!(
             final_segment,
             "approval_policy" | "approvals_reviewer" | "sandbox_mode"
-        ) || segments
-            .iter()
-            .any(|segment| *segment == "sandbox_workspace_write");
+        ) || segments.contains(&"sandbox_workspace_write");
         if protected {
             bail!("harness option {key:?} is managed by dlgt");
         }
@@ -900,8 +988,6 @@ harness_options = ["approval_policy=never"]
             "permission-prompts=none",
             "allowedTools=Bash",
             "allowed-tools=Bash",
-            "settings={}",
-            "settings-file=permissions.json",
             "bare",
             "dangerously-skip-permissions",
             "output-format=text",
@@ -1129,7 +1215,7 @@ harness_options = ["approval_policy=never"]
     }
 
     #[test]
-    fn malformed_codex_project_table_returns_an_error() {
+    fn malformed_codex_project_table_returns_a_sanitized_located_error() {
         let directory = tempfile::tempdir()
             .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
         let codex_home = directory.path().join("codex-home");
@@ -1138,13 +1224,45 @@ harness_options = ["approval_policy=never"]
             .unwrap_or_else(|error| panic!("failed to create Codex home: {error}"));
         fs::create_dir_all(&workspace)
             .unwrap_or_else(|error| panic!("failed to create workspace: {error}"));
-        fs::write(codex_home.join("config.toml"), "projects = \"invalid\"\n")
+        let config = codex_home.join("config.toml");
+        let secret = "provider-structure-secret";
+        fs::write(&config, format!("projects = \"{secret}\"\n"))
             .unwrap_or_else(|error| panic!("failed to seed malformed config: {error}"));
 
         let error = trust_codex_workspace(&codex_home, &workspace)
             .err()
             .unwrap_or_else(|| panic!("malformed projects table should fail"));
-        assert!(error.to_string().contains("must be a table"));
+        let message = format!("{error:#}");
+        assert!(message.contains(&config.display().to_string()), "{message}");
+        assert!(message.contains("1:"), "missing line and column: {message}");
+        assert!(!message.contains(secret), "source leaked: {message}");
+    }
+
+    #[test]
+    fn malformed_claude_state_structure_returns_a_sanitized_located_error() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("failed to create temporary directory: {error}"));
+        let home = directory.path().join("home");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&home)
+            .unwrap_or_else(|error| panic!("failed to create Claude home: {error}"));
+        fs::create_dir_all(&workspace)
+            .unwrap_or_else(|error| panic!("failed to create workspace: {error}"));
+        let state_path = home.join(".claude.json");
+        let secret = "claude-state-secret";
+        fs::write(&state_path, format!("{{\"projects\":\"{secret}\"}}"))
+            .unwrap_or_else(|error| panic!("failed to seed malformed state: {error}"));
+
+        let error = trust_claude_workspace(&home, &workspace)
+            .err()
+            .unwrap_or_else(|| panic!("malformed projects value should fail"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&state_path.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("1:"), "missing line and column: {message}");
+        assert!(!message.contains(secret), "source leaked: {message}");
     }
 
     #[test]

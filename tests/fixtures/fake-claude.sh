@@ -24,6 +24,10 @@ if [ "$1" = auth ] && [ "${2:-}" = status ]; then
     wait "$auth_child"
   fi
   if [ -f "$HOME/.fake-auth-status" ]; then
+    if [ -f "$HOME/.fake-auth-output-bytes" ]; then
+      output_bytes=$(cat "$HOME/.fake-auth-output-bytes")
+      awk -v count="$output_bytes" 'BEGIN { for (i = 0; i < count; i++) printf " " }'
+    fi
     cat "$HOME/.fake-auth-status"
   else
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'

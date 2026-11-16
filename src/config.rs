@@ -101,9 +101,16 @@ impl AuthMismatch {
         if self.variables.is_empty() {
             "Confirm Claude is logged in with a claude.ai subscription in the selected launch environment, or choose --auth any if another provider source is intended.".to_owned()
         } else {
+            let unset_options = self
+                .variables
+                .iter()
+                .map(|name| format!("--unset-env {name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "Unset the blocking environment variable(s) {} with matching --unset-env options (or unset them in [defaults.claude]); choose --auth any only if another provider source is intended.",
-                self.variables.join(", ")
+                "Unset the blocking environment variable(s) {} with {} (or unset them in [defaults.claude]); choose --auth any only if another provider source is intended.",
+                self.variables.join(", "),
+                unset_options,
             )
         }
     }
@@ -197,16 +204,20 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
 }
 
 pub fn parse(text: &str) -> Result<Config> {
-    let document = parse_toml_document(text, "dlgt config")?;
+    let document = parse_toml_document_as(text, "dlgt config")?;
     parse_document(&document)
         .map_err(|_| anyhow!("invalid dlgt config at 1:1: invalid configuration entry"))
 }
 
 pub fn parse_toml_document(text: &str, source: &str) -> Result<DocumentMut> {
+    parse_toml_document_as(text, &format!("TOML in {source}"))
+}
+
+fn parse_toml_document_as(text: &str, subject: &str) -> Result<DocumentMut> {
     text.parse::<DocumentMut>().map_err(|error| {
         let offset = error.span().map_or(0, |span| span.start);
         let (line, column) = line_column(text, offset);
-        anyhow!("invalid TOML in {source} at {line}:{column}: invalid TOML syntax")
+        anyhow!("invalid {subject} at {line}:{column}: invalid TOML syntax")
     })
 }
 
@@ -382,7 +393,7 @@ fn is_truthy(value: &str) -> bool {
         )
 }
 
-fn line_column(text: &str, offset: usize) -> (usize, usize) {
+pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let prefix = &text[..offset.min(text.len())];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let column = prefix
@@ -911,6 +922,7 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
             .unwrap_or_else(|| panic!("auth mismatch type was lost"));
         let hint = mismatch.hint();
         assert!(hint.contains("ANTHROPIC_BASE_URL"), "{hint}");
+        assert!(hint.contains("--unset-env ANTHROPIC_BASE_URL"), "{hint}");
         assert!(!hint.contains("ANTHROPIC_API_KEY"), "{hint}");
         assert!(!hint.contains("https://private.invalid"), "{hint}");
     }

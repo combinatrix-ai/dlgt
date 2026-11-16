@@ -195,6 +195,39 @@ class RecheckRegressions(unittest.TestCase):
         self.assertFalse((h.home / ".claude.json").exists(), "Claude workspace trust ran before validation")
         self.assertFalse((h.home / ".codex" / "config.toml").exists(), "Codex workspace trust ran before validation")
 
+    def test_managed_permission_option_returns_invalid_argument_from_cli(self) -> None:
+        h = self.harness
+        args_file = h.root / "claude-cli-args.log"
+        process = subprocess.run(
+            [
+                str(BIN),
+                "new",
+                "--title",
+                "invalid CLI option",
+                "--harness",
+                "claude",
+                "--cwd",
+                str(h.root),
+                "--request-id",
+                "invalid-cli-option",
+                "--approvals",
+                "ask",
+                "--harness-option",
+                "permission-mode=manual",
+                "--",
+                "must not launch",
+            ],
+            env=h.provider_env({"DLGT_FAKE_ARGS_FILE": str(args_file)}),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        response = json.loads(process.stdout)
+        self.assertNotEqual(process.returncode, 0, response)
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT", response)
+        self.assertIn("permission-mode", response["error"]["message"])
+        self.assertFalse(args_file.exists() and args_file.stat().st_size)
+
     def test_profile_parser_error_has_path_location_and_no_source_excerpt(self) -> None:
         h = self.harness
         config = h.root / "profiles.toml"
@@ -216,6 +249,23 @@ class RecheckRegressions(unittest.TestCase):
         self.assertIn("2:", message)
         self.assertNotIn(secret, process.stdout + process.stderr)
         self.assertNotIn("this is not TOML", process.stdout + process.stderr)
+
+    def test_provider_config_error_has_path_location_and_no_source_excerpt(self) -> None:
+        h = self.harness
+        codex_home = h.home / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        secret = "provider-config-secret-value"
+        config.write_text(f'token = "{secret}"\nthis is not TOML\n')
+
+        response = h.create("codex", "provider config must fail before launch")
+        message = response.get("error", {}).get("message", "")
+
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT", response)
+        self.assertIn(str(config), message)
+        self.assertIn("2:", message)
+        self.assertNotIn(secret, json.dumps(response))
+        self.assertNotIn("this is not TOML", json.dumps(response))
 
     def test_codex_ambiguous_write_timeout_fails_closed_for_waiting_duplicate(self) -> None:
         h = self.harness
@@ -242,12 +292,15 @@ class RecheckRegressions(unittest.TestCase):
         duplicate = h.pending("session.answer", answer)
         first_response = h.receive(first)
         state = h.state(session)
-        os.kill(provider_pid, signal.SIGCONT)
+        try:
+            os.kill(provider_pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
         duplicate_response = h.receive(duplicate)
 
         self.assertEqual(first_response.get("error", {}).get("code"), "REQUEST_DELIVERY_FAILED")
         self.assertEqual(state["session"]["state"], "failed", state)
-        self.assertEqual(state["requests"][0]["answer_state"], "failed", state)
+        self.assertEqual(state["requests"], [], "failed Requests are no longer answerable")
         self.assertEqual(
             (state.get("result") or {}).get("error", {}).get("code"),
             "REQUEST_DELIVERY_FAILED",
@@ -296,6 +349,10 @@ class RecheckRegressions(unittest.TestCase):
         self.assertIn("result", restarted, restarted)
         self.assertNotEqual(state["session"]["state"], "failed", state)
         self.assertNotEqual(answer_response.get("error", {}).get("code"), "LAUNCH_FAILED")
+        self.assertFalse(
+            any(request["answer_state"] == "sending" for request in state["requests"]),
+            "the withdrawn old-provider attempt must settle without affecting the replacement Session",
+        )
 
     def test_cancel_returns_the_captured_execution_after_a_new_turn_starts(self) -> None:
         h = self.harness
@@ -391,26 +448,53 @@ class RecheckRegressions(unittest.TestCase):
                 "environment": h.provider_env(),
                 "request_id": "slow-auth",
                 "prompt": "hello",
-                "startup_timeout_ms": 20,
+                "startup_timeout_ms": 1000,
             },
             timeout=5,
         )
         child_file = h.home / ".fake-auth-child-pid"
+        parent_file = h.home / ".fake-auth-parent-pid"
         deadline = time.monotonic() + 3
         while not child_file.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertTrue(child_file.exists(), "auth child did not start")
-        launch.settimeout(0.4)
-        try:
-            h.receive(launch)
-            timed_out = False
-        except TimeoutError:
-            timed_out = True
+        first_pids = [int(child_file.read_text()), int(parent_file.read_text())]
+        launch.settimeout(3)
+        timeout_response = h.receive(launch)
+        self.assertEqual(timeout_response.get("error", {}).get("code"), "LAUNCH_FAILED", timeout_response)
+        for pid in first_pids:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertTrue(not state or state.startswith("Z"), f"auth process {pid} survived startup timeout: {state}")
+
+        child_file.unlink()
+        parent_file.unlink()
+        second_launch = h.pending(
+            "session.create",
+            {
+                "title": "auth stopped with daemon",
+                "harness": "claude",
+                "cwd": str(h.root),
+                "environment": h.provider_env(),
+                "request_id": "slow-auth-stop",
+                "prompt": "hello",
+                "startup_timeout_ms": 10_000,
+            },
+            timeout=5,
+        )
+        deadline = time.monotonic() + 3
+        while not child_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(child_file.exists(), "second auth child did not start")
+        second_pids = [int(child_file.read_text()), int(parent_file.read_text())]
         h.rpc("server.stop", {}, timeout=3)
         h.server.wait(timeout=3)
-        self.assertFalse(timed_out, "auth status outlived the startup deadline")
-        for pid_file in (child_file, h.home / ".fake-auth-parent-pid"):
-            pid = int(pid_file.read_text().strip())
+        second_launch.close()
+        for pid in second_pids:
             state = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(pid)],
                 check=False,
@@ -418,6 +502,19 @@ class RecheckRegressions(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             self.assertTrue(not state or state.startswith("Z"), f"auth process {pid} survived daemon stop: {state}")
+
+    def test_auth_status_retains_only_bounded_output(self) -> None:
+        h = self.harness
+        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
+        (h.home / ".fake-auth-output-bytes").write_text("131072")
+
+        response = h.create("claude", "oversized auth status output")
+        if "result" in response:
+            session = response["result"]["session"]["id"]
+            h.wait_state(session, "idle")
+            h.rpc("session.stop", {"session": session, "force": True})
+
+        self.assertEqual(response.get("error", {}).get("code"), "AUTH_MISMATCH", response)
 
 
 if __name__ == "__main__":

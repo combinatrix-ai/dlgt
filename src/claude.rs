@@ -41,7 +41,6 @@ type ControlWaiters = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 pub struct ClaudeProcess {
     pid: u32,
     writer: SyncSender<WriteCommand>,
-    closed: Arc<AtomicBool>,
     controls: ControlWaiters,
     next_control: AtomicU64,
     stderr_tail: Arc<Mutex<String>>,
@@ -156,7 +155,6 @@ impl ClaudeProcess {
         Ok(Arc::new(Self {
             pid,
             writer,
-            closed,
             controls,
             next_control: AtomicU64::new(1),
             stderr_tail,
@@ -167,10 +165,6 @@ impl ClaudeProcess {
 
     pub const fn pid(&self) -> u32 {
         self.pid
-    }
-
-    pub fn is_open(&self) -> bool {
-        !self.closed.load(Ordering::Acquire)
     }
 
     pub fn stderr_tail(&self) -> String {
@@ -261,12 +255,33 @@ impl ClaudeProcess {
         }))
     }
 
-    /// Answer a `can_use_tool` request.
-    pub fn respond(&self, request_id: &str, response: &Value) -> Result<()> {
-        self.write_line(&json!({
+    pub fn respond_delivery(
+        &self,
+        request_id: &str,
+        response: &Value,
+    ) -> std::result::Result<(), crate::provider::DeliveryFailure> {
+        let mut line = serde_json::to_vec(&json!({
             "type": "control_response",
             "response": {"subtype": "success", "request_id": request_id, "response": response},
         }))
+        .map_err(|error| crate::provider::DeliveryFailure::not_handed(error.to_string()))?;
+        line.push(b'\n');
+        let (written, result) = mpsc::channel();
+        if let Err(error) = self.enqueue(WriteCommand { line, written }) {
+            return Err(crate::provider::DeliveryFailure::not_handed(
+                error.to_string(),
+            ));
+        }
+        match result.recv_timeout(WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(crate::provider::DeliveryFailure::ambiguous(message)),
+            Err(_) => {
+                self.force_stop();
+                Err(crate::provider::DeliveryFailure::ambiguous(
+                    "timed out writing to the Claude process",
+                ))
+            }
+        }
     }
 
     fn write_line(&self, value: &Value) -> Result<()> {
@@ -432,18 +447,33 @@ impl ClaudeTurns {
     }
 
     /// Drop a message the provider confirmed it will never read.
-    pub fn discard(&mut self, store: &Store, session_id: &str, uuid: &str) {
+    pub fn discard(
+        &mut self,
+        store: &Store,
+        session_id: &str,
+        runtime_generation: u64,
+        uuid: &str,
+    ) {
         let Some(unread) = self.take(uuid) else {
             return;
         };
         match unread.steer {
             Some(text) => {
-                store.append_message(session_id, MessageBody::steer(&text, false, true));
+                store.expire_steer_attempt(session_id, runtime_generation, uuid, &text);
             }
             // A prompt canceled while still queued never runs, so no result
             // will follow it.
             None if !unread.started => self.turn_open = false,
             None => {}
+        }
+    }
+
+    pub fn discard_without_record(&mut self, uuid: &str) {
+        let Some(unread) = self.take(uuid) else {
+            return;
+        };
+        if unread.steer.is_none() && !unread.started {
+            self.turn_open = false;
         }
     }
 
@@ -519,6 +549,7 @@ impl ClaudeTurns {
 pub fn apply_event(
     store: &Store,
     session_id: &str,
+    runtime_generation: u64,
     turns: &mut ClaudeTurns,
     event: &Value,
 ) -> Result<Vec<Action>> {
@@ -630,7 +661,13 @@ pub fn apply_event(
             }
             match read.steer {
                 Some(steer) => {
-                    store.append_message(session_id, MessageBody::steer(&steer, true, false));
+                    store.finish_steer_attempt(
+                        session_id,
+                        runtime_generation,
+                        &read.uuid,
+                        &steer,
+                        true,
+                    );
                 }
                 None => confirm_started(store, session_id),
             }
@@ -657,7 +694,7 @@ pub fn apply_event(
                     }
                 }
                 Some("cancelled") => {
-                    turns.discard(store, session_id, uuid);
+                    turns.discard(store, session_id, runtime_generation, uuid);
                     turns.settle(store, session_id)?;
                 }
                 _ => {}
@@ -997,17 +1034,19 @@ mod tests {
     #[test]
     fn cancel_counts_a_claude_prompt_reserved_before_transport_write() {
         let (mut store, _) = busy_session(ApprovalsMode::Ask);
-        // Recreate the window between publishing the execution and reserving
-        // the prompt in ClaudeTurns. A cancel in this window must still see
-        // the prompt that will be handed to the provider.
         let mut turns = ClaudeTurns::default();
-        let unread_before_submit_reservation = turns.unread().len();
+        // Submission reserves the prompt while holding the turns lock before
+        // publishing the execution; cancellation takes the same lock first.
+        turns.begin("u-prompt");
+        let unread_at_cancel = turns.unread().len();
+        let generation = store
+            .runtime_generation(SESSION)
+            .unwrap_or_else(|| panic!("runtime generation missing"));
         assert!(
             store
-                .cancel_turn_with_controls("turn_1", unread_before_submit_reservation + 1)
+                .cancel_turn_with_controls("turn_1", generation, unread_at_cancel + 1)
                 .unwrap_or_else(|error| panic!("failed to mark execution canceled: {error}"))
         );
-        turns.begin("u-prompt");
 
         assert!(
             !store
@@ -1022,8 +1061,35 @@ mod tests {
     }
 
     fn apply(store: &Store, turns: &mut ClaudeTurns, event: &Value) -> Vec<Action> {
-        apply_event(store, SESSION, turns, event)
+        let generation = store
+            .runtime_generation(SESSION)
+            .unwrap_or_else(|| panic!("runtime generation missing"));
+        apply_event(store, SESSION, generation, turns, event)
             .unwrap_or_else(|error| panic!("failed to apply {event}: {error}"))
+    }
+
+    fn queue_steer(store: &Store, turns: &mut ClaudeTurns, uuid: &str, text: &str) {
+        let session = store
+            .get_session(SESSION)
+            .unwrap_or_else(|| panic!("session missing"));
+        let turn_id = session
+            .active_turn_id
+            .unwrap_or_else(|| panic!("active turn missing"));
+        let turn = store
+            .get_turn(&turn_id)
+            .unwrap_or_else(|| panic!("turn missing"));
+        let generation = store
+            .runtime_generation(SESSION)
+            .unwrap_or_else(|| panic!("runtime generation missing"));
+        assert!(store.begin_steer_attempt(
+            SESSION,
+            generation,
+            &turn_id,
+            turn.execution_seq,
+            uuid,
+            text,
+        ));
+        turns.add_steer(uuid, text);
     }
 
     fn replay(uuid: &str) -> Value {
@@ -1135,7 +1201,7 @@ mod tests {
     fn a_steer_read_after_a_tool_call_stays_inside_the_same_provider_turn() {
         let (store, mut turns) = busy_session(ApprovalsMode::Ask);
         apply(&store, &mut turns, &replay("u-prompt"));
-        turns.add_steer("u-steer", "also say BANANA");
+        queue_steer(&store, &mut turns, "u-steer", "also say BANANA");
         apply(&store, &mut turns, &lifecycle("u-steer", "queued"));
         apply(&store, &mut turns, &replay("u-steer"));
         assert_eq!(state(&store), SessionState::Busy);
@@ -1145,15 +1211,16 @@ mod tests {
         assert_eq!(turn(&store).final_message.as_deref(), Some("DONE BANANA"));
         let messages = messages(&store);
         assert_eq!(messages[0]["kind"], "steer");
-        assert_eq!(messages[0]["delivered"], true);
-        assert_eq!(messages[0]["text"], "also say BANANA");
+        assert_eq!(messages[0]["delivered"], false);
+        assert_eq!(messages[1]["delivered"], true);
+        assert_eq!(messages[1]["text"], "also say BANANA");
     }
 
     #[test]
     fn an_execution_stays_busy_until_every_accepted_steer_has_run() {
         let (store, mut turns) = busy_session(ApprovalsMode::Ask);
         apply(&store, &mut turns, &replay("u-prompt"));
-        turns.add_steer("u-steer", "then say PAPAYA");
+        queue_steer(&store, &mut turns, "u-steer", "then say PAPAYA");
         // The model was only generating text, so the steer is not read
         // before this turn's result.
         apply(&store, &mut turns, &result("STORY_END"));
@@ -1184,7 +1251,7 @@ mod tests {
     fn a_canceled_execution_discards_its_unread_steer_and_settles_on_the_result() {
         let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
         apply(&store, &mut turns, &replay("u-prompt"));
-        turns.add_steer("u-steer", "extra");
+        queue_steer(&store, &mut turns, "u-steer", "extra");
         assert!(
             store
                 .cancel_turn("turn_1")
@@ -1202,17 +1269,21 @@ mod tests {
         let messages = messages(&store);
         assert_eq!(messages[0]["kind"], "steer");
         assert_eq!(messages[0]["delivered"], false);
-        assert_eq!(messages[0]["expired"], true);
+        assert_eq!(messages[1]["delivered"], false);
+        assert_eq!(messages[1]["expired"], true);
     }
 
     #[test]
     fn a_leftover_message_that_starts_a_turn_after_a_cancel_is_interrupted_again() {
         let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
         apply(&store, &mut turns, &replay("u-prompt"));
-        turns.add_steer("u-steer", "extra");
+        queue_steer(&store, &mut turns, "u-steer", "extra");
+        let generation = store
+            .runtime_generation(SESSION)
+            .unwrap_or_else(|| panic!("runtime generation missing"));
         assert!(
             store
-                .cancel_turn_with_controls("turn_1", 1)
+                .cancel_turn_with_controls("turn_1", generation, 1)
                 .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
         );
         apply(&store, &mut turns, &interrupted());

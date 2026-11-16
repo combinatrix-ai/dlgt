@@ -414,7 +414,7 @@ blocked_client_pid=
 test "$first_answer_status" -ne 0 || fail "failed provider answer delivery returned success"
 test "$duplicate_answer_status" -ne 0 || fail "duplicate replayed an undelivered answer"
 expect "$(cat "$state_dir/blocked-answer-first.json")" '"code":"REQUEST_DELIVERY_FAILED"'
-expect "$(cat "$state_dir/blocked-answer-duplicate.json")" '"code":"REQUEST_FAILED"'
+expect "$(cat "$state_dir/blocked-answer-duplicate.json")" '"code":"REQUEST_DELIVERY_FAILED"'
 expect "$("$binary" show "$blocked_answer_id")" '"state":"failed"'
 "$binary" stop "$blocked_answer_id" --force >/dev/null 2>&1 || true
 wait_until_gone @blocked-answer

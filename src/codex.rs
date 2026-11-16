@@ -280,9 +280,36 @@ impl CodexConnection {
         Ok(())
     }
 
-    /// Answer a server request the caller decided.
-    pub fn respond(&self, id: &Value, result: &Value) -> Result<()> {
-        write_message(&self.writer, &json!({"id": id, "result": result}))
+    pub fn respond_delivery(
+        &self,
+        id: &Value,
+        result: &Value,
+    ) -> std::result::Result<(), crate::provider::DeliveryFailure> {
+        let line = serialize_message(&json!({"id": id, "result": result}))
+            .map_err(|error| crate::provider::DeliveryFailure::not_handed(error.to_string()))?;
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .writer
+            .send(WriteCommand::Message(line, Some(sender)))
+            .is_err()
+        {
+            return Err(crate::provider::DeliveryFailure::not_handed(
+                "Codex app-server writer is closed",
+            ));
+        }
+        match receiver.recv_timeout(WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => {
+                self.force_stop();
+                Err(crate::provider::DeliveryFailure::ambiguous(message))
+            }
+            Err(_) => {
+                self.force_stop();
+                Err(crate::provider::DeliveryFailure::ambiguous(
+                    "timed out writing to the Codex app-server",
+                ))
+            }
+        }
     }
 
     pub fn watch_turn(self: &Arc<Self>, thread_id: &str, turn_id: &str) -> Result<()> {
@@ -354,10 +381,6 @@ impl CodexConnection {
 
     fn closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
-    }
-
-    pub fn is_open(&self) -> bool {
-        !self.closed()
     }
 
     fn signal(&self, signal: i32) {

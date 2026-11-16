@@ -33,7 +33,7 @@ struct MemoryState {
     uid_index: HashMap<String, String>,
     provider_reservations: HashMap<String, String>,
     turns: HashMap<String, TurnRecord>,
-    cancel_controls: HashMap<String, usize>,
+    cancel_controls: HashMap<String, CancelControls>,
     cancel_terminal_seen: HashSet<String>,
     events: VecDeque<EventRecord>,
     /// Highest lifecycle sequence already evicted by retention.
@@ -43,6 +43,7 @@ struct MemoryState {
     /// Messages and Requests, per Session UID.
     messages: HashMap<String, MessageLog>,
     requests: HashMap<String, RequestTable>,
+    steer_attempts: HashMap<String, SteerAttempt>,
     /// Observation positions and the watermarks behind them. Held here so
     /// minting a position is atomic with the state capture it describes.
     cursors: CursorTable,
@@ -51,6 +52,8 @@ struct MemoryState {
 
 struct StoredSession {
     record: SessionRecord,
+    /// Identifies the provider process generation that currently owns this Session.
+    runtime_generation: u64,
     /// Immutable internal identity. Public Session IDs rotate when Claude
     /// reports a new provider session, so cursors bind to this instead.
     uid: String,
@@ -58,6 +61,20 @@ struct StoredSession {
     last_provider_event_ms: Option<i64>,
     /// Diagnostics retained when the Session failed before it became ready.
     launch_failure: Option<Value>,
+}
+
+#[derive(Clone)]
+struct SteerAttempt {
+    session_uid: String,
+    runtime_generation: u64,
+    turn_id: String,
+    execution_seq: i64,
+}
+
+#[derive(Clone, Copy)]
+struct CancelControls {
+    runtime_generation: u64,
+    pending: usize,
 }
 
 struct FinishTurn<'a> {
@@ -123,6 +140,7 @@ impl Store {
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
+                runtime_generation: 1,
                 uid,
                 last_provider_event_ms: None,
                 launch_failure: None,
@@ -150,6 +168,18 @@ impl Store {
         true
     }
 
+    pub fn runtime_generation(&self, id: &str) -> Option<u64> {
+        self.state
+            .borrow()
+            .sessions
+            .get(id)
+            .map(|session| session.runtime_generation)
+    }
+
+    pub fn runtime_generation_is_current(&self, id: &str, generation: u64) -> bool {
+        self.runtime_generation(id) == Some(generation)
+    }
+
     pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
         let mut state = self.state.borrow_mut();
         let Some(session) = state.sessions.get(id) else {
@@ -169,11 +199,24 @@ impl Store {
         }) {
             bail!("active session alias already exists");
         }
+        // The old provider is about to be replaced. Withdraw its pending
+        // Requests now so a delivery failure racing process shutdown can
+        // settle only that old attempt, while a successful receipt can still
+        // commit as delivered.
+        close_requests(&mut state, id);
+        let active_turn_id = state
+            .sessions
+            .get(id)
+            .and_then(|session| session.record.active_turn_id.clone());
         let Some(session) = state.sessions.get_mut(id) else {
             return Ok(false);
         };
         session.record.state = SessionState::Restarting;
         session.record.updated_at_ms = now_ms();
+        if let Some(turn_id) = active_turn_id {
+            state.cancel_controls.remove(&turn_id);
+            state.cancel_terminal_seen.remove(&turn_id);
+        }
         Ok(true)
     }
 
@@ -195,6 +238,10 @@ impl Store {
         if session.record.state != SessionState::Restarting {
             return false;
         }
+        let Some(generation) = session.runtime_generation.checked_add(1) else {
+            return false;
+        };
+        session.runtime_generation = generation;
         session.record.state = SessionState::Starting;
         session.record.pid = None;
         session.record.active_turn_id = None;
@@ -559,23 +606,50 @@ impl Store {
 
     #[cfg(test)]
     pub fn cancel_turn(&mut self, id: &str) -> Result<bool> {
-        self.cancel_turn_with_controls(id, 0)
+        let generation = self
+            .runtime_generation_for_turn(id)
+            .context("turn runtime generation is missing")?;
+        self.cancel_turn_with_controls(id, generation, 0)
     }
 
-    pub fn cancel_turn_with_controls(&mut self, id: &str, controls: usize) -> Result<bool> {
+    pub fn cancel_turn_with_controls(
+        &mut self,
+        id: &str,
+        runtime_generation: u64,
+        controls: usize,
+    ) -> Result<bool> {
         let mut state = self.state.borrow_mut();
         let session_id = {
-            let Some(turn) = state.turns.get_mut(id) else {
+            let Some(turn) = state.turns.get(id) else {
                 bail!("turn not found");
             };
             if !turn.state.is_active() {
                 return Ok(false);
             }
-            turn.state = TurnState::Canceled;
-            turn.completed_at_ms = Some(now_ms());
             turn.session_id.clone()
         };
-        state.cancel_controls.insert(id.to_owned(), controls);
+        if !state.sessions.get(&session_id).is_some_and(|session| {
+            session.runtime_generation == runtime_generation
+                && matches!(
+                    session.record.state,
+                    SessionState::Busy | SessionState::Blocked
+                )
+                && session.record.active_turn_id.as_deref() == Some(id)
+        }) {
+            return Ok(false);
+        }
+        let Some(turn) = state.turns.get_mut(id) else {
+            return Ok(false);
+        };
+        turn.state = TurnState::Canceled;
+        turn.completed_at_ms = Some(now_ms());
+        state.cancel_controls.insert(
+            id.to_owned(),
+            CancelControls {
+                runtime_generation,
+                pending: controls,
+            },
+        );
         state.cancel_terminal_seen.remove(id);
         if let Some(session) = state.sessions.get_mut(&session_id)
             && session.record.active_turn_id.as_deref() == Some(id)
@@ -601,10 +675,16 @@ impl Store {
         if !state.sessions.get(&session_id).is_some_and(|session| {
             session.record.state == SessionState::Quiescing
                 && session.record.active_turn_id.as_deref() == Some(id)
+                && state.cancel_controls.get(id).is_some_and(|controls| {
+                    controls.runtime_generation == session.runtime_generation
+                })
         }) {
             return false;
         }
-        *state.cancel_controls.entry(id.to_owned()).or_default() += 1;
+        let Some(controls) = state.cancel_controls.get_mut(id) else {
+            return false;
+        };
+        controls.pending = controls.pending.saturating_add(1);
         true
     }
 
@@ -612,11 +692,19 @@ impl Store {
     /// has already terminalized the execution and all controls are complete.
     pub fn finish_cancel_control(&self, id: &str) -> bool {
         let mut state = self.state.borrow_mut();
-        if let Some(pending) = state.cancel_controls.get_mut(id) {
-            *pending = pending.saturating_sub(1);
+        let current_generation = state
+            .turns
+            .get(id)
+            .and_then(|turn| state.sessions.get(&turn.session_id))
+            .map(|session| session.runtime_generation);
+        if let Some(controls) = state.cancel_controls.get_mut(id)
+            && current_generation == Some(controls.runtime_generation)
+        {
+            controls.pending = controls.pending.saturating_sub(1);
         }
-        let settled = state.cancel_controls.get(id).copied().unwrap_or(0) == 0
-            && state.cancel_terminal_seen.contains(id);
+        let settled = state.cancel_controls.get(id).is_some_and(|controls| {
+            current_generation == Some(controls.runtime_generation) && controls.pending == 0
+        }) && state.cancel_terminal_seen.contains(id);
         if settled {
             state.cancel_controls.remove(id);
             state.cancel_terminal_seen.remove(id);
@@ -629,18 +717,48 @@ impl Store {
             .borrow()
             .cancel_controls
             .get(id)
-            .is_some_and(|count| *count > 0)
+            .is_some_and(|controls| controls.pending > 0)
     }
 
-    pub fn fail_canceled_turn(&self, id: &str, code: &str, message: &str) -> bool {
+    pub fn cancel_execution_complete(&self, id: &str) -> bool {
+        let state = self.state.borrow();
+        state
+            .turns
+            .get(id)
+            .is_some_and(|turn| turn.state.is_terminal())
+            && !state.cancel_controls.contains_key(id)
+            && !state.cancel_terminal_seen.contains(id)
+    }
+
+    pub fn fail_canceled_turn(
+        &self,
+        id: &str,
+        runtime_generation: u64,
+        code: &str,
+        message: &str,
+    ) -> bool {
         let mut state = self.state.borrow_mut();
-        let Some(turn) = state.turns.get_mut(id) else {
+        let Some(turn) = state.turns.get(id) else {
             return false;
         };
         if turn.state != TurnState::Canceled {
             return false;
         }
         let session_id = turn.session_id.clone();
+        if !state.sessions.get(&session_id).is_some_and(|session| {
+            session.runtime_generation == runtime_generation
+                && session.record.state == SessionState::Quiescing
+                && session.record.active_turn_id.as_deref() == Some(id)
+        }) || state
+            .cancel_controls
+            .get(id)
+            .is_none_or(|controls| controls.runtime_generation != runtime_generation)
+        {
+            return false;
+        }
+        let Some(turn) = state.turns.get_mut(id) else {
+            return false;
+        };
         turn.state = TurnState::Failed;
         turn.error = Some(json!({"code": code, "message": message}));
         turn.completed_at_ms = Some(now_ms());
@@ -669,8 +787,24 @@ impl Store {
             }
             turn.session_id.clone()
         };
+        let runtime_generation = state
+            .sessions
+            .get(&session_id)
+            .map(|session| session.runtime_generation)
+            .context("session not found")?;
+        if state
+            .cancel_controls
+            .get(id)
+            .is_none_or(|controls| controls.runtime_generation != runtime_generation)
+        {
+            return Ok(false);
+        }
         state.cancel_terminal_seen.insert(id.to_owned());
-        if state.cancel_controls.get(id).copied().unwrap_or(0) > 0 {
+        if state
+            .cancel_controls
+            .get(id)
+            .is_some_and(|controls| controls.pending > 0)
+        {
             return Ok(false);
         }
         state.cancel_controls.remove(id);
@@ -687,6 +821,16 @@ impl Store {
         session.record.state = SessionState::Idle;
         session.record.updated_at_ms = now_ms();
         Ok(true)
+    }
+
+    #[cfg(test)]
+    fn runtime_generation_for_turn(&self, id: &str) -> Option<u64> {
+        let state = self.state.borrow();
+        let turn = state.turns.get(id)?;
+        state
+            .sessions
+            .get(&turn.session_id)
+            .map(|session| session.runtime_generation)
     }
 
     pub fn record_event(&self, session_id: Option<&str>, turn_id: Option<&str>, kind: &str) -> i64 {
@@ -925,6 +1069,126 @@ impl Store {
         )
     }
 
+    pub fn begin_steer_attempt(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+        attempt_id: &str,
+        text: &str,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get(session_id) else {
+            return false;
+        };
+        if session.runtime_generation != runtime_generation
+            || session.record.state != SessionState::Busy
+            || session.record.active_turn_id.as_deref() != Some(turn_id)
+            || !state
+                .turns
+                .get(turn_id)
+                .is_some_and(|turn| turn.state.is_active() && turn.execution_seq == execution_seq)
+            || state.steer_attempts.contains_key(attempt_id)
+        {
+            return false;
+        }
+        let uid = session.uid.clone();
+        state.steer_attempts.insert(
+            attempt_id.to_owned(),
+            SteerAttempt {
+                session_uid: uid.clone(),
+                runtime_generation,
+                turn_id: turn_id.to_owned(),
+                execution_seq,
+            },
+        );
+        state
+            .messages
+            .entry(uid)
+            .or_default()
+            .push(Some(execution_seq), MessageBody::steer(text, false, false));
+        true
+    }
+
+    pub fn finish_steer_attempt(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        attempt_id: &str,
+        text: &str,
+        delivered: bool,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(attempt) = state.steer_attempts.get(attempt_id).cloned() else {
+            return false;
+        };
+        let Some(session) = state.sessions.get(session_id) else {
+            state.steer_attempts.remove(attempt_id);
+            return false;
+        };
+        let uid = session.uid.clone();
+        let session_generation = session.runtime_generation;
+        let session_state = session.record.state;
+        let active_turn_id = session.record.active_turn_id.clone();
+        let owned_attempt = attempt.session_uid == uid
+            && attempt.runtime_generation == runtime_generation
+            && state.turns.get(&attempt.turn_id).is_some_and(|turn| {
+                turn.execution_seq == attempt.execution_seq && (delivered || turn.state.is_active())
+            });
+        let session_owns_generation = session_generation == runtime_generation;
+        let execution_is_active = session_state == SessionState::Busy
+            && active_turn_id.as_deref() == Some(attempt.turn_id.as_str());
+        state.steer_attempts.remove(attempt_id);
+        if !owned_attempt || !session_owns_generation || !delivered && !execution_is_active {
+            return false;
+        }
+        state.messages.entry(uid).or_default().push(
+            Some(attempt.execution_seq),
+            MessageBody::steer(text, delivered, !delivered),
+        );
+        true
+    }
+
+    pub fn expire_steer_attempt(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        attempt_id: &str,
+        text: &str,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(attempt) = state.steer_attempts.get(attempt_id).cloned() else {
+            return false;
+        };
+        let Some(session) = state.sessions.get(session_id) else {
+            state.steer_attempts.remove(attempt_id);
+            return false;
+        };
+        let uid = session.uid.clone();
+        let session_generation = session.runtime_generation;
+        let active_turn_id = session.record.active_turn_id.clone();
+        let session_state = session.record.state;
+        let owns_generation = attempt.session_uid == uid
+            && attempt.runtime_generation == runtime_generation
+            && attempt.runtime_generation == session_generation
+            && active_turn_id.as_deref() == Some(attempt.turn_id.as_str())
+            && matches!(session_state, SessionState::Busy | SessionState::Quiescing)
+            && state
+                .turns
+                .get(&attempt.turn_id)
+                .is_some_and(|turn| turn.execution_seq == attempt.execution_seq);
+        state.steer_attempts.remove(attempt_id);
+        if !owns_generation {
+            return false;
+        }
+        state.messages.entry(uid).or_default().push(
+            Some(attempt.execution_seq),
+            MessageBody::steer(text, false, true),
+        );
+        true
+    }
+
     /// Note that the provider emitted something, for `quiet_for_ms`.
     pub fn touch_provider(&self, session_id: &str) {
         if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
@@ -1007,11 +1271,124 @@ impl Store {
         state.requests.get_mut(&uid)?.begin_answer(id, answer)
     }
 
+    pub fn answer_attempt_status(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+    ) -> Option<(crate::requests::AnswerAttemptState, Option<Resolution>)> {
+        let state = self.state.borrow();
+        let uid = &state.sessions.get(session_id)?.uid;
+        state
+            .requests
+            .get(uid)?
+            .answer_attempt_status(id, attempt_id)
+    }
+
+    pub fn answer_attempt_owns_execution(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        request_id: &str,
+        attempt_id: u64,
+        turn_id: &str,
+    ) -> bool {
+        let state = self.state.borrow();
+        let Some(session) = state.sessions.get(session_id) else {
+            return false;
+        };
+        if session.runtime_generation != runtime_generation
+            || !matches!(
+                session.record.state,
+                SessionState::Busy | SessionState::Blocked
+            )
+            || session.record.active_turn_id.as_deref() != Some(turn_id)
+        {
+            return false;
+        }
+        let Some(turn) = state.turns.get(turn_id) else {
+            return false;
+        };
+        if !turn.state.is_active() {
+            return false;
+        }
+        let Some(request) = state
+            .requests
+            .get(&session.uid)
+            .and_then(|table| table.get(request_id))
+        else {
+            return false;
+        };
+        request.answer_state == crate::requests::AnswerState::Sending
+            && request.answer_attempt_id == Some(attempt_id)
+            && request.execution_seq == Some(turn.execution_seq)
+    }
+
+    pub fn execution_is_current(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+    ) -> bool {
+        let state = self.state.borrow();
+        let Some(session) = state.sessions.get(session_id) else {
+            return false;
+        };
+        let Some(turn) = state.turns.get(turn_id) else {
+            return false;
+        };
+        session.record.state == SessionState::Busy
+            && session.runtime_generation == runtime_generation
+            && session.record.active_turn_id.as_deref() == Some(turn_id)
+            && turn.state.is_active()
+            && turn.execution_seq == execution_seq
+    }
+
+    pub fn execution_can_cancel(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+    ) -> bool {
+        let state = self.state.borrow();
+        let Some(session) = state.sessions.get(session_id) else {
+            return false;
+        };
+        let Some(turn) = state.turns.get(turn_id) else {
+            return false;
+        };
+        session.runtime_generation == runtime_generation
+            && matches!(
+                session.record.state,
+                SessionState::Busy | SessionState::Blocked
+            )
+            && session.record.active_turn_id.as_deref() == Some(turn_id)
+            && turn.state.is_active()
+            && turn.execution_seq == execution_seq
+    }
+
+    pub fn release_answer_waiter(&mut self, session_id: &str, id: &str, attempt_id: u64) {
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return;
+        };
+        if let Some(table) = state.requests.get_mut(&uid) {
+            table.release_answer_waiter(id, attempt_id);
+        }
+    }
+
     pub fn finish_request_answer(
         &self,
         session_id: &str,
         id: &str,
-        answer: Answer,
+        attempt_id: u64,
+        answer: &Answer,
         outcome: Outcome,
         receipt: Value,
     ) -> bool {
@@ -1028,11 +1405,13 @@ impl Store {
                 .requests
                 .get_mut(&uid)
                 .and_then(|table| {
-                    table.resolve_with_receipt(
+                    table.deliver_with_receipt(
                         id,
+                        attempt_id,
+                        answer,
                         Resolution {
                             outcome,
-                            answer: Some(answer),
+                            answer: Some(answer.clone()),
                         },
                         receipt,
                     )
@@ -1045,7 +1424,13 @@ impl Store {
         resolved
     }
 
-    pub fn retry_request_answer(&self, session_id: &str, id: &str, answer: &Answer) -> bool {
+    pub fn retry_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+    ) -> bool {
         let mut state = self.state.borrow_mut();
         let Some(uid) = state
             .sessions
@@ -1057,10 +1442,16 @@ impl Store {
         state
             .requests
             .get_mut(&uid)
-            .is_some_and(|table| table.retry_answer(id, answer))
+            .is_some_and(|table| table.retry_answer(id, attempt_id, answer))
     }
 
-    pub fn fail_request_answer(&self, session_id: &str, id: &str, answer: &Answer) -> bool {
+    pub fn fail_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+    ) -> bool {
         let mut state = self.state.borrow_mut();
         let Some(uid) = state
             .sessions
@@ -1072,7 +1463,31 @@ impl Store {
         state
             .requests
             .get_mut(&uid)
-            .is_some_and(|table| table.fail_answer(id, answer))
+            .is_some_and(|table| table.fail_answer(id, attempt_id, answer))
+    }
+
+    /// Settle an old delivery failure only when the provider has already
+    /// withdrawn the Request. This deliberately does not change Session or
+    /// execution state, which may belong to a replacement runtime.
+    pub fn fail_withdrawn_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return false;
+        };
+        state
+            .requests
+            .get_mut(&uid)
+            .is_some_and(|table| table.fail_withdrawn_answer(id, attempt_id, answer))
     }
 
     /// Close pending Requests as canceled: all of them, or the one the
@@ -1307,23 +1722,52 @@ mod tests {
     #[test]
     fn stale_delivery_failure_cannot_fail_a_replaced_execution() {
         let mut store = ready_store();
-        store
+        let first = store
             .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert first turn: {error}"));
+        let generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_else(|| panic!("runtime generation missing"));
         assert!(store.mark_turn_started("turn_1", Some("provider-1")));
         assert!(
             store
                 .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"), false)
                 .unwrap_or_else(|error| panic!("failed to complete first turn: {error}"))
         );
+        assert!(
+            store
+                .begin_session_restart("codex:thread-1")
+                .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
+        );
+        assert!(store.start_restarted_session("codex:thread-1"));
+        mark_ready(&store, "codex:thread-1");
         store
             .insert_turn("turn_2", "codex:thread-1", "second")
             .unwrap_or_else(|error| panic!("failed to insert second turn: {error}"));
         assert!(store.mark_turn_started("turn_2", Some("provider-2")));
         assert!(store.set_session_state("codex:thread-1", SessionState::Busy));
 
-        // This represents a delivery callback from the replaced execution.
-        store.set_session_failed("codex:thread-1");
+        // A stale delivery callback may mutate only while its generation and
+        // execution still own the Session.
+        if store.execution_is_current("codex:thread-1", generation, &first.id, first.execution_seq)
+        {
+            store.set_session_failed("codex:thread-1");
+        }
+
+        let current_generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_else(|| panic!("runtime generation missing after restart"));
+        assert!(
+            store.execution_is_current(
+                "codex:thread-1",
+                current_generation,
+                "turn_2",
+                store
+                    .get_turn("turn_2")
+                    .unwrap_or_else(|| panic!("second turn missing"))
+                    .execution_seq,
+            )
+        );
 
         assert_eq!(
             store
@@ -2095,14 +2539,16 @@ mod tests {
         assert_eq!(state(&store), SessionState::Blocked);
 
         let allowed = Answer::Allow;
-        assert_eq!(
-            store.begin_request_answer("codex:thread-1", "r1", &allowed),
-            Some(crate::requests::AnswerClaim::Started)
-        );
+        let Some(crate::requests::AnswerClaim::Started(first_attempt)) =
+            store.begin_request_answer("codex:thread-1", "r1", &allowed)
+        else {
+            panic!("first answer attempt did not start");
+        };
         assert!(store.finish_request_answer(
             "codex:thread-1",
             "r1",
-            allowed.clone(),
+            first_attempt,
+            &allowed,
             Outcome::Allowed,
             serde_json::json!({"resolution": "allowed"}),
         ));
@@ -2111,20 +2557,23 @@ mod tests {
             !store.finish_request_answer(
                 "codex:thread-1",
                 "r1",
-                allowed.clone(),
+                first_attempt,
+                &allowed,
                 Outcome::Allowed,
                 serde_json::json!({"resolution": "allowed"}),
             ),
             "a Request is resolved once"
         );
-        assert_eq!(
-            store.begin_request_answer("codex:thread-1", "r2", &allowed),
-            Some(crate::requests::AnswerClaim::Started)
-        );
+        let Some(crate::requests::AnswerClaim::Started(second_attempt)) =
+            store.begin_request_answer("codex:thread-1", "r2", &allowed)
+        else {
+            panic!("second answer attempt did not start");
+        };
         assert!(store.finish_request_answer(
             "codex:thread-1",
             "r2",
-            allowed,
+            second_attempt,
+            &allowed,
             Outcome::Allowed,
             serde_json::json!({"resolution": "allowed"}),
         ));

@@ -411,14 +411,30 @@ enum AgentRuntime {
     Codex {
         control: Arc<CodexConnection>,
         thread_id: String,
+        generation: u64,
     },
     Claude {
         process: Arc<ClaudeProcess>,
         turns: Arc<Mutex<ClaudeTurns>>,
+        generation: u64,
     },
 }
 
+struct SteerDelivery<'a> {
+    session: &'a SessionRecord,
+    turn: &'a TurnRecord,
+    runtime_generation: u64,
+    attempt_id: &'a str,
+    text: &'a str,
+}
+
 impl AgentRuntime {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Codex { generation, .. } | Self::Claude { generation, .. } => *generation,
+        }
+    }
+
     fn pid(&self) -> u32 {
         match self {
             Self::Codex { control, .. } => control.pid(),
@@ -864,6 +880,10 @@ impl Daemon {
         options: &LaunchOptions<'_>,
         startup_deadline: Instant,
     ) -> Result<Arc<AgentRuntime>> {
+        let generation = self
+            .lock_store()?
+            .runtime_generation(id)
+            .context("Session runtime generation is missing")?;
         let timeout = startup_deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             let error = anyhow!("launch failed: provider startup deadline expired");
@@ -875,8 +895,12 @@ impl Daemon {
             return Err(self.session_launch_failure(id, &error, None));
         }
         let spawned = match options.agent {
-            Agent::Claude => self.spawn_claude_runtime(runtime_session_id, options, timeout),
-            Agent::Codex => self.spawn_codex_runtime(runtime_session_id, options, timeout),
+            Agent::Claude => {
+                self.spawn_claude_runtime(runtime_session_id, options, timeout, generation)
+            }
+            Agent::Codex => {
+                self.spawn_codex_runtime(runtime_session_id, options, timeout, generation)
+            }
         };
         let runtime = match spawned {
             Ok(runtime) => runtime,
@@ -1181,6 +1205,7 @@ impl Daemon {
         runtime_session_id: &Arc<RwLock<String>>,
         options: &LaunchOptions<'_>,
         startup_timeout: Duration,
+        generation: u64,
     ) -> Result<Arc<AgentRuntime>, LaunchError> {
         let spec = claude_command(options)?;
         let turns = Arc::new(Mutex::new(ClaudeTurns::default()));
@@ -1192,6 +1217,7 @@ impl Daemon {
         let event_turns = Arc::clone(&turns);
         let event_process = Arc::clone(&process_slot);
         let event_changed = Arc::clone(&self.submission_changed);
+        let event_generation = generation;
         let on_event = Arc::new(move |event: Value| {
             let Ok(session_id) = event_session_id.read().map(|id| id.clone()) else {
                 return;
@@ -1203,7 +1229,10 @@ impl Daemon {
                 let Ok(store) = event_store.lock() else {
                     return;
                 };
-                claude::apply_event(&store, &session_id, &mut turns, &event)
+                if !store.runtime_generation_is_current(&session_id, event_generation) {
+                    return;
+                }
+                claude::apply_event(&store, &session_id, event_generation, &mut turns, &event)
             };
             event_changed.notify_all();
             let actions = match actions {
@@ -1232,6 +1261,7 @@ impl Daemon {
                                 process,
                                 session_id.clone(),
                                 turn_id,
+                                event_generation,
                             );
                         }
                     }
@@ -1261,6 +1291,7 @@ impl Daemon {
         let exit_session_id = Arc::clone(runtime_session_id);
         let exit_process = Arc::clone(&process_slot);
         let exit_changed = Arc::clone(&self.submission_changed);
+        let exit_generation = generation;
         let on_exit = Arc::new(move |code: Option<i32>| {
             let reason = code.map_or_else(
                 || "Claude process was terminated by a signal".to_owned(),
@@ -1275,6 +1306,7 @@ impl Daemon {
                     &exit_store,
                     &exit_sessions,
                     &session_id,
+                    exit_generation,
                     &reason,
                     detail.as_deref(),
                 );
@@ -1337,7 +1369,11 @@ impl Daemon {
         {
             claude::apply_permission_mode(&store, &session_id, Some(mode));
         }
-        Ok(Arc::new(AgentRuntime::Claude { process, turns }))
+        Ok(Arc::new(AgentRuntime::Claude {
+            process,
+            turns,
+            generation,
+        }))
     }
 
     fn spawn_codex_runtime(
@@ -1345,11 +1381,13 @@ impl Daemon {
         runtime_session_id: &Arc<RwLock<String>>,
         options: &LaunchOptions<'_>,
         startup_timeout: Duration,
+        generation: u64,
     ) -> Result<Arc<AgentRuntime>, LaunchError> {
         let event_store = Arc::clone(&self.store);
         let event_sessions = Arc::clone(&self.sessions);
         let event_session_id = Arc::clone(runtime_session_id);
         let event_changed = Arc::clone(&self.submission_changed);
+        let event_generation = generation;
         let items = Mutex::new(CodexItems::default());
         let handler = Arc::new(move |message: Value| {
             let request =
@@ -1363,10 +1401,20 @@ impl Daemon {
                     .pointer("/params/message")
                     .and_then(Value::as_str)
                     .unwrap_or("Codex app-server connection closed");
-                record_session_exit(&event_store, &event_sessions, &session_id, reason, None);
+                record_session_exit(
+                    &event_store,
+                    &event_sessions,
+                    &session_id,
+                    event_generation,
+                    reason,
+                    None,
+                );
             } else if let Ok(mut store) = event_store.lock()
                 && let Ok(mut items) = items.lock()
             {
+                if !store.runtime_generation_is_current(&session_id, event_generation) {
+                    return !request;
+                }
                 match codex_events::apply_notification(
                     &mut store,
                     &session_id,
@@ -1419,7 +1467,11 @@ impl Daemon {
             .map_err(|error| {
                 detailed(error.context("launch failed: could not set the Codex thread name"))
             })?;
-        Ok(Arc::new(AgentRuntime::Codex { control, thread_id }))
+        Ok(Arc::new(AgentRuntime::Codex {
+            control,
+            thread_id,
+            generation,
+        }))
     }
 
     fn public_session(&self, session: &SessionRecord) -> Result<Value> {
@@ -1504,18 +1556,32 @@ impl Daemon {
             bail!("prompt must not be empty");
         }
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
-        let (turn, acceptance_cursor) = {
-            let mut store = self.lock_store()?;
-            // The observation cursor is captured under this lock immediately
-            // before acceptance is recorded, so a fast provider cannot emit
-            // output or finish in front of the position it names.
-            let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
-            let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
-            // Busy before delivery: a provider event for this execution must
-            // never find the Session idle.
-            store.set_session_state(&session.id, SessionState::Busy);
-            store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
-            (turn, acceptance_cursor)
+        let claude_uuid = matches!(runtime.as_ref(), AgentRuntime::Claude { .. })
+            .then(|| Uuid::new_v4().to_string());
+        let (turn, acceptance_cursor) = match runtime.as_ref() {
+            AgentRuntime::Codex { .. } => {
+                let mut store = self.lock_store()?;
+                let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
+                let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
+                store.set_session_state(&session.id, SessionState::Busy);
+                store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
+                (turn, acceptance_cursor)
+            }
+            AgentRuntime::Claude { turns, .. } => {
+                // Keep the established turns-then-store lock order. The unread
+                // prompt reservation and active execution become visible as a
+                // single operation before the transport write can begin.
+                let mut turns = turns
+                    .lock()
+                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+                let mut store = self.lock_store()?;
+                let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
+                let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
+                store.set_session_state(&session.id, SessionState::Busy);
+                store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
+                turns.begin(claude_uuid.as_deref().unwrap_or_default());
+                (turn, acceptance_cursor)
+            }
         };
         // Build a receipt-safe snapshot before provider delivery. After the
         // delivery boundary, internal observation failures must degrade to a
@@ -1523,7 +1589,9 @@ impl Daemon {
         let fallback_public_session = self.public_session(&session)?;
         let mut synchronously_confirmed = false;
         match runtime.as_ref() {
-            AgentRuntime::Codex { control, thread_id } => {
+            AgentRuntime::Codex {
+                control, thread_id, ..
+            } => {
                 let started = control.start_turn(thread_id, prompt).and_then(|turn| {
                     control.watch_turn(thread_id, &turn)?;
                     Ok(turn)
@@ -1538,43 +1606,65 @@ impl Daemon {
                         }
                     }
                     Err(error) => {
+                        if self.runtime_is_current(&session.id, &runtime) {
+                            let store = self.lock_store()?;
+                            if !store.execution_is_current(
+                                &session.id,
+                                runtime.generation(),
+                                &turn.id,
+                                turn.execution_seq,
+                            ) {
+                                return Err(error);
+                            }
+                            let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
+                            if store.finish_turn_if_matching(
+                                &turn_id,
+                                None,
+                                TurnState::Failed,
+                                None,
+                                Some(&message),
+                            )? {
+                                store.set_session_failed(&session.id);
+                                store.record_event(
+                                    Some(&session.id),
+                                    Some(&turn_id),
+                                    "turn.failed",
+                                );
+                                store.record_event(Some(&session.id), None, "session.failed");
+                                drop(store);
+                                runtime.force_stop();
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            AgentRuntime::Claude { process, .. } => {
+                let uuid = claude_uuid.as_deref().unwrap_or_default();
+                if let Err(error) = process.send_user(uuid, prompt) {
+                    if self.runtime_is_current(&session.id, &runtime) {
                         let store = self.lock_store()?;
+                        if !store.execution_is_current(
+                            &session.id,
+                            runtime.generation(),
+                            &turn.id,
+                            turn.execution_seq,
+                        ) {
+                            return Err(error);
+                        }
                         let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
-                        let _ = store.finish_turn_if_matching(
+                        if store.finish_turn_if_matching(
                             &turn_id,
                             None,
                             TurnState::Failed,
                             None,
                             Some(&message),
-                        )?;
-                        store.set_session_failed(&session.id);
-                        store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
-                        store.record_event(Some(&session.id), None, "session.failed");
-                        drop(store);
-                        runtime.force_stop();
-                        return Err(error);
+                        )? {
+                            store.set_session_failed(&session.id);
+                            store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
+                            store.record_event(Some(&session.id), None, "session.failed");
+                        }
                     }
-                }
-            }
-            AgentRuntime::Claude { process, turns } => {
-                let uuid = Uuid::new_v4().to_string();
-                turns
-                    .lock()
-                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?
-                    .begin(&uuid);
-                if let Err(error) = process.send_user(&uuid, prompt) {
-                    let store = self.lock_store()?;
-                    let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
-                    let _ = store.finish_turn_if_matching(
-                        &turn_id,
-                        None,
-                        TurnState::Failed,
-                        None,
-                        Some(&message),
-                    )?;
-                    store.set_session_failed(&session.id);
-                    store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
-                    store.record_event(Some(&session.id), None, "session.failed");
                     return Err(error);
                 }
             }
@@ -1643,73 +1733,24 @@ impl Daemon {
                     session.id
                 )
             })?;
-        // Whether the same execution is still the one running. Checked again
-        // at the point of delivery so a steer can never open a later turn.
-        let still_running = |store: &Store| {
-            store.get_session(&session.id).is_some_and(|current| {
-                current.state == SessionState::Busy
-                    && current.active_turn_id.as_deref() == Some(turn.id.as_str())
-            })
-        };
-        let gone = || {
-            anyhow!(
-                "NO_ACTIVE_EXECUTION: the execution on Session {} ended before the steer was delivered",
-                session.id
-            )
+        let runtime_generation = runtime.generation();
+        let attempt_id = Uuid::new_v4().to_string();
+        let delivery = SteerDelivery {
+            session: &session,
+            turn: &turn,
+            runtime_generation,
+            attempt_id: &attempt_id,
+            text,
         };
         let cursor = match runtime.as_ref() {
-            AgentRuntime::Codex { control, thread_id } => {
-                let provider_turn_id = turn.provider_turn_id.as_deref().with_context(|| {
-                    format!(
-                        "session is unavailable: Codex has not acknowledged execution {} yet",
-                        turn.execution_seq
-                    )
-                })?;
-                let cursor = {
-                    let store = self.lock_store()?;
-                    if !still_running(&store) {
-                        return Err(gone());
-                    }
-                    let cursor = Self::acceptance_cursor(&store, &session.id)?;
-                    store.append_message(&session.id, MessageBody::steer(text, false, false));
-                    cursor
-                };
-                let delivered = control.steer_turn(thread_id, provider_turn_id, text);
-                let store = self.lock_store()?;
-                store.append_message(
-                    &session.id,
-                    MessageBody::steer(text, delivered.is_ok(), delivered.is_err()),
-                );
-                delivered?;
-                cursor
-            }
+            AgentRuntime::Codex {
+                control, thread_id, ..
+            } => self.steer_codex(&delivery, control, thread_id)?,
             AgentRuntime::Claude {
                 process,
                 turns: turn_state,
-            } => {
-                let uuid = Uuid::new_v4().to_string();
-                let mut turns = turn_state
-                    .lock()
-                    .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
-                let store = self.lock_store()?;
-                if !still_running(&store) {
-                    return Err(gone());
-                }
-                let cursor = Self::acceptance_cursor(&store, &session.id)?;
-                store.append_message(&session.id, MessageBody::steer(text, false, false));
-                turns.add_steer(&uuid, text);
-                drop(store);
-                drop(turns);
-                if let Err(error) = process.send_user(&uuid, text) {
-                    let mut turns = turn_state
-                        .lock()
-                        .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
-                    let store = self.lock_store()?;
-                    turns.discard(&store, &session.id, &uuid);
-                    return Err(error);
-                }
-                cursor
-            }
+                ..
+            } => self.steer_claude(&delivery, process, turn_state)?,
         };
         let current = self.resolve_session(&session.id)?;
         Ok(json!({
@@ -1718,6 +1759,114 @@ impl Daemon {
             "steer": "accepted",
             "cursor": cursor,
         }))
+    }
+
+    fn steer_codex(
+        &self,
+        delivery: &SteerDelivery<'_>,
+        control: &CodexConnection,
+        thread_id: &str,
+    ) -> Result<String> {
+        let provider_turn_id = delivery.turn.provider_turn_id.as_deref().with_context(|| {
+            format!(
+                "session is unavailable: Codex has not acknowledged execution {} yet",
+                delivery.turn.execution_seq
+            )
+        })?;
+        let cursor = {
+            let store = self.lock_store()?;
+            if !store.execution_is_current(
+                &delivery.session.id,
+                delivery.runtime_generation,
+                &delivery.turn.id,
+                delivery.turn.execution_seq,
+            ) {
+                bail!(
+                    "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+                    delivery.session.id
+                );
+            }
+            let cursor = Self::acceptance_cursor(&store, &delivery.session.id)?;
+            if !store.begin_steer_attempt(
+                &delivery.session.id,
+                delivery.runtime_generation,
+                &delivery.turn.id,
+                delivery.turn.execution_seq,
+                delivery.attempt_id,
+                delivery.text,
+            ) {
+                bail!(
+                    "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+                    delivery.session.id
+                );
+            }
+            cursor
+        };
+        let delivered = control.steer_turn(thread_id, provider_turn_id, delivery.text);
+        self.lock_store()?.finish_steer_attempt(
+            &delivery.session.id,
+            delivery.runtime_generation,
+            delivery.attempt_id,
+            delivery.text,
+            delivered.is_ok(),
+        );
+        delivered?;
+        Ok(cursor)
+    }
+
+    fn steer_claude(
+        &self,
+        delivery: &SteerDelivery<'_>,
+        process: &ClaudeProcess,
+        turn_state: &Arc<Mutex<ClaudeTurns>>,
+    ) -> Result<String> {
+        let mut turns = turn_state
+            .lock()
+            .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+        let store = self.lock_store()?;
+        if !store.execution_is_current(
+            &delivery.session.id,
+            delivery.runtime_generation,
+            &delivery.turn.id,
+            delivery.turn.execution_seq,
+        ) {
+            bail!(
+                "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+                delivery.session.id
+            );
+        }
+        let cursor = Self::acceptance_cursor(&store, &delivery.session.id)?;
+        if !store.begin_steer_attempt(
+            &delivery.session.id,
+            delivery.runtime_generation,
+            &delivery.turn.id,
+            delivery.turn.execution_seq,
+            delivery.attempt_id,
+            delivery.text,
+        ) {
+            bail!(
+                "NO_ACTIVE_EXECUTION: execution on Session {} ended before steer delivery",
+                delivery.session.id
+            );
+        }
+        turns.add_steer(delivery.attempt_id, delivery.text);
+        drop(store);
+        drop(turns);
+        if let Err(error) = process.send_user(delivery.attempt_id, delivery.text) {
+            let mut turns = turn_state
+                .lock()
+                .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
+            self.lock_store()?.finish_steer_attempt(
+                &delivery.session.id,
+                delivery.runtime_generation,
+                delivery.attempt_id,
+                delivery.text,
+                false,
+            );
+            turns.discard_without_record(delivery.attempt_id);
+            return Err(error);
+        }
+        Ok(cursor)
     }
 
     /// Answer a pending Request. Idempotent by Request: the same answer
@@ -1748,28 +1897,59 @@ impl Daemon {
         if let AnswerClaim::Replay(resolution) = claim {
             return self.answer_receipt(&session.id, &record, resolution.outcome, None);
         }
+        let AnswerClaim::Started(attempt_id) = claim else {
+            bail!("REQUEST_FAILED: answer attempt could not be claimed");
+        };
         let cursor = match self
             .lock_store()
             .and_then(|store| Self::acceptance_cursor(&store, &session.id))
         {
             Ok(cursor) => cursor,
             Err(error) => {
-                if let Ok(store) = self.lock_store() {
-                    store.retry_request_answer(&session.id, &record.id, &answer);
+                if self.runtime_is_current(&session.id, &runtime)
+                    && let Some(turn_id) = session.active_turn_id.as_deref()
+                    && let Ok(store) = self.lock_store()
+                    && store.answer_attempt_owns_execution(
+                        &session.id,
+                        runtime.generation(),
+                        &record.id,
+                        attempt_id,
+                        turn_id,
+                    )
+                {
+                    store.retry_request_answer(&session.id, &record.id, attempt_id, &answer);
                 }
                 self.submission_changed.notify_all();
                 return Err(error);
             }
         };
-        let receipt_extra = self.deliver_answer(
+        let receipt_extra = match self.deliver_answer(
             &session,
             runtime.as_ref(),
             &record,
             &answer,
             &payload,
             codex_request_id.as_ref(),
+        ) {
+            Ok(receipt_extra) => receipt_extra,
+            Err(failure) => {
+                self.handle_answer_delivery_failure(
+                    &session, &runtime, &record, &answer, attempt_id, &failure,
+                );
+                bail!(
+                    "REQUEST_DELIVERY_FAILED: delivery failed for Request {}",
+                    record.id
+                );
+            }
+        };
+        self.finish_answer(
+            &session,
+            &record,
+            &answer,
+            attempt_id,
+            outcome,
+            &receipt_extra,
         )?;
-        self.finish_answer(&session, &record, &answer, outcome, &receipt_extra)?;
         self.submission_changed.notify_all();
         self.answer_receipt(&session.id, &record, outcome, Some(cursor))
     }
@@ -1780,54 +1960,71 @@ impl Daemon {
         record: &RequestRecord,
         answer: &Answer,
     ) -> Result<AnswerClaim> {
-        let mut waited_for_attempt = false;
-        loop {
-            let (claim, state) = {
-                let store = self.lock_store()?;
-                let claim = store.begin_request_answer(session_id, &record.id, answer);
-                let state = store
-                    .request(session_id, &record.id)
-                    .map(|request| request.answer_state);
-                (claim, state)
-            };
-            let claim = claim.with_context(|| {
+        let mut store = self.lock_store()?;
+        let claim = store
+            .begin_request_answer(session_id, &record.id, answer)
+            .with_context(|| {
                 format!(
                     "REQUEST_NOT_FOUND: Session {session_id} has no Request {}",
                     record.id
                 )
             })?;
-            if waited_for_attempt && state == Some(crate::requests::AnswerState::Pending) {
-                bail!(
-                    "REQUEST_DELIVERY_FAILED: delivery failed for Request {}; it remains pending and can be answered again",
-                    record.id
-                );
-            }
-            match claim {
-                AnswerClaim::Started | AnswerClaim::Replay(_) => return Ok(claim),
-                AnswerClaim::Waiting => {
-                    let store = self.lock_store()?;
-                    let (store, timeout) = self
-                        .submission_changed
-                        .wait_timeout(store, Duration::from_mins(1))
-                        .map_err(|_| anyhow!("session store lock poisoned"))?;
-                    drop(store);
-                    if timeout.timed_out() {
+        match claim {
+            AnswerClaim::Started(_) | AnswerClaim::Replay(_) => Ok(claim),
+            AnswerClaim::Conflict => bail!(
+                "REQUEST_RESOLVED: Request {} was answered with a different decision",
+                record.id
+            ),
+            AnswerClaim::Failed => bail!(
+                "REQUEST_FAILED: Request {} failed or its execution ended before an answer was delivered",
+                record.id
+            ),
+            AnswerClaim::Waiting(attempt_id) => loop {
+                match store.answer_attempt_status(session_id, &record.id, attempt_id) {
+                    Some((crate::requests::AnswerAttemptState::Sending, _)) => {
+                        let (guard, timeout) = self
+                            .submission_changed
+                            .wait_timeout(store, Duration::from_mins(1))
+                            .map_err(|_| anyhow!("session store lock poisoned"))?;
+                        store = guard;
+                        if timeout.timed_out()
+                            && store
+                                .answer_attempt_status(session_id, &record.id, attempt_id)
+                                .is_some_and(|(state, _)| {
+                                    state == crate::requests::AnswerAttemptState::Sending
+                                })
+                        {
+                            store.release_answer_waiter(session_id, &record.id, attempt_id);
+                            bail!(
+                                "REQUEST_BUSY: answer delivery is still in progress for {}",
+                                record.id
+                            );
+                        }
+                    }
+                    Some((crate::requests::AnswerAttemptState::Delivered, Some(resolution))) => {
+                        store.release_answer_waiter(session_id, &record.id, attempt_id);
+                        return Ok(AnswerClaim::Replay(resolution));
+                    }
+                    Some((
+                        crate::requests::AnswerAttemptState::Retryable
+                        | crate::requests::AnswerAttemptState::Failed,
+                        _,
+                    )) => {
+                        store.release_answer_waiter(session_id, &record.id, attempt_id);
                         bail!(
-                            "REQUEST_BUSY: answer delivery is still in progress for {}",
+                            "REQUEST_DELIVERY_FAILED: answer attempt failed for Request {}",
                             record.id
                         );
                     }
-                    waited_for_attempt = true;
+                    _ => {
+                        store.release_answer_waiter(session_id, &record.id, attempt_id);
+                        bail!(
+                            "REQUEST_FAILED: answer attempt disappeared for {}",
+                            record.id
+                        );
+                    }
                 }
-                AnswerClaim::Conflict => bail!(
-                    "REQUEST_RESOLVED: Request {} was answered with a different decision",
-                    record.id
-                ),
-                AnswerClaim::Failed => bail!(
-                    "REQUEST_FAILED: Request {} failed or its execution ended before an answer was delivered",
-                    record.id
-                ),
-            }
+            },
         }
     }
 
@@ -1870,14 +2067,20 @@ impl Daemon {
         answer: &Answer,
         payload: &Value,
         codex_request_id: Option<&Value>,
-    ) -> Result<serde_json::Map<String, Value>> {
+    ) -> std::result::Result<serde_json::Map<String, Value>, crate::provider::DeliveryFailure> {
         let mut receipt_extra = serde_json::Map::new();
         let provider_delivery = match runtime {
             AgentRuntime::Claude { process, .. } => {
-                process.respond(&record.draft.provider_key, payload)
+                process.respond_delivery(&record.draft.provider_key, payload)
             }
-            AgentRuntime::Codex { control, thread_id } => {
-                let id = codex_request_id.context("Codex request ID is missing")?;
+            AgentRuntime::Codex {
+                control, thread_id, ..
+            } => {
+                let Some(id) = codex_request_id else {
+                    return Err(crate::provider::DeliveryFailure::not_handed(
+                        "Codex request ID is missing",
+                    ));
+                };
                 let reason_delivery = if let Answer::Deny {
                     message: Some(message),
                 } = &answer
@@ -1910,41 +2113,75 @@ impl Daemon {
                         receipt_extra.insert("reason_error".to_owned(), json!(error));
                     }
                 }
-                control.respond(id, payload)
+                control.respond_delivery(id, payload)
             }
         };
-        if let Err(error) = provider_delivery {
-            let available = match runtime {
-                AgentRuntime::Claude { process, .. } => process.is_open(),
-                AgentRuntime::Codex { control, .. } => control.is_open(),
-            };
-            if available {
-                if let Ok(store) = self.lock_store() {
-                    store.retry_request_answer(&session.id, &record.id, answer);
-                }
-            } else if let Ok(store) = self.lock_store() {
-                store.fail_request_answer(&session.id, &record.id, answer);
-                if let Some(turn_id) = session.active_turn_id.as_deref() {
-                    let structured = json!({"code": "answer_delivery_failed", "message": sanitize_message(&error.to_string())});
-                    let _ = store.finish_turn_if_matching(
+        provider_delivery?;
+        Ok(receipt_extra)
+    }
+
+    fn handle_answer_delivery_failure(
+        &self,
+        session: &SessionRecord,
+        runtime: &Arc<AgentRuntime>,
+        record: &RequestRecord,
+        answer: &Answer,
+        attempt_id: u64,
+        failure: &crate::provider::DeliveryFailure,
+    ) {
+        let runtime_is_current = self.sessions.read().is_ok_and(|sessions| {
+            sessions
+                .get(&session.id)
+                .is_some_and(|current| Arc::ptr_eq(current, runtime))
+        });
+        if let Ok(store) = self.lock_store() {
+            let owns_execution = runtime_is_current
+                && session.active_turn_id.as_deref().is_some_and(|turn_id| {
+                    store.answer_attempt_owns_execution(
+                        &session.id,
+                        runtime.generation(),
+                        &record.id,
+                        attempt_id,
                         turn_id,
-                        None,
-                        TurnState::Failed,
-                        None,
-                        Some(&structured),
-                    );
-                    store.set_session_failed(&session.id);
-                    store.record_event(Some(&session.id), Some(turn_id), "turn.failed");
-                    store.record_event(Some(&session.id), None, "session.failed");
+                    )
+                });
+            if !owns_execution {
+                // A replaced provider may report its write failure after the
+                // Request was withdrawn for restart. Settle that old attempt
+                // without touching the replacement Session or execution.
+                store.fail_withdrawn_request_answer(&session.id, &record.id, attempt_id, answer);
+            } else if let Some(turn_id) = session.active_turn_id.as_deref() {
+                match failure.certainty {
+                    crate::provider::DeliveryCertainty::NotHandedToTransport => {
+                        store.retry_request_answer(&session.id, &record.id, attempt_id, answer);
+                    }
+                    crate::provider::DeliveryCertainty::Ambiguous => {
+                        if store.fail_request_answer(&session.id, &record.id, attempt_id, answer) {
+                            let structured = json!({
+                                "code": "REQUEST_DELIVERY_FAILED",
+                                "message": sanitize_message(&failure.to_string()),
+                            });
+                            if store
+                                .finish_turn_if_matching(
+                                    turn_id,
+                                    None,
+                                    TurnState::Failed,
+                                    None,
+                                    Some(&structured),
+                                )
+                                .unwrap_or(false)
+                            {
+                                store.set_session_failed(&session.id);
+                                store.record_event(Some(&session.id), Some(turn_id), "turn.failed");
+                                store.record_event(Some(&session.id), None, "session.failed");
+                            }
+                            runtime.force_stop();
+                        }
+                    }
                 }
             }
-            self.submission_changed.notify_all();
-            return Err(error.context(format!(
-                "REQUEST_DELIVERY_FAILED: delivery failed for Request {}",
-                record.id
-            )));
         }
-        Ok(receipt_extra)
+        self.submission_changed.notify_all();
     }
 
     fn finish_answer(
@@ -1952,14 +2189,21 @@ impl Daemon {
         session: &SessionRecord,
         record: &RequestRecord,
         answer: &Answer,
+        attempt_id: u64,
         outcome: Outcome,
         receipt_extra: &serde_json::Map<String, Value>,
     ) -> Result<()> {
         let extra = Value::Object(receipt_extra.clone());
         {
             let store = self.lock_store()?;
-            if !store.finish_request_answer(&session.id, &record.id, answer.clone(), outcome, extra)
-            {
+            if !store.finish_request_answer(
+                &session.id,
+                &record.id,
+                attempt_id,
+                answer,
+                outcome,
+                extra,
+            ) {
                 bail!(
                     "REQUEST_RESOLVED: Request {} was withdrawn before delivery completed",
                     record.id
@@ -2061,23 +2305,34 @@ impl Daemon {
                 "reason": "NO_ACTIVE_WORK",
             }));
         };
+        let captured = self.resolve_turn(&turn_id)?;
         let timeout_ms = params
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        self.interrupt_turn(&session, &turn_id)?;
+        if captured.state.is_active()
+            && let Err(error) = self.interrupt_turn(&session, &turn_id)
+            && !self.resolve_turn(&turn_id)?.state.is_terminal()
+        {
+            return Err(error);
+        }
         loop {
             let current = self.resolve_session(&session.id)?;
-            if current.state == SessionState::Failed {
-                bail!("SESSION_UNAVAILABLE: Session failed while cancellation was in progress");
-            }
-            if current.state == SessionState::Idle || current.active_turn_id.is_none() {
-                let result = self.lock_store()?.latest_turn(&session.id);
+            let (turn, settled) = {
+                let store = self.lock_store()?;
+                (
+                    store.get_turn(&turn_id).context(
+                        "captured execution disappeared while cancellation was in progress",
+                    )?,
+                    store.cancel_execution_complete(&turn_id),
+                )
+            };
+            if settled {
                 return Ok(json!({
                     "session": self.public_session(&current)?,
-                    "canceled": true,
-                    "result": result.as_ref().map(public_result),
+                    "canceled": turn.state == TurnState::Canceled,
+                    "result": public_result(&turn),
                 }));
             }
             if Instant::now() >= deadline {
@@ -2093,20 +2348,25 @@ impl Daemon {
     fn interrupt_turn(&self, session: &SessionRecord, turn_id: &str) -> Result<()> {
         let runtime = self.runtime(&session.id)?;
         let turn = self.resolve_turn(turn_id)?;
+        let runtime_generation = runtime.generation();
         match runtime.as_ref() {
-            AgentRuntime::Codex { control, thread_id } => self.interrupt_codex_turn(
+            AgentRuntime::Codex {
+                control, thread_id, ..
+            } => self.interrupt_codex_turn(
                 session,
                 turn_id,
                 &turn,
                 Arc::clone(control),
                 thread_id.clone(),
+                runtime_generation,
             ),
-            AgentRuntime::Claude { process, turns } => self.interrupt_claude_turn(
+            AgentRuntime::Claude { process, turns, .. } => self.interrupt_claude_turn(
                 session,
                 turn_id,
                 &turn,
                 Arc::clone(process),
                 Arc::clone(turns),
+                runtime_generation,
             ),
         }
     }
@@ -2118,13 +2378,20 @@ impl Daemon {
         turn: &TurnRecord,
         control: Arc<CodexConnection>,
         thread_id: String,
+        runtime_generation: u64,
     ) -> Result<()> {
         {
             let mut store = self.lock_store()?;
             if turn.state == TurnState::Canceled && session.state == SessionState::Quiescing {
                 return Ok(());
             }
-            if !store.cancel_turn_with_controls(turn_id, 1)? {
+            if !store.execution_can_cancel(
+                &session.id,
+                runtime_generation,
+                turn_id,
+                turn.execution_seq,
+            ) || !store.cancel_turn_with_controls(turn_id, runtime_generation, 1)?
+            {
                 bail!("turn is already terminal or no longer active");
             }
             store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
@@ -2139,19 +2406,30 @@ impl Daemon {
                     let current = store.lock().ok().and_then(|store| {
                         let session = store.get_session(&session_id)?;
                         let turn = store.get_turn(&turn_id)?;
-                        Some((session, turn))
+                        Some((
+                            session,
+                            turn,
+                            store.runtime_generation_is_current(&session_id, runtime_generation),
+                        ))
                     });
-                    let Some((session, turn)) = current else {
+                    let Some((session, turn, owns_generation)) = current else {
                         return;
                     };
                     if session.state != SessionState::Quiescing
                         || session.active_turn_id.as_deref() != Some(turn_id.as_str())
+                        || !owns_generation
                     {
                         return;
                     }
                     if let Some(provider_turn_id) = turn.provider_turn_id {
                         if let Err(error) = control.interrupt_turn(&thread_id, &provider_turn_id) {
-                            fail_cancelled_turn(&store, &session_id, &turn_id, &error.to_string());
+                            fail_cancelled_turn(
+                                &store,
+                                &session_id,
+                                &turn_id,
+                                runtime_generation,
+                                &error.to_string(),
+                            );
                             control.force_stop();
                             return;
                         }
@@ -2176,6 +2454,7 @@ impl Daemon {
         turn: &TurnRecord,
         process: Arc<ClaudeProcess>,
         turns: Arc<Mutex<ClaudeTurns>>,
+        runtime_generation: u64,
     ) -> Result<()> {
         let unread = turns
             .lock()
@@ -2186,7 +2465,16 @@ impl Daemon {
             if turn.state == TurnState::Canceled && session.state == SessionState::Quiescing {
                 return Ok(());
             }
-            if !store.cancel_turn_with_controls(turn_id, unread.len() + 1)? {
+            if !store.execution_can_cancel(
+                &session.id,
+                runtime_generation,
+                turn_id,
+                turn.execution_seq,
+            ) || !store.cancel_turn_with_controls(
+                turn_id,
+                runtime_generation,
+                unread.len() + 1,
+            )? {
                 bail!("turn is already terminal or no longer active");
             }
             store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
@@ -2198,7 +2486,8 @@ impl Daemon {
             .name("dlgt-claude-cancel".to_owned())
             .spawn(move || {
                 for message in unread {
-                    if !cancel_target_is_current(&store, &session_id, &turn_id) {
+                    if !cancel_target_is_current(&store, &session_id, &turn_id, runtime_generation)
+                    {
                         return;
                     }
                     let request = json!({
@@ -2211,6 +2500,7 @@ impl Daemon {
                             &store,
                             &session_id,
                             &turn_id,
+                            runtime_generation,
                             "Claude rejected or timed out a cancel control",
                         );
                         process.force_stop();
@@ -2219,13 +2509,13 @@ impl Daemon {
                     if response.get("cancelled").and_then(Value::as_bool) == Some(true)
                         && let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock())
                     {
-                        turns.discard(&store, &session_id, &message.uuid);
+                        turns.discard(&store, &session_id, runtime_generation, &message.uuid);
                     }
                     if let Ok(store) = store.lock() {
                         store.finish_cancel_control(&turn_id);
                     }
                 }
-                if !cancel_target_is_current(&store, &session_id, &turn_id) {
+                if !cancel_target_is_current(&store, &session_id, &turn_id, runtime_generation) {
                     return;
                 }
                 if process
@@ -2236,6 +2526,7 @@ impl Daemon {
                         &store,
                         &session_id,
                         &turn_id,
+                        runtime_generation,
                         "Claude rejected or timed out the interrupt control",
                     );
                     process.force_stop();
@@ -2244,7 +2535,9 @@ impl Daemon {
                 if let Ok(store) = store.lock() {
                     store.finish_cancel_control(&turn_id);
                 }
-                if let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock()) {
+                if cancel_target_is_current(&store, &session_id, &turn_id, runtime_generation)
+                    && let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock())
+                {
                     let _ = turns.settle(&store, &session_id);
                 }
             })
@@ -2581,6 +2874,16 @@ impl Daemon {
             .with_context(|| format!("session is not active: {id}"))
     }
 
+    fn runtime_is_current(&self, id: &str, candidate: &Arc<AgentRuntime>) -> bool {
+        self.sessions.read().is_ok_and(|sessions| {
+            sessions
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, candidate))
+        }) && self
+            .lock_store()
+            .is_ok_and(|store| store.runtime_generation_is_current(id, candidate.generation()))
+    }
+
     fn lock_store(&self) -> Result<MutexGuard<'_, Store>> {
         self.store
             .lock()
@@ -2680,11 +2983,15 @@ fn record_session_exit(
     store: &Mutex<Store>,
     sessions: &SessionMap,
     session_id: &str,
+    runtime_generation: u64,
     reason: &str,
     detail: Option<&str>,
 ) {
     if let Ok(store) = store.lock() {
-        let session = store.get_session(session_id);
+        let owns_generation = store.runtime_generation_is_current(session_id, runtime_generation);
+        let session = owns_generation
+            .then(|| store.get_session(session_id))
+            .flatten();
         let restarting = session
             .as_ref()
             .is_some_and(|session| session.state == SessionState::Restarting);
@@ -2694,7 +3001,7 @@ fn record_session_exit(
                 SessionState::Stopping | SessionState::Stopped | SessionState::Restarting
             )
         });
-        if !intentional {
+        if owns_generation && !intentional {
             let detail = detail.filter(|detail| !detail.is_empty());
             store.append_message(
                 session_id,
@@ -2704,27 +3011,33 @@ fn record_session_exit(
                 )),
             );
         }
-        record_exit_result(&store, session.as_ref(), reason, intentional);
-        if restarting {
-            store.finish_session_restart_stop(session_id);
-        } else if intentional {
-            store.set_session_stopped(session_id);
-        } else {
-            store.set_session_failed(session_id);
-        }
-        store.record_event(
-            Some(session_id),
-            None,
+        if owns_generation {
+            record_exit_result(&store, session.as_ref(), reason, intentional);
             if restarting {
-                "provider.exited_for_restart"
+                store.finish_session_restart_stop(session_id);
             } else if intentional {
-                "session.stopped"
+                store.set_session_stopped(session_id);
             } else {
-                "session.failed"
-            },
-        );
+                store.set_session_failed(session_id);
+            }
+            store.record_event(
+                Some(session_id),
+                None,
+                if restarting {
+                    "provider.exited_for_restart"
+                } else if intentional {
+                    "session.stopped"
+                } else {
+                    "session.failed"
+                },
+            );
+        }
     }
-    if let Ok(mut sessions) = sessions.write() {
+    if let Ok(mut sessions) = sessions.write()
+        && sessions
+            .get(session_id)
+            .is_some_and(|runtime| runtime.generation() == runtime_generation)
+    {
         sessions.remove(session_id);
     }
 }
@@ -2762,18 +3075,35 @@ fn record_exit_result(
     }
 }
 
-fn cancel_target_is_current(store: &Arc<Mutex<Store>>, session_id: &str, turn_id: &str) -> bool {
+fn cancel_target_is_current(
+    store: &Arc<Mutex<Store>>,
+    session_id: &str,
+    turn_id: &str,
+    runtime_generation: u64,
+) -> bool {
     store.lock().is_ok_and(|store| {
-        store.get_session(session_id).is_some_and(|session| {
-            session.state == SessionState::Quiescing
-                && session.active_turn_id.as_deref() == Some(turn_id)
-        })
+        store.runtime_generation_is_current(session_id, runtime_generation)
+            && store.get_session(session_id).is_some_and(|session| {
+                session.state == SessionState::Quiescing
+                    && session.active_turn_id.as_deref() == Some(turn_id)
+            })
     })
 }
 
-fn fail_cancelled_turn(store: &Arc<Mutex<Store>>, session_id: &str, turn_id: &str, message: &str) {
+fn fail_cancelled_turn(
+    store: &Arc<Mutex<Store>>,
+    session_id: &str,
+    turn_id: &str,
+    runtime_generation: u64,
+    message: &str,
+) {
     if let Ok(store) = store.lock()
-        && store.fail_canceled_turn(turn_id, "cancel_failed", &sanitize_message(message))
+        && store.fail_canceled_turn(
+            turn_id,
+            runtime_generation,
+            "cancel_failed",
+            &sanitize_message(message),
+        )
     {
         store.record_event(Some(session_id), Some(turn_id), "turn.failed");
         store.record_event(Some(session_id), None, "session.failed");
@@ -2786,11 +3116,12 @@ fn spawn_claude_cancel_control(
     process: Arc<ClaudeProcess>,
     session_id: String,
     turn_id: String,
+    runtime_generation: u64,
 ) {
     let _ = std::thread::Builder::new()
         .name("dlgt-claude-late-cancel".to_owned())
         .spawn(move || {
-            if !cancel_target_is_current(&store, &session_id, &turn_id) {
+            if !cancel_target_is_current(&store, &session_id, &turn_id, runtime_generation) {
                 if let Ok(store) = store.lock() {
                     store.finish_cancel_control(&turn_id);
                 }
@@ -2799,14 +3130,22 @@ fn spawn_claude_cancel_control(
             if let Err(error) =
                 process.control(&json!({"subtype": "interrupt"}), CLAUDE_CONTROL_TIMEOUT)
             {
-                fail_cancelled_turn(&store, &session_id, &turn_id, &error.to_string());
+                fail_cancelled_turn(
+                    &store,
+                    &session_id,
+                    &turn_id,
+                    runtime_generation,
+                    &error.to_string(),
+                );
                 process.force_stop();
                 return;
             }
             if let Ok(store) = store.lock() {
                 store.finish_cancel_control(&turn_id);
             }
-            if let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock()) {
+            if cancel_target_is_current(&store, &session_id, &turn_id, runtime_generation)
+                && let (Ok(mut turns), Ok(store)) = (turns.lock(), store.lock())
+            {
                 let _ = turns.settle(&store, &session_id);
             }
         });
@@ -3029,8 +3368,7 @@ impl SessionLaunchFailure {
             hint: if code == "AUTH_MISMATCH" {
                 error
                     .downcast_ref::<AuthMismatch>()
-                    .map(AuthMismatch::hint)
-                    .unwrap_or_else(|| AuthMismatch::default().hint())
+                    .map_or_else(|| AuthMismatch::default().hint(), AuthMismatch::hint)
             } else {
                 "detail carries the provider's own stderr tail; if the provider needs a login, \
                    a trust decision, or first-run setup, run it once by hand in the Session's \
@@ -5183,14 +5521,25 @@ mod tests {
 
     #[test]
     fn a_blocked_fetch_with_300kb_tool_and_cwd_fits_the_hard_request_budget() {
-        let request = json!({
-            "id": "r1",
-            "kind": "approval",
-            "tool": "T".repeat(300_000),
-            "cwd": format!("/{}", "c".repeat(300_000)),
-            "summary": "A short command",
-            "input": {"command": "echo hello"}
-        });
+        let mut requests = crate::requests::RequestTable::default();
+        let request = requests
+            .open(
+                crate::requests::RequestDraft {
+                    kind: crate::requests::RequestKind::Approval,
+                    provider_key: "provider-1".to_owned(),
+                    provider: crate::requests::ProviderRequest::CodexCommand,
+                    tool: "T".repeat(300_000),
+                    summary: "A short command".to_owned(),
+                    input: json!({"command": "echo hello"}),
+                    cwd: Some(format!("/{}", "c".repeat(300_000))),
+                    reason: None,
+                    text: None,
+                    choices: Vec::new(),
+                },
+                Some(1),
+                1,
+            )
+            .public();
         let mut cut = test_cut(vec![
             SourceSpec {
                 requests: vec![request],
@@ -5645,36 +5994,34 @@ mod tests {
 
         let pair = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let observed = Arc::new(Barrier::new(2));
-        let notified = Arc::new(Barrier::new(2));
         let waiter_pair = Arc::clone(&pair);
         let waiter_observed = Arc::clone(&observed);
-        let waiter_notified = Arc::clone(&notified);
         let waiter = std::thread::spawn(move || {
             let (state, condition) = &*waiter_pair;
-            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            let guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(
                 !*guard,
                 "attempt completed before the duplicate inspected it"
             );
-            drop(guard);
-            // This is the gap in claim_request_answer: the predicate guard is
-            // released before the condition-variable wait reacquires it.
+            // Keep the predicate guard through wait_timeout. The notifier
+            // cannot pass the same mutex until the wait atomically releases it.
             waiter_observed.wait();
-            waiter_notified.wait();
-            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
             let (guard, timeout) = condition
                 .wait_timeout(guard, Duration::from_millis(20))
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (timeout.timed_out(), *guard)
         });
 
         observed.wait();
         {
             let (state, condition) = &*pair;
-            *state.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             condition.notify_all();
         }
-        notified.wait();
         let (timed_out, completed) = waiter
             .join()
             .unwrap_or_else(|_| panic!("duplicate waiter panicked"));

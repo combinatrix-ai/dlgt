@@ -166,7 +166,26 @@ pub struct RequestRecord {
     pub resolution: Option<Resolution>,
     pub answer_state: AnswerState,
     pub answer_attempt: Option<Answer>,
+    pub answer_attempt_id: Option<u64>,
+    attempts: Vec<AnswerAttempt>,
+    provider_withdrawn: bool,
     pub answer_receipt: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerAttemptState {
+    Sending,
+    Retryable,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct AnswerAttempt {
+    id: u64,
+    state: AnswerAttemptState,
+    waiters: usize,
+    resolution: Option<Resolution>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +209,8 @@ impl AnswerState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnswerClaim {
-    Started,
-    Waiting,
+    Started(u64),
+    Waiting(u64),
     Replay(Resolution),
     Conflict,
     Failed,
@@ -365,7 +384,7 @@ impl RequestRecord {
                 };
                 for field in required_fields {
                     if content.get(field).is_none_or(Value::is_null) {
-                        bail!("invalid answer: required form field {:?} is missing", field);
+                        bail!("invalid answer: required form field {field:?} is missing");
                     }
                 }
                 json!({"action": "accept", "content": content})
@@ -438,6 +457,9 @@ impl RequestDraft {
             resolution: None,
             answer_state: AnswerState::Pending,
             answer_attempt: None,
+            answer_attempt_id: None,
+            attempts: Vec::new(),
+            provider_withdrawn: false,
             answer_receipt: None,
         };
         serde_json::to_vec(&record.public()).is_ok_and(|encoded| {
@@ -462,6 +484,7 @@ fn bounded_input(input: &Value) -> Value {
 pub struct RequestTable {
     records: Vec<RequestRecord>,
     issued: u64,
+    issued_attempts: u64,
 }
 
 impl RequestTable {
@@ -480,6 +503,9 @@ impl RequestTable {
             resolution: None,
             answer_state: AnswerState::Pending,
             answer_attempt: None,
+            answer_attempt_id: None,
+            attempts: Vec::new(),
+            provider_withdrawn: false,
             answer_receipt: None,
         };
         self.records.push(record.clone());
@@ -502,29 +528,31 @@ impl RequestTable {
         self.records.iter().any(RequestRecord::pending)
     }
 
-    /// Resolve one pending Request. Returns it as it was before resolution.
-    pub fn resolve(&mut self, id: &str, resolution: Resolution) -> Option<RequestRecord> {
-        let record = self
-            .records
-            .iter_mut()
-            .find(|record| record.id == id && record.pending())?;
-        let before = record.clone();
-        record.resolution = Some(resolution);
-        record.answer_state = AnswerState::Delivered;
-        record.answer_attempt = None;
-        self.trim();
-        Some(before)
-    }
-
-    pub fn resolve_with_receipt(
+    pub fn deliver_with_receipt(
         &mut self,
         id: &str,
+        attempt_id: u64,
+        answer: &Answer,
         resolution: Resolution,
         receipt: Value,
     ) -> Option<RequestRecord> {
-        let before = self.resolve(id, resolution)?;
-        if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
-            record.answer_receipt = Some(receipt);
+        let record = self.records.iter_mut().find(|record| {
+            record.id == id
+                && record.answer_state == AnswerState::Sending
+                && record.answer_attempt_id == Some(attempt_id)
+                && record.answer_attempt.as_ref() == Some(answer)
+        })?;
+        let before = record.clone();
+        record.resolution = Some(resolution.clone());
+        record.answer_state = AnswerState::Delivered;
+        record.answer_receipt = Some(receipt);
+        if let Some(attempt) = record
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.state = AnswerAttemptState::Delivered;
+            attempt.resolution = Some(resolution);
         }
         Some(before)
     }
@@ -533,12 +561,27 @@ impl RequestTable {
         let record = self.records.iter_mut().find(|record| record.id == id)?;
         Some(match record.answer_state {
             AnswerState::Pending => {
+                self.issued_attempts = self.issued_attempts.saturating_add(1);
+                let attempt_id = self.issued_attempts;
                 record.answer_state = AnswerState::Sending;
                 record.answer_attempt = Some(answer.clone());
-                AnswerClaim::Started
+                record.answer_attempt_id = Some(attempt_id);
+                record.attempts.push(AnswerAttempt {
+                    id: attempt_id,
+                    state: AnswerAttemptState::Sending,
+                    waiters: 0,
+                    resolution: None,
+                });
+                AnswerClaim::Started(attempt_id)
             }
             AnswerState::Sending if record.answer_attempt.as_ref() == Some(answer) => {
-                AnswerClaim::Waiting
+                let Some(attempt_id) = record.answer_attempt_id else {
+                    return Some(AnswerClaim::Failed);
+                };
+                if let Some(attempt) = record.attempts.iter_mut().find(|a| a.id == attempt_id) {
+                    attempt.waiters = attempt.waiters.saturating_add(1);
+                }
+                AnswerClaim::Waiting(attempt_id)
             }
             AnswerState::Delivered => record
                 .resolution
@@ -551,29 +594,94 @@ impl RequestTable {
         })
     }
 
-    pub fn retry_answer(&mut self, id: &str, answer: &Answer) -> bool {
+    pub fn retry_answer(&mut self, id: &str, attempt_id: u64, answer: &Answer) -> bool {
         let Some(record) = self.records.iter_mut().find(|record| {
             record.id == id
                 && record.answer_state == AnswerState::Sending
+                && record.answer_attempt_id == Some(attempt_id)
                 && record.answer_attempt.as_ref() == Some(answer)
         }) else {
             return false;
         };
-        record.answer_state = AnswerState::Pending;
-        record.answer_attempt = None;
+        if let Some(attempt) = record.attempts.iter_mut().find(|a| a.id == attempt_id) {
+            attempt.state = AnswerAttemptState::Retryable;
+        }
+        if record.provider_withdrawn {
+            record.resolution = Some(Resolution {
+                outcome: Outcome::Canceled,
+                answer: None,
+            });
+            record.answer_state = AnswerState::Failed;
+            record.answer_attempt = None;
+        } else {
+            record.answer_state = AnswerState::Pending;
+        }
         true
     }
 
-    pub fn fail_answer(&mut self, id: &str, answer: &Answer) -> bool {
+    pub fn fail_answer(&mut self, id: &str, attempt_id: u64, answer: &Answer) -> bool {
         let Some(record) = self.records.iter_mut().find(|record| {
             record.id == id
                 && record.answer_state == AnswerState::Sending
+                && record.answer_attempt_id == Some(attempt_id)
                 && record.answer_attempt.as_ref() == Some(answer)
         }) else {
             return false;
         };
         record.answer_state = AnswerState::Failed;
+        if let Some(attempt) = record.attempts.iter_mut().find(|a| a.id == attempt_id) {
+            attempt.state = AnswerAttemptState::Failed;
+        }
         true
+    }
+
+    pub fn fail_withdrawn_answer(&mut self, id: &str, attempt_id: u64, answer: &Answer) -> bool {
+        let Some(record) = self.records.iter_mut().find(|record| {
+            record.id == id
+                && record.answer_state == AnswerState::Sending
+                && record.answer_attempt_id == Some(attempt_id)
+                && record.answer_attempt.as_ref() == Some(answer)
+                && record.provider_withdrawn
+        }) else {
+            return false;
+        };
+        record.answer_state = AnswerState::Failed;
+        record.resolution = Some(Resolution {
+            outcome: Outcome::Canceled,
+            answer: None,
+        });
+        if let Some(attempt) = record
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.state = AnswerAttemptState::Failed;
+        }
+        true
+    }
+
+    pub fn answer_attempt_status(
+        &self,
+        id: &str,
+        attempt_id: u64,
+    ) -> Option<(AnswerAttemptState, Option<Resolution>)> {
+        let record = self.records.iter().find(|record| record.id == id)?;
+        let attempt = record
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)?;
+        Some((attempt.state, attempt.resolution.clone()))
+    }
+
+    pub fn release_answer_waiter(&mut self, id: &str, attempt_id: u64) {
+        if let Some(record) = self.records.iter_mut().find(|record| record.id == id)
+            && let Some(attempt) = record
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.waiters = attempt.waiters.saturating_sub(1);
+        }
     }
 
     /// Close pending Requests as canceled: every one, or only the one the
@@ -581,7 +689,13 @@ impl RequestTable {
     pub fn cancel(&mut self, provider_key: Option<&str>) -> Vec<RequestRecord> {
         let mut closed = Vec::new();
         for record in &mut self.records {
-            if record.pending() && provider_key.is_none_or(|key| record.draft.provider_key == key) {
+            if !record.pending() || provider_key.is_some_and(|key| record.draft.provider_key != key)
+            {
+                continue;
+            }
+            if record.answer_state == AnswerState::Sending {
+                record.provider_withdrawn = true;
+            } else {
                 closed.push(record.clone());
                 record.resolution = Some(Resolution {
                     outcome: Outcome::Canceled,
@@ -617,8 +731,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Answer, AnswerClaim, AnswerState, Outcome, ProviderRequest, RequestDraft, RequestKind,
-        RequestRecord, RequestTable, Resolution,
+        Answer, AnswerAttemptState, AnswerClaim, AnswerState, Outcome, ProviderRequest,
+        RequestDraft, RequestKind, RequestRecord, RequestTable, Resolution,
     };
 
     fn approval(provider: ProviderRequest) -> RequestDraft {
@@ -869,7 +983,10 @@ mod tests {
         let public = record.public();
 
         assert_eq!(public["fields"].as_array().map(Vec::len), Some(17));
-        for (published, original) in public["fields"].as_array().unwrap().iter().zip(fields) {
+        let Some(published_fields) = public["fields"].as_array() else {
+            panic!("published form fields are not an array");
+        };
+        for (published, original) in published_fields.iter().zip(fields) {
             assert_eq!(published["name"], original.name);
             assert_eq!(published["required"], original.required);
             assert_eq!(
@@ -945,12 +1062,11 @@ mod tests {
         let answer = Answer::Allow;
         let mut table = RequestTable::default();
         table.open(approval(ProviderRequest::CodexCommand), None, 1);
-        assert_eq!(
-            table.begin_answer("r1", &answer),
-            Some(AnswerClaim::Started)
-        );
-
-        assert!(!table.retry_answer("r1", &answer));
+        let Some(AnswerClaim::Started(attempt_id)) = table.begin_answer("r1", &answer) else {
+            panic!("answer attempt did not start");
+        };
+        assert!(table.fail_answer("r1", attempt_id, &answer));
+        assert!(!table.retry_answer("r1", attempt_id, &answer));
         assert_eq!(
             table.get("r1").map(|record| record.answer_state),
             Some(AnswerState::Failed)
@@ -958,30 +1074,43 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_stale_answer_only_closes_a_request_withdrawn_by_restart() {
+        let answer = Answer::Allow;
+        let mut table = RequestTable::default();
+        table.open(approval(ProviderRequest::CodexCommand), None, 1);
+        let Some(AnswerClaim::Started(attempt_id)) = table.begin_answer("r1", &answer) else {
+            panic!("answer attempt did not start");
+        };
+
+        assert!(table.cancel(None).is_empty());
+        assert!(table.fail_withdrawn_answer("r1", attempt_id, &answer));
+        assert_eq!(
+            table.get("r1").map(|record| record.answer_state),
+            Some(AnswerState::Failed)
+        );
+        assert_eq!(
+            table.answer_attempt_status("r1", attempt_id),
+            Some((AnswerAttemptState::Failed, None))
+        );
+        assert_eq!(table.begin_answer("r1", &answer), Some(AnswerClaim::Failed));
+    }
+
+    #[test]
     fn delivered_answer_receipt_survives_provider_resolution_race() {
         let answer = Answer::Allow;
         let mut table = RequestTable::default();
         table.open(approval(ProviderRequest::CodexCommand), None, 1);
-        assert_eq!(
-            table.begin_answer("r1", &answer),
-            Some(AnswerClaim::Started)
-        );
+        let Some(AnswerClaim::Started(attempt_id)) = table.begin_answer("r1", &answer) else {
+            panic!("answer attempt did not start");
+        };
 
+        assert!(table.cancel(Some("p1")).is_empty());
         assert!(
             table
-                .resolve(
+                .deliver_with_receipt(
                     "r1",
-                    Resolution {
-                        outcome: Outcome::Canceled,
-                        answer: None
-                    },
-                )
-                .is_none()
-        );
-        assert!(
-            table
-                .resolve_with_receipt(
-                    "r1",
+                    attempt_id,
+                    &answer,
                     Resolution {
                         outcome: Outcome::Allowed,
                         answer: Some(answer.clone())
@@ -1015,13 +1144,12 @@ mod tests {
         let mut table = RequestTable::default();
         table.open(approval(ProviderRequest::CodexCommand), None, 1);
 
+        let Some(AnswerClaim::Started(first_attempt)) = table.begin_answer("r1", &answer) else {
+            panic!("first attempt did not start");
+        };
         assert_eq!(
             table.begin_answer("r1", &answer),
-            Some(AnswerClaim::Started)
-        );
-        assert_eq!(
-            table.begin_answer("r1", &answer),
-            Some(AnswerClaim::Waiting)
+            Some(AnswerClaim::Waiting(first_attempt))
         );
         assert_eq!(
             table.begin_answer("r1", &Answer::Allow),
@@ -1029,14 +1157,18 @@ mod tests {
         );
         assert!(table.get("r1").is_some_and(RequestRecord::pending));
 
-        assert!(table.retry_answer("r1", &answer));
+        assert!(table.retry_answer("r1", first_attempt, &answer));
         assert_eq!(
-            table.begin_answer("r1", &answer),
-            Some(AnswerClaim::Started)
+            table.answer_attempt_status("r1", first_attempt),
+            Some((super::AnswerAttemptState::Retryable, None))
         );
+        let Some(AnswerClaim::Started(second_attempt)) = table.begin_answer("r1", &answer) else {
+            panic!("second attempt did not start");
+        };
+        assert_ne!(first_attempt, second_attempt);
         assert_eq!(
             table.begin_answer("r1", &answer),
-            Some(AnswerClaim::Waiting)
+            Some(AnswerClaim::Waiting(second_attempt))
         );
 
         let resolution = Resolution {
@@ -1045,7 +1177,13 @@ mod tests {
         };
         assert!(
             table
-                .resolve_with_receipt("r1", resolution.clone(), json!({"delivered": true}))
+                .deliver_with_receipt(
+                    "r1",
+                    second_attempt,
+                    &answer,
+                    resolution.clone(),
+                    json!({"delivered": true})
+                )
                 .is_some()
         );
         assert_eq!(
@@ -1059,16 +1197,27 @@ mod tests {
     fn cancel_closes_only_pending_requests_and_can_target_one() {
         let mut table = RequestTable::default();
         let first = table.open(approval(ProviderRequest::CodexCommand), None, 1);
+        let answer = Answer::Allow;
+        let Some(AnswerClaim::Started(attempt_id)) = table.begin_answer(&first.id, &answer) else {
+            panic!("first Request answer did not start");
+        };
+        assert!(
+            table
+                .deliver_with_receipt(
+                    &first.id,
+                    attempt_id,
+                    &answer,
+                    Resolution {
+                        outcome: Outcome::Allowed,
+                        answer: Some(answer.clone()),
+                    },
+                    json!({"delivered": true}),
+                )
+                .is_some()
+        );
         let mut other = approval(ProviderRequest::CodexCommand);
         other.provider_key = "p9".to_owned();
         table.open(other, None, 1);
-        table.resolve(
-            &first.id,
-            Resolution {
-                outcome: Outcome::Allowed,
-                answer: Some(Answer::Allow),
-            },
-        );
         assert!(table.cancel(Some("p1")).is_empty(), "already resolved");
         assert_eq!(table.cancel(None).len(), 1);
         assert!(!table.has_pending());
