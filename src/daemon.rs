@@ -307,18 +307,24 @@ pub fn run() -> Result<()> {
                 empty_since = Instant::now();
                 // Accepted sockets inherit O_NONBLOCK on macOS. RPC frames
                 // larger than the socket buffer otherwise fail at ~8 KiB.
-                stream
-                    .set_nonblocking(false)
-                    .context("failed to make accepted RPC socket blocking")?;
-                let daemon = Arc::clone(&daemon);
-                std::thread::Builder::new()
+                // One connection's failure is that connection's problem: a
+                // client that disconnected right after connecting can make
+                // this call fail, and it must never stop the daemon.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("dlgt RPC connection dropped: {error}");
+                    continue;
+                }
+                let daemon_for_connection = Arc::clone(&daemon);
+                if let Err(error) = std::thread::Builder::new()
                     .name("dlgt-rpc".to_owned())
                     .spawn(move || {
-                        if let Err(error) = daemon.handle_connection(stream) {
+                        if let Err(error) = daemon_for_connection.handle_connection(stream) {
                             eprintln!("dlgt RPC connection failed: {error:#}");
                         }
                     })
-                    .context("failed to start RPC thread")?;
+                {
+                    eprintln!("dlgt RPC connection dropped: {error}");
+                }
                 false
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,

@@ -588,7 +588,10 @@ class RecheckRegressions(unittest.TestCase):
         child_file = h.home / ".fake-auth-child-pid"
         parent_file = h.home / ".fake-auth-parent-pid"
         deadline = time.monotonic() + 3
-        while not child_file.exists() and time.monotonic() < deadline:
+        def written(path: Path) -> bool:
+            return path.exists() and path.read_text().strip() != ""
+
+        while not (written(child_file) and written(parent_file)) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertTrue(child_file.exists(), "auth child did not start")
         first_pids = [int(child_file.read_text()), int(parent_file.read_text())]
@@ -620,7 +623,7 @@ class RecheckRegressions(unittest.TestCase):
             timeout=5,
         )
         deadline = time.monotonic() + 3
-        while not child_file.exists() and time.monotonic() < deadline:
+        while not (written(child_file) and written(parent_file)) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertTrue(child_file.exists(), "second auth child did not start")
         second_pids = [int(child_file.read_text()), int(parent_file.read_text())]
@@ -844,6 +847,9 @@ class RecheckRegressions(unittest.TestCase):
             h.wait_state(session, "idle")
             h.rpc("session.send", {"session": session, "request_id": f"{harness}-crash", "prompt": "crash-hold"})
             h.wait_state(session, "failed", timeout=5)
+            deadline = time.monotonic() + 3
+            while not (holder_file.exists() and holder_file.read_text().strip()) and time.monotonic() < deadline:
+                time.sleep(0.01)
             time.sleep(0.2)
             holder = int(holder_file.read_text())
             state = subprocess.run(
