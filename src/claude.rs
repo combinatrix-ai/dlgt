@@ -204,6 +204,47 @@ impl ClaudeProcess {
         }))
     }
 
+    /// Write one user message, waiting at most `window` for the write. Past
+    /// the window the write continues in the background with the usual
+    /// timeout, which stops the process if it expires, and `Ok(false)` says
+    /// delivery is still in progress.
+    pub fn send_user_within(
+        self: &Arc<Self>,
+        uuid: &str,
+        text: &str,
+        window: Duration,
+    ) -> Result<bool> {
+        let mut line = serde_json::to_vec(&json!({
+            "type": "user",
+            "uuid": uuid,
+            "session_id": "",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": text},
+        }))?;
+        line.push(b'\n');
+        let (written, result) = mpsc::channel();
+        self.enqueue(WriteCommand { line, written })?;
+        match result.recv_timeout(window) {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(message)) => Err(anyhow!(message)),
+            Err(_) => {
+                let process = Arc::downgrade(self);
+                let remaining = WRITE_TIMEOUT.saturating_sub(window);
+                std::thread::Builder::new()
+                    .name("dlgt-claude-write-watch".to_owned())
+                    .spawn(move || {
+                        if !matches!(result.recv_timeout(remaining), Ok(Ok(())))
+                            && let Some(process) = process.upgrade()
+                        {
+                            process.force_stop();
+                        }
+                    })
+                    .context("failed to start Claude write watcher")?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Send a control request and wait for Claude's response to it. Must not
     /// be called from the event thread, which is what delivers the response.
     pub fn control(&self, request: &Value, timeout: Duration) -> Result<Value> {

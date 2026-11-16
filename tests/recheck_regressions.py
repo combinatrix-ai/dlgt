@@ -1135,6 +1135,25 @@ class RecheckRegressions(unittest.TestCase):
         self.assertEqual(state["session"]["state"], "busy", state)
         self.assertNotIn("OLD_PROCESS_RESULT", json.dumps(state), state)
 
+    def test_a_stalled_claude_write_still_returns_a_pending_receipt(self) -> None:
+        h = self.harness
+        pid_file = h.root / "claude.pid"
+        session = h.create("claude", "first", {"DLGT_FAKE_PID_FILE": str(pid_file)})["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        provider = int(pid_file.read_text())
+        os.kill(provider, signal.SIGSTOP)
+        try:
+            started = time.monotonic()
+            sent = h.rpc(
+                "session.send",
+                {"session": session, "request_id": "stalled", "prompt": "x" * 300_000},
+                timeout=20,
+            )
+            self.assertLess(time.monotonic() - started, 8, sent)
+            self.assertEqual(sent.get("result", {}).get("submission"), "pending", str(sent)[:300])
+        finally:
+            os.kill(provider, signal.SIGCONT)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

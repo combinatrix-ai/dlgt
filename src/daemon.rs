@@ -1763,7 +1763,11 @@ impl Daemon {
             }
             AgentRuntime::Claude { process, .. } => {
                 let uuid = claude_uuid.as_deref().unwrap_or_default();
-                if let Err(error) = process.send_user(uuid, prompt) {
+                let delivered = process.send_user_within(uuid, prompt, SUBMISSION_CONFIRM_TIMEOUT);
+                if matches!(delivered, Ok(false)) {
+                    window_spent = true;
+                }
+                if let Err(error) = delivered {
                     self.lock_store()?.fail_execution(
                         &turn_id,
                         runtime.generation(),
