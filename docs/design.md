@@ -126,7 +126,9 @@ event from a replaced generation or a finished execution and changes nothing,
 so a stop, failure, exit, or late provider report from an old process can
 never act on the replacement. It returns the effects the store applies and the
 lifecycle events it records; callers never set a phase or record a lifecycle
-event themselves.
+event themselves. The one exception is publication: when a new Session gets
+its public ID, dlgt repeats `session.created` and `session.ready` under that
+ID so the timeline a caller can read starts there.
 
 The function guarantees, and a bounded exhaustive test checks over every
 interleaving of events from the current and previous generation:
@@ -136,8 +138,16 @@ interleaving of events from the current and previous generation:
 - an execution that leaves the Session other than by the provider's own result
   (restart, stop, exit, failure, including while canceling) gets a terminal
   result;
-- no state is a dead end: provider events alone reach `idle`, `stopped`, or
-  `failed`.
+- an event naming an execution other than the active one is refused as stale;
+- leaving an execution closes its Requests, and a published result never
+  changes;
+- each state accepts exactly the events its transition table lists;
+- no state is a dead end: an execution settles through its own provider
+  events, and provider events alone reach `idle`, `stopped`, or `failed`.
+
+Generations come from one daemon-wide counter and are never reused, so a
+Session recreated by resume does not share a generation with the process it
+replaced.
 
 A stop already in progress may be forced. Restart claims the generation the
 caller observed and is refused if another restart replaced it first.

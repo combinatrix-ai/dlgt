@@ -137,9 +137,12 @@ Request returns the original receipt with `replayed: true`.
 
 `submission` is `confirmed` or `pending`. The daemon waits up to five seconds
 for the provider's acknowledgement: the `turn/start` response for Codex, and
-Claude starting or replaying the prompt. `pending` is still success: local
-delivery occurred, so the caller must observe or replay the identical request
-ID rather than submit with a new one. A replay refreshes this field from the
+Claude starting or replaying the prompt; a prompt write that has not
+finished within that window also yields `pending`. `pending` is still
+success: the execution is reserved and delivery or acknowledgement is in
+progress, so the caller must observe or replay the identical request ID
+rather than submit with a new one. If delivery then fails, the execution ends
+with a failed result. A replay refreshes this field from the
 live execution and can change `pending` to `confirmed` without executing the
 prompt twice. Pending receipts also include a human-readable `hint` and an
 `action` containing a bounded `fetch`.

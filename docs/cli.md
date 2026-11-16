@@ -711,8 +711,9 @@ Rules:
 
 - Without `--cursor`, `fetch` returns a bounded baseline: current state,
   pending Requests, the latest retained result, the last 64 messages, and a
-  fresh position. This is the documented recovery path after a lost position
-  or a lost response.
+  fresh position. This is the recovery path after a lost cursor, a
+  `CURSOR_EXPIRED` or `CURSOR_INVALID` error, or a daemon restart. After a
+  lost response whose cursor is still known, retry that cursor instead.
 - `--wait` is optional. Omitted, the command returns immediately. Given, it
   requires an explicit duration and accepts up to 24h; there is no unbounded
   wait.
