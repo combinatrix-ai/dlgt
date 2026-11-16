@@ -49,11 +49,14 @@ pub fn call(method: &str, params: Value) -> Result<Value> {
         method: method.to_owned(),
         params,
     };
-    write_json_line(&mut stream, &request)?;
+    write_json_line(&mut stream, &request)
+        .map_err(|error| transport_lost(format!("failed to send to the dlgt daemon: {error:#}")))?;
     let mut line = String::new();
     BufReader::new(stream)
         .read_line(&mut line)
-        .context("failed to read daemon response")?;
+        .map_err(|error| {
+            transport_lost(format!("failed to read the dlgt daemon response: {error}"))
+        })?;
     decode_response(&line)
 }
 
@@ -85,11 +88,14 @@ fn call_socket_with_timeout(
         method: method.to_owned(),
         params,
     };
-    write_json_line(&mut stream, &request)?;
+    write_json_line(&mut stream, &request)
+        .map_err(|error| transport_lost(format!("failed to send to the dlgt daemon: {error:#}")))?;
     let mut line = String::new();
     BufReader::new(stream)
         .read_line(&mut line)
-        .context("failed to read daemon response")?;
+        .map_err(|error| {
+            transport_lost(format!("failed to read the dlgt daemon response: {error}"))
+        })?;
     decode_response(&line)
 }
 
@@ -464,9 +470,29 @@ fn write_json_line(writer: &mut impl Write, value: &impl serde::Serialize) -> Re
     Ok(())
 }
 
+/// The daemon went away mid-request. Retrying may succeed, so this is
+/// `RPC_UNAVAILABLE`, not an argument error.
+fn transport_lost(message: String) -> anyhow::Error {
+    RpcFailure {
+        code: "RPC_UNAVAILABLE".to_owned(),
+        message,
+        session_id: None,
+        launch_id: None,
+        correlation_id: None,
+        hint: None,
+        session_state: None,
+        action: None,
+        request_ids: None,
+        detail: None,
+    }
+    .into()
+}
+
 fn decode_response(line: &str) -> Result<Value> {
     if line.is_empty() {
-        bail!("dlgt server closed the connection without a response");
+        return Err(transport_lost(
+            "dlgt server closed the connection without a response".to_owned(),
+        ));
     }
     let response: Response = serde_json::from_str(line).context("invalid daemon response")?;
     if let Ok(mut info) = LAST_INFO.lock() {
@@ -533,6 +559,17 @@ mod tests {
         RpcFailure, configure_daemon_output, daemon_start_failed, decode_response,
         is_auto_start_connect_error, socket_is_stale, socket_unavailable,
     };
+
+    #[test]
+    fn a_daemon_that_closes_mid_request_is_unavailable_not_an_argument_error() {
+        let error = super::decode_response("")
+            .err()
+            .unwrap_or_else(|| panic!("an empty response was accepted"));
+        let failure = error
+            .downcast_ref::<super::RpcFailure>()
+            .unwrap_or_else(|| panic!("untyped transport error: {error:#}"));
+        assert_eq!(failure.code, "RPC_UNAVAILABLE");
+    }
 
     #[test]
     fn rpc_failure_preserves_launch_correlation_id() {
