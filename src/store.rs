@@ -485,6 +485,24 @@ impl Store {
         }
     }
 
+    /// The Session's current key for `session_id`, which may be an ID it had
+    /// before a provider rotation. Work that captured the old ID, such as an
+    /// answer receipt, still finds its Session.
+    fn session_key(&self, session_id: &str) -> String {
+        let state = self.state.borrow();
+        if state.sessions.contains_key(session_id) {
+            return session_id.to_owned();
+        }
+        state
+            .uid_index
+            .get(session_id)
+            .and_then(|uid| state.sessions.values().find(|session| session.uid == *uid))
+            .map_or_else(
+                || session_id.to_owned(),
+                |session| session.record.id.clone(),
+            )
+    }
+
     pub fn get_session(&self, selector: &str) -> Option<SessionRecord> {
         let state = self.state.borrow();
         if let Some(session) = state.sessions.get(selector) {
@@ -1108,6 +1126,8 @@ impl Store {
     /// Record a message against the Session's active execution, if any. A
     /// refused approval is counted on that execution's result.
     pub fn append_message(&self, session_id: &str, body: MessageBody) -> Option<u64> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let mut state = self.state.borrow_mut();
         let session = state.sessions.get(session_id)?;
         let uid = session.uid.clone();
@@ -1140,6 +1160,8 @@ impl Store {
         execution_seq: Option<i64>,
         body: MessageBody,
     ) -> Option<u64> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let Some(execution_seq) = execution_seq else {
             return self.append_message(session_id, body);
         };
@@ -1329,6 +1351,8 @@ impl Store {
     }
 
     pub fn request(&self, session_id: &str, id: &str) -> Option<RequestRecord> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let state = self.state.borrow();
         let uid = &state.sessions.get(session_id)?.uid;
         state.requests.get(uid)?.get(id).cloned()
@@ -1349,6 +1373,8 @@ impl Store {
         id: &str,
         answer: &Answer,
     ) -> Option<AnswerClaim> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let mut state = self.state.borrow_mut();
         let uid = state.sessions.get(session_id)?.uid.clone();
         state.requests.get_mut(&uid)?.begin_answer(id, answer)
@@ -1360,6 +1386,8 @@ impl Store {
         id: &str,
         attempt_id: u64,
     ) -> Option<(crate::requests::AnswerAttemptState, Option<Resolution>)> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let state = self.state.borrow();
         let uid = &state.sessions.get(session_id)?.uid;
         state
@@ -1376,6 +1404,8 @@ impl Store {
         attempt_id: u64,
         turn_id: &str,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let state = self.state.borrow();
         let Some(session) = state.sessions.get(session_id) else {
             return false;
@@ -1416,6 +1446,8 @@ impl Store {
         turn_id: &str,
         execution_seq: i64,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         self.owned_execution(session_id, runtime_generation, turn_id, execution_seq)
             .is_some_and(|execution| !execution.blocked && execution.cancel.is_none())
     }
@@ -1443,11 +1475,15 @@ impl Store {
         turn_id: &str,
         execution_seq: i64,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         self.owned_execution(session_id, runtime_generation, turn_id, execution_seq)
             .is_some_and(|execution| execution.cancel.is_none())
     }
 
     pub fn release_answer_waiter(&mut self, session_id: &str, id: &str, attempt_id: u64) {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let mut state = self.state.borrow_mut();
         let Some(uid) = state
             .sessions
@@ -1470,6 +1506,8 @@ impl Store {
         outcome: Outcome,
         receipt: Value,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let resolved = {
             let mut state = self.state.borrow_mut();
             let Some(uid) = state
@@ -1509,6 +1547,8 @@ impl Store {
         attempt_id: u64,
         answer: &Answer,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let mut state = self.state.borrow_mut();
         let Some(uid) = state
             .sessions
@@ -1530,6 +1570,8 @@ impl Store {
         attempt_id: u64,
         answer: &Answer,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let mut state = self.state.borrow_mut();
         let Some(uid) = state
             .sessions
@@ -1554,6 +1596,8 @@ impl Store {
         attempt_id: u64,
         answer: &Answer,
     ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let mut state = self.state.borrow_mut();
         let Some(uid) = state
             .sessions
@@ -1575,6 +1619,8 @@ impl Store {
         session_id: &str,
         provider_key: Option<&str>,
     ) -> Vec<RequestRecord> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
         let closed = {
             let mut state = self.state.borrow_mut();
             let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
@@ -2402,6 +2448,38 @@ mod tests {
         // The provider's own turn ID is routing data, not part of the result.
         after.provider_turn_id = None;
         assert_eq!(Some(format!("{after:?}")), published);
+    }
+
+    #[test]
+    fn an_answer_started_before_a_rotation_commits_after_it() {
+        let store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let request = store
+            .open_request("codex:thread-1", approval_draft("provider-1"))
+            .unwrap_or_else(|| panic!("request was not opened"));
+        let Some(crate::requests::AnswerClaim::Started(attempt)) =
+            store.begin_request_answer("codex:thread-1", &request.id, &Answer::Allow)
+        else {
+            panic!("answer was not started");
+        };
+        store
+            .rekey_session("codex:thread-1", "codex:thread-2")
+            .unwrap_or_else(|error| panic!("failed to rekey: {error}"));
+        assert!(store.finish_request_answer(
+            "codex:thread-1",
+            &request.id,
+            attempt,
+            &Answer::Allow,
+            Outcome::Allowed,
+            serde_json::json!({}),
+        ));
+        assert!(
+            store
+                .pending_requests(&store.session_uid("codex:thread-2").unwrap_or_default())
+                .is_empty()
+        );
     }
 
     #[test]

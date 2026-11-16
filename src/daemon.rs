@@ -984,10 +984,9 @@ impl Daemon {
                 ));
             }
         };
-        self.sessions
-            .write()
-            .map_err(|_| anyhow!("session map lock poisoned"))?
-            .insert(id.to_owned(), Arc::clone(&runtime));
+        // Publish the runtime only while its generation owns the Session, as
+        // one step under the store lock (store, then runtime map), so a
+        // launch that a restart replaced never displaces the replacement.
         let store = self.lock_store()?;
         if !store.spawned(id, generation, Some(runtime.pid())) {
             store.fail_session(
@@ -997,10 +996,6 @@ impl Daemon {
                 "the provider process exited before the Session became ready",
             );
             drop(store);
-            self.sessions
-                .write()
-                .map_err(|_| anyhow!("session map lock poisoned"))?
-                .remove(id);
             runtime.force_stop();
             return Err(self.session_launch_failure(
                 generation,
@@ -1011,6 +1006,10 @@ impl Daemon {
                 Some(runtime.stderr_tail()),
             ));
         }
+        self.sessions
+            .write()
+            .map_err(|_| anyhow!("session map lock poisoned"))?
+            .insert(id.to_owned(), Arc::clone(&runtime));
         store.ready(id, generation);
         Ok(runtime)
     }
@@ -3062,13 +3061,17 @@ impl Daemon {
     }
 
     fn runtime_is_current(&self, id: &str, candidate: &Arc<AgentRuntime>) -> bool {
-        self.sessions.read().is_ok_and(|sessions| {
+        // Release the runtime map before taking the store: the order
+        // elsewhere is store, then runtime map.
+        let mapped = self.sessions.read().is_ok_and(|sessions| {
             sessions
                 .get(id)
                 .is_some_and(|current| Arc::ptr_eq(current, candidate))
-        }) && self
-            .lock_store()
-            .is_ok_and(|store| store.runtime_generation_is_current(id, candidate.generation()))
+        });
+        mapped
+            && self
+                .lock_store()
+                .is_ok_and(|store| store.runtime_generation_is_current(id, candidate.generation()))
     }
 
     fn lock_store(&self) -> Result<MutexGuard<'_, Store>> {
