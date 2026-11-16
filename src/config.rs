@@ -87,19 +87,45 @@ impl Default for ResolvedLaunch {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AuthMismatch;
+#[derive(Debug, Clone, Default)]
+pub struct AuthMismatch {
+    pub variables: Vec<String>,
+}
+
+impl AuthMismatch {
+    pub fn from_variables(variables: Vec<String>) -> Self {
+        Self { variables }
+    }
+
+    pub fn hint(&self) -> String {
+        if self.variables.is_empty() {
+            "Confirm Claude is logged in with a claude.ai subscription in the selected launch environment, or choose --auth any if another provider source is intended.".to_owned()
+        } else {
+            format!(
+                "Unset the blocking environment variable(s) {} with matching --unset-env options (or unset them in [defaults.claude]); choose --auth any only if another provider source is intended.",
+                self.variables.join(", ")
+            )
+        }
+    }
+}
 
 impl fmt::Display for AuthMismatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(AUTH_MISMATCH_MESSAGE)
+        if self.variables.is_empty() {
+            formatter.write_str(AUTH_MISMATCH_MESSAGE)
+        } else {
+            write!(
+                formatter,
+                "{AUTH_MISMATCH_MESSAGE}: {}",
+                self.variables.join(", ")
+            )
+        }
     }
 }
 
 impl Error for AuthMismatch {}
 
 pub const AUTH_MISMATCH_MESSAGE: &str = "Claude subscription authentication could not be confirmed or a non-subscription provider source is configured";
-pub const AUTH_MISMATCH_HINT: &str = "Remove each offending variable with its matching --unset-env option (or unset it in [defaults.claude]): --unset-env ANTHROPIC_API_KEY, --unset-env ANTHROPIC_AUTH_TOKEN, --unset-env ANTHROPIC_AWS_API_KEY, --unset-env ANTHROPIC_AWS_BASE_URL, --unset-env ANTHROPIC_AWS_WORKSPACE_ID, --unset-env ANTHROPIC_BASE_URL, --unset-env ANTHROPIC_BEDROCK_BASE_URL, --unset-env ANTHROPIC_BEDROCK_MANTLE_BASE_URL, --unset-env ANTHROPIC_BEDROCK_REGION_PREFIX, --unset-env ANTHROPIC_BEDROCK_SERVICE_TIER, --unset-env ANTHROPIC_CUSTOM_HEADERS, --unset-env ANTHROPIC_FEDERATION_RULE_ID, --unset-env ANTHROPIC_FOUNDRY_API_KEY, --unset-env ANTHROPIC_FOUNDRY_AUTH_TOKEN, --unset-env ANTHROPIC_FOUNDRY_BASE_URL, --unset-env ANTHROPIC_FOUNDRY_RESOURCE, --unset-env ANTHROPIC_GOOGLE_CLOUD_BASE_URL, --unset-env ANTHROPIC_GOOGLE_CLOUD_LOCATION, --unset-env ANTHROPIC_GOOGLE_CLOUD_PROJECT, --unset-env ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID, --unset-env ANTHROPIC_ORGANIZATION_ID, --unset-env ANTHROPIC_PROFILE, --unset-env ANTHROPIC_VERTEX_BASE_URL, --unset-env ANTHROPIC_VERTEX_PROJECT_ID, --unset-env ANTHROPIC_WORKSPACE_ID, --unset-env AWS_BEARER_TOKEN_BEDROCK, --unset-env CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, --unset-env CLAUDE_CODE_SIMPLE, --unset-env CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH, --unset-env CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH, --unset-env CLAUDE_CODE_SKIP_BEDROCK_AUTH, --unset-env CLAUDE_CODE_SKIP_FOUNDRY_AUTH, --unset-env CLAUDE_CODE_SKIP_MANTLE_AUTH, --unset-env CLAUDE_CODE_SKIP_VERTEX_AUTH, --unset-env CLAUDE_CODE_USE_ANTHROPIC_AWS, --unset-env CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD, --unset-env CLAUDE_CODE_USE_BEDROCK, --unset-env CLAUDE_CODE_USE_FOUNDRY, --unset-env CLAUDE_CODE_USE_MANTLE, --unset-env CLAUDE_CODE_USE_VERTEX; or pass --auth any";
 
 const SUBSCRIPTION_BLOCKING_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -171,13 +197,17 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
 }
 
 pub fn parse(text: &str) -> Result<Config> {
-    let document = text.parse::<DocumentMut>().map_err(|error| {
-        let offset = error.span().map_or(0, |span| span.start);
-        let (line, column) = line_column(text, offset);
-        anyhow!("invalid dlgt config at {line}:{column}: invalid TOML syntax")
-    })?;
+    let document = parse_toml_document(text, "dlgt config")?;
     parse_document(&document)
         .map_err(|_| anyhow!("invalid dlgt config at 1:1: invalid configuration entry"))
+}
+
+pub fn parse_toml_document(text: &str, source: &str) -> Result<DocumentMut> {
+    text.parse::<DocumentMut>().map_err(|error| {
+        let offset = error.span().map_or(0, |span| span.start);
+        let (line, column) = line_column(text, offset);
+        anyhow!("invalid TOML in {source} at {line}:{column}: invalid TOML syntax")
+    })
 }
 
 fn parse_document(document: &DocumentMut) -> Result<Config> {
@@ -336,10 +366,10 @@ pub fn validate_auth_environment<'a>(
                     !value.is_empty()
                 }
         })
-        .map(|(key, _)| key.as_str())
+        .map(|(key, _)| key.as_str().to_owned())
         .collect::<Vec<_>>();
     if policy == AuthPolicy::Subscription && !blocked.is_empty() {
-        return Err(AuthMismatch.into());
+        return Err(AuthMismatch::from_variables(blocked).into());
     }
     Ok(())
 }
@@ -876,5 +906,12 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
             !message.contains("ANTHROPIC_API_KEY"),
             "unrelated remedy: {message}"
         );
+        let mismatch = error
+            .downcast_ref::<AuthMismatch>()
+            .unwrap_or_else(|| panic!("auth mismatch type was lost"));
+        let hint = mismatch.hint();
+        assert!(hint.contains("ANTHROPIC_BASE_URL"), "{hint}");
+        assert!(!hint.contains("ANTHROPIC_API_KEY"), "{hint}");
+        assert!(!hint.contains("https://private.invalid"), "{hint}");
     }
 }

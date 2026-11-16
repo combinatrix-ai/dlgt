@@ -192,6 +192,8 @@ class RecheckRegressions(unittest.TestCase):
                 self.assertIn(option.split("=")[0], response["error"]["message"])
         self.assertFalse(claude_args.exists() and claude_args.stat().st_size)
         self.assertFalse(codex_args.exists() and codex_args.stat().st_size)
+        self.assertFalse((h.home / ".claude.json").exists(), "Claude workspace trust ran before validation")
+        self.assertFalse((h.home / ".codex" / "config.toml").exists(), "Codex workspace trust ran before validation")
 
     def test_profile_parser_error_has_path_location_and_no_source_excerpt(self) -> None:
         h = self.harness

@@ -560,7 +560,7 @@ pub fn apply_event(
             let auth_mismatch = session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription
                 && text("apiKeySource") != Some("none");
             if auth_mismatch {
-                let error = json!({"code": "AUTH_MISMATCH", "message": AuthMismatch.to_string()});
+                let error = json!({"code": "AUTH_MISMATCH", "message": AuthMismatch::default().to_string()});
                 if let Some(turn_id) = session.active_turn_id.as_deref() {
                     store.finish_turn_if_matching(
                         turn_id,

@@ -277,6 +277,7 @@ pub fn run() -> Result<()> {
         store: Arc::new(Mutex::new(store)),
         submission_changed: Arc::new(Condvar::new()),
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        auth_processes: Arc::new(crate::provider::AuthProcessGroups::default()),
         shutting_down: AtomicBool::new(false),
         update_notice: Arc::new(RwLock::new(None)),
         update_shutdown,
@@ -375,6 +376,7 @@ struct Daemon {
     store: Arc<Mutex<Store>>,
     submission_changed: Arc<Condvar>,
     sessions: SessionMap,
+    auth_processes: Arc<crate::provider::AuthProcessGroups>,
     shutting_down: AtomicBool,
     update_notice: Arc<RwLock<Option<Value>>>,
     update_shutdown: SyncSender<()>,
@@ -386,6 +388,7 @@ type SessionMap = Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>;
 impl Daemon {
     fn request_shutdown(&self) {
         signal_shutdown(&self.shutting_down, &self.update_shutdown);
+        self.auth_processes.terminate_all();
     }
 }
 
@@ -505,6 +508,7 @@ impl Daemon {
                 ),
             );
         }
+        let mut direct_auth_hint = None;
         let response = match self.dispatch(&request.method, &request.params) {
             Ok(result) => Response::ok(request.id, result).with_info(
                 self.update_notice
@@ -513,6 +517,7 @@ impl Daemon {
                     .and_then(|notice| notice.clone()),
             ),
             Err(error) => {
+                direct_auth_hint = error.downcast_ref::<AuthMismatch>().map(AuthMismatch::hint);
                 if let Some(failure) = error.downcast_ref::<SessionLaunchFailure>() {
                     failure.response(request.id)
                 } else {
@@ -522,8 +527,10 @@ impl Daemon {
         };
         let mut response = response;
         if let Some(error) = response.error.as_mut() {
-            if error.code == "AUTH_MISMATCH" {
-                error.hint = Some(config::AUTH_MISMATCH_HINT.to_owned());
+            if error.code == "AUTH_MISMATCH"
+                && let Some(hint) = direct_auth_hint
+            {
+                error.hint = Some(hint);
             }
             if let Some(correlation_id) =
                 request.params.get("correlation_id").and_then(Value::as_str)
@@ -694,6 +701,7 @@ impl Daemon {
                 .context("invalid harness_options")?,
             Some(_) => bail!("harness_options must be an array"),
         };
+        crate::provider::validate_harness_options(agent, &harness_options)?;
         let approvals = params
             .get("approvals")
             .and_then(Value::as_str)
@@ -703,13 +711,34 @@ impl Daemon {
         let environment = launch_environment(params)?;
         if agent == Agent::Claude {
             config::validate_auth_environment(auth_policy, environment.iter())?;
-            if auth_policy == AuthPolicy::Subscription {
-                crate::provider::verify_claude_subscription_login()?;
-            }
         }
+        let startup_deadline = Instant::now() + startup_timeout(params);
         let mut id = generate_internal_id();
         let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
             .then(|| Uuid::new_v4().to_string());
+
+        let options = LaunchOptions {
+            agent,
+            title,
+            cwd: &cwd,
+            model,
+            effort,
+            harness_options: &harness_options,
+            new_provider_id: new_provider_id.as_deref(),
+            resume_provider_id,
+            environment: &environment,
+            approvals,
+        };
+        if agent == Agent::Claude && auth_policy == AuthPolicy::Subscription {
+            let spec = crate::provider::claude_command(&options)?;
+            crate::provider::verify_claude_subscription_login(
+                &spec,
+                startup_deadline,
+                &self.reaper,
+                &self.auth_processes,
+                &self.shutting_down,
+            )?;
+        }
 
         prepare_workspace(agent, &cwd)?;
         for attempt in 0..16 {
@@ -757,19 +786,7 @@ impl Daemon {
         self.lock_store()?
             .record_event(Some(&id), None, "session.created");
         let runtime_session_id = Arc::new(RwLock::new(id.clone()));
-        let options = LaunchOptions {
-            agent,
-            title,
-            cwd: &cwd,
-            model,
-            effort,
-            harness_options: &harness_options,
-            new_provider_id: new_provider_id.as_deref(),
-            resume_provider_id,
-            environment: &environment,
-            approvals,
-        };
-        let runtime = self.launch_runtime(&id, &runtime_session_id, &options, params)?;
+        let runtime = self.launch_runtime(&id, &runtime_session_id, &options, startup_deadline)?;
         let provider_id = match runtime.as_ref() {
             AgentRuntime::Codex { thread_id, .. } => thread_id.clone(),
             AgentRuntime::Claude { .. } => resume_provider_id
@@ -821,7 +838,7 @@ impl Daemon {
                     self.lock_store()?.set_session_failed(&id);
                 }
                 let error = if session_has_auth_mismatch(&self.store, &id) {
-                    AuthMismatch.into()
+                    AuthMismatch::default().into()
                 } else {
                     error
                 };
@@ -845,9 +862,18 @@ impl Daemon {
         id: &str,
         runtime_session_id: &Arc<RwLock<String>>,
         options: &LaunchOptions<'_>,
-        params: &Value,
+        startup_deadline: Instant,
     ) -> Result<Arc<AgentRuntime>> {
-        let timeout = startup_timeout(params);
+        let timeout = startup_deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            let error = anyhow!("launch failed: provider startup deadline expired");
+            {
+                let store = self.lock_store()?;
+                store.set_session_failed(id);
+                store.record_event(Some(id), None, "session.failed");
+            }
+            return Err(self.session_launch_failure(id, &error, None));
+        }
         let spawned = match options.agent {
             Agent::Claude => self.spawn_claude_runtime(runtime_session_id, options, timeout),
             Agent::Codex => self.spawn_codex_runtime(runtime_session_id, options, timeout),
@@ -1063,23 +1089,43 @@ impl Daemon {
             .context("session is unavailable because it has no provider conversation to resume")?
             .to_owned();
         let agent = Agent::parse(&session.agent)?;
+        crate::provider::validate_harness_options(agent, &session.harness_options)?;
         let cwd = PathBuf::from(&session.cwd)
             .canonicalize()
             .context("session cwd does not exist")?;
         if !cwd.is_dir() {
             bail!("session cwd is not a directory: {}", cwd.display());
         }
+        let startup_deadline = Instant::now() + startup_timeout(params);
         let environment = launch_environment(params)?;
+        let options = LaunchOptions {
+            agent,
+            title: &session.title,
+            cwd: &cwd,
+            model: session.model.as_deref(),
+            effort: session.effort.as_deref(),
+            harness_options: &session.harness_options,
+            new_provider_id: None,
+            resume_provider_id: Some(&provider_id),
+            environment: &environment,
+            approvals: session.approvals.requested,
+        };
         if agent == Agent::Claude {
             config::validate_auth_environment(
                 session.auth_policy.unwrap_or_default(),
                 environment.iter(),
             )?;
             if session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription {
-                crate::provider::verify_claude_subscription_login()?;
+                let spec = crate::provider::claude_command(&options)?;
+                crate::provider::verify_claude_subscription_login(
+                    &spec,
+                    startup_deadline,
+                    &self.reaper,
+                    &self.auth_processes,
+                    &self.shutting_down,
+                )?;
             }
         }
-        let startup_deadline = Instant::now() + startup_timeout(params);
 
         prepare_workspace(agent, &cwd)?;
         if !self.lock_store()?.begin_session_restart(&session.id)? {
@@ -1119,31 +1165,11 @@ impl Daemon {
             self.lock_store()?.set_session_failed(&session.id);
             bail!("restart launch timed out before starting the replacement process");
         }
-        let options = LaunchOptions {
-            agent,
-            title: &session.title,
-            cwd: &cwd,
-            model: session.model.as_deref(),
-            effort: session.effort.as_deref(),
-            harness_options: &session.harness_options,
-            new_provider_id: None,
-            resume_provider_id: Some(&provider_id),
-            environment: &environment,
-            approvals: session.approvals.requested,
-        };
         // The replacement process reports its own effective mode.
         self.lock_store()?
             .set_requested_approvals(&session.id, session.approvals.requested);
         let runtime_session_id = Arc::new(RwLock::new(session.id.clone()));
-        let remaining = json!({
-            "startup_timeout_ms": u64::try_from(
-                startup_deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis()
-            )
-            .unwrap_or(u64::MAX),
-        });
-        self.launch_runtime(&session.id, &runtime_session_id, &options, &remaining)
+        self.launch_runtime(&session.id, &runtime_session_id, &options, startup_deadline)
             .map_err(|error| error.context("session restart launch failed"))?;
         let current = self.resolve_session(&session.id)?;
         Ok(json!({"session": self.public_session(&current)?}))
@@ -1265,7 +1291,7 @@ impl Daemon {
         if session_has_auth_mismatch(&self.store, &session_id) {
             interrupt_and_stop_claude(&process);
             return Err(LaunchError {
-                error: AuthMismatch.into(),
+                error: AuthMismatch::default().into(),
                 detail: Some(process.final_stderr_tail()),
             });
         }
@@ -1284,7 +1310,7 @@ impl Daemon {
                 }
                 return Err(LaunchError {
                     error: if auth_mismatch {
-                        AuthMismatch.into()
+                        AuthMismatch::default().into()
                     } else {
                         error.context(
                             "launch failed: Claude did not answer the stream-json initialize request",
@@ -1301,7 +1327,7 @@ impl Daemon {
         if session_has_auth_mismatch(&self.store, &id) {
             interrupt_and_stop_claude(&process);
             return Err(LaunchError {
-                error: AuthMismatch.into(),
+                error: AuthMismatch::default().into(),
                 detail: Some(process.final_stderr_tail()),
             });
         }
@@ -1460,7 +1486,7 @@ impl Daemon {
     fn submit_turn(&self, params: &Value) -> Result<Value> {
         let (session, runtime) = self.live_session(params_string(params, "session")?)?;
         if session_is_auth_mismatch(&session) {
-            return Err(AuthMismatch.into());
+            return Err(AuthMismatch::default().into());
         }
         if session.state == SessionState::Blocked {
             bail!("session blocked on input");
@@ -1564,7 +1590,7 @@ impl Daemon {
                 .and_then(|turn| turn.error)
                 .is_some_and(|error| error["code"] == "AUTH_MISMATCH")
         {
-            return Err(AuthMismatch.into());
+            return Err(AuthMismatch::default().into());
         }
         let submission = if confirmed { "confirmed" } else { "pending" };
         let public_session = self
@@ -2850,6 +2876,8 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         || message.contains("app-server child was unavailable")
     {
         "LAUNCH_FAILED"
+    } else if message.contains("harness option") || message.contains("managed by dlgt") {
+        "INVALID_ARGUMENT"
     } else if message.contains("not found") {
         "NOT_FOUND"
     } else if message.contains("not active")
@@ -2999,7 +3027,10 @@ impl SessionLaunchFailure {
             code,
             message: format!("{error:#}"),
             hint: if code == "AUTH_MISMATCH" {
-                config::AUTH_MISMATCH_HINT.to_owned()
+                error
+                    .downcast_ref::<AuthMismatch>()
+                    .map(AuthMismatch::hint)
+                    .unwrap_or_else(|| AuthMismatch::default().hint())
             } else {
                 "detail carries the provider's own stderr tail; if the provider needs a login, \
                    a trust decision, or first-run setup, run it once by hand in the Session's \

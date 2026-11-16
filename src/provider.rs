@@ -1,9 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -12,11 +17,44 @@ use crate::protocol::ApprovalsMode;
 use toml_edit::{DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
+use crate::reaper::{Reaper, Registration};
+
 static CODEX_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static CLAUDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 const CODEX_UPDATE_SUPPRESSION: &str = "check_for_update_on_startup=false";
 const CLAUDE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
+const AUTH_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Default)]
+pub struct AuthProcessGroups {
+    groups: Mutex<HashSet<i32>>,
+}
+
+impl AuthProcessGroups {
+    fn insert(&self, group: i32) {
+        if let Ok(mut groups) = self.groups.lock() {
+            groups.insert(group);
+        }
+    }
+
+    fn remove(&self, group: i32) {
+        if let Ok(mut groups) = self.groups.lock() {
+            groups.remove(&group);
+        }
+    }
+
+    pub fn terminate_all(&self) {
+        if let Ok(groups) = self.groups.lock() {
+            for group in groups.iter().copied() {
+                // SAFETY: auth checks are spawned as leaders of their process groups.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
 
 const CLAUDE_SESSION_MARKER_HEX_LEN: usize = 12;
 
@@ -196,8 +234,14 @@ fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
             return Err(error).with_context(|| format!("failed to read {}", state_path.display()));
         }
     };
-    let mut state = serde_json::from_str::<serde_json::Value>(&existing)
-        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+    let mut state = serde_json::from_str::<serde_json::Value>(&existing).map_err(|error| {
+        anyhow!(
+            "invalid JSON in {} at {}:{}: invalid JSON syntax",
+            state_path.display(),
+            error.line(),
+            error.column()
+        )
+    })?;
     let root = state
         .as_object_mut()
         .context("Claude state root must be an object")?;
@@ -255,9 +299,8 @@ fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
             return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
         }
     };
-    let mut document = existing
-        .parse::<DocumentMut>()
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let source = config_path.display().to_string();
+    let mut document = crate::config::parse_toml_document(&existing, &source)?;
     let cwd = cwd
         .to_str()
         .context("Codex workspace path is not valid UTF-8")?;
@@ -378,35 +421,150 @@ pub fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     })
 }
 
-/// Confirm a Claude subscription login without inheriting provider-routing
-/// overrides or exposing the command's potentially sensitive output.
-pub fn verify_claude_subscription_login() -> Result<()> {
-    let program =
-        std::env::var_os("DLGT_CLAUDE_BIN").map_or_else(|| PathBuf::from("claude"), PathBuf::from);
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let mut command = std::process::Command::new(program);
+/// Confirm subscription auth using the exact resolved command context that
+/// will launch the provider. Captured output is drained but retained only up
+/// to a fixed limit, and the process group is owned by the daemon reaper.
+pub fn verify_claude_subscription_login(
+    spec: &CommandSpec,
+    deadline: Instant,
+    reaper: &Arc<Reaper>,
+    auth_processes: &Arc<AuthProcessGroups>,
+    shutting_down: &AtomicBool,
+) -> Result<()> {
+    if shutting_down.load(Ordering::Acquire) {
+        bail!("launch failed: daemon is stopping before Claude auth status");
+    }
+    let mut command = Command::new(&spec.program);
     command
         .args(["auth", "status"])
+        .current_dir(&spec.cwd)
         .env_clear()
-        .env("HOME", home);
-    for name in ["PATH", "USER", "TERM"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+        .envs(&spec.environment)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .context("launch failed: could not start Claude auth status")?;
+    let pid = child.id();
+    let group = i32::try_from(pid).context("Claude auth status pid is too large")?;
+    let registration = match reaper.watch(pid) {
+        Ok(registration) => registration,
+        Err(error) => {
+            kill_process_group(group);
+            let _ = child.wait();
+            return Err(error);
         }
+    };
+    auth_processes.insert(group);
+    let _group_guard = AuthGroupGuard {
+        group,
+        auth_processes,
+        _registration: registration,
+    };
+    if shutting_down.load(Ordering::Acquire) {
+        kill_process_group(group);
     }
-    let output = command.output().map_err(|_| crate::config::AuthMismatch)?;
-    if !output.status.success() {
-        return Err(crate::config::AuthMismatch.into());
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("Claude auth status stdout was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Claude auth status stderr was unavailable")?;
+    let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_process_group(group);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_process_group(group);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            return Err(error);
+        }
+    };
+
+    let status = loop {
+        if shutting_down.load(Ordering::Acquire) || Instant::now() >= deadline {
+            kill_process_group(group);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            if shutting_down.load(Ordering::Acquire) {
+                bail!("launch failed: daemon stopped during Claude auth status");
+            }
+            bail!("launch failed: Claude auth status exceeded the startup deadline");
+        }
+        match child
+            .try_wait()
+            .context("failed to wait for Claude auth status")?
+        {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let _stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(crate::config::AuthMismatch::default().into());
     }
-    let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return Err(crate::config::AuthMismatch.into());
+    let Ok(status) = serde_json::from_slice::<serde_json::Value>(&stdout) else {
+        return Err(crate::config::AuthMismatch::default().into());
     };
     let confirmed = status.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(true)
         && status.get("authMethod").and_then(serde_json::Value::as_str) == Some("claude.ai");
     if !confirmed {
-        return Err(crate::config::AuthMismatch.into());
+        return Err(crate::config::AuthMismatch::default().into());
     }
     Ok(())
+}
+
+struct AuthGroupGuard<'a> {
+    group: i32,
+    auth_processes: &'a AuthProcessGroups,
+    _registration: Registration,
+}
+
+impl Drop for AuthGroupGuard<'_> {
+    fn drop(&mut self) {
+        self.auth_processes.remove(self.group);
+    }
+}
+
+fn drain_bounded<R: Read + Send + 'static>(
+    name: &str,
+    mut reader: R,
+) -> Result<JoinHandle<Vec<u8>>> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let mut retained = Vec::with_capacity(AUTH_STATUS_OUTPUT_LIMIT);
+            let mut buffer = [0_u8; 8192];
+            while let Ok(size) = reader.read(&mut buffer) {
+                if size == 0 {
+                    break;
+                }
+                let remaining = AUTH_STATUS_OUTPUT_LIMIT.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..size.min(remaining)]);
+            }
+            retained
+        })
+        .context("failed to start Claude auth status output reader")
+}
+
+fn kill_process_group(group: i32) {
+    // SAFETY: auth checks are spawned as leaders of their process groups.
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
 }
 
 fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
@@ -446,11 +604,14 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
                     | "allow-dangerously-skip-permissions"
                     | "allowedTools"
                     | "allowed-tools"
-                    | "settings"
-                    | "settings-file"
                     | "bare"
             ) {
                 bail!("harness option {key:?} is managed by dlgt");
+            }
+            if key == "agents" {
+                validate_claude_agents_option(
+                    value.context("harness option \"agents\" requires a JSON object")?,
+                )?;
             }
             Ok(value.map_or_else(|| format!("--{key}"), |value| format!("--{key}={value}")))
         })
@@ -473,24 +634,45 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
         if value.is_empty() {
             bail!("harness option {key:?} requires a non-empty value");
         }
-        if matches!(
+        let segments = key.split('.').collect::<Vec<_>>();
+        let final_segment = segments.last().copied().unwrap_or_default();
+        let protected = matches!(
             key,
-            "check_for_update_on_startup"
-                | "model"
-                | "model_reasoning_effort"
-                | "approval_policy"
-                | "sandbox_mode"
-                | "approvals_reviewer"
-                | "sandbox_workspace_write"
-        ) {
-            bail!("harness option {key:?} is managed by dlgt");
-        }
-        if key.starts_with("sandbox_workspace_write.") {
+            "check_for_update_on_startup" | "model" | "model_reasoning_effort"
+        ) || matches!(
+            final_segment,
+            "approval_policy" | "approvals_reviewer" | "sandbox_mode"
+        ) || segments
+            .iter()
+            .any(|segment| *segment == "sandbox_workspace_write");
+        if protected {
             bail!("harness option {key:?} is managed by dlgt");
         }
         args.extend(["--config".to_owned(), option.clone()]);
     }
     Ok(args)
+}
+
+fn validate_claude_agents_option(value: &str) -> Result<()> {
+    let agents: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(value).context("harness option \"agents\" must be a JSON object")?;
+    for (name, definition) in agents {
+        if let Some(mode) = definition.get("permissionMode")
+            && mode.as_str() != Some("default")
+        {
+            bail!(
+                "harness option \"agents\" definition {name:?} has managed permissionMode; only \"default\" is allowed"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_harness_options(agent: Agent, options: &[String]) -> Result<()> {
+    match agent {
+        Agent::Claude => claude_harness_args(options).map(|_| ()),
+        Agent::Codex => codex_harness_args(options).map(|_| ()),
+    }
 }
 
 fn claude_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {

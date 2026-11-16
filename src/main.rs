@@ -40,8 +40,8 @@ fn main() {
             |failure| failure.message.clone(),
         );
         let mut error_json = json!({"code":code,"message":message});
-        if auth_mismatch.is_some() {
-            error_json["hint"] = json!(config::AUTH_MISMATCH_HINT);
+        if let Some(auth_mismatch) = auth_mismatch {
+            error_json["hint"] = json!(auth_mismatch.hint());
         }
         if let Some(failure) = failure
             && let Some(error_object) = error_json.as_object_mut()

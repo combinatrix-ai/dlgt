@@ -501,9 +501,8 @@ fn read_profiles() -> Result<Value> {
             return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let document = text
-        .parse::<toml_edit::DocumentMut>()
-        .context("invalid dlgt config TOML")?;
+    let source = path.display().to_string();
+    let document = crate::config::parse_toml_document(&text, &source)?;
     let names = document
         .get("profiles")
         .and_then(toml_edit::Item::as_table_like)
