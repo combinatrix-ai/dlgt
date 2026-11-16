@@ -500,6 +500,19 @@ fn bounded_input(input: &Value) -> Value {
     json!({"truncated": true, "preview": &encoded[..end]})
 }
 
+/// The integration regressions shrink retention to reach trimming without
+/// hundreds of Requests. Release builds always keep the full limit.
+fn resolved_retention() -> usize {
+    if cfg!(debug_assertions)
+        && let Some(limit) = std::env::var("DLGT_TEST_RESOLVED_RETENTION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    RESOLVED_RETENTION
+}
+
 #[derive(Debug, Default)]
 pub struct RequestTable {
     records: Vec<RequestRecord>,
@@ -737,7 +750,7 @@ impl RequestTable {
             .iter()
             .filter(|record| !record.pending())
             .count();
-        let mut excess = resolved.saturating_sub(RESOLVED_RETENTION);
+        let mut excess = resolved.saturating_sub(resolved_retention());
         self.records.retain(|record| {
             // A duplicate still waiting on an attempt reads its outcome here.
             let awaited = record.attempts.iter().any(|attempt| attempt.waiters > 0);

@@ -2020,7 +2020,7 @@ impl Daemon {
         if let AnswerClaim::Replay(resolution) = claim {
             // Build the receipt while a waiter still pins the Request against
             // retention trimming, then release it.
-            let receipt = self.answer_receipt(&session.id, &record, resolution.outcome, None);
+            let receipt = self.answer_receipt(&session.id, &record, resolution.outcome, None, None);
             if let Some(attempt_id) = waited {
                 self.lock_store()?
                     .release_answer_waiter(&session.id, &record.id, attempt_id);
@@ -2082,7 +2082,15 @@ impl Daemon {
             &receipt_extra,
         )?;
         self.submission_changed.notify_all();
-        self.answer_receipt(&session.id, &record, outcome, Some(cursor))
+        // The delivery's own fields, not a re-read: retention may already
+        // have trimmed this Request from the table.
+        self.answer_receipt(
+            &session.id,
+            &record,
+            outcome,
+            Some(cursor),
+            Some(&receipt_extra),
+        )
     }
 
     fn claim_request_answer(
@@ -2165,12 +2173,16 @@ impl Daemon {
         record: &RequestRecord,
         outcome: Outcome,
         cursor: Option<String>,
+        delivered: Option<&serde_json::Map<String, Value>>,
     ) -> Result<Value> {
         let current = self.resolve_session(session_id)?;
-        let latest = self
+        let mut latest = self
             .lock_store()?
             .request(session_id, &record.id)
             .unwrap_or(record.clone());
+        if let Some(delivered) = delivered {
+            latest.answer_receipt = Some(Value::Object(delivered.clone()));
+        }
         let mut value = json!({
             "session": self.public_session(&current)?,
             "request": {"id": record.id, "resolution": outcome.as_str()},

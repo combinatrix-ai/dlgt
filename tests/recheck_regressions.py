@@ -865,6 +865,30 @@ class RecheckRegressions(unittest.TestCase):
         self.assertTrue((codex_home / "config.toml").exists())
         self.assertFalse((h.home / ".codex" / "config.toml").exists())
 
+    def test_answer_receipts_keep_their_fields_when_retention_trims_the_request(self) -> None:
+        self.harness.close()
+        self.harness = Harness(
+            {
+                "DLGT_TEST_RESOLVED_RETENTION": "0",
+                "DLGT_TEST_PAUSE_BEFORE_ANSWER_DELIVERY_MS": "400",
+            }
+        )
+        h = self.harness
+        session = h.create("codex", "ask", approvals="ask")["result"]["session"]["id"]
+        h.wait_state(session, "blocked")
+        answer = {"session": session, "request": "r1", "decision": "deny", "message": "no"}
+        first = h.pending("session.answer", answer)
+        time.sleep(0.1)
+        duplicate = h.rpc("session.answer", answer)
+        first = h.receive(first)
+        for receipt in (first, duplicate):
+            self.assertIs(receipt.get("result", {}).get("request", {}).get("reason_delivered"), True, receipt)
+        h.wait_state(session, "idle")
+        h.rpc("session.send", {"session": session, "request_id": "ask-alone", "prompt": "ask"})
+        h.wait_state(session, "blocked")
+        alone = h.rpc("session.answer", {"session": session, "request": "r2", "decision": "deny", "message": "no"})
+        self.assertIs(alone.get("result", {}).get("request", {}).get("reason_delivered"), True, alone)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
