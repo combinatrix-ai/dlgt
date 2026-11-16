@@ -18,7 +18,6 @@ dbg_macro = "deny"
 [dependencies]
 anyhow = "1"
 attestation-verify = { git = "https://github.com/combinatrix-ai/attestation-verify", rev = "73d3b53ecbf2d3c71846ae4cab3fa6482be012eb" }
-base64 = "0.22"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

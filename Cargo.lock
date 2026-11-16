@@ -219,7 +219,6 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "attestation-verify",
- "base64 0.22.1",
  "libc",
  "serde",
  "serde_json",
