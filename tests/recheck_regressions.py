@@ -497,6 +497,24 @@ class RecheckRegressions(unittest.TestCase):
         latest = h.wait_state(session, "idle")["result"]
         self.assertEqual((latest["execution_seq"], latest["denied_requests"]), (2, 0), latest)
 
+    def test_cancel_settles_when_the_provider_exits_mid_cancel(self) -> None:
+        h = self.harness
+        pid_file = h.root / "claude.pid"
+        session = h.create(
+            "claude",
+            "hold-exit",
+            {"DLGT_FAKE_INTERRUPT_DELAY": "20", "DLGT_FAKE_PID_FILE": str(pid_file)},
+        )["result"]["session"]["id"]
+        h.wait_state(session, "busy")
+        cancel = h.pending("session.cancel", {"session": session, "timeout_ms": 5_000})
+        time.sleep(0.3)
+        os.killpg(os.getpgid(int(pid_file.read_text())), signal.SIGKILL)
+        started = time.monotonic()
+        canceled = h.receive(cancel)
+        self.assertLess(time.monotonic() - started, 4, canceled)
+        self.assertIn("result", canceled, canceled)
+        self.assertEqual(canceled["result"]["session"]["state"], "failed", canceled)
+
     def test_multiple_queued_claude_steers_are_canceled_before_followup(self) -> None:
         h = self.harness
         response = h.create("claude", "hold-queue", approvals="ask")

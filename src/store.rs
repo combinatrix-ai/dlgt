@@ -1701,6 +1701,16 @@ fn close_requests(state: &mut MemoryState, session_id: &str) {
 
 fn set_terminal_session(state: &mut MemoryState, id: &str, terminal_state: SessionState) {
     close_requests(state, id);
+    // No provider is left to answer an outstanding cancel control, so a
+    // cancel waiting on this execution settles with what is recorded now.
+    if let Some(turn_id) = state
+        .sessions
+        .get(id)
+        .and_then(|session| session.record.active_turn_id.clone())
+    {
+        state.cancel_controls.remove(&turn_id);
+        state.cancel_terminal_seen.remove(&turn_id);
+    }
     if let Some(session) = state.sessions.get_mut(id) {
         session.record.state = terminal_state;
         session.record.pid = None;
