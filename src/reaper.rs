@@ -122,3 +122,28 @@ pub fn run() -> Result<()> {
     }
     Ok(())
 }
+
+/// Reap a provider on its own thread and kill the rest of its process group
+/// once it exits. Exit is then visible even while a descendant still holds
+/// an inherited output pipe, and killing the group closes those pipes.
+pub fn watch_exit(
+    mut child: std::process::Child,
+    name: &str,
+) -> anyhow::Result<std::sync::mpsc::Receiver<Option<std::process::ExitStatus>>> {
+    use anyhow::Context as _;
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let status = child.wait().ok();
+            if let Ok(group) = i32::try_from(pid) {
+                // SAFETY: providers are spawned as leaders of their own
+                // process groups; signalling one touches no Rust memory.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
+            let _ = sender.send(status);
+        })
+        .context("failed to start provider exit thread")?;
+    Ok(receiver)
+}

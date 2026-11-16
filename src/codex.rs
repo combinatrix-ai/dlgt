@@ -105,22 +105,7 @@ impl CodexConnection {
             .spawn(move || retain_tail(stderr, &tail))
             .context("failed to start Codex stderr thread")?;
 
-        // Exit is observed apart from stdout EOF, which a descendant holding
-        // the inherited pipe could delay indefinitely; killing the rest of
-        // the group on exit closes those pipes.
-        let (exit_sender, exit_status) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("dlgt-codex-exit".to_owned())
-            .spawn(move || {
-                let status = child.wait().ok();
-                if let Ok(group) = i32::try_from(pid) {
-                    // SAFETY: the app-server leads this process group;
-                    // signalling it touches no Rust memory.
-                    unsafe { libc::kill(-group, libc::SIGKILL) };
-                }
-                let _ = exit_sender.send(status);
-            })
-            .context("failed to start Codex app-server exit thread")?;
+        let exit_status = crate::reaper::watch_exit(child, "dlgt-codex-exit")?;
 
         let io_handler = Arc::clone(&handler);
         let io_pending = Arc::clone(&pending);

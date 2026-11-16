@@ -55,6 +55,7 @@ struct WriteCommand {
 }
 
 impl ClaudeProcess {
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         spec: &CommandSpec,
         on_event: EventHandler,
@@ -121,23 +122,7 @@ impl ClaudeProcess {
             })
             .context("failed to start Claude stderr thread")?;
 
-        // Process exit is observed on its own thread, not after stdout EOF: a
-        // descendant that inherited stdout would otherwise hide the exit for
-        // as long as it lives. On exit the rest of the group is killed, which
-        // closes those inherited pipes and lets the event thread drain.
-        let (exit_sender, exit_status) = mpsc::channel::<Option<i32>>();
-        std::thread::Builder::new()
-            .name("dlgt-claude-exit".to_owned())
-            .spawn(move || {
-                let code = child.wait().ok().and_then(|status| status.code());
-                if let Ok(group) = i32::try_from(pid) {
-                    // SAFETY: the provider was spawned as the leader of this
-                    // process group; signalling it touches no Rust memory.
-                    unsafe { libc::kill(-group, libc::SIGKILL) };
-                }
-                let _ = exit_sender.send(code);
-            })
-            .context("failed to start Claude exit thread")?;
+        let exit_status = crate::reaper::watch_exit(child, "dlgt-claude-exit")?;
 
         let waiters = Arc::clone(&controls);
         let event_closed = Arc::clone(&closed);
@@ -166,7 +151,13 @@ impl ClaudeProcess {
                     waiters.clear();
                 }
                 event_closed.store(true, Ordering::Release);
-                on_exit(exit_status.recv().ok().flatten());
+                on_exit(
+                    exit_status
+                        .recv()
+                        .ok()
+                        .flatten()
+                        .and_then(|status| status.code()),
+                );
             })
             .context("failed to start Claude event thread")?;
 
