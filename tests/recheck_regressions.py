@@ -787,6 +787,26 @@ class RecheckRegressions(unittest.TestCase):
         followup = h.rpc("session.send", {"session": session, "request_id": "after-order", "prompt": "next"})
         self.assertIn("result", followup, followup)
 
+    def test_a_send_racing_restart_never_strands_the_replacement(self) -> None:
+        for harness in ("claude", "codex"):
+            self.harness.close()
+            self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_SUBMIT_RESERVATION_MS": "800"})
+            h = self.harness
+            session = h.create(harness, "hello")["result"]["session"]["id"]
+            h.wait_state(session, "idle", timeout=10)
+            send = h.pending("session.send", {"session": session, "request_id": "racy", "prompt": "racy"})
+            time.sleep(0.2)
+            restarted = h.rpc(
+                "session.restart",
+                {"session": session, "environment": h.provider_env(), "startup_timeout_ms": 5_000},
+            )
+            self.assertIn("result", restarted, restarted)
+            raced = h.receive(send)
+            self.assertEqual(raced.get("error", {}).get("code"), "SESSION_UNAVAILABLE", (harness, raced))
+            h.wait_state(session, "idle")
+            followup = h.rpc("session.send", {"session": session, "request_id": "later", "prompt": "later"})
+            self.assertIn("result", followup, (harness, followup))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

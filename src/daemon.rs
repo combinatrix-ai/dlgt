@@ -1642,9 +1642,21 @@ impl Daemon {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let claude_uuid = matches!(runtime.as_ref(), AgentRuntime::Claude { .. })
             .then(|| Uuid::new_v4().to_string());
+        test_pause("DLGT_TEST_PAUSE_BEFORE_SUBMIT_RESERVATION_MS");
+        // A restart may have replaced the runtime captured above. Reserve the
+        // execution only for the generation this prompt will be written to.
+        let owns_generation =
+            |store: &Store| store.runtime_generation(&session.id) == Some(runtime.generation());
         let (turn, acceptance_cursor) = match runtime.as_ref() {
             AgentRuntime::Codex { .. } => {
                 let mut store = self.lock_store()?;
+                if !owns_generation(&store) {
+                    fail!(
+                        SessionUnavailable,
+                        "Session {} was restarted before the prompt was accepted; send it again",
+                        session.id
+                    );
+                }
                 let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
                 let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
                 store.set_session_state(&session.id, SessionState::Busy);
@@ -1659,6 +1671,13 @@ impl Daemon {
                     .lock()
                     .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
                 let mut store = self.lock_store()?;
+                if !owns_generation(&store) {
+                    fail!(
+                        SessionUnavailable,
+                        "Session {} was restarted before the prompt was accepted; send it again",
+                        session.id
+                    );
+                }
                 let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
                 let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
                 store.set_session_state(&session.id, SessionState::Busy);
