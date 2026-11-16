@@ -123,16 +123,23 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Reap a provider on its own thread and kill the rest of its process group
-/// once it exits. Exit is then visible even while a descendant still holds
-/// an inherited output pipe, and killing the group closes those pipes.
+/// How long exit reporting waits for the provider's output to drain, so the
+/// events a provider wrote just before exiting are applied first.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reap a provider on its own thread, kill the rest of its process group,
+/// and report the exit. The report waits for the output reader to signal
+/// that it drained (by dropping its end of `drained`), but only for a short
+/// grace: a process that left the group while holding an inherited output
+/// pipe cannot delay the exit any longer than that.
 pub fn watch_exit(
     mut child: std::process::Child,
     name: &str,
-) -> anyhow::Result<std::sync::mpsc::Receiver<Option<std::process::ExitStatus>>> {
+    drained: std::sync::mpsc::Receiver<()>,
+    on_exit: impl FnOnce(Option<std::process::ExitStatus>) + Send + 'static,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let pid = child.id();
-    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
@@ -142,8 +149,9 @@ pub fn watch_exit(
                 // process groups; signalling one touches no Rust memory.
                 unsafe { libc::kill(-group, libc::SIGKILL) };
             }
-            let _ = sender.send(status);
+            let _ = drained.recv_timeout(DRAIN_GRACE);
+            on_exit(status);
         })
         .context("failed to start provider exit thread")?;
-    Ok(receiver)
+    Ok(())
 }

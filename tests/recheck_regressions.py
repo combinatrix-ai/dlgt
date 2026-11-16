@@ -961,6 +961,75 @@ class RecheckRegressions(unittest.TestCase):
         after = len(reads.read_text().split()) if reads.exists() else 0
         self.assertLessEqual(after - before, 6, "settled turns kept polling thread/read")
 
+    def events_of(self, session: str) -> list:
+        history = self.harness.rpc("session.fetch", {"session": session, "from_start": True})
+        return [
+            event.get("type")
+            for bucket in history.get("result", {}).get("sessions", [])
+            for event in bucket.get("events", [])
+        ]
+
+    def test_a_settled_cancel_announces_idle_once(self) -> None:
+        h = self.harness
+        for harness, extra in (("claude", {}), ("codex", {}), ("codex", {"DLGT_FAKE_INTERRUPT_REPLY_LAST": "1"})):
+            session = h.create(harness, "hold-events", extra)["result"]["session"]["id"]
+            h.wait_state(session, "busy")
+            canceled = h.rpc("session.cancel", {"session": session, "timeout_ms": 3_000})
+            self.assertEqual(canceled.get("result", {}).get("result", {}).get("status"), "canceled", canceled)
+            events = self.events_of(session)
+            self.assertEqual(events[events.index("session.canceling"):], ["session.canceling", "session.idle"], (harness, extra, events))
+
+    def test_a_rejected_codex_start_during_cancel_fails_the_session(self) -> None:
+        h = self.harness
+        release = h.root / "reject-release"
+        created = h.create(
+            "codex",
+            "first",
+            {"DLGT_FAKE_DELAY_TURN_START_ACK": str(release), "DLGT_FAKE_REJECT_TURN_START": "1"},
+        )
+        self.assertEqual(created.get("result", {}).get("submission"), "pending", created)
+        session = created["result"]["session"]["id"]
+        cancel = h.pending("session.cancel", {"session": session, "timeout_ms": 4_000})
+        time.sleep(0.3)
+        release.touch()
+        canceled = h.receive(cancel)
+        state = h.wait_state(session, "failed")
+        self.assertIn(state["result"]["status"], ("failed", "canceled"), (canceled, state))
+        followup = h.rpc("session.send", {"session": session, "request_id": "after-reject", "prompt": "x"})
+        self.assertEqual(followup.get("error", {}).get("code"), "SESSION_NOT_RUNNING", followup)
+
+    def test_a_stop_can_be_forced_while_the_provider_ignores_it(self) -> None:
+        h = self.harness
+        session = h.create("claude", "first", {"DLGT_FAKE_IGNORE_TERM": "1"})["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        self.assertIn("result", h.rpc("session.stop", {"session": session}))
+        h.wait_state(session, "stopping")
+        forced = h.rpc("session.stop", {"session": session, "force": True})
+        self.assertIn("result", forced, forced)
+        h.wait_state(session, "stopped")
+
+    def test_a_provider_exit_is_seen_while_an_escaped_process_holds_its_output(self) -> None:
+        h = self.harness
+        for harness in ("claude", "codex"):
+            holder_file = h.root / f"{harness}-escaped.pid"
+            session = h.create(
+                harness,
+                "first",
+                {"DLGT_FAKE_HOLDER_PID_FILE": str(holder_file), "DLGT_FAKE_ESCAPE_HOLDER": "1"},
+            )["result"]["session"]["id"]
+            h.wait_state(session, "idle")
+            h.rpc("session.send", {"session": session, "request_id": f"{harness}-escape", "prompt": "crash-hold"})
+            h.wait_state(session, "failed", timeout=6)
+
+    def test_create_returns_the_id_claude_rotated_to(self) -> None:
+        h = self.harness
+        created = h.create("claude", "rotate", {"DLGT_FAKE_ROTATE_AT_START": "1"})
+        session = created["result"]["session"]["id"]
+        self.assertIn("result", h.rpc("session.read", {"session": session}), created)
+        h.wait_state(session, "idle")
+        followup = h.rpc("session.send", {"session": session, "request_id": "after-rotate", "prompt": "next"})
+        self.assertIn("result", followup, followup)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

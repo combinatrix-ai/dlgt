@@ -91,13 +91,22 @@ while IFS= read -r line; do
         while [ ! -e "${DLGT_FAKE_DELAY_TURN_START_ACK}" ]; do sleep 0.02; done
         unset DLGT_FAKE_DELAY_TURN_START_ACK
       fi
+      if [ -n "${DLGT_FAKE_REJECT_TURN_START:-}" ]; then
+        printf '{"id":%s,"error":{"code":-32603,"message":"start refused"}}\n' "$id"
+        continue
+      fi
       reply "{\"turn\":{\"id\":\"$turn\"}}"
       notify turn/started "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"items\":[]}}"
       case "$text" in
         hold*) holding=1 ;;
         crash-hold*)
-          sleep 30 &
-          printf '%s\n' "$!" >"${DLGT_FAKE_HOLDER_PID_FILE:-/dev/null}"
+          if [ -n "${DLGT_FAKE_ESCAPE_HOLDER:-}" ]; then
+            python3 -c 'import os, time; os.setpgid(0, 0); open(os.environ["DLGT_FAKE_HOLDER_PID_FILE"], "w").write(str(os.getpid())); time.sleep(30)' &
+            while [ ! -s "$DLGT_FAKE_HOLDER_PID_FILE" ]; do sleep 0.01; done
+          else
+            sleep 30 &
+            printf '%s\n' "$!" >"${DLGT_FAKE_HOLDER_PID_FILE:-/dev/null}"
+          fi
           exit 1
           ;;
         empty*) finish_empty ;;

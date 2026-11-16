@@ -481,6 +481,14 @@ impl Store {
         if let Some(session) = state.sessions.get(selector) {
             return Some(session.record.clone());
         }
+        // A public ID the Session had before Claude rotated it still
+        // addresses it. Internal launch IDs were never published.
+        if !selector.starts_with("internal:")
+            && let Some(uid) = state.uid_index.get(selector)
+            && let Some(session) = state.sessions.values().find(|session| session.uid == *uid)
+        {
+            return Some(session.record.clone());
+        }
         state
             .sessions
             .values()

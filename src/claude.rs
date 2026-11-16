@@ -122,10 +122,18 @@ impl ClaudeProcess {
             })
             .context("failed to start Claude stderr thread")?;
 
-        let exit_status = crate::reaper::watch_exit(child, "dlgt-claude-exit")?;
+        let (drained, drained_signal) = mpsc::channel::<()>();
+        let exit_waiters = Arc::clone(&controls);
+        let exit_closed = Arc::clone(&closed);
+        crate::reaper::watch_exit(child, "dlgt-claude-exit", drained_signal, move |status| {
+            if let Ok(mut waiters) = exit_waiters.lock() {
+                waiters.clear();
+            }
+            exit_closed.store(true, Ordering::Release);
+            on_exit(status.and_then(|status| status.code()));
+        })?;
 
         let waiters = Arc::clone(&controls);
-        let event_closed = Arc::clone(&closed);
         std::thread::Builder::new()
             .name("dlgt-claude-events".to_owned())
             .spawn(move || {
@@ -147,17 +155,7 @@ impl ClaudeProcess {
                     }
                     on_event(event);
                 }
-                if let Ok(mut waiters) = waiters.lock() {
-                    waiters.clear();
-                }
-                event_closed.store(true, Ordering::Release);
-                on_exit(
-                    exit_status
-                        .recv()
-                        .ok()
-                        .flatten()
-                        .and_then(|status| status.code()),
-                );
+                drop(drained);
             })
             .context("failed to start Claude event thread")?;
 

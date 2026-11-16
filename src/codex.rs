@@ -105,13 +105,24 @@ impl CodexConnection {
             .spawn(move || retain_tail(stderr, &tail))
             .context("failed to start Codex stderr thread")?;
 
-        let exit_status = crate::reaper::watch_exit(child, "dlgt-codex-exit")?;
+        let (drained, drained_signal) = std::sync::mpsc::channel::<()>();
+        let exit_handler = Arc::clone(&handler);
+        let exit_pending = Arc::clone(&pending);
+        let exit_closed = Arc::clone(&closed);
+        crate::reaper::watch_exit(child, "dlgt-codex-exit", drained_signal, move |status| {
+            let reason = status.map_or_else(
+                || "Codex app-server closed the connection".to_owned(),
+                |status| format!("Codex app-server exited: {status}"),
+            );
+            fail_pending(&exit_pending, &reason);
+            exit_closed.store(true, Ordering::Release);
+            exit_handler(transport_closed(&reason));
+        })?;
 
         let io_handler = Arc::clone(&handler);
         let io_pending = Arc::clone(&pending);
         let io_terminal_turns = Arc::clone(&terminal_turns);
         let io_writer = writer.clone();
-        let io_closed = Arc::clone(&closed);
         std::thread::Builder::new()
             .name("dlgt-codex-app-server".to_owned())
             .spawn(move || {
@@ -136,14 +147,7 @@ impl CodexConnection {
                         }
                     }
                 }
-                let status = exit_status.recv().ok().flatten();
-                let reason = status.map_or_else(
-                    || "Codex app-server closed the connection".to_owned(),
-                    |status| format!("Codex app-server exited: {status}"),
-                );
-                fail_pending(&io_pending, &reason);
-                io_closed.store(true, Ordering::Release);
-                io_handler(transport_closed(&reason));
+                drop(drained);
             })
             .context("failed to start Codex app-server I/O thread")?;
 

@@ -1,4 +1,5 @@
 #!/bin/sh
+[ -n "${DLGT_FAKE_IGNORE_TERM:-}" ] && trap '' TERM
 # A stand-in for `claude -p` speaking stream-json, driven by prompt keywords:
 #   hold*      stay busy until interrupted or steered
 #   ask*       request permission for a Bash call, then report the answer
@@ -78,6 +79,7 @@ if [ -n "${DLGT_FAKE_ROTATE_FILE:-}" ] && [ -f "$DLGT_FAKE_ROTATE_FILE" ] \
   && [ "$(cat "$DLGT_FAKE_ROTATE_FILE")" = "$session" ]; then
   session="$session-rotated"
 fi
+[ -n "${DLGT_FAKE_ROTATE_AT_START:-}" ] && session="$session-rotated"
 key_source=none
 [ -n "${ANTHROPIC_API_KEY:-}" ] && key_source=ANTHROPIC_API_KEY
 [ -n "${DLGT_FAKE_API_KEY_SOURCE:-}" ] && key_source=$DLGT_FAKE_API_KEY_SOURCE
@@ -213,8 +215,13 @@ while IFS= read -r line; do
           printf '{"type":"control_request","request_id":"ask-%s","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","requires_user_interaction":true,"input":{"questions":[{"question":"Which color?","header":"Color","options":[{"label":"Red","description":"r"},{"label":"Blue","description":"b"}],"multiSelect":false}]}}}\n' "$ask_id"
           ;;
         crash-hold*)
-          sleep 30 &
-          printf '%s\n' "$!" >"${DLGT_FAKE_HOLDER_PID_FILE:-/dev/null}"
+          if [ -n "${DLGT_FAKE_ESCAPE_HOLDER:-}" ]; then
+            python3 -c 'import os, time; os.setpgid(0, 0); open(os.environ["DLGT_FAKE_HOLDER_PID_FILE"], "w").write(str(os.getpid())); time.sleep(30)' &
+            while [ ! -s "$DLGT_FAKE_HOLDER_PID_FILE" ]; do sleep 0.01; done
+          else
+            sleep 30 &
+            printf '%s\n' "$!" >"${DLGT_FAKE_HOLDER_PID_FILE:-/dev/null}"
+          fi
           exit 1
           ;;
         crash*)
