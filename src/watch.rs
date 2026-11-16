@@ -30,6 +30,9 @@ pub fn run(selector: &str, from_start: bool, until_idle: bool) -> Result<()> {
         json!({"session": session, "messages": false})
     };
     let mut asked = HashSet::new();
+    // Results wait here until their execution's messages are all printed,
+    // which can take several pages.
+    let mut held = Vec::new();
     let mut history = !from_start;
     loop {
         let response = fetch(params)?;
@@ -40,7 +43,8 @@ pub fn run(selector: &str, from_start: bool, until_idle: bool) -> Result<()> {
         for gap in gaps(&response, bucket) {
             lines.push(format!("[gap]    {gap} retention_overrun"));
         }
-        lines.extend(render(bucket, &mut asked, history));
+        let more = response.get("has_more").and_then(Value::as_bool) == Some(true);
+        lines.extend(render(bucket, &mut asked, &mut held, history, !more));
         history = false;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -53,7 +57,6 @@ pub fn run(selector: &str, from_start: bool, until_idle: bool) -> Result<()> {
             .pointer("/session/state")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let more = response.get("has_more").and_then(Value::as_bool) == Some(true);
         if !more && (matches!(state, "stopped" | "failed") || (until_idle && state == "idle")) {
             return Ok(());
         }
@@ -78,8 +81,15 @@ fn gaps<'a>(response: &'a Value, bucket: &'a Value) -> impl Iterator<Item = &'a 
 }
 
 /// Text lines for one fetch bucket: messages with each execution's result
-/// after them, then Requests that have not been announced yet.
-fn render(bucket: &Value, asked: &mut HashSet<String>, history: bool) -> Vec<String> {
+/// after them, then Requests that have not been announced yet. A result is
+/// held until a later execution's message appears or the page is `drained`.
+fn render(
+    bucket: &Value,
+    asked: &mut HashSet<String>,
+    held: &mut Vec<Value>,
+    history: bool,
+    drained: bool,
+) -> Vec<String> {
     let harness = bucket
         .pointer("/session/harness")
         .and_then(Value::as_str)
@@ -94,23 +104,29 @@ fn render(bucket: &Value, asked: &mut HashSet<String>, history: bool) -> Vec<Str
     let execution = |value: &Value| value.get("execution_seq").and_then(Value::as_i64);
     // A result that starts in this bucket closes its execution: it is
     // printed after that execution's messages, not after the whole page.
-    let mut results = list("results")
-        .filter(|result| {
-            !history && result.get("final_text_offset").and_then(Value::as_u64) == Some(0)
-        })
-        .peekable();
+    held.extend(
+        list("results")
+            .filter(|result| {
+                !history && result.get("final_text_offset").and_then(Value::as_u64) == Some(0)
+            })
+            .cloned(),
+    );
     let done = |result: &Value| {
         let status = result.get("status").and_then(Value::as_str).unwrap_or("?");
         format!("{} done   {status}", prefix(result))
     };
     let mut lines = Vec::new();
     for message in list("messages") {
-        while let Some(result) = results.next_if(|result| execution(result) < execution(message)) {
-            lines.push(done(result));
-        }
+        let (earlier, later): (Vec<_>, Vec<_>) = held
+            .drain(..)
+            .partition(|result| execution(result) < execution(message));
+        *held = later;
+        lines.extend(earlier.iter().map(done));
         lines.push(message_line(harness, message));
     }
-    lines.extend(results.map(done));
+    if drained {
+        lines.extend(held.drain(..).map(|result| done(&result)));
+    }
     for request in list("requests") {
         let text = |name: &str| {
             request
@@ -219,8 +235,9 @@ mod tests {
             ],
         });
         let mut asked = HashSet::new();
+        let mut held = Vec::new();
         assert_eq!(
-            render(&bucket, &mut asked, false),
+            render(&bucket, &mut asked, &mut held, false, true),
             [
                 "[exec 6] note   earlier",
                 "[exec 6] done   canceled",
@@ -233,10 +250,35 @@ mod tests {
             ]
         );
         assert!(
-            render(&bucket, &mut asked, true)
+            render(&bucket, &mut asked, &mut held, true, true)
                 .iter()
                 .all(|line| !line.contains("ask") && !line.contains("done")),
             "a Request is announced once and a baseline result is history"
+        );
+    }
+
+    #[test]
+    fn a_result_waits_for_its_messages_on_later_pages() {
+        let first = json!({
+            "session": {"harness": "codex"},
+            "results": [{"execution_seq": 1, "status": "completed", "final_text_offset": 0}],
+            "messages": [{"seq": 0, "execution_seq": 1, "kind": "assistant", "text": "one"}],
+        });
+        let second = json!({
+            "session": {"harness": "codex"},
+            "messages": [{"seq": 1, "execution_seq": 1, "kind": "assistant", "text": "two"}],
+        });
+        let mut asked = HashSet::new();
+        let mut held = Vec::new();
+        let mut lines = render(&first, &mut asked, &mut held, false, false);
+        lines.extend(render(&second, &mut asked, &mut held, false, true));
+        assert_eq!(
+            lines,
+            [
+                "[exec 1] codex  one",
+                "[exec 1] codex  two",
+                "[exec 1] done   completed",
+            ]
         );
     }
 }
