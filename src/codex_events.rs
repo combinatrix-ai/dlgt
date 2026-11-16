@@ -283,21 +283,17 @@ pub fn apply_notification(
             let turn_id = if let Some(turn_id) = current.active_turn_id {
                 turn_id
             } else {
+                // Codex started a turn dlgt did not submit: it becomes a new
+                // execution so its result stays observable.
                 let turn_id = format!("turn_{}", Uuid::new_v4().simple());
                 let prompt = codex_turn_prompt(params);
-                store.insert_turn(&turn_id, session_id, &prompt)?;
-                store.record_event(Some(session_id), Some(&turn_id), "turn.submitted");
+                let generation = store
+                    .runtime_generation(session_id)
+                    .context("session disappeared while starting Codex turn")?;
+                store.submit_turn(&turn_id, session_id, generation, &prompt, true)?;
                 turn_id
             };
-            if store.mark_turn_started(&turn_id, Some(provider_turn_id)) {
-                if store
-                    .get_turn(&turn_id)
-                    .is_some_and(|turn| turn.state != TurnState::Canceled)
-                {
-                    store.set_session_state(session_id, SessionState::Busy);
-                }
-                store.record_event(Some(session_id), Some(&turn_id), "turn.started");
-            }
+            store.mark_turn_started(&turn_id, Some(provider_turn_id));
         }
         "error" => {
             if !codex_thread_matches(&session, params)? {
@@ -350,24 +346,20 @@ pub fn apply_notification(
                 final_message.as_deref(),
                 error.as_ref(),
             )?;
-            if completed {
-                store.set_session_state(session_id, SessionState::Idle);
+            // The lifecycle records the result event; a report that matched
+            // no execution is recorded here, as a diagnostic.
+            let settled = completed
+                || store.settle_canceled_turn(&turn_id, Some(provider_turn_id))?
+                || store
+                    .get_turn(&turn_id)
+                    .is_some_and(|turn| turn.state == TurnState::Canceled);
+            if !settled {
+                store.record_event(
+                    Some(session_id),
+                    Some(&turn_id),
+                    "provider.completion_unmatched",
+                );
             }
-            let quiesced =
-                !completed && store.settle_canceled_turn(&turn_id, Some(provider_turn_id))?;
-            let event_kind = if completed {
-                match turn_state {
-                    TurnState::Completed => "turn.completed",
-                    TurnState::Failed => "turn.failed",
-                    TurnState::Interrupted => "turn.interrupted",
-                    _ => unreachable!(),
-                }
-            } else if quiesced {
-                "provider.quiesced"
-            } else {
-                "provider.completion_unmatched"
-            };
-            store.record_event(Some(session_id), Some(&turn_id), event_kind);
         }
         "item/started" | "item/completed" => {
             if codex_thread_matches(&session, params)?

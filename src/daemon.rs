@@ -23,6 +23,7 @@ use crate::codex::CodexConnection;
 use crate::codex_events::{self, CodexItems};
 use crate::config::{self, AuthMismatch};
 use crate::cursor;
+use crate::lifecycle::Phase;
 use crate::messages::{Decider, Decision, MessageBody};
 use crate::paths;
 use crate::protocol::{
@@ -821,7 +822,7 @@ impl Daemon {
                 .lock_store()?
                 .reserve_provider_session(provider_ref, &id);
             if !reserved {
-                self.lock_store()?.set_session_failed(&id);
+                self.fail_unpublished(&id, "provider conversation is already reserved");
                 fail!(
                     SessionBusy,
                     "provider conversation is already reserved: {provider_ref}"
@@ -856,7 +857,7 @@ impl Daemon {
             &runtime_session_id,
         ) {
             runtime.force_stop();
-            self.lock_store()?.set_session_failed(&id);
+            self.fail_unpublished(&id, "failed to publish provider Session ID");
             return Err(self.session_launch_failure(
                 &id,
                 &error.context("failed to publish provider Session ID"),
@@ -884,12 +885,7 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => {
                 runtime.force_stop();
-                if self
-                    .resolve_session(&id)
-                    .is_ok_and(|session| session.state != SessionState::Stopped)
-                {
-                    self.lock_store()?.set_session_failed(&id);
-                }
+                self.fail_unpublished(&id, "initial prompt acceptance failed");
                 let error = if session_has_auth_mismatch(&self.store, &id) {
                     AuthMismatch::default().into()
                 } else {
@@ -927,11 +923,12 @@ impl Daemon {
                 Code::LaunchFailed,
                 "launch failed: provider startup deadline expired",
             );
-            {
-                let store = self.lock_store()?;
-                store.set_session_failed(id);
-                store.record_event(Some(id), None, "session.failed");
-            }
+            self.lock_store()?.fail_session(
+                id,
+                generation,
+                "launch_failed",
+                "provider startup deadline expired",
+            );
             return Err(self.session_launch_failure(id, &error, None));
         }
         let spawned = match options.agent {
@@ -950,16 +947,20 @@ impl Daemon {
                     .map_or_else(|_| id.to_owned(), |id| id.clone());
                 let store = self.lock_store()?;
                 if failure.error.downcast_ref::<AuthMismatch>().is_some() {
-                    if store
-                        .get_session(&session_id)
-                        .is_some_and(|session| session.state != SessionState::Stopped)
-                    {
-                        store.set_session_stopped(&session_id);
-                        store.record_event(Some(&session_id), None, "session.stopped");
-                    }
+                    // A refused login is a deliberate stop, not a crash.
+                    let _ = store.begin_stop(&session_id, generation, false);
+                    store.exited(
+                        &session_id,
+                        generation,
+                        "Claude login is not the subscription",
+                    );
                 } else {
-                    store.set_session_failed(&session_id);
-                    store.record_event(Some(&session_id), None, "session.failed");
+                    store.fail_session(
+                        &session_id,
+                        generation,
+                        "launch_failed",
+                        "the provider did not start",
+                    );
                 }
                 drop(store);
                 return Err(self.session_launch_failure(
@@ -974,8 +975,13 @@ impl Daemon {
             .map_err(|_| anyhow!("session map lock poisoned"))?
             .insert(id.to_owned(), Arc::clone(&runtime));
         let store = self.lock_store()?;
-        if !store.set_session_running(id, Some(runtime.pid())) {
-            store.set_session_failed(id);
+        if !store.spawned(id, generation, Some(runtime.pid())) {
+            store.fail_session(
+                id,
+                generation,
+                "launch_failed",
+                "the provider process exited before the Session became ready",
+            );
             drop(store);
             self.sessions
                 .write()
@@ -990,10 +996,18 @@ impl Daemon {
                 Some(runtime.stderr_tail()),
             ));
         }
-        store.record_event(Some(id), None, "session.started");
-        store.set_session_state(id, SessionState::Idle);
-        store.record_event(Some(id), None, "session.ready");
+        store.ready(id, generation);
         Ok(runtime)
+    }
+
+    /// Fail a Session that never reached its callers, at whatever
+    /// generation it has; nothing else can own it yet.
+    fn fail_unpublished(&self, id: &str, message: &str) {
+        if let Ok(store) = self.lock_store()
+            && let Some(generation) = store.runtime_generation(id)
+        {
+            store.fail_session(id, generation, "launch_failed", message);
+        }
     }
 
     /// Describe a launch that never became ready. The provider's stderr tail
@@ -1219,8 +1233,6 @@ impl Daemon {
                 session.id
             );
         }
-        self.lock_store()?
-            .record_event(Some(&session.id), None, "session.restarting");
         if let Some(runtime) = previous_runtime {
             runtime.force_stop();
             loop {
@@ -1235,7 +1247,8 @@ impl Daemon {
                 if Instant::now() >= startup_deadline {
                     // Fail rather than stay `restarting`: a failed Session
                     // can be resumed, a stuck one cannot.
-                    self.lock_store()?.set_session_failed(&session.id);
+                    self.lock_store()?
+                        .abandon_restart(&session.id, expected_generation);
                     fail!(
                         LaunchFailed,
                         "restart launch timed out while stopping the previous process"
@@ -1244,19 +1257,26 @@ impl Daemon {
                 std::thread::sleep(Duration::from_millis(10));
             }
         } else {
-            let store = self.lock_store()?;
-            if let Some(turn_id) = store
-                .interrupt_active_turn(&session.id, "session restarted before execution completed")
-            {
-                store.record_event(Some(&session.id), Some(&turn_id), "turn.interrupted");
-            }
-            store.finish_session_restart_stop(&session.id);
+            // No process of this generation is running.
+            self.lock_store()?.exited(
+                &session.id,
+                expected_generation,
+                "no provider process was running",
+            );
         }
-        if !self.lock_store()?.start_restarted_session(&session.id) {
+        if !self
+            .lock_store()?
+            .start_restarted_session(&session.id, expected_generation)
+        {
             fail!(LaunchFailed, "session left restarting state before launch");
         }
         if Instant::now() >= startup_deadline {
-            self.lock_store()?.set_session_failed(&session.id);
+            self.lock_store()?.fail_session(
+                &session.id,
+                expected_generation + 1,
+                "launch_failed",
+                "restart launch timed out before starting the replacement process",
+            );
             fail!(
                 LaunchFailed,
                 "restart launch timed out before starting the replacement process"
@@ -1578,14 +1598,11 @@ impl Daemon {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !self
-            .lock_store()?
-            .set_session_state(&session.id, SessionState::Stopping)
-        {
-            fail!(SessionUnavailable, "session is already stopped or failed");
-        }
+        // Stop the generation this request found; a restart in between owns
+        // the Session now. A stop already in progress can still be forced.
         self.lock_store()?
-            .record_event(Some(&session.id), None, "session.stopping");
+            .begin_stop(&session.id, runtime.generation(), force)
+            .map_err(|refusal| refusal.into_error(&session.id))?;
         if force {
             runtime.force_stop();
         } else {
@@ -1661,22 +1678,19 @@ impl Daemon {
         test_pause("DLGT_TEST_PAUSE_BEFORE_SUBMIT_RESERVATION_MS");
         // A restart may have replaced the runtime captured above. Reserve the
         // execution only for the generation this prompt will be written to.
-        let owns_generation =
-            |store: &Store| store.runtime_generation(&session.id) == Some(runtime.generation());
         let (turn, acceptance_cursor) = match runtime.as_ref() {
             AgentRuntime::Codex { .. } => {
-                let mut store = self.lock_store()?;
-                if !owns_generation(&store) {
-                    fail!(
-                        SessionUnavailable,
-                        "Session {} was restarted before the prompt was accepted; send it again",
-                        session.id
-                    );
-                }
+                // The reservation is for the runtime captured above; a
+                // restart in between makes the lifecycle refuse it as stale.
+                let store = self.lock_store()?;
                 let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
-                let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
-                store.set_session_state(&session.id, SessionState::Busy);
-                store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
+                let turn = store.submit_turn(
+                    &turn_id,
+                    &session.id,
+                    runtime.generation(),
+                    prompt,
+                    false,
+                )?;
                 (turn, acceptance_cursor)
             }
             AgentRuntime::Claude { turns, .. } => {
@@ -1686,18 +1700,17 @@ impl Daemon {
                 let mut turns = turns
                     .lock()
                     .map_err(|_| anyhow!("Claude turn lock poisoned"))?;
-                let mut store = self.lock_store()?;
-                if !owns_generation(&store) {
-                    fail!(
-                        SessionUnavailable,
-                        "Session {} was restarted before the prompt was accepted; send it again",
-                        session.id
-                    );
-                }
+                // The reservation is for the runtime captured above; a
+                // restart in between makes the lifecycle refuse it as stale.
+                let store = self.lock_store()?;
                 let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
-                let turn = store.insert_turn(&turn_id, &session.id, prompt)?;
-                store.set_session_state(&session.id, SessionState::Busy);
-                store.record_event(Some(&session.id), Some(&turn_id), "turn.submitted");
+                let turn = store.submit_turn(
+                    &turn_id,
+                    &session.id,
+                    runtime.generation(),
+                    prompt,
+                    false,
+                )?;
                 test_pause("DLGT_TEST_PAUSE_BEFORE_CLAUDE_RESERVATION_MS");
                 turns.begin(claude_uuid.as_deref().unwrap_or_default());
                 (turn, acceptance_cursor)
@@ -1722,9 +1735,7 @@ impl Daemon {
                     store: Arc::clone(&self.store),
                     control: Arc::clone(control),
                     thread_id: thread_id.clone(),
-                    session_id: session.id.clone(),
                     turn_id: turn_id.clone(),
-                    execution_seq: turn.execution_seq,
                     generation: runtime.generation(),
                     prompt: prompt.to_owned(),
                 };
@@ -1743,29 +1754,12 @@ impl Daemon {
             AgentRuntime::Claude { process, .. } => {
                 let uuid = claude_uuid.as_deref().unwrap_or_default();
                 if let Err(error) = process.send_user(uuid, prompt) {
-                    if self.runtime_is_current(&session.id, &runtime) {
-                        let store = self.lock_store()?;
-                        if !store.execution_is_current(
-                            &session.id,
-                            runtime.generation(),
-                            &turn.id,
-                            turn.execution_seq,
-                        ) {
-                            return Err(crate::error::with_code(error, Code::SessionUnavailable));
-                        }
-                        let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
-                        if store.finish_turn_if_matching(
-                            &turn_id,
-                            None,
-                            TurnState::Failed,
-                            None,
-                            Some(&message),
-                        )? {
-                            store.set_session_failed(&session.id);
-                            store.record_event(Some(&session.id), Some(&turn_id), "turn.failed");
-                            store.record_event(Some(&session.id), None, "session.failed");
-                        }
-                    }
+                    self.lock_store()?.fail_execution(
+                        &turn_id,
+                        runtime.generation(),
+                        "provider_error",
+                        &sanitize_message(&error.to_string()),
+                    );
                     return Err(crate::error::with_code(error, Code::SessionUnavailable));
                 }
             }
@@ -2286,24 +2280,12 @@ impl Daemon {
                     }
                     crate::provider::DeliveryCertainty::Ambiguous => {
                         if store.fail_request_answer(&session.id, &record.id, attempt_id, answer) {
-                            let structured = json!({
-                                "code": "REQUEST_DELIVERY_FAILED",
-                                "message": sanitize_message(&failure.to_string()),
-                            });
-                            if store
-                                .finish_turn_if_matching(
-                                    turn_id,
-                                    None,
-                                    TurnState::Failed,
-                                    None,
-                                    Some(&structured),
-                                )
-                                .unwrap_or(false)
-                            {
-                                store.set_session_failed(&session.id);
-                                store.record_event(Some(&session.id), Some(turn_id), "turn.failed");
-                                store.record_event(Some(&session.id), None, "session.failed");
-                            }
+                            store.fail_execution(
+                                turn_id,
+                                runtime.generation(),
+                                "REQUEST_DELIVERY_FAILED",
+                                &sanitize_message(&failure.to_string()),
+                            );
                             runtime.force_stop();
                         }
                     }
@@ -2532,7 +2514,6 @@ impl Daemon {
                     "turn is already terminal or no longer active"
                 );
             }
-            store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
         }
         let store = Arc::clone(&self.store);
         let session_id = session.id.clone();
@@ -2622,7 +2603,6 @@ impl Daemon {
                     "turn is already terminal or no longer active"
                 );
             }
-            store.record_event(Some(&session.id), Some(turn_id), "turn.canceled");
             unread
         };
         let store = Arc::clone(&self.store);
@@ -3162,20 +3142,16 @@ fn record_session_exit(
     detail: Option<&str>,
 ) {
     if let Ok(store) = store.lock() {
-        let owns_generation = store.runtime_generation_is_current(session_id, runtime_generation);
-        let session = owns_generation
-            .then(|| store.get_session(session_id))
-            .flatten();
-        let restarting = session
-            .as_ref()
-            .is_some_and(|session| session.state == SessionState::Restarting);
-        let intentional = session.as_ref().is_some_and(|session| {
-            matches!(
-                session.state,
-                SessionState::Stopping | SessionState::Stopped | SessionState::Restarting
-            )
+        // An exit is a crash only while this generation still expected to
+        // run; stop and restart own the exits they cause.
+        let crashed = store.lifecycle(session_id).is_some_and(|lifecycle| {
+            lifecycle.generation() == runtime_generation
+                && matches!(
+                    lifecycle.phase(),
+                    Phase::Starting { .. } | Phase::Idle | Phase::Active(_)
+                )
         });
-        if owns_generation && !intentional {
+        if crashed {
             let detail = detail.filter(|detail| !detail.is_empty());
             store.append_message(
                 session_id,
@@ -3185,27 +3161,7 @@ fn record_session_exit(
                 )),
             );
         }
-        if owns_generation {
-            record_exit_result(&store, session.as_ref(), reason, intentional);
-            if restarting {
-                store.finish_session_restart_stop(session_id);
-            } else if intentional {
-                store.set_session_stopped(session_id);
-            } else {
-                store.set_session_failed(session_id);
-            }
-            store.record_event(
-                Some(session_id),
-                None,
-                if restarting {
-                    "provider.exited_for_restart"
-                } else if intentional {
-                    "session.stopped"
-                } else {
-                    "session.failed"
-                },
-            );
-        }
+        store.exited(session_id, runtime_generation, reason);
     }
     if let Ok(mut sessions) = sessions.write()
         && sessions
@@ -3213,39 +3169,6 @@ fn record_session_exit(
             .is_some_and(|runtime| runtime.generation() == runtime_generation)
     {
         sessions.remove(session_id);
-    }
-}
-
-fn record_exit_result(
-    store: &Store,
-    session: Option<&SessionRecord>,
-    reason: &str,
-    intentional: bool,
-) {
-    let Some(session) = session else { return };
-    let Some(turn_id) = session.active_turn_id.as_deref() else {
-        return;
-    };
-    let state = if intentional {
-        TurnState::Interrupted
-    } else {
-        TurnState::Failed
-    };
-    let error = json!({"code": "provider_exit", "message": reason});
-    match store.finish_turn_if_matching(turn_id, None, state, None, Some(&error)) {
-        Ok(true) => {
-            let _ = store.record_event(
-                Some(&session.id),
-                Some(turn_id),
-                if intentional {
-                    "turn.interrupted"
-                } else {
-                    "turn.failed"
-                },
-            );
-        }
-        Ok(false) => {}
-        Err(error) => eprintln!("dlgt failed to record provider exit result: {error:#}"),
     }
 }
 
@@ -3271,16 +3194,14 @@ fn fail_cancelled_turn(
     runtime_generation: u64,
     message: &str,
 ) {
-    if let Ok(store) = store.lock()
-        && store.fail_canceled_turn(
+    let _ = session_id;
+    if let Ok(store) = store.lock() {
+        store.fail_execution(
             turn_id,
             runtime_generation,
             "cancel_failed",
             &sanitize_message(message),
-        )
-    {
-        store.record_event(Some(session_id), Some(turn_id), "turn.failed");
-        store.record_event(Some(session_id), None, "session.failed");
+        );
     }
 }
 
@@ -3331,9 +3252,7 @@ struct CodexStart {
     store: Arc<Mutex<Store>>,
     control: Arc<CodexConnection>,
     thread_id: String,
-    session_id: String,
     turn_id: String,
-    execution_seq: i64,
     generation: u64,
     prompt: String,
 }
@@ -3354,36 +3273,20 @@ impl CodexStart {
             .map_err(|_| anyhow!("session store lock poisoned"))?;
         match started {
             Ok(provider_turn_id) => {
-                if store.mark_turn_started(&self.turn_id, Some(&provider_turn_id)) {
-                    store.record_event(Some(&self.session_id), Some(&self.turn_id), "turn.started");
-                }
+                store.mark_turn_started(&self.turn_id, Some(&provider_turn_id));
                 Ok(())
             }
             Err(error) => {
-                if store.execution_is_current(
-                    &self.session_id,
-                    self.generation,
+                // A rejected start fails the execution it was for, also while
+                // that execution is being canceled: no turn ID will come.
+                if store.fail_execution(
                     &self.turn_id,
-                    self.execution_seq,
+                    self.generation,
+                    "provider_error",
+                    &sanitize_message(&error.to_string()),
                 ) {
-                    let message = json!({"code": "provider_error", "message": sanitize_message(&error.to_string())});
-                    if store.finish_turn_if_matching(
-                        &self.turn_id,
-                        None,
-                        TurnState::Failed,
-                        None,
-                        Some(&message),
-                    )? {
-                        store.set_session_failed(&self.session_id);
-                        store.record_event(
-                            Some(&self.session_id),
-                            Some(&self.turn_id),
-                            "turn.failed",
-                        );
-                        store.record_event(Some(&self.session_id), None, "session.failed");
-                        drop(store);
-                        self.control.force_stop();
-                    }
+                    drop(store);
+                    self.control.force_stop();
                 }
                 Err(error)
             }
@@ -4703,7 +4606,7 @@ fn normalized_page(store: &Store, uid: &str, after: i64, limit: usize) -> EventP
 }
 
 fn normalize_event(event: &crate::protocol::EventRecord) -> Option<Value> {
-    let event_type = normalize_event_type(&event.kind)?;
+    let event_type = crate::lifecycle::public_event(&event.kind)?;
     // Pre-bind events belong to a launch that had no public identity. They are
     // plumbing, and publishing them would expose an internal launch ID that
     // the contract says is never a Session ID.
@@ -4735,26 +4638,6 @@ fn normalize_event(event: &crate::protocol::EventRecord) -> Option<Value> {
         value["reason"] = json!("user_input");
     }
     Some(value)
-}
-
-fn normalize_event_type(kind: &str) -> Option<&'static str> {
-    match kind {
-        "session.created" => Some("session.created"),
-        "session.restarting" => Some("session.restarting"),
-        "session.ready" => Some("session.ready"),
-        "turn.started" => Some("session.busy"),
-        "session.blocked" => Some("session.blocked"),
-        "session.resumed" => Some("session.resumed"),
-        "turn.canceled" => Some("session.canceling"),
-        "turn.completed" | "turn.failed" | "turn.interrupted" | "provider.quiesced" => {
-            Some("session.idle")
-        }
-        "session.stopping" => Some("session.stopping"),
-        "session.stopped" => Some("session.stopped"),
-        "session.failed" => Some("session.failed"),
-        "provider.retrying" | "provider.error.retrying" => Some("provider.retrying"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -5029,7 +4912,7 @@ mod tests {
 
     #[test]
     fn busy_public_session_exposes_bounded_diagnostic_ages() {
-        let mut store = ready_store("codex");
+        let store = ready_store("codex");
         store
             .insert_turn("turn_busy", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
@@ -5084,7 +4967,7 @@ mod tests {
 
     #[test]
     fn public_result_exposes_sequence_but_not_internal_turn_identity() {
-        let mut store = ready_store("codex");
+        let store = ready_store("codex");
         let turn = store
             .insert_turn("turn_private", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
@@ -5113,16 +4996,17 @@ mod tests {
 
     #[test]
     fn restart_interrupt_result_uses_a_structured_error_object() {
-        let mut store = ready_store("codex");
+        let store = ready_store("codex");
         store
             .insert_turn("turn_restart", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        assert_eq!(
-            store.interrupt_active_turn(
-                "codex:thread-1",
-                "session restarted before execution completed"
-            ),
-            Some("turn_restart".to_owned())
+        let generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_default();
+        assert!(
+            store
+                .begin_session_restart("codex:thread-1", generation)
+                .unwrap_or(false)
         );
         let turn = store
             .get_turn("turn_restart")
@@ -5138,7 +5022,7 @@ mod tests {
 
     #[test]
     fn pending_submission_receipt_upgrades_across_session_rekey() {
-        let mut store = ready_store("claude");
+        let store = ready_store("claude");
         store
             .insert_turn("turn_1", "claude:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));

@@ -519,33 +519,28 @@ impl ClaudeTurns {
         } else {
             text
         };
-        let kind = if turn.state == TurnState::Canceled {
-            if store.settle_canceled_turn(&turn_id, None)? {
-                "provider.quiesced"
-            } else {
-                "provider.stop_unmatched"
-            }
+        // The lifecycle records the result event; only a report that matched
+        // no execution is recorded here, as a diagnostic.
+        let unmatched = if turn.state == TurnState::Canceled {
+            store.settle_canceled_turn(&turn_id, None)?;
+            None
         } else if let Some(failure) = self.failure.take() {
             let error = json!({"code": "provider_error", "message": failure});
-            if store.finish_turn_if_matching(
+            (!store.finish_turn_if_matching(
                 &turn_id,
                 None,
                 TurnState::Failed,
                 Some(&text),
                 Some(&error),
-            )? {
-                store.set_session_state(session_id, SessionState::Idle);
-                "turn.failed"
-            } else {
-                "provider.failure_unmatched"
-            }
-        } else if store.complete_turn_if_matching(&turn_id, None, Some(&text), recovered)? {
-            store.set_session_state(session_id, SessionState::Idle);
-            "turn.completed"
+            )?)
+            .then_some("provider.failure_unmatched")
         } else {
-            "provider.stop_unmatched"
+            (!store.complete_turn_if_matching(&turn_id, None, Some(&text), recovered)?)
+                .then_some("provider.stop_unmatched")
         };
-        store.record_event(Some(session_id), Some(&turn_id), kind);
+        if let Some(kind) = unmatched {
+            store.record_event(Some(session_id), Some(&turn_id), kind);
+        }
         let auth_checked = self.auth_checked;
         *self = Self::default();
         self.auth_checked = auth_checked;
@@ -609,10 +604,9 @@ pub fn apply_event(
                         None,
                         Some(&error),
                     )?;
-                    store.record_event(Some(session_id), Some(turn_id), "turn.failed");
                 }
-                store.set_session_stopped(session_id);
-                store.record_event(Some(session_id), None, "session.stopped");
+                // The daemon stops this process; the Session stops with it.
+                let _ = store.begin_stop(session_id, runtime_generation, false);
                 actions.push(Action::AuthMismatch);
                 return Ok(actions);
             }
@@ -797,9 +791,8 @@ fn confirm_started(store: &Store, session_id: &str) {
     if let Some(turn_id) = store
         .get_session(session_id)
         .and_then(|session| session.active_turn_id)
-        && store.mark_turn_started(&turn_id, None)
     {
-        store.record_event(Some(session_id), Some(&turn_id), "turn.started");
+        store.mark_turn_started(&turn_id, None);
     }
 }
 
@@ -1015,7 +1008,7 @@ mod tests {
     const SESSION: &str = "claude:s1";
 
     fn busy_session(approvals: ApprovalsMode) -> (Store, ClaudeTurns) {
-        let mut store = Store::new();
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: SESSION,
@@ -1505,7 +1498,8 @@ mod tests {
         let session = store
             .get_session(SESSION)
             .unwrap_or_else(|| panic!("session missing"));
-        assert_eq!(session.state, SessionState::Stopped);
+        // The process is still alive until the daemon stops it.
+        assert_eq!(session.state, SessionState::Stopping);
         assert_eq!(session.auth, Some(Auth::ApiKey));
         assert_eq!(session.auth_policy, None);
         assert!(
@@ -1541,7 +1535,7 @@ mod tests {
 
     #[test]
     fn process_auth_mode_and_model_survive_turn_settlement() {
-        let (mut store, mut turns) = busy_session(ApprovalsMode::Ask);
+        let (store, mut turns) = busy_session(ApprovalsMode::Ask);
         apply(
             &store,
             &mut turns,

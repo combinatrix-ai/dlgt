@@ -7,9 +7,6 @@
 //! each call site. `apply` returns the effects the store must carry out and
 //! the lifecycle events it must record; it never touches anything itself.
 
-// Wired into the store in the next change.
-#![allow(dead_code)]
-
 use crate::protocol::SessionState;
 
 pub type Generation = u64;
@@ -144,6 +141,37 @@ pub enum Refusal {
     NotRunning,
     NoActiveExecution,
     Unavailable(SessionState),
+}
+
+impl Refusal {
+    /// The public error for a refused caller operation on `session_id`.
+    pub fn into_error(self, session_id: &str) -> anyhow::Error {
+        use crate::error::{Code, coded};
+        match self {
+            Self::Stale => coded(
+                Code::SessionUnavailable,
+                format!(
+                    "Session {session_id} changed state or was restarted by another request; check it before retrying"
+                ),
+            ),
+            Self::Busy => coded(Code::SessionBusy, "session already has an active turn"),
+            Self::Blocked => coded(Code::SessionBlocked, "session blocked on input"),
+            Self::NotRunning => coded(
+                Code::SessionNotRunning,
+                format!(
+                    "Session {session_id} is not running; retry with --resume using the same Session ID"
+                ),
+            ),
+            Self::NoActiveExecution => coded(
+                Code::NoActiveExecution,
+                format!("Session {session_id} has no running execution"),
+            ),
+            Self::Unavailable(state) => coded(
+                Code::SessionUnavailable,
+                format!("session is unavailable in state {}", state.public_name()),
+            ),
+        }
+    }
 }
 
 impl Lifecycle {
