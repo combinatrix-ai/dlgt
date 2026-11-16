@@ -817,12 +817,18 @@ impl Daemon {
                 Err(error) => return Err(error),
             }
         }
+        // The generation this create launches. Cleanup acts only on it, so a
+        // restart that replaced the Session meanwhile is never failed by it.
+        let generation = self
+            .lock_store()?
+            .runtime_generation(&id)
+            .context("Session runtime generation is missing")?;
         let _provider_reservation = if let Some(provider_ref) = provider_ref.as_deref() {
             let reserved = self
                 .lock_store()?
                 .reserve_provider_session(provider_ref, &id);
             if !reserved {
-                self.fail_unpublished(&id, "provider conversation is already reserved");
+                self.fail_unpublished(&id, generation, "provider conversation is already reserved");
                 fail!(
                     SessionBusy,
                     "provider conversation is already reserved: {provider_ref}"
@@ -857,7 +863,7 @@ impl Daemon {
             &runtime_session_id,
         ) {
             runtime.force_stop();
-            self.fail_unpublished(&id, "failed to publish provider Session ID");
+            self.fail_unpublished(&id, generation, "failed to publish provider Session ID");
             return Err(self.session_launch_failure(
                 &id,
                 &error.context("failed to publish provider Session ID"),
@@ -885,7 +891,7 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => {
                 runtime.force_stop();
-                self.fail_unpublished(&id, "initial prompt acceptance failed");
+                self.fail_unpublished(&id, generation, "initial prompt acceptance failed");
                 let error = if session_has_auth_mismatch(&self.store, &id) {
                     AuthMismatch::default().into()
                 } else {
@@ -1000,12 +1006,9 @@ impl Daemon {
         Ok(runtime)
     }
 
-    /// Fail a Session that never reached its callers, at whatever
-    /// generation it has; nothing else can own it yet.
-    fn fail_unpublished(&self, id: &str, message: &str) {
-        if let Ok(store) = self.lock_store()
-            && let Some(generation) = store.runtime_generation(id)
-        {
+    /// Fail the generation a create launched, if it still owns the Session.
+    fn fail_unpublished(&self, id: &str, generation: u64, message: &str) {
+        if let Ok(store) = self.lock_store() {
             store.fail_session(id, generation, "launch_failed", message);
         }
     }

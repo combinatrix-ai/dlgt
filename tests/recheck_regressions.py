@@ -1033,6 +1033,39 @@ class RecheckRegressions(unittest.TestCase):
         followup = h.rpc("session.send", {"session": session, "request_id": "after-rotate", "prompt": "next"})
         self.assertIn("result", followup, followup)
 
+    def test_a_failed_create_never_fails_the_restart_that_replaced_it(self) -> None:
+        for harness in ("claude", "codex"):
+            self.harness.close()
+            self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_SUBMIT_RESERVATION_MS": "1500"})
+            h = self.harness
+            create = h.pending(
+                "session.create",
+                {
+                    "title": "create race",
+                    "harness": harness,
+                    "cwd": str(h.root),
+                    "environment": h.provider_env(),
+                    "request_id": f"create-race-{harness}",
+                    "prompt": "hello",
+                },
+            )
+            deadline = time.monotonic() + 5
+            session = None
+            while session is None and time.monotonic() < deadline:
+                listed = h.rpc("session.list", {}).get("result", [])
+                session = next((item["id"] for item in listed if item.get("state") == "idle"), None)
+                time.sleep(0.05)
+            self.assertIsNotNone(session, "the created Session never became idle")
+            restarted = h.rpc(
+                "session.restart",
+                {"session": session, "environment": h.provider_env(), "startup_timeout_ms": 5_000},
+            )
+            self.assertIn("result", restarted, restarted)
+            self.assertIn("error", h.receive(create))
+            h.wait_state(session, "idle")
+            followup = h.rpc("session.send", {"session": session, "request_id": "after-race", "prompt": "after"})
+            self.assertIn("result", followup, (harness, followup))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
