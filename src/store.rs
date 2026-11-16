@@ -1092,6 +1092,36 @@ impl Store {
         )
     }
 
+    /// Append a message that belongs to a known execution, whatever execution
+    /// is active now. A Request's outcome can commit after its execution ended.
+    pub fn append_execution_message(
+        &self,
+        session_id: &str,
+        execution_seq: Option<i64>,
+        body: MessageBody,
+    ) -> Option<u64> {
+        let Some(execution_seq) = execution_seq else {
+            return self.append_message(session_id, body);
+        };
+        let mut state = self.state.borrow_mut();
+        let uid = state.sessions.get(session_id)?.uid.clone();
+        if body.refuses()
+            && let Some(turn) = state
+                .turns
+                .values_mut()
+                .find(|turn| turn.session_id == session_id && turn.execution_seq == execution_seq)
+        {
+            turn.denied_requests += 1;
+        }
+        Some(
+            state
+                .messages
+                .entry(uid)
+                .or_default()
+                .push(Some(execution_seq), body),
+        )
+    }
+
     pub fn begin_steer_attempt(
         &self,
         session_id: &str,

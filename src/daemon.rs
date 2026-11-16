@@ -2276,6 +2276,7 @@ impl Daemon {
         receipt_extra: &serde_json::Map<String, Value>,
     ) -> Result<()> {
         let extra = Value::Object(receipt_extra.clone());
+        test_pause("DLGT_TEST_PAUSE_BEFORE_ANSWER_RECEIPT_MS");
         {
             let store = self.lock_store()?;
             if !store.finish_request_answer(
@@ -2293,8 +2294,9 @@ impl Daemon {
                 );
             }
             if record.draft.kind == RequestKind::Approval {
-                store.append_message(
+                store.append_execution_message(
                     &session.id,
+                    record.execution_seq,
                     MessageBody::approval(
                         if outcome == Outcome::Allowed {
                             Decision::Approved

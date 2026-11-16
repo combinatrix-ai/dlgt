@@ -474,6 +474,29 @@ class RecheckRegressions(unittest.TestCase):
         self.assertTrue(duplicate.get("result", {}).get("replayed"), duplicate)
         self.assertEqual(h.wait_state(session, "idle")["result"]["final_text"], "allowed")
 
+    def test_a_late_denial_receipt_counts_against_its_own_execution(self) -> None:
+        self.harness.close()
+        self.harness = Harness({"DLGT_TEST_PAUSE_BEFORE_ANSWER_RECEIPT_MS": "600"})
+        h = self.harness
+        session = h.create("claude", "ask", approvals="ask")["result"]["session"]["id"]
+        h.wait_state(session, "blocked")
+        answer = h.pending("session.answer", {"session": session, "request": "r1", "decision": "deny"})
+        h.wait_state(session, "idle")
+        h.rpc("session.send", {"session": session, "request_id": "next", "prompt": "hold-next"})
+        h.wait_state(session, "busy")
+        self.assertIn("result", h.receive(answer))
+        history = h.rpc("session.fetch", {"session": session, "from_start": True, "messages": 64})
+        approvals = [
+            message
+            for bucket in history["result"]["sessions"]
+            for message in bucket.get("messages", [])
+            if message.get("kind") == "approval"
+        ]
+        self.assertEqual([message.get("execution_seq") for message in approvals], [1], history)
+        h.rpc("session.cancel", {"session": session, "timeout_ms": 3_000})
+        latest = h.wait_state(session, "idle")["result"]
+        self.assertEqual((latest["execution_seq"], latest["denied_requests"]), (2, 0), latest)
+
     def test_multiple_queued_claude_steers_are_canceled_before_followup(self) -> None:
         h = self.harness
         response = h.create("claude", "hold-queue", approvals="ask")
