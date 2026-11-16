@@ -342,9 +342,14 @@ impl Lifecycle {
                 let execution = self.owned(*seq)?;
                 let turn_id = execution.turn_id.as_str();
                 match execution.cancel {
+                    // Requests the finished execution left open can no
+                    // longer be answered.
                     None => Ok((
                         Some(Phase::Idle),
-                        vec![record(outcome_kind(*outcome), Some(turn_id))],
+                        vec![
+                            Effect::CloseRequests,
+                            record(outcome_kind(*outcome), Some(turn_id)),
+                        ],
                     )),
                     Some(cancel) if cancel.pending_controls == 0 => Ok((
                         Some(Phase::Idle),
@@ -408,7 +413,11 @@ impl Lifecycle {
                 let Some(cancel) = execution.cancel else {
                     return Err(Refusal::NoActiveExecution);
                 };
-                let pending_controls = cancel.pending_controls.saturating_sub(1);
+                // Every control finishes once; an extra report is stale.
+                if cancel.pending_controls == 0 {
+                    return Err(Refusal::Stale);
+                }
+                let pending_controls = cancel.pending_controls - 1;
                 if pending_controls == 0 && cancel.provider_finished {
                     return Ok((
                         Some(Phase::Idle),
@@ -592,32 +601,28 @@ mod tests {
             .collect()
     }
 
-    /// Every event worth trying from `state`, from the current generation and
-    /// the one before it, naming the active execution and the one before it.
-    fn alphabet(state: &Lifecycle) -> Vec<(u64, Event<'static>)> {
+    /// Every event worth trying from `state`: from the current generation and
+    /// the one before it, naming the active execution, an earlier one, and the
+    /// next one. `next_seq` is the sequence the next prompt gets.
+    fn alphabet(state: &Lifecycle, next_seq: i64) -> Vec<(u64, Event<'static>)> {
         let generation = state.generation();
-        let seq = state.active().map_or(0, |execution| execution.seq);
+        let mut seqs = vec![next_seq - 1, next_seq - 2, next_seq];
+        seqs.retain(|seq| *seq > 0);
         let mut events = Vec::new();
         for generation in [generation, generation.saturating_sub(1)] {
             events.push((generation, Event::Spawned));
             events.push((generation, Event::Ready));
-            events.push((
-                generation,
-                Event::Submit {
-                    turn_id: "t",
-                    seq: seq + 1,
-                    acknowledged: false,
-                },
-            ));
-            events.push((
-                generation,
-                Event::Submit {
-                    turn_id: "t",
-                    seq: seq + 1,
-                    acknowledged: true,
-                },
-            ));
-            for seq in [seq, seq - 1] {
+            for acknowledged in [false, true] {
+                events.push((
+                    generation,
+                    Event::Submit {
+                        turn_id: "t",
+                        seq: next_seq,
+                        acknowledged,
+                    },
+                ));
+            }
+            for &seq in &seqs {
                 events.push((generation, Event::Started { seq }));
                 events.push((generation, Event::Blocked { seq }));
                 events.push((generation, Event::Unblocked { seq }));
@@ -641,8 +646,24 @@ mod tests {
         events
     }
 
-    /// Events the provider and the daemon produce on their own, without a
-    /// caller: enough to show that no state is a dead end.
+    /// The execution sequence an event names, if any.
+    const fn named_seq(event: &Event<'_>) -> Option<i64> {
+        match event {
+            Event::Started { seq }
+            | Event::Blocked { seq }
+            | Event::Unblocked { seq }
+            | Event::Finished { seq, .. }
+            | Event::Cancel { seq, .. }
+            | Event::ControlReserved { seq }
+            | Event::ControlDone { seq }
+            | Event::Fail { seq: Some(seq) } => Some(*seq),
+            _ => None,
+        }
+    }
+
+    /// Whether events no caller sends reach a resting state. An execution
+    /// must settle through its own provider events, canceled or not; process
+    /// exit is not allowed to stand in for a broken cancel.
     fn settles(state: &Lifecycle) -> bool {
         let mut seen = HashSet::new();
         let mut queue = VecDeque::from([state.clone()]);
@@ -654,18 +675,28 @@ mod tests {
                 continue;
             }
             let generation = state.generation();
-            let seq = state.active().map_or(0, |execution| execution.seq);
-            for event in [
-                Event::Spawned,
-                Event::Ready,
-                Event::Finished {
-                    seq,
-                    outcome: Outcome::Completed,
-                },
-                Event::ControlDone { seq },
-                Event::Exited,
-                Event::RestartLaunch,
-            ] {
+            let provider_events = match state.active() {
+                Some(execution) => {
+                    let mut events = vec![Event::Finished {
+                        seq: execution.seq,
+                        outcome: Outcome::Interrupted,
+                    }];
+                    if execution
+                        .cancel
+                        .is_some_and(|cancel| cancel.pending_controls > 0)
+                    {
+                        events.push(Event::ControlDone { seq: execution.seq });
+                    }
+                    events
+                }
+                None => vec![
+                    Event::Spawned,
+                    Event::Ready,
+                    Event::Exited,
+                    Event::RestartLaunch,
+                ],
+            };
+            for event in provider_events {
                 let mut next = state.clone();
                 if next.apply(generation, &event).is_ok() {
                     queue.push_back(next);
@@ -676,40 +707,50 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn every_interleaving_keeps_the_lifecycle_invariants() {
         let mut seen = HashSet::new();
-        let mut queue = VecDeque::from([(Lifecycle::new(), 0_usize)]);
+        let mut queue = VecDeque::from([(Lifecycle::new(), 1_i64, 0_usize)]);
         let mut transitions = 0_usize;
-        while let Some((state, depth)) = queue.pop_front() {
-            if !seen.insert(state.clone()) {
+        let mut sequences = HashSet::new();
+        while let Some((state, next_seq, depth)) = queue.pop_front() {
+            if !seen.insert((state.clone(), next_seq)) {
                 continue;
             }
             assert!(settles(&state), "dead end: {state:?}");
-            if depth == 9 || state.generation() > 3 {
+            if let Some(execution) = state.active() {
+                sequences.insert(execution.seq);
+            }
+            if depth == 12 || state.generation() > 3 || next_seq > 4 {
                 continue;
             }
-            for (generation, event) in alphabet(&state) {
+            for (generation, event) in alphabet(&state, next_seq) {
                 let mut next = state.clone();
                 let result = next.apply(generation, &event);
+                let names_other = named_seq(&event)
+                    .is_some_and(|seq| state.active().is_none_or(|active| active.seq != seq));
+                if generation != state.generation() || names_other {
+                    assert!(
+                        result.is_err(),
+                        "{event:?} from gen {generation} applied to {state:?}"
+                    );
+                }
                 let Ok(effects) = result else {
                     assert_eq!(next, state, "a refused {event:?} changed {state:?}");
-                    if generation != state.generation() {
-                        assert_eq!(result, Err(Refusal::Stale));
+                    let other_active = named_seq(&event)
+                        .is_some_and(|seq| state.active().is_some_and(|active| active.seq != seq));
+                    if generation != state.generation() || other_active {
+                        assert_eq!(result, Err(Refusal::Stale), "{event:?} on {state:?}");
                     }
                     continue;
                 };
                 transitions += 1;
-                assert_eq!(
-                    generation,
-                    state.generation(),
-                    "{event:?} from an old generation applied"
-                );
 
                 let before = state.public_state();
                 let after = next.public_state();
+                let published = recorded(&effects);
                 if before != after {
                     let expected = announces(after);
-                    let published = recorded(&effects);
                     let silent_submit = matches!(
                         event,
                         Event::Submit {
@@ -724,7 +765,6 @@ mod tests {
                         "{before:?} -> {after:?} on {event:?} published {published:?}"
                     );
                 }
-                let published = recorded(&effects);
                 let mut unique = published.clone();
                 unique.dedup();
                 assert_eq!(
@@ -747,6 +787,10 @@ mod tests {
                         settled_by_provider || ended,
                         "execution {execution:?} left without a result on {event:?}"
                     );
+                    assert!(
+                        execution.cancel.is_some() || effects.contains(&Effect::CloseRequests),
+                        "execution {execution:?} left on {event:?} with its Requests open"
+                    );
                 }
                 if let Some(execution) = next.active() {
                     assert!(
@@ -754,11 +798,20 @@ mod tests {
                         "blocked while canceling: {next:?}"
                     );
                 }
-                queue.push_back((next, depth + 1));
+                let next_seq = if matches!(event, Event::Submit { .. }) {
+                    next_seq + 1
+                } else {
+                    next_seq
+                };
+                queue.push_back((next, next_seq, depth + 1));
             }
         }
         assert!(
-            seen.len() > 50 && transitions > 500,
+            sequences.len() >= 3,
+            "explored executions {sequences:?} only"
+        );
+        assert!(
+            seen.len() > 100 && transitions > 1_000,
             "explored only {} states and {transitions} transitions",
             seen.len()
         );

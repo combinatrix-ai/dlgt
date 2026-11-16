@@ -1723,7 +1723,9 @@ fn end_turn(
     let Some(turn) = state.turns.get_mut(turn_id) else {
         return;
     };
-    if !(turn.state.is_active() || turn.state == TurnState::Canceled) {
+    // A published result never changes: a canceled execution stays
+    // canceled even if its provider fails afterwards.
+    if !turn.state.is_active() {
         return;
     }
     let (code, message) = detail.unwrap_or(match reason {
