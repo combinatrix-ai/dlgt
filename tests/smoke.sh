@@ -8,10 +8,14 @@ server_pid=
 old_server_pid=
 blocked_provider_pid=
 blocked_client_pid=
+preack_new_pid=
+preack_cancel_pid=
 
 cleanup() {
   if [ -n "$blocked_client_pid" ]; then kill -KILL "$blocked_client_pid" 2>/dev/null || true; fi
   if [ -n "$blocked_provider_pid" ]; then kill -KILL "$blocked_provider_pid" 2>/dev/null || true; fi
+  if [ -n "$preack_new_pid" ]; then kill -KILL "$preack_new_pid" 2>/dev/null || true; fi
+  if [ -n "$preack_cancel_pid" ]; then kill -KILL "$preack_cancel_pid" 2>/dev/null || true; fi
   if [ -n "$server_pid" ]; then
     DLGT_HOME="$state_dir" "$binary" server stop >/dev/null 2>&1 || true
     wait "$server_pid" 2>/dev/null || true
@@ -932,6 +936,48 @@ expect "$("$binary" fetch "$codex_id" --wait 5s)" '"final_text":"fake:after-rest
 "$binary" stop "$codex_id" >/dev/null
 wait_until_gone @codex
 expect "$("$binary" show "$codex_id")" '"state":"stopped"'
+
+# A steer before turn/start is acknowledged is rejected, while cancellation
+# retains its execution-bound intent until the provider turn ID arrives.
+preack_release="$state_dir/codex-preack-release"
+preack_seen="$state_dir/codex-preack-seen"
+preack_new_json="$state_dir/codex-preack-new.json"
+preack_cancel_json="$state_dir/codex-preack-cancel.json"
+preack_interrupts_before=$(grep -c '"method":"turn/interrupt"' "$DLGT_FAKE_CODEX_LOG" || true)
+"$binary" new --title codex-preack --alias @codex-preack --harness codex \
+  --approvals ask --cwd "$repo_root" \
+  --env "DLGT_FAKE_DELAY_TURN_START_ACK=$preack_release" \
+  --env "DLGT_FAKE_TURN_START_SEEN=$preack_seen" \
+  --request-id codex-preack-1 -- hold-preack >"$preack_new_json" 2>&1 &
+preack_new_pid=$!
+attempt=0
+while [ ! -s "$preack_seen" ]; do
+  attempt=$((attempt + 1)); test "$attempt" -lt 200 || fail "Codex did not reach delayed turn/start acknowledgement"
+  sleep 0.02
+done
+rejected 1 "$binary" send @codex-preack --steer --request-id codex-preack-steer -- before-ack
+expect "$output" '"code":"SESSION_UNAVAILABLE"'
+"$binary" cancel @codex-preack --timeout 10s >"$preack_cancel_json" 2>&1 &
+preack_cancel_pid=$!
+sleep 0.1
+kill -0 "$preack_cancel_pid" 2>/dev/null || fail "pre-ack cancellation did not wait for the provider turn ID"
+test ! -s "$preack_cancel_json" || fail "pre-ack cancellation completed before the turn ID arrived"
+touch "$preack_release"
+wait "$preack_new_pid" || fail "new failed after delayed Codex acknowledgement: $(cat "$preack_new_json")"
+preack_new_pid=
+wait "$preack_cancel_pid" || fail "pre-ack cancellation failed: $(cat "$preack_cancel_json")"
+preack_cancel_pid=
+expect "$(cat "$preack_cancel_json")" '"status":"canceled"'
+preack_id=$(cat "$preack_new_json" | field id)
+test -n "$preack_id" || fail "pre-ack Session ID was not returned"
+"$binary" send "$preack_id" --request-id codex-preack-2 -- after-preack >/dev/null
+preack_after=$("$binary" fetch "$preack_id" --wait 5s)
+expect "$preack_after" '"final_text":"fake:after-preack"'
+preack_interrupts_after=$(grep -c '"method":"turn/interrupt"' "$DLGT_FAKE_CODEX_LOG" || true)
+test "$preack_interrupts_after" -eq "$((preack_interrupts_before + 1))" \
+  || fail "pre-ack cancellation did not dispatch exactly one interrupt"
+"$binary" stop "$preack_id" --force >/dev/null
+wait_until_gone @codex-preack
 
 # Stopping the daemon takes every provider process with it.
 "$binary" server stop >/dev/null

@@ -40,7 +40,7 @@ while IFS= read -r line; do
       *'"method":"thread/start"'* | *'"method":"thread/resume"'*)
         printf '%s\n' "$line" >>"$DLGT_FAKE_CODEX_LOG"
         ;;
-      *'"method":"turn/steer"'* | *'"id":"srv-'*'"result"'*)
+      *'"method":"turn/steer"'* | *'"method":"turn/interrupt"'* | *'"id":"srv-'*'"result"'*)
         printf '%s\n' "$line" >>"$DLGT_FAKE_CODEX_LOG"
         ;;
     esac
@@ -77,6 +77,13 @@ while IFS= read -r line; do
       turns=$((turns + 1))
       turn=turn-$turns
       text=$(text_of)
+      if [ -n "${DLGT_FAKE_DELAY_TURN_START_ACK:-}" ]; then
+        if [ -n "${DLGT_FAKE_TURN_START_SEEN:-}" ]; then
+          printf '%s\n' "$turn" >"${DLGT_FAKE_TURN_START_SEEN}"
+        fi
+        while [ ! -e "${DLGT_FAKE_DELAY_TURN_START_ACK}" ]; do sleep 0.02; done
+        unset DLGT_FAKE_DELAY_TURN_START_ACK
+      fi
       reply "{\"turn\":{\"id\":\"$turn\"}}"
       notify turn/started "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"items\":[]}}"
       case "$text" in
