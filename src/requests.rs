@@ -445,7 +445,7 @@ fn validate_form_answer(schema: &Value, content: &Value) -> Result<()> {
         .flatten()
         .filter_map(Value::as_str)
     {
-        if content.get(field).is_none_or(Value::is_null) {
+        if content.get(field).is_none() {
             fail!(
                 InvalidArgument,
                 "invalid answer: required form field {field:?} is missing"
@@ -979,6 +979,12 @@ mod tests {
                 .reply(&Answer::Json(Value::Object(answer.clone())))
                 .is_err()
         );
+        answer.insert("plan".to_owned(), Value::Null);
+        let (_, reply) = record
+            .reply(&Answer::Json(Value::Object(answer.clone())))
+            .unwrap_or_else(|error| panic!("a present null value was rejected: {error}"));
+        assert_eq!(reply["content"]["plan"], Value::Null);
+        answer.insert("field_0".to_owned(), json!(true));
         answer.insert("plan".to_owned(), json!("opaque-b93"));
         let (outcome, reply) = record
             .reply(&Answer::Json(Value::Object(answer.clone())))

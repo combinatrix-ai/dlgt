@@ -868,8 +868,10 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
             fail!(InvalidArgument, "harness option {key:?} is managed by dlgt");
         }
         // An inline table can carry any protected key under an innocent name.
-        let value_start = value.trim_start();
-        if value_start.starts_with('{') || (value_start.starts_with('[') && value.contains('{')) {
+        if value
+            .parse::<toml_edit::Value>()
+            .is_ok_and(|parsed| holds_table(&parsed))
+        {
             fail!(
                 InvalidArgument,
                 "harness option {key:?} must not be a table; set nested keys with dotted names"
@@ -878,6 +880,16 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
         args.extend(["--config".to_owned(), option.clone()]);
     }
     Ok(args)
+}
+
+/// Whether a TOML value is, or contains, a table. A value that does not
+/// parse as TOML reaches Codex as a plain string.
+fn holds_table(value: &toml_edit::Value) -> bool {
+    match value {
+        toml_edit::Value::InlineTable(_) => true,
+        toml_edit::Value::Array(array) => array.iter().any(holds_table),
+        _ => false,
+    }
 }
 
 pub fn validate_harness_options(agent: Agent, options: &[String]) -> Result<()> {
@@ -1239,6 +1251,8 @@ harness_options = ["approval_policy=never"]
             );
         }
         assert!(codex_harness_args(&["features.web_search=true".to_owned()]).is_ok());
+        assert!(codex_harness_args(&[r#"example=["ordinary { text"]"#.to_owned()]).is_ok());
+        assert!(codex_harness_args(&[r#"example=[[{nested = 1}]]"#.to_owned()]).is_err());
         assert!(claude_harness_args(&["add-dir=/private/tmp".to_owned()]).is_ok());
     }
 
