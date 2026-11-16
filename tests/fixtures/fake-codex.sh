@@ -99,6 +99,11 @@ while IFS= read -r line; do
       notify turn/started "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"items\":[]}}"
       case "$text" in
         hold*) holding=1 ;;
+        close-output*)
+          exec 1>&-
+          sleep 30
+          exit 0
+          ;;
         crash-hold*)
           if [ -n "${DLGT_FAKE_ESCAPE_HOLDER:-}" ]; then
             python3 -c 'import os, time; os.setpgid(0, 0); open(os.environ["DLGT_FAKE_HOLDER_PID_FILE"], "w").write(str(os.getpid())); time.sleep(30)' &

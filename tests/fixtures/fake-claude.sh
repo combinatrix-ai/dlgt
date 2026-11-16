@@ -214,6 +214,11 @@ while IFS= read -r line; do
           ask_id=$((ask_id + 1))
           printf '{"type":"control_request","request_id":"ask-%s","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","requires_user_interaction":true,"input":{"questions":[{"question":"Which color?","header":"Color","options":[{"label":"Red","description":"r"},{"label":"Blue","description":"b"}],"multiSelect":false}]}}}\n' "$ask_id"
           ;;
+        close-output*)
+          exec 1>&-
+          sleep 30
+          exit 0
+          ;;
         crash-hold*)
           if [ -n "${DLGT_FAKE_ESCAPE_HOLDER:-}" ]; then
             python3 -c 'import os, time; os.setpgid(0, 0); open(os.environ["DLGT_FAKE_HOLDER_PID_FILE"], "w").write(str(os.getpid())); time.sleep(30)' &

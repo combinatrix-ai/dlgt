@@ -137,13 +137,16 @@ pub fn watch_exit(
     name: &str,
     drained: std::sync::mpsc::Receiver<()>,
     on_exit: impl FnOnce(Option<std::process::ExitStatus>) + Send + 'static,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     use anyhow::Context as _;
     let pid = child.id();
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exit_flag = std::sync::Arc::clone(&exited);
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
             let status = child.wait().ok();
+            exit_flag.store(true, std::sync::atomic::Ordering::Release);
             if let Ok(group) = i32::try_from(pid) {
                 // SAFETY: providers are spawned as leaders of their own
                 // process groups; signalling one touches no Rust memory.
@@ -153,5 +156,23 @@ pub fn watch_exit(
             on_exit(status);
         })
         .context("failed to start provider exit thread")?;
-    Ok(())
+    Ok(exited)
+}
+
+/// The provider closed its output. A provider that is still running after
+/// the drain grace cannot be talked to any more, so its process group is
+/// killed and the exit path reports it.
+pub fn output_closed(pid: u32, exited: &std::sync::atomic::AtomicBool) {
+    let deadline = std::time::Instant::now() + DRAIN_GRACE;
+    while std::time::Instant::now() < deadline {
+        if exited.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if let Ok(group) = i32::try_from(pid) {
+        // SAFETY: providers lead their own process groups; signalling one
+        // touches no Rust memory.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
 }

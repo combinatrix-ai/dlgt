@@ -1096,6 +1096,15 @@ class RecheckRegressions(unittest.TestCase):
         h.rpc("session.send", {"session": session, "request_id": "after-rotation", "prompt": "next"})
         final = h.wait_state(session, "idle", timeout=10)["result"]
         self.assertEqual(final["final_text"], "fake:next", final)
+    def test_a_provider_that_closes_its_output_fails_the_session(self) -> None:
+        h = self.harness
+        for harness in ("claude", "codex"):
+            session = h.create(harness, "first")["result"]["session"]["id"]
+            h.wait_state(session, "idle")
+            h.rpc("session.send", {"session": session, "request_id": f"{harness}-close", "prompt": "close-output"})
+            failed = h.wait_state(session, "failed", timeout=8)
+            self.assertIsNotNone(failed["result"], failed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

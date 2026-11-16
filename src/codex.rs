@@ -110,15 +110,16 @@ impl CodexConnection {
         let exit_handler = Arc::clone(&handler);
         let exit_pending = Arc::clone(&pending);
         let exit_closed = Arc::clone(&closed);
-        crate::reaper::watch_exit(child, "dlgt-codex-exit", drained_signal, move |status| {
-            let reason = status.map_or_else(
-                || "Codex app-server closed the connection".to_owned(),
-                |status| format!("Codex app-server exited: {status}"),
-            );
-            fail_pending(&exit_pending, &reason);
-            exit_closed.store(true, Ordering::Release);
-            exit_handler(transport_closed(&reason));
-        })?;
+        let exited =
+            crate::reaper::watch_exit(child, "dlgt-codex-exit", drained_signal, move |status| {
+                let reason = status.map_or_else(
+                    || "Codex app-server closed the connection".to_owned(),
+                    |status| format!("Codex app-server exited: {status}"),
+                );
+                fail_pending(&exit_pending, &reason);
+                exit_closed.store(true, Ordering::Release);
+                exit_handler(transport_closed(&reason));
+            })?;
 
         let io_handler = Arc::clone(&handler);
         let io_pending = Arc::clone(&pending);
@@ -149,6 +150,7 @@ impl CodexConnection {
                     }
                 }
                 drop(drained);
+                crate::reaper::output_closed(pid, &exited);
             })
             .context("failed to start Codex app-server I/O thread")?;
 

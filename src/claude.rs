@@ -125,13 +125,14 @@ impl ClaudeProcess {
         let (drained, drained_signal) = mpsc::channel::<()>();
         let exit_waiters = Arc::clone(&controls);
         let exit_closed = Arc::clone(&closed);
-        crate::reaper::watch_exit(child, "dlgt-claude-exit", drained_signal, move |status| {
-            if let Ok(mut waiters) = exit_waiters.lock() {
-                waiters.clear();
-            }
-            exit_closed.store(true, Ordering::Release);
-            on_exit(status.and_then(|status| status.code()));
-        })?;
+        let exited =
+            crate::reaper::watch_exit(child, "dlgt-claude-exit", drained_signal, move |status| {
+                if let Ok(mut waiters) = exit_waiters.lock() {
+                    waiters.clear();
+                }
+                exit_closed.store(true, Ordering::Release);
+                on_exit(status.and_then(|status| status.code()));
+            })?;
 
         let waiters = Arc::clone(&controls);
         std::thread::Builder::new()
@@ -156,6 +157,7 @@ impl ClaudeProcess {
                     on_event(event);
                 }
                 drop(drained);
+                crate::reaper::output_closed(pid, &exited);
             })
             .context("failed to start Claude event thread")?;
 
