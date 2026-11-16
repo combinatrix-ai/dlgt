@@ -1275,9 +1275,13 @@ impl Daemon {
             fail!(LaunchFailed, "session left restarting state before launch");
         }
         if Instant::now() >= startup_deadline {
+            let generation = self
+                .lock_store()?
+                .runtime_generation(&session.id)
+                .context("Session runtime generation is missing")?;
             self.lock_store()?.fail_session(
                 &session.id,
-                expected_generation + 1,
+                generation,
                 "launch_failed",
                 "restart launch timed out before starting the replacement process",
             );

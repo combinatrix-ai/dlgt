@@ -7,9 +7,20 @@
 //! each call site. `apply` returns the effects the store must carry out and
 //! the lifecycle events it must record; it never touches anything itself.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::protocol::SessionState;
 
 pub type Generation = u64;
+
+/// Generations are never reused within a daemon, across Sessions, restarts,
+/// or a resume that recreates a Session: an event from any earlier process
+/// can never be mistaken for the current one's.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_generation() -> Generation {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Lifecycle {
@@ -175,9 +186,9 @@ impl Refusal {
 }
 
 impl Lifecycle {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            generation: 1,
+            generation: fresh_generation(),
             phase: Phase::Starting { spawned: false },
         }
     }
@@ -227,7 +238,7 @@ impl Lifecycle {
         let (phase, effects) = self.next(event)?;
         if let Some(phase) = phase {
             if matches!(event, Event::RestartLaunch) {
-                self.generation += 1;
+                self.generation = fresh_generation();
             }
             self.phase = phase;
         }
@@ -604,12 +615,12 @@ mod tests {
     /// Every event worth trying from `state`: from the current generation and
     /// the one before it, naming the active execution, an earlier one, and the
     /// next one. `next_seq` is the sequence the next prompt gets.
-    fn alphabet(state: &Lifecycle, next_seq: i64) -> Vec<(u64, Event<'static>)> {
+    fn alphabet(state: &Lifecycle, stale: u64, next_seq: i64) -> Vec<(u64, Event<'static>)> {
         let generation = state.generation();
         let mut seqs = vec![next_seq - 1, next_seq - 2, next_seq];
         seqs.retain(|seq| *seq > 0);
         let mut events = Vec::new();
-        for generation in [generation, generation.saturating_sub(1)] {
+        for generation in [generation, stale] {
             events.push((generation, Event::Spawned));
             events.push((generation, Event::Ready));
             for acknowledged in [false, true] {
@@ -710,10 +721,11 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn every_interleaving_keeps_the_lifecycle_invariants() {
         let mut seen = HashSet::new();
-        let mut queue = VecDeque::from([(Lifecycle::new(), 1_i64, 0_usize)]);
+        // A generation no live process has: events from it are stale.
+        let mut queue = VecDeque::from([(Lifecycle::new(), 0_u64, 0_usize, 1_i64, 0_usize)]);
         let mut transitions = 0_usize;
         let mut sequences = HashSet::new();
-        while let Some((state, next_seq, depth)) = queue.pop_front() {
+        while let Some((state, stale, restarts, next_seq, depth)) = queue.pop_front() {
             if !seen.insert((state.clone(), next_seq)) {
                 continue;
             }
@@ -721,10 +733,10 @@ mod tests {
             if let Some(execution) = state.active() {
                 sequences.insert(execution.seq);
             }
-            if depth == 12 || state.generation() > 3 || next_seq > 4 {
+            if depth == 12 || restarts > 2 || next_seq > 4 {
                 continue;
             }
-            for (generation, event) in alphabet(&state, next_seq) {
+            for (generation, event) in alphabet(&state, stale, next_seq) {
                 let mut next = state.clone();
                 let result = next.apply(generation, &event);
                 let names_other = named_seq(&event)
@@ -803,7 +815,12 @@ mod tests {
                 } else {
                     next_seq
                 };
-                queue.push_back((next, next_seq, depth + 1));
+                let (stale, restarts) = if next.generation() == state.generation() {
+                    (stale, restarts)
+                } else {
+                    (state.generation(), restarts + 1)
+                };
+                queue.push_back((next, stale, restarts, next_seq, depth + 1));
             }
         }
         assert!(
@@ -922,7 +939,7 @@ mod tests {
                 .apply(state.generation(), &event)
                 .unwrap_or_else(|refusal| panic!("{event:?}: {refusal:?}"));
         }
-        assert_eq!(state.generation(), old + 1);
+        assert_ne!(state.generation(), old);
         for event in [
             Event::Stop { force: false },
             Event::Restart,

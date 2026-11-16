@@ -1105,6 +1105,36 @@ class RecheckRegressions(unittest.TestCase):
             failed = h.wait_state(session, "failed", timeout=8)
             self.assertIsNotNone(failed["result"], failed)
 
+    def test_output_from_a_dead_process_never_reaches_its_resumed_session(self) -> None:
+        h = self.harness
+        holder = h.root / "old-holder.pid"
+        extra = {
+            "DLGT_FAKE_HOLDER_PID_FILE": str(holder),
+            "DLGT_FAKE_ESCAPE_HOLDER": "1",
+            "DLGT_FAKE_ESCAPE_EMIT_AFTER": "5",
+        }
+        session = h.create("claude", "first", extra)["result"]["session"]["id"]
+        h.wait_state(session, "idle")
+        h.rpc("session.send", {"session": session, "request_id": "crash", "prompt": "crash-hold"})
+        h.wait_state(session, "failed", timeout=6)
+        resumed = h.rpc(
+            "session.send",
+            {
+                "session": session,
+                "resume": True,
+                "request_id": "resume",
+                "prompt": "hold-new",
+                "cwd": str(h.root),
+                "environment": h.provider_env(),
+            },
+        )
+        self.assertIn("result", resumed, resumed)
+        current = resumed["result"]["session"]["id"]
+        time.sleep(5)
+        state = h.state(current)
+        self.assertEqual(state["session"]["state"], "busy", state)
+        self.assertNotIn("OLD_PROCESS_RESULT", json.dumps(state), state)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

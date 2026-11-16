@@ -221,7 +221,7 @@ while IFS= read -r line; do
           ;;
         crash-hold*)
           if [ -n "${DLGT_FAKE_ESCAPE_HOLDER:-}" ]; then
-            python3 -c 'import os, time; os.setpgid(0, 0); open(os.environ["DLGT_FAKE_HOLDER_PID_FILE"], "w").write(str(os.getpid())); time.sleep(30)' &
+            python3 -c 'import os, sys, time; os.setpgid(0, 0); open(os.environ["DLGT_FAKE_HOLDER_PID_FILE"], "w").write(str(os.getpid())); delay = float(os.environ.get("DLGT_FAKE_ESCAPE_EMIT_AFTER") or 0); time.sleep(delay) if delay else None; delay and (sys.stdout.write("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"OLD_PROCESS_RESULT\",\"permission_denials\":[]}\n"), sys.stdout.flush()); time.sleep(30)' &
             while [ ! -s "$DLGT_FAKE_HOLDER_PID_FILE" ]; do sleep 0.01; done
           else
             sleep 30 &
