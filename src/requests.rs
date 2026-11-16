@@ -574,6 +574,7 @@ impl RequestTable {
             attempt.state = AnswerAttemptState::Delivered;
             attempt.resolution = Some(resolution);
         }
+        self.trim();
         Some(before)
     }
 
@@ -702,6 +703,7 @@ impl RequestTable {
         {
             attempt.waiters = attempt.waiters.saturating_sub(1);
         }
+        self.trim();
     }
 
     /// Close pending Requests as canceled: every one, or only the one the
@@ -737,7 +739,9 @@ impl RequestTable {
             .count();
         let mut excess = resolved.saturating_sub(RESOLVED_RETENTION);
         self.records.retain(|record| {
-            if excess > 0 && !record.pending() {
+            // A duplicate still waiting on an attempt reads its outcome here.
+            let awaited = record.attempts.iter().any(|attempt| attempt.waiters > 0);
+            if excess > 0 && !record.pending() && !awaited {
                 excess -= 1;
                 return false;
             }
@@ -990,6 +994,49 @@ mod tests {
         answer.insert("field_16".to_owned(), json!("v"));
         answer.insert("not_in_form".to_owned(), json!("v"));
         assert!(record.reply(&Answer::Json(Value::Object(answer))).is_err());
+    }
+
+    #[test]
+    fn delivered_answers_are_trimmed_to_the_retention_limit_except_awaited_ones() {
+        let mut table = RequestTable::default();
+        let mut awaited = None;
+        for index in 0..300 {
+            let record = table.open(approval(ProviderRequest::CodexCommand), Some(1), 1);
+            let Some(AnswerClaim::Started(attempt)) =
+                table.begin_answer(&record.id, &Answer::Allow)
+            else {
+                panic!("answer was not started");
+            };
+            if index == 0 {
+                assert_eq!(
+                    table.begin_answer(&record.id, &Answer::Allow),
+                    Some(AnswerClaim::Waiting(attempt))
+                );
+                awaited = Some((record.id.clone(), attempt));
+            }
+            let resolution = Resolution {
+                outcome: Outcome::Allowed,
+                answer: Some(Answer::Allow),
+            };
+            assert!(
+                table
+                    .deliver_with_receipt(
+                        &record.id,
+                        attempt,
+                        &Answer::Allow,
+                        resolution,
+                        json!({})
+                    )
+                    .is_some()
+            );
+        }
+        let Some((id, attempt)) = awaited else {
+            panic!("no awaited attempt");
+        };
+        assert!(table.get(&id).is_some(), "an awaited attempt was trimmed");
+        assert!(table.records.len() <= super::RESOLVED_RETENTION + 1);
+        table.release_answer_waiter(&id, attempt);
+        assert!(table.records.len() <= super::RESOLVED_RETENTION);
     }
 
     #[test]
