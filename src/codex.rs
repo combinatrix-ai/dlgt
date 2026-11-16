@@ -101,12 +101,6 @@ impl CodexConnection {
         let closed = Arc::new(AtomicBool::new(false));
         let writer = spawn_writer(stdin, Arc::clone(&closed), pid)?;
 
-        let tail = Arc::clone(&stderr_tail);
-        std::thread::Builder::new()
-            .name("dlgt-codex-stderr".to_owned())
-            .spawn(move || retain_tail(stderr, &tail))
-            .context("failed to start Codex stderr thread")?;
-
         let (drained, drained_signal) = std::sync::mpsc::channel::<()>();
         let exit_handler = Arc::clone(&handler);
         let exit_pending = Arc::clone(&pending);
@@ -121,6 +115,18 @@ impl CodexConnection {
                 exit_closed.store(true, Ordering::Release);
                 exit_handler(transport_closed(&reason));
             })?;
+
+        let tail = Arc::clone(&stderr_tail);
+        let stderr_stop = Arc::clone(&exit_watch.stop_output);
+        std::thread::Builder::new()
+            .name("dlgt-codex-stderr".to_owned())
+            .spawn(move || {
+                retain_tail(
+                    crate::reaper::StoppableOutput::new(stderr, stderr_stop),
+                    &tail,
+                )
+            })
+            .context("failed to start Codex stderr thread")?;
 
         let io_handler = Arc::clone(&handler);
         let io_pending = Arc::clone(&pending);

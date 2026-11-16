@@ -1198,7 +1198,7 @@ class RecheckRegressions(unittest.TestCase):
             h.rpc("session.send", {"session": session, "request_id": f"{harness}-reader", "prompt": "crash-hold"})
             h.wait_state(session, "failed", timeout=6)
         time.sleep(1.5)
-        self.assertLessEqual(threads(), baseline + 2, "provider output readers outlived their exit")
+        self.assertLessEqual(threads(), baseline, "provider output readers outlived their exit")
 
     def test_a_create_never_submits_to_the_restart_that_replaced_it(self) -> None:
         for harness in ("claude", "codex"):

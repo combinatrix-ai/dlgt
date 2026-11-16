@@ -112,16 +112,6 @@ impl ClaudeProcess {
             })
             .context("failed to start Claude stdin writer thread")?;
 
-        let tail = Arc::clone(&stderr_tail);
-        let (stderr_closed, stderr_done) = mpsc::channel::<()>();
-        std::thread::Builder::new()
-            .name("dlgt-claude-stderr".to_owned())
-            .spawn(move || {
-                retain_tail(stderr, &tail);
-                drop(stderr_closed);
-            })
-            .context("failed to start Claude stderr thread")?;
-
         let (drained, drained_signal) = mpsc::channel::<()>();
         let exit_waiters = Arc::clone(&controls);
         let exit_closed = Arc::clone(&closed);
@@ -133,6 +123,20 @@ impl ClaudeProcess {
                 exit_closed.store(true, Ordering::Release);
                 on_exit(status.and_then(|status| status.code()));
             })?;
+
+        let tail = Arc::clone(&stderr_tail);
+        let stderr_stop = Arc::clone(&exit_watch.stop_output);
+        let (stderr_closed, stderr_done) = mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("dlgt-claude-stderr".to_owned())
+            .spawn(move || {
+                retain_tail(
+                    crate::reaper::StoppableOutput::new(stderr, stderr_stop),
+                    &tail,
+                );
+                drop(stderr_closed);
+            })
+            .context("failed to start Claude stderr thread")?;
 
         let waiters = Arc::clone(&controls);
         std::thread::Builder::new()
