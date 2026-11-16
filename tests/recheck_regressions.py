@@ -109,7 +109,12 @@ class Harness:
                     break
 
     def close(self) -> None:
-        for path in [*self.root.glob("*.pid"), self.home / ".fake-auth-child-pid", self.home / ".fake-auth-parent-pid"]:
+        for path in [
+            *self.root.glob("*.pid"),
+            self.home / ".fake-auth-child-pid",
+            self.home / ".fake-auth-parent-pid",
+            self.home / ".fake-auth-holder-pid",
+        ]:
             self.stop_provider_pid_file(path)
         try:
             if self.server.poll() is None:
@@ -578,6 +583,29 @@ class RecheckRegressions(unittest.TestCase):
             h.rpc("session.stop", {"session": session, "force": True})
 
         self.assertEqual(response.get("error", {}).get("code"), "AUTH_MISMATCH", response)
+
+    def test_auth_status_rejects_a_valid_prefix_followed_by_discarded_bytes(self) -> None:
+        h = self.harness
+        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
+        (h.home / ".fake-auth-trailing-bytes").write_text("70000")
+        response = h.create("claude", "valid prefix then garbage")
+        self.assertEqual(response.get("error", {}).get("code"), "AUTH_MISMATCH", response)
+
+    def test_auth_status_deadline_covers_a_descendant_holding_stdout(self) -> None:
+        h = self.harness
+        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
+        (h.home / ".fake-auth-hold-stdout").write_text("20")
+        started = time.monotonic()
+        response = h.create("claude", "held stdout", startup_timeout_ms=1000)
+        elapsed = time.monotonic() - started
+        self.assertEqual(response.get("error", {}).get("code"), "LAUNCH_FAILED", response)
+        self.assertLess(elapsed, 3, elapsed)
+        holder = int((h.home / ".fake-auth-holder-pid").read_text())
+        time.sleep(0.2)
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(holder)], check=False, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertTrue(not state or state.startswith("Z"), f"stdout holder survived: {state}")
 
 
 if __name__ == "__main__":

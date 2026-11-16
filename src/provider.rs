@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -575,7 +574,7 @@ pub fn verify_claude_subscription_login(
         .take()
         .context("Claude auth status stderr was unavailable")?;
     let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout) {
-        Ok(output_task) => output_task,
+        Ok(output) => output,
         Err(error) => {
             kill_process_group(group);
             let _ = child.wait();
@@ -583,21 +582,25 @@ pub fn verify_claude_subscription_login(
         }
     };
     let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr) {
-        Ok(output_task) => output_task,
+        Ok(output) => output,
         Err(error) => {
             kill_process_group(group);
             let _ = child.wait();
-            let _ = stdout_reader.join();
             return Err(error);
         }
     };
 
-    let status = loop {
+    // The check is done when the process has exited and both streams reached
+    // EOF. A descendant can hold a stream open after the parent exits, so the
+    // deadline covers the reads too; on expiry the whole group is killed and
+    // the readers finish on their own once the last writer is gone.
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr_done = false;
+    while status.is_none() || stdout.is_none() || !stderr_done {
         if shutting_down.load(Ordering::Acquire) || Instant::now() >= deadline {
             kill_process_group(group);
             let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
             if shutting_down.load(Ordering::Acquire) {
                 fail!(
                     LaunchFailed,
@@ -609,16 +612,24 @@ pub fn verify_claude_subscription_login(
                 "launch failed: Claude auth status exceeded the startup deadline"
             );
         }
-        match child
-            .try_wait()
-            .context("failed to wait for Claude auth status")?
-        {
-            Some(status) => break status,
-            None => std::thread::sleep(Duration::from_millis(5)),
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .context("failed to wait for Claude auth status")?;
         }
+        if stdout.is_none() {
+            stdout = stdout_reader.try_recv().ok();
+        }
+        stderr_done = stderr_done || stderr_reader.try_recv().is_ok();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (Some(status), Some(stdout)) = (status, stdout) else {
+        return Err(anyhow!("Claude auth status ended without its result"));
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let _stderr = stderr_reader.join().unwrap_or_default();
+    if stdout.overflowed {
+        return Err(crate::config::AuthMismatch::default().into());
+    }
+    let stdout = stdout.retained;
     if !status.success() {
         return Err(crate::config::AuthMismatch::default().into());
     }
@@ -645,25 +656,40 @@ impl Drop for AuthGroupGuard<'_> {
     }
 }
 
+struct BoundedOutput {
+    retained: Vec<u8>,
+    overflowed: bool,
+}
+
+/// Read a stream to EOF on its own thread, keeping at most the output limit
+/// and recording whether anything beyond it was discarded.
 fn drain_bounded<R: Read + Send + 'static>(
     name: &str,
     mut reader: R,
-) -> Result<JoinHandle<Vec<u8>>> {
+) -> Result<std::sync::mpsc::Receiver<BoundedOutput>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            let mut retained = Vec::with_capacity(AUTH_STATUS_OUTPUT_LIMIT);
+            let mut output = BoundedOutput {
+                retained: Vec::with_capacity(AUTH_STATUS_OUTPUT_LIMIT),
+                overflowed: false,
+            };
             let mut buffer = [0_u8; 8192];
             while let Ok(size) = reader.read(&mut buffer) {
                 if size == 0 {
                     break;
                 }
-                let remaining = AUTH_STATUS_OUTPUT_LIMIT.saturating_sub(retained.len());
-                retained.extend_from_slice(&buffer[..size.min(remaining)]);
+                let remaining = AUTH_STATUS_OUTPUT_LIMIT.saturating_sub(output.retained.len());
+                output.overflowed |= size > remaining;
+                output
+                    .retained
+                    .extend_from_slice(&buffer[..size.min(remaining)]);
             }
-            retained
+            let _ = sender.send(output);
         })
-        .context("failed to start Claude auth status output reader")
+        .context("failed to start Claude auth status output reader")?;
+    Ok(receiver)
 }
 
 fn kill_process_group(group: i32) {

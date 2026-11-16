@@ -29,6 +29,15 @@ if [ "$1" = auth ] && [ "${2:-}" = status ]; then
       awk -v count="$output_bytes" 'BEGIN { for (i = 0; i < count; i++) printf " " }'
     fi
     cat "$HOME/.fake-auth-status"
+    if [ -f "$HOME/.fake-auth-trailing-bytes" ]; then
+      trailing=$(cat "$HOME/.fake-auth-trailing-bytes")
+      awk -v count="$trailing" 'BEGIN { for (i = 0; i < count; i++) printf " "; printf "not json" }'
+    fi
+    if [ -f "$HOME/.fake-auth-hold-stdout" ]; then
+      sleep "$(cat "$HOME/.fake-auth-hold-stdout")" &
+      printf '%s\n' "$!" >"$HOME/.fake-auth-holder-pid"
+      exit 0
+    fi
   else
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
   fi
