@@ -36,6 +36,15 @@ if [ "$1" = auth ] && [ "${2:-}" = status ]; then
       trailing=$(cat "$HOME/.fake-auth-trailing-bytes")
       awk -v count="$trailing" 'BEGIN { for (i = 0; i < count; i++) printf " "; printf "not json" }'
     fi
+    if [ -f "$HOME/.fake-auth-linger" ]; then
+      sleep 20 </dev/null >/dev/null 2>&1 &
+      printf '%s\n' "$!" >"$HOME/.fake-auth-linger-pid"
+    fi
+    if [ -f "$HOME/.fake-auth-escape" ]; then
+      python3 -c 'import os, time; os.setpgid(0, 0); time.sleep(20)' &
+      printf '%s\n' "$!" >>"$HOME/.fake-auth-escape-pids"
+      exit 0
+    fi
     if [ -f "$HOME/.fake-auth-hold-stdout" ]; then
       sleep "$(cat "$HOME/.fake-auth-hold-stdout")" &
       printf '%s\n' "$!" >"$HOME/.fake-auth-holder-pid"

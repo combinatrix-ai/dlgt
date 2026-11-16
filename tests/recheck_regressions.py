@@ -114,6 +114,7 @@ class Harness:
             self.home / ".fake-auth-child-pid",
             self.home / ".fake-auth-parent-pid",
             self.home / ".fake-auth-holder-pid",
+            self.home / ".fake-auth-linger-pid",
         ]:
             self.stop_provider_pid_file(path)
         try:
@@ -127,6 +128,13 @@ class Harness:
             self.server.kill()
             self.server.wait(timeout=3)
         self.log.close()
+        escaped = self.home / ".fake-auth-escape-pids"
+        if escaped.exists():
+            for line in escaped.read_text().split():
+                try:
+                    os.kill(int(line), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
         import shutil
 
         shutil.rmtree(self.root, ignore_errors=True)
@@ -663,6 +671,40 @@ class RecheckRegressions(unittest.TestCase):
             ["ps", "-o", "stat=", "-p", str(holder)], check=False, capture_output=True, text=True
         ).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"stdout holder survived: {state}")
+
+    def test_a_successful_auth_check_leaves_no_process_in_its_group(self) -> None:
+        h = self.harness
+        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
+        (h.home / ".fake-auth-linger").write_text("")
+        response = h.create("claude", "lingering auth child")
+        self.assertIn("result", response, response)
+        lingering = int((h.home / ".fake-auth-linger-pid").read_text())
+        time.sleep(0.2)
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(lingering)], check=False, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertTrue(not state or state.startswith("Z"), f"auth group member survived: {state}")
+
+    def test_auth_readers_end_when_an_escaped_process_holds_the_pipes(self) -> None:
+        h = self.harness
+        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
+        (h.home / ".fake-auth-escape").write_text("")
+
+        def threads() -> int:
+            task_dir = Path(f"/proc/{h.server.pid}/task")
+            if task_dir.exists():
+                return len(list(task_dir.iterdir()))
+            listing = subprocess.run(
+                ["ps", "-M", "-p", str(h.server.pid)], check=False, capture_output=True, text=True
+            ).stdout
+            return len(listing.splitlines()) - 1
+
+        baseline = threads()
+        for attempt in range(3):
+            response = h.create("claude", f"escaped {attempt}", startup_timeout_ms=500)
+            self.assertEqual(response.get("error", {}).get("code"), "LAUNCH_FAILED", response)
+        time.sleep(0.3)
+        self.assertLessEqual(threads(), baseline + 1, "auth reader threads leaked")
 
 
 if __name__ == "__main__":

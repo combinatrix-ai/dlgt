@@ -556,9 +556,11 @@ pub fn verify_claude_subscription_login(
         }
     };
     auth_processes.insert(group);
+    let readers_stop = Arc::new(AtomicBool::new(false));
     let _group_guard = AuthGroupGuard {
         group,
         auth_processes,
+        readers_stop: Arc::clone(&readers_stop),
         _registration: registration,
     };
     if shutting_down.load(Ordering::Acquire) {
@@ -573,7 +575,7 @@ pub fn verify_claude_subscription_login(
         .stderr
         .take()
         .context("Claude auth status stderr was unavailable")?;
-    let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout) {
+    let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout, Arc::clone(&readers_stop)) {
         Ok(output) => output,
         Err(error) => {
             kill_process_group(group);
@@ -581,7 +583,7 @@ pub fn verify_claude_subscription_login(
             return Err(error);
         }
     };
-    let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr) {
+    let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr, Arc::clone(&readers_stop)) {
         Ok(output) => output,
         Err(error) => {
             kill_process_group(group);
@@ -644,14 +646,21 @@ pub fn verify_claude_subscription_login(
     Ok(())
 }
 
+/// Owns an auth check's process group for the length of the check. However
+/// the check ends, the rest of the group is killed and the output readers are
+/// told to stop, so neither a lingering descendant nor a reader blocked on a
+/// pipe that an escaped process still holds outlives it.
 struct AuthGroupGuard<'a> {
     group: i32,
     auth_processes: &'a AuthProcessGroups,
+    readers_stop: Arc<AtomicBool>,
     _registration: Registration,
 }
 
 impl Drop for AuthGroupGuard<'_> {
     fn drop(&mut self) {
+        kill_process_group(self.group);
+        self.readers_stop.store(true, Ordering::Release);
         self.auth_processes.remove(self.group);
     }
 }
@@ -663,10 +672,21 @@ struct BoundedOutput {
 
 /// Read a stream to EOF on its own thread, keeping at most the output limit
 /// and recording whether anything beyond it was discarded.
-fn drain_bounded<R: Read + Send + 'static>(
+fn drain_bounded<R: Read + std::os::fd::AsRawFd + Send + 'static>(
     name: &str,
     mut reader: R,
+    stop: Arc<AtomicBool>,
 ) -> Result<std::sync::mpsc::Receiver<BoundedOutput>> {
+    // Nonblocking, so the reader can notice `stop` while a process outside
+    // the killed group still holds the write end open.
+    // SAFETY: fcntl only reads and sets the status flags of this valid fd.
+    unsafe {
+        let fd = reader.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name(name.to_owned())
@@ -676,10 +696,20 @@ fn drain_bounded<R: Read + Send + 'static>(
                 overflowed: false,
             };
             let mut buffer = [0_u8; 8192];
-            while let Ok(size) = reader.read(&mut buffer) {
-                if size == 0 {
-                    break;
-                }
+            loop {
+                let size = match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(size) => size,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
                 let remaining = AUTH_STATUS_OUTPUT_LIMIT.saturating_sub(output.retained.len());
                 output.overflowed |= size > remaining;
                 output
