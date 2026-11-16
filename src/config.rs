@@ -206,13 +206,46 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
 }
 
 pub fn parse(text: &str) -> Result<Config> {
-    let document = parse_toml_document_as(text, "dlgt config")?;
-    parse_document(&document).map_err(|_| {
+    let document = toml_edit::Document::parse(text).map_err(|error| {
+        let offset = error.span().map_or(0, |span| span.start);
+        let (line, column) = line_column(text, offset);
         coded(
             Code::InvalidArgument,
-            "invalid dlgt config at 1:1: invalid configuration entry",
+            format!("invalid dlgt config at {line}:{column}: invalid TOML syntax"),
+        )
+    })?;
+    // The reason can quote a configured value, so only the location of the
+    // innermost offending item is reported.
+    parse_document(document.as_table()).map_err(|error| {
+        let offset = error.downcast_ref::<ItemSpan>().map_or(0, |span| span.0);
+        let (line, column) = line_column(text, offset);
+        coded(
+            Code::InvalidArgument,
+            format!("invalid dlgt config at {line}:{column}: invalid configuration entry"),
         )
     })
+}
+
+/// Where in the source the item being parsed starts.
+#[derive(Debug)]
+struct ItemSpan(usize);
+
+impl fmt::Display for ItemSpan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at offset {}", self.0)
+    }
+}
+
+impl Error for ItemSpan {}
+
+/// Record the innermost item that failed; outer items keep its location.
+fn at_item<T>(item: &Item, result: Result<T>) -> Result<T> {
+    match (result, item.span()) {
+        (Err(error), Some(span)) if error.downcast_ref::<ItemSpan>().is_none() => {
+            Err(error.context(ItemSpan(span.start)))
+        }
+        (result, _) => result,
+    }
 }
 
 pub fn parse_toml_document(text: &str, source: &str) -> Result<DocumentMut> {
@@ -230,7 +263,7 @@ fn parse_toml_document_as(text: &str, subject: &str) -> Result<DocumentMut> {
     })
 }
 
-fn parse_document(document: &DocumentMut) -> Result<Config> {
+fn parse_document(document: &toml_edit::Table) -> Result<Config> {
     let mut config = Config::default();
 
     if let Some(defaults) = document.get("defaults") {
@@ -238,14 +271,24 @@ fn parse_document(document: &DocumentMut) -> Result<Config> {
             .as_table_like()
             .context("[defaults] must be a table")?;
         for (key, item) in table.iter() {
-            match key {
-                "approvals" => {
-                    config.approvals = Some(parse_approvals(item, "[defaults].approvals")?);
-                }
-                "claude" => config.claude = parse_defaults_harness(item, "defaults.claude", true)?,
-                "codex" => config.codex = parse_defaults_harness(item, "defaults.codex", false)?,
-                _ => bail!("unknown key {key:?} in [defaults]"),
-            }
+            at_item(
+                item,
+                (|| {
+                    match key {
+                        "approvals" => {
+                            config.approvals = Some(parse_approvals(item, "[defaults].approvals")?);
+                        }
+                        "claude" => {
+                            config.claude = parse_defaults_harness(item, "defaults.claude", true)?;
+                        }
+                        "codex" => {
+                            config.codex = parse_defaults_harness(item, "defaults.codex", false)?;
+                        }
+                        _ => bail!("unknown key {key:?} in [defaults]"),
+                    }
+                    Ok(())
+                })(),
+            )?;
         }
     }
 
@@ -257,7 +300,7 @@ fn parse_document(document: &DocumentMut) -> Result<Config> {
             let profile_table = item
                 .as_table_like()
                 .with_context(|| format!("profile {name:?} must be a table"))?;
-            let profile = parse_profile(name, profile_table)?;
+            let profile = at_item(item, parse_profile(name, profile_table))?;
             config.profiles.insert(name.to_owned(), profile);
         }
     }
@@ -555,34 +598,39 @@ fn parse_settings(
 ) -> Result<PartialLaunch> {
     let mut settings = PartialLaunch::default();
     for (key, item) in table.iter() {
-        if !allowed_keys.contains(&key) || key == "auth" && !claude {
-            bail!("unknown key {key:?} in [{name}]");
-        }
-        let key_name = format!("{name}.{key}");
-        match key {
-            "model" => settings.model = Some(required_string(item, &key_name)?),
-            "effort" => settings.effort = Some(required_string(item, &key_name)?),
-            "approvals" => settings.approvals = Some(parse_approvals(item, &key_name)?),
-            "auth" => {
-                let value = required_string(item, &key_name)?;
-                settings.auth =
-                    Some(AuthPolicy::parse(&value).with_context(|| {
-                        format!("{key_name} must be \"subscription\" or \"any\"")
-                    })?);
-            }
-            "clean_env" => {
-                settings.clean_env = Some(
-                    item.as_bool()
-                        .with_context(|| format!("{key_name} must be a boolean"))?,
-                );
-            }
-            "env" => settings.env = parse_env(item, &key_name)?,
-            "pass_env" => settings.pass_env = string_array(item, &key_name)?,
-            "unset_env" => settings.unset_env = string_array(item, &key_name)?,
-            "harness_options" => settings.harness_options = string_array(item, &key_name)?,
-            "harness" => {}
-            _ => bail!("unknown key {key:?} in [{name}]"),
-        }
+        at_item(
+            item,
+            (|| {
+                if !allowed_keys.contains(&key) || key == "auth" && !claude {
+                    bail!("unknown key {key:?} in [{name}]");
+                }
+                let key_name = format!("{name}.{key}");
+                match key {
+                    "model" => settings.model = Some(required_string(item, &key_name)?),
+                    "effort" => settings.effort = Some(required_string(item, &key_name)?),
+                    "approvals" => settings.approvals = Some(parse_approvals(item, &key_name)?),
+                    "auth" => {
+                        let value = required_string(item, &key_name)?;
+                        settings.auth = Some(AuthPolicy::parse(&value).with_context(|| {
+                            format!("{key_name} must be \"subscription\" or \"any\"")
+                        })?);
+                    }
+                    "clean_env" => {
+                        settings.clean_env = Some(
+                            item.as_bool()
+                                .with_context(|| format!("{key_name} must be a boolean"))?,
+                        );
+                    }
+                    "env" => settings.env = parse_env(item, &key_name)?,
+                    "pass_env" => settings.pass_env = string_array(item, &key_name)?,
+                    "unset_env" => settings.unset_env = string_array(item, &key_name)?,
+                    "harness_options" => settings.harness_options = string_array(item, &key_name)?,
+                    "harness" => {}
+                    _ => bail!("unknown key {key:?} in [{name}]"),
+                }
+                Ok(())
+            })(),
+        )?;
     }
     Ok(settings)
 }
@@ -800,9 +848,17 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
 
     #[test]
     fn invalid_entries_are_rejected_without_echoing_the_config_source() {
-        for text in [
-            "[defaults.claude]\nunknown = true",
-            "[defaults.mystery]\nmodel = \"x\"",
+        for (text, location) in [
+            ("[defaults.claude]\nunknown = true", "2:"),
+            ("[defaults.mystery]\nmodel = \"x\"", "1:"),
+            (
+                "[defaults]\napprovals = \"ask\"\n\n[defaults.claude]\nclean_env = \"mystery\"",
+                "5:",
+            ),
+            (
+                "[profiles.p]\nharness = \"claude\"\nmodel = \"m\"\nunknown = \"mystery\"",
+                "4:",
+            ),
         ] {
             let result = super::parse(text);
             assert!(
@@ -813,7 +869,10 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
                 || "invalid defaults unexpectedly parsed".to_owned(),
                 |error| error.to_string(),
             );
-            assert!(message.contains("1:1"), "missing location: {message}");
+            assert!(
+                message.contains(&format!("at {location}")),
+                "wrong location for {text:?}: {message}"
+            );
             assert!(
                 !message.contains("unknown") && !message.contains("mystery"),
                 "source text leaked in error: {message}"
