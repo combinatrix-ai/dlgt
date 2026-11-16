@@ -549,7 +549,7 @@ SESSION_BUSY           Active execution; retry after it terminalizes
 SESSION_BLOCKED        A Request is pending; answer it
 REQUEST_BUSY           An identical answer is still being delivered
 REQUEST_DELIVERY_FAILED Answer delivery failed; an ambiguous write fails the Session
-REQUEST_FAILED         Request delivery failed and the provider Session is unavailable
+REQUEST_FAILED         The Request can no longer be answered: it failed or its execution ended
 SESSION_UNAVAILABLE    Session state cannot accept the operation
 REQUEST_NOT_FOUND      No such Request on this Session
 REQUEST_RESOLVED       The Request already has a different answer

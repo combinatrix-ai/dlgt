@@ -130,8 +130,9 @@ event themselves. The one exception is publication: when a new Session gets
 its public ID, dlgt repeats `session.created` and `session.ready` under that
 ID so the timeline a caller can read starts there.
 
-The function guarantees, and a bounded exhaustive test checks over every
-interleaving of events from the current and previous generation:
+The function guarantees, and a bounded exhaustive test of the function
+itself checks over every interleaving of events from the current and a
+replaced generation, across several executions:
 
 - a refused event changes nothing;
 - each public state change is announced by its event exactly once;
@@ -148,6 +149,15 @@ interleaving of events from the current and previous generation:
 Generations come from one daemon-wide counter and are never reused, so a
 Session recreated by resume does not share a generation with the process it
 replaced.
+
+The exhaustive test covers the transition function, not the code around it.
+Whether callers pass the generation they captured when their operation
+began, whether the store applies the effects, and whether published results
+stay unchanged are covered by focused integration regressions instead. Each
+operation captures its generation (or execution) at its start and carries
+it to every later step: launch, create cleanup, rekey, answer receipts,
+cancel controls, and provider callbacks. A published result is frozen: no
+later report changes any of its fields.
 
 A stop already in progress may be forced. Restart claims the generation the
 caller observed and is refused if another restart replaced it first.
@@ -290,7 +300,7 @@ reject  steer
 | Mode | Idle | Busy | Blocked | Canceling or other |
 | --- | --- | --- | --- | --- |
 | `reject` | Start a new execution. | `SESSION_BUSY`, no side effects. | `SESSION_BLOCKED` with the pending Request IDs. | `SESSION_BUSY` while canceling; `SESSION_NOT_RUNNING` when starting, stopping, stopped, or failed; `SESSION_UNAVAILABLE` while restarting. |
-| `steer` | `NO_ACTIVE_EXECUTION`. | Add the message to the running execution. | `SESSION_BLOCKED`; a steer cannot answer a Request. | `SESSION_UNAVAILABLE`. |
+| `steer` | `NO_ACTIVE_EXECUTION`. | Add the message to the running execution. | `SESSION_BLOCKED`; a steer cannot answer a Request. | `SESSION_NOT_RUNNING` when starting, stopping, stopped, or failed; `SESSION_UNAVAILABLE` otherwise. |
 
 Both modes are decided against current Session state under the store lock.
 A busy Session rejects a new prompt; dlgt never holds one for later dispatch.
