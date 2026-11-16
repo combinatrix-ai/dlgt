@@ -11,7 +11,7 @@ use crate::claude::{brief, input_summary};
 use crate::codex::final_agent_message_text;
 use crate::messages::{Decider, Decision, MessageBody};
 use crate::protocol::{SessionRecord, SessionState, TurnState};
-use crate::requests::{FormField, ProviderRequest, RequestDraft, RequestKind};
+use crate::requests::{ProviderRequest, RequestDraft, RequestKind};
 use crate::store::Store;
 
 /// What dlgt remembers about thread items, so a later approval request or
@@ -195,15 +195,16 @@ impl CodexItems {
             }
             "mcpServer/elicitation/request" => {
                 let form = text("mode") != Some("url");
-                let (fields, required_fields) = elicitation_fields(params);
                 let mut asked = text("message").unwrap_or_default().to_owned();
                 if let Some(url) = text("url") {
                     asked = format!("{asked}\n{url}");
                 }
                 question(
                     ProviderRequest::CodexElicitation {
-                        fields,
-                        required_fields,
+                        schema: params
+                            .get("requestedSchema")
+                            .cloned()
+                            .unwrap_or(Value::Null),
                         form,
                     },
                     text("serverName").unwrap_or("mcp"),
@@ -214,71 +215,6 @@ impl CodexItems {
             _ => return None,
         })
     }
-}
-
-fn elicitation_fields(params: &Value) -> (Vec<FormField>, Vec<String>) {
-    let schema = params.get("requestedSchema").unwrap_or(&Value::Null);
-    let required_fields = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let required = required_fields
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    let fields = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|properties| properties.iter())
-        .map(|(name, property)| {
-            let field_type = property.get("type").map_or_else(
-                || "unknown".to_owned(),
-                |value| match value {
-                    Value::String(value) => value.clone(),
-                    Value::Array(values) => values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" | "),
-                    _ => "unknown".to_owned(),
-                },
-            );
-            let enum_values = property
-                .get("enum")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect();
-            let constraints = Value::Object(
-                property
-                    .as_object()
-                    .into_iter()
-                    .flat_map(|object| object.iter())
-                    .filter(|(key, _)| {
-                        matches!(
-                            key.as_str(),
-                            "minimum" | "maximum" | "minLength" | "maxLength" | "pattern"
-                        )
-                    })
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            );
-            FormField {
-                name: name.clone(),
-                field_type,
-                required: required.contains(name.as_str()),
-                enum_values,
-                constraints,
-            }
-        })
-        .collect();
-    (fields, required_fields)
 }
 
 fn review_action(action: &Value) -> (&'static str, String) {
@@ -843,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_elicitation_publishes_bounded_multi_field_schema() {
+    fn mcp_elicitation_publishes_the_providers_schema_unchanged() {
         let (mut store, mut items) = busy_store();
         apply_notification(
             &mut store,
@@ -873,11 +809,16 @@ mod tests {
             .session_uid("codex:thread-1")
             .unwrap_or_else(|| panic!("session uid missing"));
         let public = store.pending_requests(&uid)[0].public();
-        assert_eq!(public["fields"].as_array().map(Vec::len), Some(2));
-        assert_eq!(public["fields"][0]["name"], "color");
-        assert_eq!(public["fields"][0]["enum"], json!(["red", "blue"]));
-        assert_eq!(public["fields"][1]["name"], "name");
-        assert_eq!(public["fields"][1]["required"], true);
+        assert_eq!(
+            public["schema"],
+            json!({
+                "type": "object", "required": ["name", "color"],
+                "properties": {
+                    "name": {"type": "string", "maxLength": 40},
+                    "color": {"type": "string", "enum": ["red", "blue"]}
+                }
+            })
+        );
     }
 
     #[test]

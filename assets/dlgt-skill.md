@@ -509,8 +509,8 @@ uses an API key from the environment instead of the subscription.
 - When `fetch` returns `reason: "blocked"`, read `requests` and answer each
   one: `dlgt answer <session.id> <request.id> --allow`, `--deny [--message
   <TEXT>]`, `--text <TEXT>`, `--choice <N>`, or `--json '<OBJECT>'` for an MCP
-  form elicitation. JSON answers are objects; required form fields must be
-  present. Choices are numbered from 1. An unanswered Request never times out
+  form elicitation. JSON answers are objects whose keys come from the
+  Request's `schema`; its required fields must be present. Choices are numbered from 1. An unanswered Request never times out
   into an approval. If the decision is not yours to make, ask the user.
 - Answer delivery is bound to one attempt. Duplicate answers wait for that
   attempt and never start another one. Dlgt restores `pending` only when it
@@ -520,8 +520,8 @@ uses an API key from the environment instead of the subscription.
   successful delivery stays replayable if provider withdrawal or execution
   completion arrives before dlgt commits its receipt.
 - A blocked `fetch` includes the bounded fields needed to answer its Request.
-  Form field names, required lists, enum values, and constraints remain exact.
-  Dlgt truncates display-only text with a marker. If an exact form schema
+  A form's `schema` is the provider's own, unchanged. Dlgt truncates
+  display-only text with a marker. If a form schema
   cannot fit the minimum Request, dlgt declines it to the provider and records
   a `notice`. If a small `--max-bytes` cannot fit the minimum, retry at the
   budget named by `INVALID_ARGUMENT`; an empty `requests` list is never a

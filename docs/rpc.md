@@ -316,10 +316,10 @@ A pending Request has this shape:
 `summary`, `input`, and, when the provider supplied them, `cwd` and `reason`. An
 `input` larger than 2 KiB is replaced by
 `{"truncated": true, "preview": "..."}`. A question carries `summary`,
-`text`, and, when supplied, numbered choices or MCP form `fields`. Choice
-indexes remain exact, and display labels are bounded. Form fields preserve the
-exact `name`, `type`, `required` list, enum values, and constraints. Dlgt
-truncates display-only text with a marker. If an exact form schema cannot fit
+`text`, and, when supplied, numbered choices or an MCP form `schema`. Choice
+indexes remain exact, and display labels are bounded. `schema` is the
+provider's `requestedSchema`, unchanged. Dlgt truncates display-only text with
+a marker. If a form schema cannot fit
 in the minimum Request, dlgt declines it to the provider and records a `notice`
 instead of publishing a changed schema. Every published field is bounded so
 the minimum Request fits under the 256 KiB hard response limit. When a provider

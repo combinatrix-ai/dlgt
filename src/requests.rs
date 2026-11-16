@@ -25,15 +25,6 @@ const TEXT_LIMIT: usize = 8192;
 const REASON_LIMIT: usize = 8192;
 const LABEL_LIMIT: usize = 512;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct FormField {
-    pub name: String,
-    pub field_type: String,
-    pub required: bool,
-    pub enum_values: Vec<Value>,
-    pub constraints: Value,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
     Approval,
@@ -150,9 +141,9 @@ pub enum ProviderRequest {
     CodexUserInput {
         question_ids: Vec<String>,
     },
+    /// `schema` is the provider's `requestedSchema`, published unchanged.
     CodexElicitation {
-        fields: Vec<FormField>,
-        required_fields: Vec<String>,
+        schema: Value,
         form: bool,
     },
 }
@@ -293,30 +284,8 @@ impl RequestRecord {
                         ),
                     );
                 }
-                if let ProviderRequest::CodexElicitation {
-                    fields,
-                    required_fields,
-                    form: true,
-                } = &draft.provider
-                {
-                    value.insert("required".to_owned(), json!(required_fields));
-                    value.insert(
-                        "fields".to_owned(),
-                        json!(
-                            fields
-                                .iter()
-                                .map(|field| {
-                                    json!({
-                                        "name": field.name,
-                                        "type": field.field_type,
-                                        "required": field.required,
-                                        "enum": field.enum_values,
-                                        "constraints": field.constraints,
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        ),
-                    );
+                if let ProviderRequest::CodexElicitation { schema, form: true } = &draft.provider {
+                    value.insert("schema".to_owned(), schema.clone());
                 }
             }
         }
@@ -386,11 +355,7 @@ impl RequestRecord {
                     .collect::<Map<_, _>>();
                 json!({"answers": answers})
             }
-            ProviderRequest::CodexElicitation {
-                required_fields,
-                form,
-                ..
-            } => {
+            ProviderRequest::CodexElicitation { schema, form } => {
                 if !form {
                     return Ok((outcome, json!({"action": "accept"})));
                 }
@@ -408,13 +373,29 @@ impl RequestRecord {
                         "invalid answer: this form requires --json with a JSON object"
                     ),
                 };
-                for field in required_fields {
+                for field in schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
                     if content.get(field).is_none_or(Value::is_null) {
                         fail!(
                             InvalidArgument,
                             "invalid answer: required form field {field:?} is missing"
                         );
                     }
+                }
+                if let (Some(properties), Some(object)) = (
+                    schema.get("properties").and_then(Value::as_object),
+                    content.as_object(),
+                ) && let Some(unknown) = object.keys().find(|key| !properties.contains_key(*key))
+                {
+                    fail!(
+                        InvalidArgument,
+                        "invalid answer: form has no field {unknown:?}"
+                    );
                 }
                 json!({"action": "accept", "content": content})
             }
@@ -829,8 +810,7 @@ mod tests {
     #[test]
     fn answerable_requests_always_have_a_short_public_summary() {
         let mut draft = question(ProviderRequest::CodexElicitation {
-            fields: Vec::new(),
-            required_fields: Vec::new(),
+            schema: Value::Null,
             form: true,
         });
         draft.text = Some(String::new());
@@ -943,120 +923,66 @@ mod tests {
     }
 
     #[test]
-    fn multi_field_elicitation_publishes_schema_and_requires_required_fields() {
-        let fields = vec![
-            super::FormField {
-                name: "name".to_owned(),
-                field_type: "string".to_owned(),
-                required: true,
-                enum_values: Vec::new(),
-                constraints: json!({"maxLength": 40}),
-            },
-            super::FormField {
-                name: "color".to_owned(),
-                field_type: "string".to_owned(),
-                required: true,
-                enum_values: vec![json!("red"), json!("blue")],
-                constraints: Value::Null,
-            },
-        ];
+    fn form_schemas_are_published_verbatim_and_answers_checked_against_them() {
+        let long_name = "required_".to_owned() + &"n".repeat(180);
+        let mut properties = serde_json::Map::new();
+        for index in 0..17 {
+            properties.insert(format!("field_{index}"), json!({"type": "string"}));
+        }
+        properties.insert(long_name.clone(), json!({"type": "string"}));
+        properties.insert(
+            "email".to_owned(),
+            json!({"type": "string", "format": "email"}),
+        );
+        properties.insert(
+            "plan".to_owned(),
+            json!({"type": "string", "oneOf": [
+                {"const": "opaque-a17", "title": "Small"},
+                {"const": "opaque-b93", "title": "Large"}
+            ]}),
+        );
+        properties.insert(
+            "tags".to_owned(),
+            json!({"type": "array", "items": {"type": "string", "enum": ["x", "y"]}}),
+        );
+        let mut required = (0..17)
+            .map(|index| format!("field_{index}"))
+            .collect::<Vec<_>>();
+        required.extend([long_name.clone(), "plan".to_owned()]);
+        let schema = json!({"type": "object", "properties": properties, "required": required});
         let mut draft = question(ProviderRequest::CodexElicitation {
-            fields: fields.clone(),
-            required_fields: vec!["name".to_owned(), "color".to_owned()],
+            schema: schema.clone(),
             form: true,
         });
         draft.choices.clear();
         let record = RequestTable::default().open(draft, Some(4), 1);
-        let public = record.public();
-        assert_eq!(public["fields"][0]["name"], "name");
-        assert_eq!(public["required"], json!(["name", "color"]));
-        assert_eq!(public["fields"][0]["type"], "string");
-        assert_eq!(public["fields"][0]["required"], true);
-        assert_eq!(public["fields"][0]["constraints"]["maxLength"], 40);
-        assert_eq!(public["fields"][1]["enum"], json!(["red", "blue"]));
-        assert!(record.reply(&Answer::Json(json!({"name": "Ada"}))).is_err());
+
+        assert_eq!(record.public()["schema"], schema);
+
+        let mut answer = (0..17)
+            .map(|index| (format!("field_{index}"), json!("v")))
+            .collect::<serde_json::Map<_, _>>();
+        answer.insert(long_name.clone(), json!("v"));
+        assert!(
+            record
+                .reply(&Answer::Json(Value::Object(answer.clone())))
+                .is_err()
+        );
+        answer.insert("plan".to_owned(), json!("opaque-b93"));
         let (outcome, reply) = record
-            .reply(&Answer::Json(json!({"name": "Ada", "color": "blue"})))
+            .reply(&Answer::Json(Value::Object(answer.clone())))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(outcome, Outcome::Answered);
-        assert_eq!(
-            reply,
-            json!({"action": "accept", "content": {
-                "name": "Ada", "color": "blue"
-            }})
+        assert_eq!(reply["content"]["plan"], "opaque-b93");
+        answer.remove("field_16");
+        assert!(
+            record
+                .reply(&Answer::Json(Value::Object(answer.clone())))
+                .is_err()
         );
-    }
-
-    #[test]
-    fn form_publication_preserves_every_schema_identity() {
-        let fields = (0..17)
-            .map(|index| super::FormField {
-                name: format!("field_{index}_{}", "n".repeat(180)),
-                field_type: "string".to_owned(),
-                required: index == 16,
-                enum_values: if index == 16 {
-                    vec![json!(format!("choice_{}", "v".repeat(180)))]
-                } else {
-                    Vec::new()
-                },
-                constraints: json!({"pattern": format!("^{}$", "p".repeat(180))}),
-            })
-            .collect::<Vec<_>>();
-        let draft = question(ProviderRequest::CodexElicitation {
-            fields: fields.clone(),
-            required_fields: fields
-                .iter()
-                .filter(|field| field.required)
-                .map(|field| field.name.clone())
-                .collect(),
-            form: true,
-        });
-        let record = RequestTable::default().open(draft, Some(4), 1);
-        let public = record.public();
-
-        assert_eq!(public["fields"].as_array().map(Vec::len), Some(17));
-        let Some(published_fields) = public["fields"].as_array() else {
-            panic!("published form fields are not an array");
-        };
-        for (published, original) in published_fields.iter().zip(fields) {
-            assert_eq!(published["name"], original.name);
-            assert_eq!(published["required"], original.required);
-            assert_eq!(
-                published["enum"][0],
-                original.enum_values.first().cloned().unwrap_or(Value::Null)
-            );
-            assert_eq!(published["constraints"], original.constraints);
-        }
-    }
-
-    #[test]
-    fn form_publication_preserves_long_names_enums_and_patterns() {
-        let name = "required_".to_owned() + &"n".repeat(180);
-        let enum_values = (0..9)
-            .map(|index| json!(format!("choice_{index}_{}", "v".repeat(180))))
-            .collect::<Vec<_>>();
-        let pattern = format!("^{}$", "p".repeat(240));
-        let field = super::FormField {
-            name: name.clone(),
-            field_type: "string".to_owned(),
-            required: true,
-            enum_values: enum_values.clone(),
-            constraints: json!({"pattern": pattern}),
-        };
-        let record = RequestTable::default().open(
-            question(ProviderRequest::CodexElicitation {
-                fields: vec![field],
-                required_fields: vec![name.clone()],
-                form: true,
-            }),
-            Some(4),
-            1,
-        );
-        let public = record.public();
-
-        assert_eq!(public["fields"][0]["name"], name);
-        assert_eq!(public["fields"][0]["enum"], json!(enum_values));
-        assert_eq!(public["fields"][0]["constraints"]["pattern"], pattern);
+        answer.insert("field_16".to_owned(), json!("v"));
+        answer.insert("not_in_form".to_owned(), json!("v"));
+        assert!(record.reply(&Answer::Json(Value::Object(answer))).is_err());
     }
 
     #[test]

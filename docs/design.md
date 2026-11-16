@@ -359,9 +359,8 @@ Provider requests reach dlgt on the structured channel:
 | Claude `can_use_tool` with no active or canceling execution | refused, with a `notice` message |
 
 Dlgt bounds every field in a published Request so its minimum form fits under
-the 256 KiB response limit. Form field names, required lists, enum values, and
-constraints remain exact; dlgt truncates display-only text with a marker. If
-the exact schema cannot fit, dlgt declines the request to the provider and
+the 256 KiB response limit. A form's `requestedSchema` is published unchanged;
+dlgt truncates display-only text with a marker. If the schema cannot fit, dlgt declines the request to the provider and
 records a `notice` instead of publishing a changed form.
 
 Codex `auto_review` decisions arrive as `item/autoApprovalReview/completed`

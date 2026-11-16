@@ -827,8 +827,8 @@ are answered. A Request's `input` larger than 2 KiB is replaced by
 While a Session is blocked, `fetch` always includes an answerable minimum
 Request with its ID, kind, tool, short summary, and the data required to answer
 it. Every published field is bounded so the minimum Request fits under the
-256 KiB hard limit. Choice indexes and form schema identities remain exact;
-dlgt truncates display text with a marker. If an exact form schema cannot fit,
+256 KiB hard limit. Choice indexes and form schemas remain exact;
+dlgt truncates display text with a marker. If a form schema cannot fit,
 dlgt declines it to the provider and records a `notice` instead of publishing a
 changed schema. If a smaller `--max-bytes` cannot hold a Request, `fetch` fails
 with `INVALID_ARGUMENT` and names a measured working budget; retry at that
@@ -970,10 +970,11 @@ question   the worker asked the user something and is waiting for the reply
 ```
 
 A question carries a short `summary` and `text`, plus either numbered choices
-or form `fields`. Choice objects keep their 1-based `index` when labels are
-truncated. MCP form fields expose their exact `name`, `type`, `required` list,
-enum values, and constraints. Display-only text is truncated with a marker.
-JSON answers must include all required form fields. If the complete schema
+or a form `schema`. Choice objects keep their 1-based `index` when labels are
+truncated. An MCP form's `schema` is the provider's `requestedSchema`,
+unchanged. Display-only text is truncated with a marker. A JSON answer must be
+an object, include every field in the schema's `required` list, and name only
+fields in its `properties`. If the complete schema
 cannot fit in a minimum Request, dlgt declines the provider request and records
 a `notice`. `id` is a short per-Session ordinal, so it survives an agent's
 context. When a provider asks several questions in one request, `text` lists
@@ -999,7 +1000,8 @@ Rules:
 
 - `--allow` and `--deny` answer an `approval`. `--text` and `--choice` answer
   a `question`. `--json` answers an MCP form elicitation with a JSON object;
-  required fields are validated before delivery. The wrong pairing is
+  required and unknown fields are checked before delivery. Values are checked
+  by the provider, not by dlgt. The wrong pairing is
   `INVALID_ARGUMENT`.
 - An allow applies to that one Request. There is no "allow for the rest of
   the Session"; use `--approvals` to change the policy.
