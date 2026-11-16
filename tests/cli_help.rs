@@ -7,8 +7,9 @@ fn dlgt(args: &[&str]) -> std::io::Result<std::process::Output> {
 fn cli_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dlgt"));
     command
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", std::env::temp_dir())
         .env("DLGT_CONFIG", "/dev/null");
     command
 }

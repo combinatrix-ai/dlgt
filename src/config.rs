@@ -98,9 +98,51 @@ impl fmt::Display for AuthMismatch {
 
 impl Error for AuthMismatch {}
 
-pub const AUTH_MISMATCH_MESSAGE: &str =
-    "Claude is configured for subscription authentication but an API key source is present";
-pub const AUTH_MISMATCH_HINT: &str = "Remove ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN with --unset-env ANTHROPIC_API_KEY (or unset_env in [defaults.claude]), or pass --auth any";
+pub const AUTH_MISMATCH_MESSAGE: &str = "Claude subscription authentication could not be confirmed or a non-subscription provider source is configured";
+pub const AUTH_MISMATCH_HINT: &str = "Remove each offending variable with its matching --unset-env option (or unset it in [defaults.claude]): --unset-env ANTHROPIC_API_KEY, --unset-env ANTHROPIC_AUTH_TOKEN, --unset-env ANTHROPIC_AWS_API_KEY, --unset-env ANTHROPIC_AWS_BASE_URL, --unset-env ANTHROPIC_AWS_WORKSPACE_ID, --unset-env ANTHROPIC_BASE_URL, --unset-env ANTHROPIC_BEDROCK_BASE_URL, --unset-env ANTHROPIC_BEDROCK_MANTLE_BASE_URL, --unset-env ANTHROPIC_BEDROCK_REGION_PREFIX, --unset-env ANTHROPIC_BEDROCK_SERVICE_TIER, --unset-env ANTHROPIC_CUSTOM_HEADERS, --unset-env ANTHROPIC_FEDERATION_RULE_ID, --unset-env ANTHROPIC_FOUNDRY_API_KEY, --unset-env ANTHROPIC_FOUNDRY_AUTH_TOKEN, --unset-env ANTHROPIC_FOUNDRY_BASE_URL, --unset-env ANTHROPIC_FOUNDRY_RESOURCE, --unset-env ANTHROPIC_GOOGLE_CLOUD_BASE_URL, --unset-env ANTHROPIC_GOOGLE_CLOUD_LOCATION, --unset-env ANTHROPIC_GOOGLE_CLOUD_PROJECT, --unset-env ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID, --unset-env ANTHROPIC_ORGANIZATION_ID, --unset-env ANTHROPIC_PROFILE, --unset-env ANTHROPIC_VERTEX_BASE_URL, --unset-env ANTHROPIC_VERTEX_PROJECT_ID, --unset-env ANTHROPIC_WORKSPACE_ID, --unset-env AWS_BEARER_TOKEN_BEDROCK, --unset-env CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, --unset-env CLAUDE_CODE_SIMPLE, --unset-env CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH, --unset-env CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH, --unset-env CLAUDE_CODE_SKIP_BEDROCK_AUTH, --unset-env CLAUDE_CODE_SKIP_FOUNDRY_AUTH, --unset-env CLAUDE_CODE_SKIP_MANTLE_AUTH, --unset-env CLAUDE_CODE_SKIP_VERTEX_AUTH, --unset-env CLAUDE_CODE_USE_ANTHROPIC_AWS, --unset-env CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD, --unset-env CLAUDE_CODE_USE_BEDROCK, --unset-env CLAUDE_CODE_USE_FOUNDRY, --unset-env CLAUDE_CODE_USE_MANTLE, --unset-env CLAUDE_CODE_USE_VERTEX; or pass --auth any";
+
+const SUBSCRIPTION_BLOCKING_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_BEDROCK_REGION_PREFIX",
+    "ANTHROPIC_BEDROCK_SERVICE_TIER",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+    "ANTHROPIC_GOOGLE_CLOUD_LOCATION",
+    "ANTHROPIC_GOOGLE_CLOUD_PROJECT",
+    "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_SIMPLE",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+];
 
 pub fn path() -> PathBuf {
     std::env::var_os("DLGT_CONFIG").map_or_else(
@@ -129,9 +171,16 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
 }
 
 pub fn parse(text: &str) -> Result<Config> {
-    let document = text
-        .parse::<DocumentMut>()
-        .context("invalid dlgt config TOML")?;
+    let document = text.parse::<DocumentMut>().map_err(|error| {
+        let offset = error.span().map_or(0, |span| span.start);
+        let (line, column) = line_column(text, offset);
+        anyhow!("invalid dlgt config at {line}:{column}: invalid TOML syntax")
+    })?;
+    parse_document(&document)
+        .map_err(|_| anyhow!("invalid dlgt config at 1:1: invalid configuration entry"))
+}
+
+fn parse_document(document: &DocumentMut) -> Result<Config> {
     let mut config = Config::default();
 
     if let Some(defaults) = document.get("defaults") {
@@ -272,17 +321,45 @@ impl Config {
 
 pub fn validate_auth_environment<'a>(
     policy: AuthPolicy,
-    mut values: impl Iterator<Item = (&'a String, &'a String)>,
+    values: impl Iterator<Item = (&'a String, &'a String)>,
 ) -> Result<()> {
-    if policy == AuthPolicy::Subscription
-        && values.any(|(key, value)| {
-            matches!(key.as_str(), "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN")
-                && !value.is_empty()
+    let blocked = values
+        .filter(|(key, value)| {
+            SUBSCRIPTION_BLOCKING_ENV.contains(&key.as_str())
+                && if key.starts_with("CLAUDE_CODE_USE_")
+                    || key.starts_with("CLAUDE_CODE_SKIP_")
+                    || key.as_str() == "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
+                    || key.as_str() == "CLAUDE_CODE_SIMPLE"
+                {
+                    is_truthy(value)
+                } else {
+                    !value.is_empty()
+                }
         })
-    {
+        .map(|(key, _)| key.as_str())
+        .collect::<Vec<_>>();
+    if policy == AuthPolicy::Subscription && !blocked.is_empty() {
         return Err(AuthMismatch.into());
     }
     Ok(())
+}
+
+fn is_truthy(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let prefix = &text[..offset.min(text.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .map_or(1, |last| last.chars().count() + 1);
+    (line, column)
 }
 
 fn collect_pass_env(
@@ -672,7 +749,7 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
     }
 
     #[test]
-    fn unknown_default_keys_and_harness_names_are_rejected() {
+    fn invalid_entries_are_rejected_without_echoing_the_config_source() {
         for text in [
             "[defaults.claude]\nunknown = true",
             "[defaults.mystery]\nmodel = \"x\"",
@@ -686,8 +763,27 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
                 || "invalid defaults unexpectedly parsed".to_owned(),
                 |error| error.to_string(),
             );
-            assert!(message.contains("unknown"), "unexpected error: {message}");
+            assert!(message.contains("1:1"), "missing location: {message}");
+            assert!(
+                !message.contains("unknown") && !message.contains("mystery"),
+                "source text leaked in error: {message}"
+            );
         }
+    }
+
+    #[test]
+    fn malformed_toml_errors_include_location_without_source_text() {
+        let secret = "super-secret-config-token";
+        let text = format!("[profiles.secret]\nvalue = \"{secret}\"\nthis is not TOML");
+        let Err(error) = super::parse(&text) else {
+            panic!("malformed configuration was accepted");
+        };
+        let message = error.to_string();
+        assert!(message.contains("3:"), "missing source location: {message}");
+        assert!(
+            !message.contains(secret),
+            "secret leaked in error: {message}"
+        );
     }
 
     #[test]
@@ -714,18 +810,47 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
     }
 
     #[test]
-    fn subscription_policy_rejects_only_nonempty_api_key_variables() {
+    fn subscription_policy_rejects_api_keys_and_provider_routing_environment() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AWS_BASE_URL",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+            "ANTHROPIC_FOUNDRY_BASE_URL",
+            "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+            "ANTHROPIC_VERTEX_BASE_URL",
+        ] {
+            let values = client_environment(&[(key, "sensitive-route-value")]);
+            let Err(error) = validate_auth_environment(AuthPolicy::Subscription, values.iter())
+            else {
+                panic!("subscription auth accepted {key}");
+            };
+            assert!(error.downcast_ref::<AuthMismatch>().is_some());
+            assert!(!error.to_string().contains("sensitive-route-value"));
+        }
+        for key in [
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_SIMPLE",
+        ] {
+            let values = client_environment(&[(key, "true")]);
+            assert!(
+                validate_auth_environment(AuthPolicy::Subscription, values.iter()).is_err(),
+                "subscription auth accepted {key}"
+            );
+            let false_values = client_environment(&[(key, "false")]);
+            assert!(
+                validate_auth_environment(AuthPolicy::Subscription, false_values.iter()).is_ok()
+            );
+        }
         let values = client_environment(&[("ANTHROPIC_API_KEY", "dummy-not-a-key")]);
-        let result = validate_auth_environment(AuthPolicy::Subscription, values.iter());
-        assert!(
-            result.is_err(),
-            "subscription policy must reject a nonempty API key"
-        );
-        let error = result
-            .err()
-            .unwrap_or_else(|| anyhow::anyhow!("expected an auth mismatch"));
-        assert!(error.downcast_ref::<AuthMismatch>().is_some());
-        assert!(!error.to_string().contains("dummy-not-a-key"));
         assert!(validate_auth_environment(AuthPolicy::Any, values.iter()).is_ok());
         let empty = client_environment(&[("ANTHROPIC_API_KEY", "")]);
         assert!(validate_auth_environment(AuthPolicy::Subscription, empty.iter()).is_ok());

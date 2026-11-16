@@ -378,6 +378,37 @@ pub fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     })
 }
 
+/// Confirm a Claude subscription login without inheriting provider-routing
+/// overrides or exposing the command's potentially sensitive output.
+pub fn verify_claude_subscription_login() -> Result<()> {
+    let program =
+        std::env::var_os("DLGT_CLAUDE_BIN").map_or_else(|| PathBuf::from("claude"), PathBuf::from);
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let mut command = std::process::Command::new(program);
+    command
+        .args(["auth", "status"])
+        .env_clear()
+        .env("HOME", home);
+    for name in ["PATH", "USER", "TERM"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command.output().map_err(|_| crate::config::AuthMismatch)?;
+    if !output.status.success() {
+        return Err(crate::config::AuthMismatch.into());
+    }
+    let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return Err(crate::config::AuthMismatch.into());
+    };
+    let confirmed = status.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(true)
+        && status.get("authMethod").and_then(serde_json::Value::as_str) == Some("claude.ai");
+    if !confirmed {
+        return Err(crate::config::AuthMismatch.into());
+    }
+    Ok(())
+}
+
 fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
     options
         .iter()
@@ -413,6 +444,11 @@ fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
                     | "permission-prompts"
                     | "dangerously-skip-permissions"
                     | "allow-dangerously-skip-permissions"
+                    | "allowedTools"
+                    | "allowed-tools"
+                    | "settings"
+                    | "settings-file"
+                    | "bare"
             ) {
                 bail!("harness option {key:?} is managed by dlgt");
             }
@@ -445,7 +481,11 @@ fn codex_harness_args(options: &[String]) -> Result<Vec<String>> {
                 | "approval_policy"
                 | "sandbox_mode"
                 | "approvals_reviewer"
+                | "sandbox_workspace_write"
         ) {
+            bail!("harness option {key:?} is managed by dlgt");
+        }
+        if key.starts_with("sandbox_workspace_write.") {
             bail!("harness option {key:?} is managed by dlgt");
         }
         args.extend(["--config".to_owned(), option.clone()]);
@@ -621,6 +661,11 @@ mod tests {
             "permission-mode=plan",
             "permission-prompt-tool=x",
             "permission-prompts=none",
+            "allowedTools=Bash",
+            "allowed-tools=Bash",
+            "settings={}",
+            "settings-file=permissions.json",
+            "bare",
             "dangerously-skip-permissions",
             "output-format=text",
         ] {
@@ -695,6 +740,8 @@ mod tests {
             "approval_policy=never",
             "sandbox_mode=danger-full-access",
             "approvals_reviewer=user",
+            "sandbox_workspace_write=true",
+            "sandbox_workspace_write.network_access=true",
             "check_for_update_on_startup=true",
         ] {
             assert!(
