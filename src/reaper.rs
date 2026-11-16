@@ -137,11 +137,12 @@ pub fn watch_exit(
     name: &str,
     drained: std::sync::mpsc::Receiver<()>,
     on_exit: impl FnOnce(Option<std::process::ExitStatus>) + Send + 'static,
-) -> anyhow::Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+) -> anyhow::Result<ExitWatch> {
     use anyhow::Context as _;
     let pid = child.id();
-    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let exit_flag = std::sync::Arc::clone(&exited);
+    let watch = ExitWatch::default();
+    let exit_flag = std::sync::Arc::clone(&watch.exited);
+    let stop_output = std::sync::Arc::clone(&watch.stop_output);
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
@@ -153,10 +154,60 @@ pub fn watch_exit(
                 unsafe { libc::kill(-group, libc::SIGKILL) };
             }
             let _ = drained.recv_timeout(DRAIN_GRACE);
+            // Whatever is still unread after the grace belongs to a process
+            // outside the provider's group; stop reading it.
+            stop_output.store(true, std::sync::atomic::Ordering::Release);
             on_exit(status);
         })
         .context("failed to start provider exit thread")?;
-    Ok(exited)
+    Ok(watch)
+}
+
+/// Flags shared between a provider's exit thread and its output reader.
+#[derive(Default)]
+pub struct ExitWatch {
+    pub exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub stop_output: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A provider output stream that ends when its provider's exit has been
+/// reported, even if a process outside the provider's group still holds the
+/// write end open.
+pub struct StoppableOutput<R> {
+    inner: R,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R> StoppableOutput<R> {
+    pub const fn new(inner: R, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { inner, stop }
+    }
+}
+
+impl<R: std::io::Read + std::os::fd::AsRawFd> std::io::Read for StoppableOutput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(0);
+            }
+            let mut ready = libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads one valid pollfd for this open descriptor.
+            let polled = unsafe { libc::poll(&raw mut ready, 1, 200) };
+            if polled > 0 {
+                return self.inner.read(buffer);
+            }
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 /// The provider closed its output. A provider that is still running after

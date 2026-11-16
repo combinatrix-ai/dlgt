@@ -57,6 +57,7 @@ pub struct CodexConnection {
 }
 
 impl CodexConnection {
+    #[allow(clippy::too_many_lines)]
     pub fn connect(
         handler: NotificationHandler,
         environment: Option<&HashMap<String, String>>,
@@ -110,7 +111,7 @@ impl CodexConnection {
         let exit_handler = Arc::clone(&handler);
         let exit_pending = Arc::clone(&pending);
         let exit_closed = Arc::clone(&closed);
-        let exited =
+        let exit_watch =
             crate::reaper::watch_exit(child, "dlgt-codex-exit", drained_signal, move |status| {
                 let reason = status.map_or_else(
                     || "Codex app-server closed the connection".to_owned(),
@@ -128,6 +129,10 @@ impl CodexConnection {
         std::thread::Builder::new()
             .name("dlgt-codex-app-server".to_owned())
             .spawn(move || {
+                let stdout = crate::reaper::StoppableOutput::new(
+                    stdout,
+                    Arc::clone(&exit_watch.stop_output),
+                );
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
                     if line.trim().is_empty() {
@@ -150,7 +155,7 @@ impl CodexConnection {
                     }
                 }
                 drop(drained);
-                crate::reaper::output_closed(pid, &exited);
+                crate::reaper::output_closed(pid, &exit_watch.exited);
             })
             .context("failed to start Codex app-server I/O thread")?;
 

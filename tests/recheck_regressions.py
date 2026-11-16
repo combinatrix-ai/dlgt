@@ -1154,6 +1154,32 @@ class RecheckRegressions(unittest.TestCase):
         finally:
             os.kill(provider, signal.SIGCONT)
 
+    def test_output_readers_end_after_an_escaped_holder_outlives_the_provider(self) -> None:
+        h = self.harness
+
+        def threads() -> int:
+            task_dir = Path(f"/proc/{h.server.pid}/task")
+            if task_dir.exists():
+                return len(list(task_dir.iterdir()))
+            listing = subprocess.run(
+                ["ps", "-M", "-p", str(h.server.pid)], check=False, capture_output=True, text=True
+            ).stdout
+            return len(listing.splitlines()) - 1
+
+        baseline = threads()
+        for harness in ("claude", "codex"):
+            holder_file = h.root / f"{harness}-reader.pid"
+            session = h.create(
+                harness,
+                "first",
+                {"DLGT_FAKE_HOLDER_PID_FILE": str(holder_file), "DLGT_FAKE_ESCAPE_HOLDER": "1"},
+            )["result"]["session"]["id"]
+            h.wait_state(session, "idle")
+            h.rpc("session.send", {"session": session, "request_id": f"{harness}-reader", "prompt": "crash-hold"})
+            h.wait_state(session, "failed", timeout=6)
+        time.sleep(1.5)
+        self.assertLessEqual(threads(), baseline + 2, "provider output readers outlived their exit")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
