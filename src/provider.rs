@@ -612,10 +612,11 @@ pub fn verify_claude_subscription_login(
     };
     auth_processes.insert(group);
     let readers_stop = Arc::new(AtomicBool::new(false));
-    let _group_guard = AuthGroupGuard {
+    let mut group_guard = AuthGroupGuard {
         group,
         auth_processes,
         readers_stop: Arc::clone(&readers_stop),
+        readers: Vec::new(),
         _registration: registration,
     };
     if shutting_down.load(Ordering::Acquire) {
@@ -631,7 +632,10 @@ pub fn verify_claude_subscription_login(
         .take()
         .context("Claude auth status stderr was unavailable")?;
     let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout, Arc::clone(&readers_stop)) {
-        Ok(output) => output,
+        Ok((output, thread)) => {
+            group_guard.readers.push(thread);
+            output
+        }
         Err(error) => {
             kill_process_group(group);
             let _ = child.wait();
@@ -639,7 +643,10 @@ pub fn verify_claude_subscription_login(
         }
     };
     let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr, Arc::clone(&readers_stop)) {
-        Ok(output) => output,
+        Ok((output, thread)) => {
+            group_guard.readers.push(thread);
+            output
+        }
         Err(error) => {
             kill_process_group(group);
             let _ = child.wait();
@@ -709,6 +716,7 @@ struct AuthGroupGuard<'a> {
     group: i32,
     auth_processes: &'a AuthProcessGroups,
     readers_stop: Arc<AtomicBool>,
+    readers: Vec<std::thread::JoinHandle<()>>,
     _registration: Registration,
 }
 
@@ -716,6 +724,11 @@ impl Drop for AuthGroupGuard<'_> {
     fn drop(&mut self) {
         kill_process_group(self.group);
         self.readers_stop.store(true, Ordering::Release);
+        // Readers poll a nonblocking pipe and check `stop` on every pass, so
+        // joining here waits at most one poll interval.
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
         self.auth_processes.remove(self.group);
     }
 }
@@ -731,19 +744,25 @@ fn drain_bounded<R: Read + std::os::fd::AsRawFd + Send + 'static>(
     name: &str,
     mut reader: R,
     stop: Arc<AtomicBool>,
-) -> Result<std::sync::mpsc::Receiver<BoundedOutput>> {
+) -> Result<(
+    std::sync::mpsc::Receiver<BoundedOutput>,
+    std::thread::JoinHandle<()>,
+)> {
     // Nonblocking, so the reader can notice `stop` while a process outside
     // the killed group still holds the write end open.
     // SAFETY: fcntl only reads and sets the status flags of this valid fd.
-    unsafe {
+    let nonblocking = unsafe {
         let fd = reader.as_raw_fd();
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+    };
+    if !nonblocking {
+        return Err(anyhow!(
+            "could not make Claude auth status output nonblocking"
+        ));
     }
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    let reader = std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
             let mut output = BoundedOutput {
@@ -751,14 +770,11 @@ fn drain_bounded<R: Read + std::os::fd::AsRawFd + Send + 'static>(
                 overflowed: false,
             };
             let mut buffer = [0_u8; 8192];
-            loop {
+            while !stop.load(Ordering::Acquire) {
                 let size = match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(size) => size,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if stop.load(Ordering::Acquire) {
-                            break;
-                        }
                         std::thread::sleep(Duration::from_millis(5));
                         continue;
                     }
@@ -774,7 +790,7 @@ fn drain_bounded<R: Read + std::os::fd::AsRawFd + Send + 'static>(
             let _ = sender.send(output);
         })
         .context("failed to start Claude auth status output reader")?;
-    Ok(receiver)
+    Ok((receiver, reader))
 }
 
 fn kill_process_group(group: i32) {
@@ -1297,6 +1313,27 @@ harness_options = ["approval_policy=never"]
             );
         }
         assert!(claude_harness_args(&["add-dir=/private/tmp".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn an_auth_reader_stops_on_request_even_while_input_keeps_arriving() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let zero = std::fs::File::open("/dev/zero")
+            .unwrap_or_else(|error| panic!("failed to open /dev/zero: {error}"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (output, reader) = super::drain_bounded("test-zero", zero, Arc::clone(&stop))
+            .unwrap_or_else(|error| panic!("{error}"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, Ordering::Release);
+        let stopped = output
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("reader kept reading after stop"));
+        assert!(stopped.overflowed);
+        reader
+            .join()
+            .unwrap_or_else(|_| panic!("reader panicked"));
     }
 
     #[test]
