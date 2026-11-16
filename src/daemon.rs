@@ -4807,8 +4807,19 @@ mod tests {
             .unwrap_or_else(|| panic!("second starter acquired the ownership lock"));
         assert!(second.to_string().contains("ownership lock"));
         drop(first);
-        DaemonLock::acquire(&socket_path)
-            .unwrap_or_else(|error| panic!("lock was not released with the daemon: {error:#}"));
+        // Other tests spawn processes concurrently. A child forked before its
+        // exec briefly shares every open lock file, so allow that window to
+        // pass instead of treating it as a held lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match DaemonLock::acquire(&socket_path) {
+                Ok(_) => break,
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    panic!("lock was not released with the daemon: {error:#}")
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
     }
 
     #[test]
