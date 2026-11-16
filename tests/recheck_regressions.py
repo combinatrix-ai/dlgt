@@ -1081,6 +1081,10 @@ class RecheckRegressions(unittest.TestCase):
             h.wait_state(session, "idle")
             followup = h.rpc("session.send", {"session": session, "request_id": "after-race", "prompt": "after"})
             self.assertIn("result", followup, (harness, followup))
+            h.wait_state(session, "idle")
+            h.rpc("session.stop", {"session": session, "force": True})
+            stopped = h.wait_state(session, "stopped")
+            self.assertIsNone(stopped.get("launch_failure"), (harness, stopped))
 
     def test_a_late_rotation_from_a_replaced_claude_never_renames_its_replacement(self) -> None:
         self.harness.close()

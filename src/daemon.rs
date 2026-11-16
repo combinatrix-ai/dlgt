@@ -866,6 +866,7 @@ impl Daemon {
             runtime.force_stop();
             self.fail_unpublished(&id, generation, "failed to publish provider Session ID");
             return Err(self.session_launch_failure(
+                generation,
                 &id,
                 &error.context("failed to publish provider Session ID"),
                 None,
@@ -903,6 +904,7 @@ impl Daemon {
                     error
                 };
                 return Err(self.session_launch_failure(
+                    generation,
                     &id,
                     &error.context("initial prompt acceptance failed"),
                     Some(runtime.stderr_tail()),
@@ -940,7 +942,7 @@ impl Daemon {
                 "launch_failed",
                 "provider startup deadline expired",
             );
-            return Err(self.session_launch_failure(id, &error, None));
+            return Err(self.session_launch_failure(generation, id, &error, None));
         }
         let spawned = match options.agent {
             Agent::Claude => {
@@ -975,6 +977,7 @@ impl Daemon {
                 }
                 drop(store);
                 return Err(self.session_launch_failure(
+                    generation,
                     &session_id,
                     &failure.error,
                     failure.detail,
@@ -1000,6 +1003,7 @@ impl Daemon {
                 .remove(id);
             runtime.force_stop();
             return Err(self.session_launch_failure(
+                generation,
                 id,
                 &anyhow!(
                     "launch failed: the provider process exited before the Session became ready"
@@ -1023,6 +1027,7 @@ impl Daemon {
     /// failed Session for `show`.
     fn session_launch_failure(
         &self,
+        generation: u64,
         session_id: &str,
         error: &anyhow::Error,
         detail: Option<String>,
@@ -1034,7 +1039,7 @@ impl Daemon {
         });
         let failure = SessionLaunchFailure::new(session_id, agent, error, detail);
         if let Ok(store) = self.lock_store() {
-            store.set_launch_failure(session_id, failure.to_json());
+            store.set_launch_failure(session_id, generation, failure.to_json());
         }
         failure.into()
     }

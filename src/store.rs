@@ -164,7 +164,12 @@ impl Store {
 
     /// The provider process for `generation` is ready for prompts.
     pub fn ready(&self, id: &str, generation: Generation) -> bool {
-        self.transition(id, generation, &Event::Ready, None).is_ok()
+        let ready = self.transition(id, generation, &Event::Ready, None).is_ok();
+        if ready && let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
+            // A launch that succeeded replaces any earlier launch's diagnostics.
+            session.launch_failure = None;
+        }
+        ready
     }
 
     /// The provider process for `generation` exited. An execution it was
@@ -363,8 +368,12 @@ impl Store {
             .is_ok()
     }
 
-    pub fn set_launch_failure(&self, id: &str, failure: Value) {
-        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
+    /// Keep the diagnostics of a launch that failed, only while that launch's
+    /// generation still owns the Session.
+    pub fn set_launch_failure(&self, id: &str, generation: Generation, failure: Value) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id)
+            && session.lifecycle.generation() == generation
+        {
             session.launch_failure = Some(failure);
         }
     }
