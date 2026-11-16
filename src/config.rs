@@ -601,8 +601,10 @@ fn parse_profile(name: &str, table: &dyn TableLike) -> Result<Profile> {
             )
         })
         .transpose()?;
-    if harness.as_deref() == Some("codex") && settings.auth.is_some() {
-        bail!("auth is only valid for Claude Profiles");
+    if harness.as_deref() == Some("codex")
+        && let Some(auth) = table.get("auth")
+    {
+        at_item(auth, Err(anyhow!("auth is only valid for Claude Profiles")))?;
     }
     let mut public = Map::new();
     for (key, item) in table.iter() {
@@ -918,6 +920,7 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
                 "5:",
             ),
             ("# c\n\n[defualts.codex]\napprovals = \"ask\"", "3:"),
+            ("[profiles.p]\nharness = \"codex\"\nauth = \"any\"", "3:"),
         ] {
             let result = super::parse(text);
             assert!(

@@ -311,7 +311,7 @@ fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
         return Err(provider_config_error(
             &state_path,
             &existing,
-            json_key_offset(&existing, "projects"),
+            json_member_offset(&existing, &["projects"]),
         ));
     }
     let Some(projects) = projects_entry.as_object_mut() else {
@@ -327,7 +327,7 @@ fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
         return Err(provider_config_error(
             &state_path,
             &existing,
-            json_key_offset(&existing, cwd),
+            json_member_offset(&existing, &["projects", cwd]),
         ));
     }
     let Some(project) = cwd_entry.as_object_mut() else {
@@ -401,31 +401,44 @@ fn provider_config_error(path: &Path, contents: &str, offset: usize) -> anyhow::
     )
 }
 
-/// Offset of `key` as a member of the top-level JSON object, found by
-/// walking the text so a same-named key nested deeper is never chosen.
-fn json_key_offset(contents: &str, key: &str) -> usize {
+/// Offset of the member at `path` (object keys from the root), found by
+/// walking the text with decoded keys, so neither a same-named key elsewhere
+/// nor an escaped spelling of the key misleads it. 0 when not found.
+fn json_member_offset(contents: &str, path: &[&str]) -> usize {
     let bytes = contents.as_bytes();
-    let mut depth = 0_usize;
+    // Object nesting from the root: for each level, the key being read.
+    let mut keys: Vec<Option<String>> = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'{' => keys.push(None),
+            b'[' => keys.push(Some(String::new())),
+            b'}' | b']' => {
+                keys.pop();
+            }
             b'"' => {
                 let start = index;
                 index += 1;
                 while index < bytes.len() && bytes[index] != b'"' {
                     index += if bytes[index] == b'\\' { 2 } else { 1 };
                 }
-                let text = contents
-                    .get(start + 1..index.min(bytes.len()))
+                let raw = contents
+                    .get(start..=index.min(bytes.len() - 1))
                     .unwrap_or_default();
-                let is_member = contents[index.min(bytes.len())..]
-                    .trim_start_matches('"')
-                    .trim_start()
-                    .starts_with(':');
-                if depth == 1 && is_member && text == key {
-                    return start;
+                let rest = contents.get(index + 1..).unwrap_or_default();
+                if rest.trim_start().starts_with(':')
+                    && let Ok(key) = serde_json::from_str::<String>(raw)
+                {
+                    if let Some(level) = keys.last_mut() {
+                        *level = Some(key);
+                    }
+                    let current = keys
+                        .iter()
+                        .map(|key| key.as_deref().unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    if current == path {
+                        return start;
+                    }
                 }
             }
             _ => {}
@@ -1331,9 +1344,19 @@ harness_options = ["approval_policy=never"]
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap_or_else(|_| panic!("reader kept reading after stop"));
         assert!(stopped.overflowed);
-        reader
-            .join()
-            .unwrap_or_else(|_| panic!("reader panicked"));
+        reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    }
+
+    #[test]
+    fn json_members_are_located_by_decoded_path() {
+        let text = "{\n  \"nested\": {\"projects\": {}},\n  \"pro\\u006aects\": {\n    \"/w\": 3\n  }\n}\n";
+        let line = |offset: usize| text[..offset].matches('\n').count() + 1;
+        assert_eq!(line(super::json_member_offset(text, &["projects"])), 3);
+        assert_eq!(
+            line(super::json_member_offset(text, &["projects", "/w"])),
+            4
+        );
+        assert_eq!(super::json_member_offset(text, &["missing"]), 0);
     }
 
     #[test]
