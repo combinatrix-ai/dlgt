@@ -615,6 +615,24 @@ impl Store {
         self.state.borrow().turns.get(id).cloned()
     }
 
+    /// The execution bound to `provider_turn_id` in this Session, if any.
+    pub fn execution_for_provider_turn(
+        &self,
+        session_id: &str,
+        provider_turn_id: &str,
+    ) -> Option<i64> {
+        let session_id = self.session_key(session_id);
+        self.state
+            .borrow()
+            .turns
+            .values()
+            .find(|turn| {
+                turn.session_id == session_id
+                    && turn.provider_turn_id.as_deref() == Some(provider_turn_id)
+            })
+            .map(|turn| turn.execution_seq)
+    }
+
     pub fn turn_for_execution(&self, session_id: &str, execution_seq: i64) -> Option<TurnRecord> {
         self.state
             .borrow()

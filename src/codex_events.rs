@@ -280,9 +280,25 @@ pub fn apply_notification(
             let current = store
                 .get_session(session_id)
                 .context("session disappeared while starting Codex turn")?;
-            let turn_id = if let Some(turn_id) = current.active_turn_id {
-                turn_id
-            } else {
+            if let Some(turn_id) = current.active_turn_id {
+                // An execution dlgt submitted takes its provider turn ID from
+                // the turn/start response only. A notification naming another
+                // turn must not bind to it.
+                let bound = store
+                    .get_turn(&turn_id)
+                    .and_then(|turn| turn.provider_turn_id);
+                if bound.as_deref() == Some(provider_turn_id) {
+                    store.mark_turn_started(&turn_id, None);
+                } else {
+                    store.record_event(
+                        Some(session_id),
+                        Some(&turn_id),
+                        "provider.turn_started_unmatched",
+                    );
+                }
+                return Ok(true);
+            }
+            let turn_id = {
                 // Codex started a turn dlgt did not submit: it becomes a new
                 // execution so its result stays observable.
                 let turn_id = format!("turn_{}", Uuid::new_v4().simple());
@@ -366,7 +382,15 @@ pub fn apply_notification(
                 && let Some(item) = params.get("item")
                 && let Some(body) = items.message(method == "item/completed", item)
             {
-                store.append_message(session_id, body);
+                match owning_execution(store, session_id, params) {
+                    Owner::Session => {
+                        store.append_message(session_id, body);
+                    }
+                    Owner::Execution(seq) => {
+                        store.append_execution_message(session_id, Some(seq), body);
+                    }
+                    Owner::Unbound => {}
+                }
             }
         }
         "item/autoApprovalReview/completed" => {
@@ -380,10 +404,16 @@ pub fn apply_notification(
                 Some("aborted") => Decision::Aborted,
                 _ => return Ok(true),
             };
+            let execution = match owning_execution(store, session_id, params) {
+                Owner::Session => None,
+                Owner::Execution(seq) => Some(seq),
+                Owner::Unbound => return Ok(true),
+            };
             let action = params.get("action").unwrap_or(&Value::Null);
             let (tool, summary) = review_action(action);
-            store.append_message(
+            store.append_execution_message(
                 session_id,
+                execution,
                 MessageBody::approval(
                     decision,
                     Decider::ProviderReviewer,
@@ -479,6 +509,33 @@ fn codex_thread_matches(session: &SessionRecord, params: &Value) -> Result<bool>
         .id
         .strip_prefix("codex:")
         .is_some_and(|provider_id| provider_id == thread_id))
+}
+
+/// The execution a notification belongs to, by its `turnId`: the execution
+/// bound to that provider turn, the active one while its turn ID is still
+/// unknown, or none when it names a turn dlgt has not bound. `Some(None)`
+/// means the notification carries no turn and belongs to the Session.
+fn owning_execution(store: &Store, session_id: &str, params: &Value) -> Owner {
+    let Some(provider_turn_id) = params.get("turnId").and_then(Value::as_str) else {
+        return Owner::Session;
+    };
+    if let Some(execution) = store.execution_for_provider_turn(session_id, provider_turn_id) {
+        return Owner::Execution(execution);
+    }
+    store
+        .get_session(session_id)
+        .and_then(|session| session.active_turn_id)
+        .and_then(|turn_id| store.get_turn(&turn_id))
+        .filter(|active| active.provider_turn_id.is_none())
+        .map_or(Owner::Unbound, |active| {
+            Owner::Execution(active.execution_seq)
+        })
+}
+
+enum Owner {
+    Session,
+    Execution(i64),
+    Unbound,
 }
 
 fn local_turn_for_provider(
@@ -577,22 +634,13 @@ mod tests {
     }
 
     fn busy_store() -> (Store, CodexItems) {
-        let mut store = ready_store("codex");
+        let store = ready_store("codex");
         store
             .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        let mut items = CodexItems::default();
-        apply_notification(
-            &mut store,
-            "codex:thread-1",
-            &mut items,
-            &json!({
-                "method": "turn/started",
-                "params": {"threadId": "thread-1", "turn": {"id": "provider-turn", "items": []}},
-            }),
-        )
-        .unwrap_or_else(|error| panic!("failed to start Codex turn: {error}"));
-        (store, items)
+        // The turn/start response binds the provider turn, as CodexStart does.
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
+        (store, CodexItems::default())
     }
 
     fn messages(store: &Store) -> Vec<serde_json::Value> {
@@ -886,7 +934,48 @@ mod tests {
     }
 
     #[test]
-    fn codex_retry_error_does_not_finish_before_authoritative_completion() {
+    fn notifications_from_another_turn_never_bind_to_or_land_in_the_active_execution() {
+        let (mut store, mut items) = busy_store();
+        apply_notification(
+            &mut store,
+            "codex:thread-1",
+            &mut items,
+            &json!({
+                "method": "turn/started",
+                "params": {"threadId": "thread-1", "turn": {"id": "WRONG-TURN", "items": []}},
+            }),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply start: {error}"));
+        assert_eq!(
+            store
+                .get_turn("turn_1")
+                .and_then(|turn| turn.provider_turn_id)
+                .as_deref(),
+            Some("provider-turn")
+        );
+        apply_notification(
+            &mut store,
+            "codex:thread-1",
+            &mut items,
+            &json!({
+                "method": "item/autoApprovalReview/completed",
+                "params": {
+                    "threadId": "thread-1", "turnId": "WRONG-TURN", "reviewId": "rv",
+                    "review": {"status": "denied", "riskLevel": "high", "rationale": "x"},
+                    "action": {"type": "command", "command": "rm -rf /"},
+                },
+            }),
+        )
+        .unwrap_or_else(|error| panic!("failed to apply review: {error}"));
+        assert_eq!(
+            store.get_turn("turn_1").map(|turn| turn.denied_requests),
+            Some(0)
+        );
+        assert!(messages(&store).is_empty(), "{:?}", messages(&store));
+    }
+
+    #[test]
+    fn a_start_notification_never_binds_a_turn_awaiting_its_start_response() {
         let mut store = ready_store("codex");
         store
             .insert_turn("turn_1", "codex:thread-1", "hello")
@@ -896,10 +985,25 @@ mod tests {
             "codex:thread-1",
             &json!({
                 "method": "turn/started",
-                "params": {"threadId": "thread-1", "turn": {"id": "provider-turn", "items": []}},
+                "params": {"threadId": "thread-1", "turn": {"id": "WRONG-TURN", "items": []}},
             }),
         )
-        .unwrap_or_else(|error| panic!("failed to start Codex turn: {error}"));
+        .unwrap_or_else(|error| panic!("failed to apply start: {error}"));
+        assert_eq!(
+            store
+                .get_turn("turn_1")
+                .and_then(|turn| turn.provider_turn_id),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_retry_error_does_not_finish_before_authoritative_completion() {
+        let mut store = ready_store("codex");
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-turn")));
         apply_codex_notification(
             &mut store,
             "codex:thread-1",
