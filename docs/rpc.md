@@ -40,8 +40,9 @@ Failure:
 
 Raw RPC responses do not use the CLI's `ok:true` or `ok:false` wrapper. Blank
 input lines are ignored. Invalid JSON, framing failures, and a closed transport
-terminate the stdio proxy. The proxy rejects a method outside the public list
-with `INVALID_ARGUMENT`.
+terminate the stdio proxy. A malformed JSON frame sent directly to the socket,
+an unknown daemon method, or a method outside the stdio proxy's public list
+returns `INVALID_ARGUMENT`.
 
 A request `id` is echoed in the response envelope, so it is bounded: an id
 longer than 200 bytes is rejected with `INVALID_ARGUMENT`, and the rejection
@@ -67,12 +68,15 @@ profile.list          List client-side Profiles
 `claude:<session-id>` Session ID, or the active human alias. `harness` is
 `codex` or `claude`.
 
+`from_start` is an RPC-only `session.fetch` parameter; the CLI does not expose
+it as a `fetch` option.
+
 | Method | Parameters |
 | --- | --- |
 | `session.create` | `title`, optional `alias`, `harness`, optional `cwd`, optional `model`, optional `effort`, optional `approvals` (`auto`, `ask`, or `bypass`; default `auto`), optional `harness_options`, required non-empty `prompt`, required `request_id`, optional `startup_timeout_ms`, launch `environment` |
 | `session.restart` | `session`, optional `startup_timeout_ms`, fresh launch `environment` |
 | `session.send` | `session`, required non-empty `prompt`, required `request_id`, optional `steer` boolean, optional `resume` boolean; with `resume:true`, the launch parameters of `session.create` except `title`, `alias`, and `harness` |
-| `session.answer` | `session`, `request` (a Request ID such as `r3`), `decision` (`allow`, `deny`, `text`, or `choice`), `message` with `deny`, `text` with `text`, `choice` (1-based) with `choice` |
+| `session.answer` | `session`, `request` (a Request ID such as `r3`), `decision` (`allow`, `deny`, `text`, `choice`, or `json`), `message` with `deny`, `text` with `text`, `choice` (1-based) with `choice`, `json` object with `json` |
 | `session.fetch` | `session`, optional `cursor` (a position, as a number or a string of digits), optional `wait_ms` (max 86,400,000), optional `messages` (boolean or a positive count), optional `max_bytes`, optional `from_start` boolean |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
@@ -152,8 +156,9 @@ A steer returns the running execution instead of a new one:
 ```
 
 Steering requires a `busy` Session. Idle is `NO_ACTIVE_EXECUTION`, blocked is
-`SESSION_BLOCKED`, and canceling is `SESSION_UNAVAILABLE`. Delivery is
-reported later through `steer` messages. See
+`SESSION_BLOCKED`, and canceling is `SESSION_UNAVAILABLE`. A Codex steer before
+the `turn/start` response binds the provider turn ID returns
+`SESSION_UNAVAILABLE`. Delivery is reported later through `steer` messages. See
 [Design](design.md#steering) for how each provider delivers it.
 
 ### Answers
@@ -171,6 +176,14 @@ an approval; `text` and `choice` answer a question. The Session must be live:
 otherwise the call fails with `SESSION_NOT_RUNNING`. An unknown Request is
 `REQUEST_NOT_FOUND`, and a different answer to a resolved Request is
 `REQUEST_RESOLVED`. The answer returns as soon as the provider accepted it.
+While delivery is in progress the Request has `answer_state: "sending"`; a
+duplicate of that same answer waits for the outcome and replays only a
+delivered receipt. If delivery fails while the provider remains available,
+the Request returns to `pending` and can be answered again. If the provider
+cannot receive the answer, dlgt fails the Session with a structured error.
+Codex denial receipts include `reason_delivered`; when false they also include
+`reason_error`. dlgt sends the denial reason through `turn/steer` before the
+decline when the provider turn is available.
 
 ### Other results
 
@@ -185,6 +198,11 @@ otherwise the call fails with `SESSION_NOT_RUNNING`. An unknown Request is
 
 `resume_command` is the provider's own command for opening the conversation
 in its interactive UI, such as `claude --resume <id>` or `codex resume <id>`.
+`session.restart` accepts an active `canceling` Session. If a cancel arrives
+before Codex acknowledges its provider turn ID, dlgt holds it for that same
+execution and applies the interrupt when the ID arrives. The cancellation
+timeout covers this wait and all provider controls; expiration returns
+`CANCEL_TIMEOUT` while the Session stays `canceling`.
 
 ## Session and result schemas
 
@@ -260,8 +278,7 @@ A retained result has this shape:
 
 `status` is `completed`, `failed`, `canceled`, or `interrupted`.
 `final_text` is always a string, although it may be empty. `error` is `null`
-or a string describing the failure; a provider failure carries a JSON-encoded
-object with `code` and `message` in that string. `usage` is Claude's token
+or an object with `code` and `message`. `usage` is Claude's token
 counts, or `null` for Codex. `denied_requests` counts approvals denied or timed
 out during the execution, by the provider's reviewer or by the caller.
 
@@ -291,9 +308,13 @@ A pending Request has this shape:
 `kind` is `approval` or `question`. An approval carries `tool`, `summary`,
 `input`, and, when the provider supplied them, `cwd` and `reason`. An `input`
 larger than 2 KiB is replaced by `{"truncated": true, "preview": "..."}`. A
-question carries `text` and, when the provider supplied them, `choices`. When
-a provider asks several questions in one request, `text` lists them one per
-line and there are no `choices`.
+question carries `summary`, `text`, and, when supplied, numbered choices or
+MCP form `fields`. Choices carry `index` and a bounded `label`; form fields
+carry bounded `name`, `type`, `required`, `enum`, and `constraints`. The public
+field and choice limits keep an answerable Request below the 256 KiB hard
+response limit. When a provider asks several questions in one request, `text`
+lists them one per line and there are no `choices`. `answer_state` is
+`pending`, `sending`, `delivered`, or `failed`.
 
 `id` is a short per-Session ordinal. At most 16 pending Requests are published
 per response; when more are pending, the bucket carries
@@ -503,12 +524,14 @@ code families are:
 ```text
 INVALID_ARGUMENT       Request cannot be retried unchanged
 NOT_FOUND              Session or configuration object does not exist
-NO_RESULT              Session has never accepted work
 NO_ACTIVE_EXECUTION    A steer found no running execution
 SESSION_NOT_RUNNING    No live Session matches; retry with resume
 ALIAS_IN_USE           Exact alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
 SESSION_BLOCKED        A Request is pending; answer it
+REQUEST_BUSY           An identical answer is still being delivered
+REQUEST_DELIVERY_FAILED Provider did not accept the answer; inspect the Request state
+REQUEST_FAILED         Request delivery failed and the provider Session is unavailable
 SESSION_UNAVAILABLE    Session state cannot accept the operation
 REQUEST_NOT_FOUND      No such Request on this Session
 REQUEST_RESOLVED       The Request already has a different answer

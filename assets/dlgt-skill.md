@@ -352,7 +352,7 @@ file.
 | `new` | `--title`, `--request-id`, a Harness (`--harness` or `--profile <PROFILE>`), and the prompt (`--prompt-file`, `--stdin`, or `-- <PROMPT>`) | `--model` (provider default), `--effort` (harness default), `--cwd` (current directory), `--alias` (generated from the title), `--approvals auto|ask|bypass` (`auto`), `--startup-timeout` (60s), env options |
 | `send` | the Session address, `--request-id`, and the prompt | `--steer` (add the prompt to the execution that is already running), `--resume`; launch options are accepted only with `--resume` |
 | `fetch` | the Session address | `--cursor` (omit = bounded baseline snapshot), `--wait <DURATION>` (omit = return immediately; binds to the active/latest execution and waits for its terminal result; up to 24h), `--messages[=N]`/`--no-messages`, `--max-bytes` (32 KiB) |
-| `answer` | the Session address, the Request ID, and one of `--allow`, `--deny`, `--text <TEXT>`, `--choice <N>` | `--message <TEXT>` with `--deny` |
+| `answer` | the Session address, the Request ID, and one of `--allow`, `--deny`, `--text <TEXT>`, `--choice <N>`, `--json <OBJECT>` | `--message <TEXT>` with `--deny` |
 | `stop`, `cancel`, `show`, `restart` | the Session address | `cancel --timeout` (30s), `stop --force` |
 
 ## Recover a lost response
@@ -481,6 +481,10 @@ uses an API key from the environment instead of the subscription.
 - `send --resume` relaunches the saved provider conversation and atomically
   submits the follow-up. An already-live matching Session is reused rather
   than duplicated. Claude may return a new canonical `session.id`; retain it.
+- `send --resume` keeps the Session's stored approvals and Claude auth policy
+  unless an explicit `--approvals`, `--auth`, or matching Profile supplies a
+  replacement. Built-in and `[defaults]` values do not overwrite retained
+  policy.
 - Keep one active execution per Session. `SESSION_BUSY` means observe until
   the current execution terminalizes. dlgt never queues prompts.
 
@@ -503,9 +507,19 @@ uses an API key from the environment instead of the subscription.
   notices. Follow `has_more` with the returned cursor to read on.
 - When `fetch` returns `reason: "blocked"`, read `requests` and answer each
   one: `dlgt answer <session.id> <request.id> --allow`, `--deny [--message
-  <TEXT>]`, `--text <TEXT>`, or `--choice <N>`. An unanswered Request never
-  times out into an approval. If the decision is not yours to make, ask the
-  user.
+  <TEXT>]`, `--text <TEXT>`, `--choice <N>`, or `--json '<OBJECT>'` for an MCP
+  form elicitation. JSON answers are objects; required form fields must be
+  present. Choices are numbered from 1. An unanswered Request never times out
+  into an approval. If the decision is not yours to make, ask the user.
+- A blocked `fetch` includes the bounded fields needed to answer its Request.
+  If a small `--max-bytes` cannot fit that minimum, retry at the budget named
+  by `INVALID_ARGUMENT`; an empty `requests` list is never a complete blocked
+  observation.
+- A Codex `send --steer` before its provider turn ID is acknowledged returns
+  `SESSION_UNAVAILABLE`; retry only after observing the active execution. A
+  `cancel` issued before that acknowledgement remains bound to the same
+  execution and is applied when the ID arrives. `CANCEL_TIMEOUT` includes
+  provider control dispatch; cancellation continues after it expires.
 - If a Session stays `busy` without the expected result, `fetch` it and read
   `quiet_for_ms`, the latest messages, and any `notice`. There is no terminal
   to attach to: a human who wants to take the conversation over runs
@@ -535,6 +549,7 @@ uses an API key from the environment instead of the subscription.
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address by ID. |
 | `LAUNCH_FAILED` | The provider process could not be launched or never became ready. Read `error.detail`: it is the provider's own stderr tail. `show <launch_id or session_id>` keeps the same `launch_failure`. If the provider needs a login, a trust decision, or first-run setup, tell the user to run `error.action` (`claude` or `codex`) once by hand in that directory, then retry with a new `--request-id`. This differs from a process that launched and later failed: that execution failure appears in `results[].status`. |
+| `AUTH_MISMATCH` | Claude subscription auth could not be positively established, or an API-key, custom endpoint, or provider-routing variable is set. Remove the named variables with matching `--unset-env <NAME>` options, or explicitly choose `--auth any`. |
 
 ## Observation and control reference
 

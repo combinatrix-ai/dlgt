@@ -9,8 +9,8 @@ invariants, lifecycle rationale, security model, and acceptance criteria.
 
 > **Status: implemented on the terminal-less branch, not released.** Released
 > dlgt 0.5.x still implements the PTY-based v1 CLI. [RPC](rpc.md) and
-> [Design](design.md) have not been rewritten yet and still describe v1.
-> Behavior that has not been measured against a provider is listed under
+> [Design](design.md) describe the terminal-less v2 interface. Behavior that
+> has not been measured against a provider is listed under
 > [Open questions](#open-questions).
 
 ## Product definition
@@ -204,8 +204,9 @@ and their live Sessions continue on their versioned sockets.
 ## Approvals
 
 One option decides who approves what a worker does. It is set at `new`, stored
-with the Session, and reused by `restart` and `send --resume` unless that
-command supplies a new value.
+with the Session, and reused by `restart` and `send --resume`. `send --resume`
+keeps the stored policy unless an explicit `--approvals` option or Profile
+supplies a replacement; built-in and `[defaults]` values do not replace it.
 
 ```text
 --approvals auto|ask|bypass     (default: auto)
@@ -226,7 +227,7 @@ dlgt.
 Rules:
 
 - dlgt never approves on its own. In `auto` the provider's reviewer decides;
-  in `ask` the caller decides through [`answer`](#answer); in `bypass` nothing
+  in `ask` the caller decides through [`answer`](#blocked-input-and-answer); in `bypass` nothing
   is asked.
 - Every reviewer decision that dlgt can observe is recorded as an `approval`
   message, so the caller can read afterwards what was approved or denied and
@@ -247,11 +248,14 @@ Rules:
   action the provider let through.
 - A request that nobody answers never times out into an approval. It stays
   pending and the Session stays `blocked` until `answer`, `cancel`, or `stop`.
-- Harness options that would override the mapping above
+- Harness options that would change the mapping above or pre-approve tools
   (`permission-mode`, `permission-prompt-tool`, `permission-prompts`,
-  `dangerously-skip-permissions`, `approval_policy`, `sandbox_mode`,
-  `approvals_reviewer`) are managed by dlgt and rejected with
-  `INVALID_ARGUMENT`.
+  `dangerously-skip-permissions`, `allow-dangerously-skip-permissions`,
+  `allowedTools`, `allowed-tools`, `settings`, `settings-file`, `bare`,
+  `approval_policy`, `sandbox_workspace_write`, `approvals_reviewer`,
+  `sandbox_mode`) are managed by dlgt and rejected with
+  `INVALID_ARGUMENT` under every mode. The entire Claude `settings` option is
+  rejected because it can contain permission rules.
 - Codex `workspace-write` still allows writes under the system temporary
   directories. Those writes produce no approval request in any mode.
 
@@ -432,7 +436,7 @@ alias.
 
 Rules:
 
-- Active `idle`, `busy`, and `blocked` Sessions may be restarted, as may
+- Active `idle`, `busy`, `blocked`, and `canceling` Sessions may be restarted, as may
   terminal `stopped` and `failed` Sessions. An active execution is durably
   completed as `interrupted` before the replacement process starts.
 - `starting`, `stopping`, and `restarting` Sessions reject a second lifecycle
@@ -466,6 +470,7 @@ Session ID returned by `new`:
 
 ```text
 dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
+  [--profile <PROFILE>]
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
@@ -482,7 +487,9 @@ dlgt send <codex:PROVIDER_THREAD_ID|claude:PROVIDER_SESSION_ID> --resume
 ```
 
 The launch options above are accepted only with `--resume`, and `--harness`
-is rejected because the provider prefix selects the Harness. A matching live Session is reused; if
+is rejected because the provider prefix selects the Harness. `--profile` is
+also accepted only with `--resume` and must match the Harness. A matching live
+Session is reused; if
 none exists dlgt reserves the provider conversation, launches a new Session,
 waits for bind/readiness, and atomically accepts the prompt. Success returns
 the same canonical `session.id` and caller correlation ID. If Claude rotates
@@ -497,7 +504,8 @@ Rules:
 
 - The target Session must already exist.
 - Launch, model, and environment options are accepted only with `--resume`;
-  Profile options are not accepted by `send`.
+  `--profile` is accepted only with `--resume` and must match the Session's
+  Harness.
 - The prompt is required. `--` is recommended so prompt text beginning with an
   option-like token is never parsed as a CLI option; multiple remaining words
   are joined with spaces.
@@ -505,6 +513,8 @@ Rules:
   Prefer `--prompt-file` for long prompts from an agent-controlled shell so
   no shell pipe or redirection wraps the direct `dlgt send` invocation.
 - If the Session is idle, dlgt accepts the prompt and transitions it to busy.
+- A Codex `turn/started` reported without an active dlgt execution is retained
+  as a new execution, so its later result remains observable.
 - If the Session is busy, canceling, blocked, stopping, or stopped, plain
   `send` fails immediately and has no side effects. Busy and canceling return
   `SESSION_BUSY`; blocked returns `SESSION_BLOCKED` with an `answer` action;
@@ -560,6 +570,8 @@ dlgt send claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629 --steer \
   send the prompt without `--steer` instead. A blocked Session returns
   `SESSION_BLOCKED`: answer the Request first. A canceling Session returns
   `SESSION_UNAVAILABLE`.
+- Before Codex acknowledges a turn and supplies its provider turn ID, a steer
+  returns `SESSION_UNAVAILABLE` and has no side effects.
 - The response carries the running `execution_seq`. A steer has no result of
   its own; the execution still ends with exactly one retained result.
 - Acceptance means dlgt handed the message to the provider and is recorded
@@ -612,7 +624,8 @@ The retained result shape is:
 `status` is one of `completed`, `failed`, `canceled`, or `interrupted`.
 `final_text` is the Harness-reported final assistant message and is always a
 string for `completed`, although it may be empty. Failed terminal states may
-provide partial final text and must provide a structured error. Usage is
+provide partial final text and must provide an error object with `code` and
+`message`, or `null` when there is no error. Usage is
 nullable because availability differs by Harness: Claude reports its token
 counts, and Codex reports none.
 
@@ -648,6 +661,10 @@ dlgt fetch <SESSION_ID|@ALIAS>
 the current Session snapshot, pending Requests, every terminal result and
 lifecycle event after the cursor, the forward message delta, and the response's
 cursor position.
+
+The `from_start` parameter is available only through raw RPC; the CLI has no
+`fetch --from-start` flag. Use cursors with `fetch`, or `watch --from-start`
+when replaying retained messages for a person.
 
 Every observation succeeds. A long poll that expires with nothing new is
 `{"ok":true,"reason":"timeout"}` with empty deltas, not an error. The same
@@ -793,6 +810,15 @@ has `"requests_truncated": true` and the rest appear as the published ones
 are answered. A Request's `input` larger than 2 KiB is replaced by
 `{"truncated": true, "preview": "..."}`.
 
+While a Session is blocked, `fetch` always includes an answerable minimum
+Request with its ID, kind, tool, short summary, and the data required to answer
+it. Choices retain their 1-based indexes; form fields include their names,
+types, and required flags. These fields and choice labels are bounded so a
+Request fits under the 256 KiB hard limit. If a smaller `--max-bytes` cannot
+hold one, `fetch` fails with `INVALID_ARGUMENT` and names a measured working
+budget; retry at that value. A blocked response never reports an empty Request
+list as complete.
+
 Three things are outside the bound, all deliberately:
 
 - an optional `info` notice, which the daemon injects rarely and independently
@@ -928,14 +954,17 @@ question   the worker asked the user something and is waiting for the reply
 }
 ```
 
-A question carries `text` and, when the provider supplied them, `choices`.
-`id` is a short per-Session ordinal, so it survives an agent's context. When a
-provider asks several questions in one request, `text` lists them one per line,
-there are no `choices`, and one `--text` answer is given to all of them.
+A question carries a short `summary` and `text`, plus either numbered choices
+or form `fields`. Choice objects keep their 1-based `index` when labels are
+truncated. MCP form fields expose bounded `name`, `type`, `required`, enum, and
+constraint data. `id` is a short per-Session ordinal, so it survives an agent's
+context. When a provider asks several questions in one request, `text` lists
+them one per line, there are no `choices`, and one `--text` answer is given to
+all of them.
 
 ```text
 dlgt answer <SESSION_ID|@ALIAS> <REQUEST_ID>
-  (--allow | --deny [--message <TEXT>] | --text <TEXT> | --choice <N>)
+  (--allow | --deny [--message <TEXT>] | --text <TEXT> | --choice <N> | --json <OBJECT>)
   [--pretty]
 ```
 
@@ -951,19 +980,29 @@ dlgt answer claude:8bc7859c-4c82-4b9a-a00d-2f3c483a9629 r3 --deny \
 Rules:
 
 - `--allow` and `--deny` answer an `approval`. `--text` and `--choice` answer
-  a `question`. The wrong pairing is `INVALID_ARGUMENT`.
+  a `question`. `--json` answers an MCP form elicitation with a JSON object;
+  required fields are validated before delivery. The wrong pairing is
+  `INVALID_ARGUMENT`.
 - An allow applies to that one Request. There is no "allow for the rest of
   the Session"; use `--approvals` to change the policy.
 - `--deny --message` gives the worker the reason. The worker continues its
   turn and normally reports that it could not do the step. Claude receives
   the message as the denial itself. Codex's decline carries no text, so dlgt
-  hands the message to the same turn through `turn/steer` right after it.
+  sends the message through `turn/steer` before the decline when a provider
+  turn is available. The receipt includes `reason_delivered: true|false`; if
+  the reason could not be sent, `reason_error` explains why.
 - `--choice <N>` is 1-based and answers with that choice's label. `--text`
-  answers in free text. For an MCP form elicitation with more than one field,
-  `--text` is a JSON object of the form's fields.
+  answers in free text. For an MCP form elicitation, use `--json
+  '{"name":"Ada","color":"blue"}'`; missing required fields are rejected
+  before dlgt sends an answer.
 - The Session must be live: a stopped Session returns `SESSION_NOT_RUNNING`.
 - `answer` returns as soon as the provider accepted the answer. It does not
   wait for the execution; follow it with `fetch --wait`.
+- An answer moves through `pending`, `sending`, `delivered`, and `failed`.
+  While delivery is in progress, a duplicate answer waits for its outcome. A
+  failed write is never replayed as success: the Request stays pending when
+  the provider can still answer, otherwise the Session fails with a structured
+  error.
 - Answering is idempotent by Request. Repeating the same answer returns the
   original receipt with `"replayed": true`. A different answer to a resolved
   Request is `REQUEST_RESOLVED`. An unknown ID is `REQUEST_NOT_FOUND`.
@@ -1014,6 +1053,13 @@ Cancellation is bounded and defaults to 30 seconds. On timeout, dlgt returns
 provider quiescence in the background. `fetch` reveals the eventual terminal
 state.
 
+The timeout includes dispatch and completion of all provider control messages.
+If cancellation begins before Codex acknowledges the active turn, dlgt keeps
+the cancel intent bound to that execution and applies `turn/interrupt` when the
+turn ID arrives, within the same timeout. The Session remains unavailable until
+its cancellation controls settle. A late control can never interrupt a later
+execution.
+
 Canceling an idle Session is idempotent: it returns exit 0 with
 `{"canceled":false,"reason":"NO_ACTIVE_WORK"}`.
 
@@ -1038,6 +1084,8 @@ dlgt restart <SESSION_ID> [environment options]
   the same `code`, `message`, `hint`, and `action` that the launch error
   returned. `show` also carries `resume_command`, the provider's own command
   for opening the conversation in its interactive UI.
+- A Claude Session also has a stable `marker` such as `dlgt:8bc7859c4c82` in
+  its snapshot and provider conversation name. Codex Sessions have no marker.
 - `stop` requests graceful Session termination.
 - `stop --force` terminates the provider process group.
 
@@ -1274,12 +1322,23 @@ scalar Profile and default values.
   that key instead of the subscription. `auth_policy` is Claude's retained
   `subscription` or `any` launch policy and is shown by `show`; it defaults to
   `subscription`, including when no config file exists. Use `--auth
-  subscription|any` on `new` or `send --resume` to override it. Under the
-  subscription policy, a non-empty API-key variable causes `AUTH_MISMATCH`
-  before Claude launches; remove it with `--unset-env ANTHROPIC_API_KEY` (or
+  subscription|any` on `new` or `send --resume` to override it; `send --resume`
+  retains the Session's policy when no explicit `--auth` or Profile value is
+  supplied. Built-in and `[defaults]` values do not replace the stored policy.
+  Under `subscription`, dlgt runs `claude auth status` with inherited
+  environment variables cleared and requires `loggedIn: true` and
+  `authMethod: "claude.ai"`. The non-interactive status command reports its
+  result as JSON; see the [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference).
+  Preflight also rejects non-empty API, custom endpoint, and provider-routing
+  variables, including `ANTHROPIC_BASE_URL` and truthy `CLAUDE_CODE_USE_*`
+  flags. The provider variable list follows the current [Claude Code
+  environment-variable reference](https://code.claude.com/docs/en/env-vars).
+  `AUTH_MISMATCH` names every offending variable without printing its value;
+  remove each one with its matching `--unset-env <NAME>` option (or
   `unset_env` in `[defaults.claude]`), or explicitly opt out with `--auth any`.
-  As a backstop, if Claude's `system/init` reports an `apiKeySource` other than
-  `none`, dlgt interrupts the turn, records it as failed, and stops the Session.
+  As a backstop, `system/init` must include `apiKeySource: "none"`; a missing
+  value or any other value causes dlgt to interrupt the turn, record a
+  structured failure, and stop the Session.
   The same `AUTH_MISMATCH` is returned when this occurs during the `new` or
   `send --resume` confirmation window. The observed `auth` and existing API-key
   `notice` remain available in the stopped Session. With `any`, dlgt allows the
@@ -1304,7 +1363,7 @@ scalar Profile and default values.
 
 The JSON error code is the primary machine-readable reason. Exit status is the
 shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
-5. `NO_RESULT`, `NO_ACTIVE_EXECUTION`, `REQUEST_NOT_FOUND`, `REQUEST_RESOLVED`,
+5. `NO_ACTIVE_EXECUTION`, `REQUEST_NOT_FOUND`, `REQUEST_RESOLVED`,
 `ALIAS_IN_USE`, `SESSION_NOT_RUNNING`, `SESSION_UNAVAILABLE`, `CURSOR_EXPIRED`,
 and `CURSOR_INVALID` use exit 1.
 `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
@@ -1320,12 +1379,14 @@ The stable v2 structured error-code families are:
 ```text
 INVALID_ARGUMENT       Invocation cannot be retried unchanged
 NOT_FOUND              Session or configuration object does not exist
-NO_RESULT              Session has never accepted work
 NO_ACTIVE_EXECUTION    send --steer found no running execution
 SESSION_NOT_RUNNING    No live Session matches; retry with --resume
 ALIAS_IN_USE           Exact Alias belongs to a non-terminal Session
 SESSION_BUSY           Active execution; retry after it terminalizes
 SESSION_BLOCKED        A Request is pending; answer it
+REQUEST_BUSY           An identical answer is still being delivered
+REQUEST_DELIVERY_FAILED Provider did not accept the answer; inspect the Request state
+REQUEST_FAILED         Request delivery failed and the provider Session is unavailable
 SESSION_UNAVAILABLE    Session state cannot accept the requested operation
 REQUEST_NOT_FOUND      No such Request on this Session
 REQUEST_RESOLVED       The Request already has a different answer
@@ -1333,7 +1394,7 @@ CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-AUTH_MISMATCH          Claude's subscription policy rejected an API-key source
+AUTH_MISMATCH          Claude's subscription authentication was not established
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```

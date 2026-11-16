@@ -72,7 +72,8 @@ starting  idle  busy  blocked  canceling  restarting  stopping  stopped  failed
 ```
 
 `canceling` covers the interval after an interrupt was requested and before
-the provider reported the interrupted turn's result.
+the provider reported the interrupted turn's result and every cancel control
+for that execution was dispatched and settled.
 
 ```text
 starting --provider ready------------------------------> idle
@@ -82,7 +83,7 @@ idle --prompt accepted---------------------------------> busy
 busy --Request opened----------------------------------> blocked
 blocked --last pending Request closed------------------> busy
 busy|blocked --cancel----------------------------------> canceling
-canceling --interrupted turn's result reported---------> idle
+canceling --interrupted result and controls settled----> idle
 
 busy --execution settled-------------------------------> idle
 
@@ -124,7 +125,10 @@ Messages are derived from the same events but are never a state transition.
 An assistant sentence that looks final does not complete an execution.
 Missing provider events fail closed: a live process remains busy, blocked, or
 canceling until authoritative evidence arrives; an unexpectedly dead process
-or a closed transport fails the Session.
+or a closed transport fails the Session. Provider writes use dedicated
+writer threads or queued controls. RPC handlers release the store and provider
+state locks before enqueueing or waiting for writes, so blocked stdin never
+stalls stdout draining or unrelated Sessions.
 
 Busy snapshots report `busy_for_ms` and `quiet_for_ms`, the time since the
 provider last emitted any event. They are diagnostics. Silence never changes
@@ -142,7 +146,7 @@ resumes the thread itself.
 | `thread/started` | Diagnostic only. The thread was already bound from the response. |
 | `turn/start` response | Bind the provider turn ID to the reserved execution and confirm the submission. |
 | `turn/started` | Match the thread and confirm `busy`. A turn that starts while no execution is active is recorded as a new execution so its result is retained. |
-| `turn/completed`, `completed` | Store the final agent message, terminalize the matching execution as completed, and become `idle`. |
+| `turn/completed`, `completed` | Store the final agent message, or an empty string with `final_text_source: "missing"`, terminalize the matching execution as completed, and become `idle`. |
 | `turn/completed`, `failed` | Store the sanitized error, terminalize as failed, and become `idle`. |
 | `turn/completed`, `interrupted` | Terminalize as interrupted, or settle a dlgt-initiated cancel as `canceled`, and become `idle`. |
 | `error` with `willRetry` | Emit `provider.retrying`; remain `busy`. |
@@ -163,8 +167,8 @@ A `turn/completed` notification that reports `completed` without an agent
 message is not trusted on its own, because the app-server can send it before
 the turn's items are complete. After `turn/start`, dlgt also polls
 `thread/read` every 250 ms. When the thread is idle and the turn is terminal,
-it applies that turn as the completion. A non-completed status must be read
-twice in a row before it is applied.
+it applies that turn as the completion, including an empty result. A
+non-completed status must be read twice in a row before it is applied.
 
 ## Claude lifecycle observation
 
@@ -272,23 +276,29 @@ message as a continuation turn, and the [settling
 rule](#settling-a-claude-execution) keeps that turn in the same execution. A
 steer therefore cannot leak into a later execution.
 
-The check that the execution is still running and the write of the steer
-happen under one lock that the event thread also takes before it can settle
-the execution, so a steer cannot be written after the execution ended.
+The check that the execution is still running and the reservation of its
+steer happen under the execution lock. The transport write is queued after
+releasing the store and execution locks; a failed write rolls back the pending
+delivery or fails the Session, and cannot block the event reader.
 
 `delivered` does not mean acted on. Provider compliance is not observable.
 
 ### Cancel
 
-Cancel affects only the active execution. Idle cancellation is idempotent.
-Cancel records the intent, closes every pending Request as `canceled`, and
-asks the provider to interrupt. The Session returns to `idle` only when the
-provider reports the interrupted turn's result.
+Cancel affects only the execution it was issued for. Idle cancellation is
+idempotent. Cancel records the intent, closes every pending Request as
+`canceled`, and asks the provider to interrupt. The Session stays
+`canceling` until the matching provider result arrives and all cancel controls
+for that execution are dispatched and settled; an old interrupt cannot reach
+a later execution.
 
 Codex quiescence comes from the matching `turn/completed` with
 `interrupted`.
 
-For Claude, dlgt first sends `cancel_async_message` for each message the model
+If a Codex `turn/start` acknowledgement has not arrived, dlgt retains the
+cancel intent and waits for that execution's provider turn ID before sending
+`turn/interrupt`. The wait is part of the caller's timeout. For Claude, dlgt
+first sends `cancel_async_message` for each message the model
 has not read. Each one Claude confirms as cancelled is dropped and reported as
 an expired steer. dlgt then sends the `interrupt` control request. Quiescence
 comes from the interrupted turn's `result`, or, when the prompt was canceled
@@ -296,9 +306,10 @@ while still queued, from the settling rule finding nothing left to wait for.
 If a leftover message still starts a provider turn after the cancel, dlgt
 interrupts that turn too.
 
-Cancellation is bounded. A timeout returns `CANCEL_TIMEOUT` and leaves the
-Session `canceling`; it never infers quiescence. The caller escalates with an
-explicit `restart` or `stop`.
+Cancellation is bounded from before the first provider control. A timeout
+returns `CANCEL_TIMEOUT` and leaves the Session `canceling`; control work
+continues for that execution and dlgt never infers quiescence. The caller may
+escalate with an explicit `restart` or `stop`.
 
 ### Restart and stop
 
@@ -342,9 +353,10 @@ Provider requests reach dlgt on the structured channel:
 | Codex `item/permissions/requestApproval` | approval Request |
 | Codex `item/tool/requestUserInput` | question Request |
 | Codex `mcpServer/elicitation/request` | question Request |
-| any other Codex server request | JSON-RPC error `-32601` and a `notice` message |
-| Claude `can_use_tool` | approval Request, or a question Request for `AskUserQuestion` |
-| Claude `can_use_tool` with no active execution | refused, with a `notice` message |
+| supported Codex server request owned by the active execution | matching approval or question Request; enter `blocked` |
+| unsupported, stale, idle, or canceling Codex server request | explicit JSON-RPC refusal; never attach it to another execution |
+| Claude `can_use_tool` in an active execution | approval Request, or a question Request for `AskUserQuestion` |
+| Claude `can_use_tool` with no active or canceling execution | refused, with a `notice` message |
 
 Codex `auto_review` decisions arrive as `item/autoApprovalReview/completed`
 and are recorded as `approval` messages; they do not become Requests. Claude
@@ -357,13 +369,17 @@ Answers map back onto the provider's own channel:
 | --- | --- | --- |
 | Claude tool | `{"behavior":"allow","updatedInput":...}` | `{"behavior":"deny","message":...}` |
 | Claude `AskUserQuestion` | `allow` with the answers in `updatedInput` | not applicable |
-| Codex command or file change | `{"decision":"accept"}` | `{"decision":"decline"}`, then the `--message` through `turn/steer` |
+| Codex command or file change | `{"decision":"accept"}` | `--message` through `turn/steer` before `{"decision":"decline"}`; the receipt says whether the reason was delivered |
 | Codex permissions | the requested permissions | `{"permissions":{}}` |
 | Codex user input | `{"answers":...}` keyed by question ID | not applicable |
 | Codex elicitation | `{"action":"accept","content":...}` | not applicable |
 
-The Request is claimed in the store before dlgt writes the answer, so two
-concurrent answers cannot both reach the provider. Every reviewer decision
+The Request moves through `pending`, `sending`, `delivered`, and `failed`. It
+leaves `blocked` only after provider delivery succeeds. A duplicate answer
+waits while the same attempt is sending and replays only a delivered receipt.
+If delivery fails while the provider remains open, the Request stays pending;
+if the provider cannot receive it, dlgt fails the Session with a structured
+error. Every reviewer decision
 dlgt can observe is an `approval` message whose `by` is `provider_reviewer`,
 `caller`, or `provider_policy`. Denials and reviewer timeouts count toward the
 result's `denied_requests`, because a provider reports a turn as successful
@@ -466,13 +482,18 @@ move keeps the caller's position instead of spending a new one.
 
 ## Authentication reporting
 
-Claude reports how it authenticated in `system/init` on the first turn of a
-process. dlgt records `apiKeySource: "none"` as `auth: "subscription"` and
-any other source as `auth: "api_key"`, and appends a `notice` message for an
-API key, because a client environment that carries `ANTHROPIC_API_KEY` makes
-Claude bill that key instead of the subscription. The field is absent until
-the first turn. Codex Sessions have no `auth` field. The launch policy for
-Claude authentication is defined in
+Under the `subscription` policy, dlgt first runs `claude auth status` with
+inherited environment variables cleared and requires `loggedIn: true` and
+`authMethod: "claude.ai"`. It rejects non-empty API keys, custom endpoints,
+and provider-routing variables documented by Claude Code; provider-selection
+and auth-skipping flags must be false or unset. This preflight does not print
+variable values. On the provider process, `system/init` must explicitly report
+`apiKeySource: "none"`; a missing field or any other value fails the Session.
+With policy `any`, `apiKeySource: "none"` reports `auth: "subscription"`, and
+other values report `auth: "api_key"` with a notice. The process-level auth
+check and resolved model survive turn settlement, even when Claude emits
+`system/init` only once per process. Codex Sessions have no `auth` field. The
+launch policy for Claude authentication is defined in
 [CLI](cli.md#profiles-and-launch-environment).
 
 ## Process ownership
