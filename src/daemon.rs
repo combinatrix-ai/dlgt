@@ -1746,6 +1746,9 @@ impl Daemon {
         let fallback_public_session = self.public_session(&session)?;
         let mut synchronously_confirmed = false;
         let mut window_spent = false;
+        // One receipt window covers delivery and acknowledgement together.
+        let receipt_deadline = Instant::now() + SUBMISSION_CONFIRM_TIMEOUT;
+        let remaining = || receipt_deadline.saturating_duration_since(Instant::now());
         match runtime.as_ref() {
             AgentRuntime::Codex {
                 control, thread_id, ..
@@ -1769,7 +1772,7 @@ impl Daemon {
                         let _ = sender.send(starter.run());
                     })
                     .context("failed to start Codex turn/start worker")?;
-                match outcome.recv_timeout(SUBMISSION_CONFIRM_TIMEOUT) {
+                match outcome.recv_timeout(remaining()) {
                     Ok(Ok(())) => synchronously_confirmed = true,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => window_spent = true,
@@ -1777,7 +1780,7 @@ impl Daemon {
             }
             AgentRuntime::Claude { process, .. } => {
                 let uuid = claude_uuid.as_deref().unwrap_or_default();
-                let delivered = process.send_user_within(uuid, prompt, SUBMISSION_CONFIRM_TIMEOUT);
+                let delivered = process.send_user_within(uuid, prompt, remaining());
                 if matches!(delivered, Ok(false)) {
                     window_spent = true;
                 }
@@ -1795,7 +1798,7 @@ impl Daemon {
         let confirmed = synchronously_confirmed
             || (!window_spent
                 && self
-                    .wait_for_submission_confirmation(&turn_id)
+                    .wait_for_submission_confirmation(&turn_id, receipt_deadline)
                     .unwrap_or(false));
         if !confirmed
             && self
@@ -2372,8 +2375,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn wait_for_submission_confirmation(&self, turn_id: &str) -> Result<bool> {
-        let deadline = Instant::now() + SUBMISSION_CONFIRM_TIMEOUT;
+    fn wait_for_submission_confirmation(&self, turn_id: &str, deadline: Instant) -> Result<bool> {
         let mut store = self.lock_store()?;
         loop {
             let turn = store
