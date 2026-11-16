@@ -112,6 +112,7 @@ impl Store {
                     harness_options: session.harness_options.to_vec(),
                     approvals: Approvals::new(session.approvals),
                     auth: None,
+                    auth_policy: None,
                     resolved_model: None,
                     active_turn_id: None,
                     pid: None,
@@ -1003,6 +1004,12 @@ impl Store {
         let changed = session.record.auth != Some(auth);
         session.record.auth = Some(auth);
         changed
+    }
+
+    pub fn set_auth_policy(&self, session_id: &str, auth_policy: crate::protocol::AuthPolicy) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.auth_policy = Some(auth_policy);
+        }
     }
 
     pub fn set_resolved_model(&self, session_id: &str, model: &str) {

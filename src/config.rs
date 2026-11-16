@@ -1,0 +1,733 @@
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
+use std::io;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Map, Value, json};
+use toml_edit::{DocumentMut, Item, TableLike};
+
+use crate::protocol::{ApprovalsMode, AuthPolicy};
+
+const PROFILE_KEYS: &[&str] = &[
+    "harness",
+    "model",
+    "effort",
+    "approvals",
+    "auth",
+    "clean_env",
+    "pass_env",
+    "unset_env",
+    "env",
+    "harness_options",
+];
+const DEFAULT_HARNESS_KEYS: &[&str] = &[
+    "model",
+    "effort",
+    "approvals",
+    "auth",
+    "clean_env",
+    "pass_env",
+    "unset_env",
+    "env",
+    "harness_options",
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    profiles: BTreeMap<String, Profile>,
+    approvals: Option<ApprovalsMode>,
+    claude: PartialLaunch,
+    codex: PartialLaunch,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Profile {
+    pub harness: Option<String>,
+    settings: PartialLaunch,
+    public: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialLaunch {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub approvals: Option<ApprovalsMode>,
+    pub auth: Option<AuthPolicy>,
+    pub clean_env: Option<bool>,
+    pub env: BTreeMap<String, String>,
+    pub pass_env: Vec<String>,
+    pub unset_env: Vec<String>,
+    pub harness_options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLaunch {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub approvals: ApprovalsMode,
+    pub auth: AuthPolicy,
+    pub clean_env: bool,
+    pub harness_options: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
+impl Default for ResolvedLaunch {
+    fn default() -> Self {
+        Self {
+            model: None,
+            effort: None,
+            approvals: ApprovalsMode::Auto,
+            auth: AuthPolicy::Subscription,
+            clean_env: false,
+            harness_options: Vec::new(),
+            environment: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AuthMismatch;
+
+impl fmt::Display for AuthMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(AUTH_MISMATCH_MESSAGE)
+    }
+}
+
+impl Error for AuthMismatch {}
+
+pub const AUTH_MISMATCH_MESSAGE: &str =
+    "Claude is configured for subscription authentication but an API key source is present";
+pub const AUTH_MISMATCH_HINT: &str = "Remove ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN with --unset-env ANTHROPIC_API_KEY (or unset_env in [defaults.claude]), or pass --auth any";
+
+pub fn path() -> PathBuf {
+    std::env::var_os("DLGT_CONFIG").map_or_else(
+        || {
+            std::env::var_os("HOME")
+                .map_or_else(PathBuf::new, PathBuf::from)
+                .join(".config/dlgt/config.toml")
+        },
+        PathBuf::from,
+    )
+}
+
+pub fn load() -> Result<Config> {
+    load_from_path(&path())
+}
+
+pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    parse(&text).with_context(|| format!("invalid dlgt config at {}", path.display()))
+}
+
+pub fn parse(text: &str) -> Result<Config> {
+    let document = text
+        .parse::<DocumentMut>()
+        .context("invalid dlgt config TOML")?;
+    let mut config = Config::default();
+
+    if let Some(defaults) = document.get("defaults") {
+        let table = defaults
+            .as_table_like()
+            .context("[defaults] must be a table")?;
+        for (key, item) in table.iter() {
+            match key {
+                "approvals" => {
+                    config.approvals = Some(parse_approvals(item, "[defaults].approvals")?);
+                }
+                "claude" => config.claude = parse_defaults_harness(item, "defaults.claude", true)?,
+                "codex" => config.codex = parse_defaults_harness(item, "defaults.codex", false)?,
+                _ => bail!("unknown key {key:?} in [defaults]"),
+            }
+        }
+    }
+
+    if let Some(profiles) = document.get("profiles") {
+        let table = profiles
+            .as_table_like()
+            .context("[profiles] must be a table")?;
+        for (name, item) in table.iter() {
+            let profile_table = item
+                .as_table_like()
+                .with_context(|| format!("profile {name:?} must be a table"))?;
+            let profile = parse_profile(name, profile_table)?;
+            config.profiles.insert(name.to_owned(), profile);
+        }
+    }
+    Ok(config)
+}
+
+impl Config {
+    pub fn profile(&self, name: &str) -> Result<&Profile> {
+        self.profiles
+            .get(name)
+            .with_context(|| format!("profile not found: {name}"))
+    }
+
+    pub fn profiles_value(&self) -> Value {
+        Value::Object(
+            self.profiles
+                .iter()
+                .map(|(name, profile)| (name.clone(), profile.public.clone()))
+                .collect(),
+        )
+    }
+
+    pub fn profile_value(&self, name: &str) -> Result<Value> {
+        Ok(self.profile(name)?.public.clone())
+    }
+
+    pub fn resolved_defaults_value(&self) -> Value {
+        json!({
+            "claude": defaults_value(
+                self.approvals,
+                &self.claude,
+                Some(AuthPolicy::Subscription),
+            ),
+            "codex": defaults_value(self.approvals, &self.codex, None),
+        })
+    }
+
+    pub fn resolve(
+        &self,
+        harness: &str,
+        profile: Option<&Profile>,
+        explicit: &PartialLaunch,
+        client_environment: &BTreeMap<String, String>,
+    ) -> Result<ResolvedLaunch> {
+        let mut resolved = ResolvedLaunch::default();
+        if let Some(approvals) = self.approvals {
+            resolved.approvals = approvals;
+        }
+        let defaults = match harness {
+            "claude" => &self.claude,
+            "codex" => &self.codex,
+            other => bail!("unsupported harness {other:?}; expected codex or claude"),
+        };
+        overlay(&mut resolved, defaults);
+        if let Some(profile) = profile {
+            if harness == "codex" && profile.settings.auth.is_some() {
+                bail!("profile auth is only valid with the Claude harness");
+            }
+            overlay(&mut resolved, &profile.settings);
+        }
+        if harness == "codex" && explicit.auth.is_some() {
+            bail!("--auth is only valid with --harness claude");
+        }
+        overlay(&mut resolved, explicit);
+
+        let clean_env = resolved.clean_env;
+        let pass_env = collect_pass_env(self, harness, profile, explicit);
+        let unset_env = collect_unset_env(self, harness, profile, explicit);
+        let mut environment = if clean_env {
+            BTreeMap::new()
+        } else {
+            client_environment.clone()
+        };
+        if clean_env {
+            for key in pass_env {
+                if let Some(value) = client_environment.get(&key) {
+                    environment.insert(key, value.clone());
+                }
+            }
+        }
+        let mut assignments = BTreeMap::new();
+        assignments.extend(
+            defaults
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        if let Some(profile) = profile {
+            assignments.extend(
+                profile
+                    .settings
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        assignments.extend(
+            explicit
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        environment.extend(assignments);
+        for key in unset_env {
+            environment.remove(&key);
+        }
+        resolved.environment = environment;
+        Ok(resolved)
+    }
+}
+
+pub fn validate_auth_environment<'a>(
+    policy: AuthPolicy,
+    mut values: impl Iterator<Item = (&'a String, &'a String)>,
+) -> Result<()> {
+    if policy == AuthPolicy::Subscription
+        && values.any(|(key, value)| {
+            matches!(key.as_str(), "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN")
+                && !value.is_empty()
+        })
+    {
+        return Err(AuthMismatch.into());
+    }
+    Ok(())
+}
+
+fn collect_pass_env(
+    config: &Config,
+    harness: &str,
+    profile: Option<&Profile>,
+    explicit: &PartialLaunch,
+) -> Vec<String> {
+    let mut values = config.defaults_for(harness).pass_env.clone();
+    if let Some(profile) = profile {
+        values.extend(profile.settings.pass_env.iter().cloned());
+    }
+    values.extend(explicit.pass_env.iter().cloned());
+    values
+}
+
+fn collect_unset_env(
+    config: &Config,
+    harness: &str,
+    profile: Option<&Profile>,
+    explicit: &PartialLaunch,
+) -> Vec<String> {
+    let mut values = config.defaults_for(harness).unset_env.clone();
+    if let Some(profile) = profile {
+        values.extend(profile.settings.unset_env.iter().cloned());
+    }
+    values.extend(explicit.unset_env.iter().cloned());
+    values
+}
+
+impl Config {
+    fn defaults_for(&self, harness: &str) -> &PartialLaunch {
+        if harness == "claude" {
+            &self.claude
+        } else {
+            &self.codex
+        }
+    }
+}
+
+fn overlay(resolved: &mut ResolvedLaunch, layer: &PartialLaunch) {
+    if let Some(value) = &layer.model {
+        resolved.model.clone_from(&Some(value.clone()));
+    }
+    if let Some(value) = &layer.effort {
+        resolved.effort.clone_from(&Some(value.clone()));
+    }
+    if let Some(value) = layer.approvals {
+        resolved.approvals = value;
+    }
+    if let Some(value) = layer.auth {
+        resolved.auth = value;
+    }
+    if let Some(value) = layer.clean_env {
+        resolved.clean_env = value;
+    }
+    resolved
+        .harness_options
+        .extend(layer.harness_options.iter().cloned());
+}
+
+fn defaults_value(
+    global_approvals: Option<ApprovalsMode>,
+    settings: &PartialLaunch,
+    default_auth: Option<AuthPolicy>,
+) -> Value {
+    let mut value = Map::new();
+    value.insert(
+        "approvals".to_owned(),
+        json!(
+            settings
+                .approvals
+                .unwrap_or(global_approvals.unwrap_or(ApprovalsMode::Auto))
+        ),
+    );
+    if let Some(auth) = settings.auth.or(default_auth) {
+        value.insert("auth".to_owned(), json!(auth.as_str()));
+    }
+    if let Some(model) = &settings.model {
+        value.insert("model".to_owned(), json!(model));
+    }
+    if let Some(effort) = &settings.effort {
+        value.insert("effort".to_owned(), json!(effort));
+    }
+    value.insert(
+        "clean_env".to_owned(),
+        json!(settings.clean_env.unwrap_or(false)),
+    );
+    value.insert("pass_env".to_owned(), json!(settings.pass_env));
+    value.insert("unset_env".to_owned(), json!(settings.unset_env));
+    value.insert(
+        "harness_options".to_owned(),
+        json!(settings.harness_options),
+    );
+    value.insert("env".to_owned(), redact_env(&settings.env));
+    Value::Object(value)
+}
+
+fn parse_defaults_harness(item: &Item, name: &str, claude: bool) -> Result<PartialLaunch> {
+    let table = item
+        .as_table_like()
+        .with_context(|| format!("[{name}] must be a table"))?;
+    parse_settings(table, name, claude, DEFAULT_HARNESS_KEYS)
+}
+
+fn parse_profile(name: &str, table: &dyn TableLike) -> Result<Profile> {
+    let profile_name = format!("profiles.{name}");
+    let settings = parse_settings(table, &profile_name, true, PROFILE_KEYS)?;
+    let harness = table
+        .get("harness")
+        .map(|item| required_string(item, &format!("{profile_name}.harness")))
+        .transpose()?;
+    if let Some(harness) = &harness
+        && !matches!(harness.as_str(), "claude" | "codex")
+    {
+        bail!("{profile_name}.harness must be \"claude\" or \"codex\"");
+    }
+    if harness.as_deref() == Some("codex") && settings.auth.is_some() {
+        bail!("auth is only valid for Claude Profiles");
+    }
+    let mut public = Map::new();
+    for (key, item) in table.iter() {
+        let value = if key == "env" {
+            redact_env(&parse_env(item, &format!("{profile_name}.env"))?)
+        } else {
+            item_to_json(item)
+                .with_context(|| format!("unsupported value for {profile_name}.{key}"))?
+        };
+        public.insert(key.to_owned(), value);
+    }
+    Ok(Profile {
+        harness,
+        settings,
+        public: Value::Object(public),
+    })
+}
+
+fn parse_settings(
+    table: &dyn TableLike,
+    name: &str,
+    claude: bool,
+    allowed_keys: &[&str],
+) -> Result<PartialLaunch> {
+    let mut settings = PartialLaunch::default();
+    for (key, item) in table.iter() {
+        if !allowed_keys.contains(&key) || key == "auth" && !claude {
+            bail!("unknown key {key:?} in [{name}]");
+        }
+        let key_name = format!("{name}.{key}");
+        match key {
+            "model" => settings.model = Some(required_string(item, &key_name)?),
+            "effort" => settings.effort = Some(required_string(item, &key_name)?),
+            "approvals" => settings.approvals = Some(parse_approvals(item, &key_name)?),
+            "auth" => {
+                let value = required_string(item, &key_name)?;
+                settings.auth =
+                    Some(AuthPolicy::parse(&value).with_context(|| {
+                        format!("{key_name} must be \"subscription\" or \"any\"")
+                    })?);
+            }
+            "clean_env" => {
+                settings.clean_env = Some(
+                    item.as_bool()
+                        .with_context(|| format!("{key_name} must be a boolean"))?,
+                );
+            }
+            "env" => settings.env = parse_env(item, &key_name)?,
+            "pass_env" => settings.pass_env = string_array(item, &key_name)?,
+            "unset_env" => settings.unset_env = string_array(item, &key_name)?,
+            "harness_options" => settings.harness_options = string_array(item, &key_name)?,
+            "harness" => {}
+            _ => bail!("unknown key {key:?} in [{name}]"),
+        }
+    }
+    Ok(settings)
+}
+
+fn parse_approvals(item: &Item, name: &str) -> Result<ApprovalsMode> {
+    let value = required_string(item, name)?;
+    ApprovalsMode::parse(&value).with_context(|| format!("{name} must be auto, ask, or bypass"))
+}
+
+fn required_string(item: &Item, name: &str) -> Result<String> {
+    item.as_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{name} must be a string"))
+}
+
+fn string_array(item: &Item, name: &str) -> Result<Vec<String>> {
+    item.as_array()
+        .with_context(|| format!("{name} must be an array of strings"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{name} entries must be strings"))
+        })
+        .collect()
+}
+
+fn parse_env(item: &Item, name: &str) -> Result<BTreeMap<String, String>> {
+    if let Some(table) = item.as_table_like() {
+        return table
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .as_str()
+                    .with_context(|| format!("{name}.{key} must be a string"))?;
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect();
+    }
+    if let Some(array) = item.as_array() {
+        return array
+            .iter()
+            .map(|value| {
+                let assignment = value
+                    .as_str()
+                    .with_context(|| format!("{name} entries must be KEY=VALUE strings"))?;
+                let (key, value) = assignment
+                    .split_once('=')
+                    .with_context(|| format!("{name} entries must use KEY=VALUE"))?;
+                if key.is_empty() {
+                    bail!("{name} keys must not be empty");
+                }
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect();
+    }
+    Err(anyhow!(
+        "{name} must be a table or an array of KEY=VALUE strings"
+    ))
+}
+
+fn redact_env(values: &BTreeMap<String, String>) -> Value {
+    Value::Object(
+        values
+            .keys()
+            .map(|key| (key.clone(), json!("<redacted>")))
+            .collect(),
+    )
+}
+
+fn item_to_json(item: &Item) -> Result<Value> {
+    if let Some(value) = item.as_str() {
+        return Ok(json!(value));
+    }
+    if let Some(value) = item.as_bool() {
+        return Ok(json!(value));
+    }
+    if let Some(array) = item.as_array() {
+        return array
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(|value| json!(value))
+                    .context("array entries must be strings")
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array);
+    }
+    bail!("unsupported TOML value")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthMismatch, PartialLaunch, validate_auth_environment};
+    use crate::protocol::{ApprovalsMode, AuthPolicy};
+    use std::collections::BTreeMap;
+
+    fn client_environment(values: &[(&str, &str)]) -> BTreeMap<String, String> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn each_precedence_layer_overrides_scalars_and_concatenates_lists() -> anyhow::Result<()> {
+        let config = super::parse(
+            r#"
+[defaults]
+approvals = "ask"
+
+[defaults.claude]
+model = "defaults-model"
+effort = "defaults-effort"
+approvals = "bypass"
+auth = "any"
+harness_options = ["defaults-option"]
+pass_env = ["DEFAULT_PASS"]
+unset_env = ["DEFAULT_UNSET"]
+env = { LAYER = "defaults", DEFAULT_ONLY = "yes" }
+
+[profiles.review]
+harness = "claude"
+model = "profile-model"
+effort = "profile-effort"
+approvals = "ask"
+auth = "subscription"
+harness_options = ["profile-option"]
+pass_env = ["PROFILE_PASS"]
+unset_env = ["PROFILE_UNSET"]
+env = ["LAYER=profile", "PROFILE_ONLY=yes"]
+"#,
+        )?;
+        let profile = config.profile("review")?;
+        let mut explicit = PartialLaunch {
+            model: Some("cli-model".to_owned()),
+            effort: Some("cli-effort".to_owned()),
+            approvals: Some(ApprovalsMode::Auto),
+            auth: Some(AuthPolicy::Any),
+            clean_env: Some(true),
+            pass_env: vec!["CLI_PASS".to_owned()],
+            unset_env: vec!["CLI_UNSET".to_owned()],
+            harness_options: vec!["cli-option".to_owned()],
+            ..PartialLaunch::default()
+        };
+        explicit.env.insert("LAYER".to_owned(), "cli".to_owned());
+        let client_env = client_environment(&[
+            ("DEFAULT_PASS", "default-pass"),
+            ("PROFILE_PASS", "profile-pass"),
+            ("CLI_PASS", "cli-pass"),
+            ("DEFAULT_UNSET", "remove"),
+            ("PROFILE_UNSET", "remove"),
+            ("CLI_UNSET", "remove"),
+        ]);
+        let resolved = config.resolve("claude", Some(profile), &explicit, &client_env)?;
+
+        assert_eq!(resolved.model.as_deref(), Some("cli-model"));
+        assert_eq!(resolved.effort.as_deref(), Some("cli-effort"));
+        assert_eq!(resolved.approvals, ApprovalsMode::Auto);
+        assert_eq!(resolved.auth, AuthPolicy::Any);
+        assert_eq!(
+            resolved.harness_options,
+            ["defaults-option", "profile-option", "cli-option"]
+        );
+        assert_eq!(
+            resolved.environment.get("LAYER").map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            resolved.environment.get("DEFAULT_ONLY").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            resolved.environment.get("PROFILE_ONLY").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            resolved.environment.get("DEFAULT_PASS").map(String::as_str),
+            Some("default-pass")
+        );
+        assert_eq!(
+            resolved.environment.get("PROFILE_PASS").map(String::as_str),
+            Some("profile-pass")
+        );
+        assert_eq!(
+            resolved.environment.get("CLI_PASS").map(String::as_str),
+            Some("cli-pass")
+        );
+        for key in ["DEFAULT_UNSET", "PROFILE_UNSET", "CLI_UNSET"] {
+            assert!(!resolved.environment.contains_key(key));
+        }
+
+        let no_cli = config.resolve(
+            "claude",
+            Some(profile),
+            &PartialLaunch::default(),
+            &client_env,
+        )?;
+        assert_eq!(no_cli.model.as_deref(), Some("profile-model"));
+        assert_eq!(no_cli.approvals, ApprovalsMode::Ask);
+        assert_eq!(no_cli.auth, AuthPolicy::Subscription);
+
+        let no_profile = config.resolve("claude", None, &PartialLaunch::default(), &client_env)?;
+        assert_eq!(no_profile.model.as_deref(), Some("defaults-model"));
+        assert_eq!(no_profile.approvals, ApprovalsMode::Bypass);
+        assert_eq!(no_profile.auth, AuthPolicy::Any);
+
+        let codex = config.resolve("codex", None, &PartialLaunch::default(), &client_env)?;
+        assert_eq!(codex.approvals, ApprovalsMode::Ask);
+        assert_eq!(codex.auth, AuthPolicy::Subscription);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_default_keys_and_harness_names_are_rejected() {
+        for text in [
+            "[defaults.claude]\nunknown = true",
+            "[defaults.mystery]\nmodel = \"x\"",
+        ] {
+            let result = super::parse(text);
+            assert!(
+                result.is_err(),
+                "invalid defaults unexpectedly parsed: {text}"
+            );
+            let message = result.err().map_or_else(
+                || "invalid defaults unexpectedly parsed".to_owned(),
+                |error| error.to_string(),
+            );
+            assert!(message.contains("unknown"), "unexpected error: {message}");
+        }
+    }
+
+    #[test]
+    fn profile_output_redacts_environment_values() -> anyhow::Result<()> {
+        let config = super::parse(
+            "[profiles.safe]\nharness = \"claude\"\nenv = { API_KEY = \"secret-value\" }",
+        )?;
+        let rendered = config.profiles_value().to_string();
+        assert!(!rendered.contains("secret-value"));
+        assert!(rendered.contains("<redacted>"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_defaults_include_builtins_and_specific_overrides() -> anyhow::Result<()> {
+        let config =
+            super::parse("[defaults]\napprovals = \"ask\"\n[defaults.claude]\nauth = \"any\"")?;
+        let defaults = config.resolved_defaults_value();
+        assert_eq!(defaults["claude"]["approvals"], "ask");
+        assert_eq!(defaults["claude"]["auth"], "any");
+        assert_eq!(defaults["codex"]["approvals"], "ask");
+        assert!(defaults["codex"].get("auth").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn subscription_policy_rejects_only_nonempty_api_key_variables() {
+        let values = client_environment(&[("ANTHROPIC_API_KEY", "dummy-not-a-key")]);
+        let result = validate_auth_environment(AuthPolicy::Subscription, values.iter());
+        assert!(
+            result.is_err(),
+            "subscription policy must reject a nonempty API key"
+        );
+        let error = result
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("expected an auth mismatch"));
+        assert!(error.downcast_ref::<AuthMismatch>().is_some());
+        assert!(!error.to_string().contains("dummy-not-a-key"));
+        assert!(validate_auth_environment(AuthPolicy::Any, values.iter()).is_ok());
+        let empty = client_environment(&[("ANTHROPIC_API_KEY", "")]);
+        assert!(validate_auth_environment(AuthPolicy::Subscription, empty.iter()).is_ok());
+    }
+}

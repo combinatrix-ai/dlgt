@@ -1,7 +1,16 @@
 use std::process::Command;
 
 fn dlgt(args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new(env!("CARGO_BIN_EXE_dlgt")).args(args).output()
+    cli_command().args(args).output()
+}
+
+fn cli_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dlgt"));
+    command
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("DLGT_CONFIG", "/dev/null");
+    command
 }
 
 #[test]
@@ -91,6 +100,16 @@ fn acceptance_help_documents_prompt_files() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn auth_policy_help_covers_new_and_resume() -> Result<(), Box<dyn std::error::Error>> {
+    let new_help = String::from_utf8(cli_command().arg("new").arg("--help").output()?.stdout)?;
+    let send_help = String::from_utf8(cli_command().arg("send").arg("--help").output()?.stdout)?;
+    assert!(new_help.contains("--auth <subscription|any>"));
+    assert!(send_help.contains("--auth <subscription|any>"));
+    assert!(send_help.contains("--profile <PROFILE>"));
+    Ok(())
+}
+
+#[test]
 fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::error::Error>> {
     let output = dlgt(&["new", "--", "--help"])?;
 
@@ -103,7 +122,7 @@ fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::
 fn unknown_long_options_are_named_with_the_command_usage() -> Result<(), Box<dyn std::error::Error>>
 {
     let home = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args(["show", "codex:test-session", "--json"])
         .output()?;
@@ -130,7 +149,7 @@ fn acceptance_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Er
         vec!["new", "--title", "t", "--harness", "claude", "--", "hello"],
         vec!["send", "codex:test-session", "--", "hello"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        let output = cli_command()
             .env("DLGT_HOME", home.path())
             .args(&command)
             .output()?;
@@ -160,7 +179,7 @@ fn an_idempotency_key_is_validated_before_the_prompt_is_read()
         (over_limit.as_str(), true),
     ];
     for (key, rejected) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        let output = cli_command()
             .env("DLGT_HOME", home.path())
             .current_dir(workdir.path())
             // A missing --cwd fails after the key check, so it marks how far
@@ -204,7 +223,7 @@ fn an_idempotency_key_is_validated_before_the_prompt_is_read()
 fn prompt_file_errors_before_starting_a_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     let workdir = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .current_dir(workdir.path())
         .args([
@@ -235,7 +254,7 @@ fn prompt_sources_are_mutually_exclusive() -> Result<(), Box<dyn std::error::Err
     let home = tempfile::tempdir()?;
     let prompt = home.path().join("prompt.md");
     std::fs::write(&prompt, "from file")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args([
             "new",
@@ -265,7 +284,7 @@ fn prompt_sources_are_mutually_exclusive() -> Result<(), Box<dyn std::error::Err
 #[test]
 fn resuming_also_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args(["send", "claude:some-session", "--resume", "--", "hello"])
         .output()?;
@@ -280,7 +299,7 @@ fn resuming_also_requires_an_idempotency_key() -> Result<(), Box<dyn std::error:
 fn send_no_longer_accepts_the_removed_wait_flags() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     for flag in [["--wait", "--timeout"], ["--timeout", "1s"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        let output = cli_command()
             .env("DLGT_HOME", home.path())
             .args([
                 "send",
@@ -308,7 +327,7 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
 -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     let workdir = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .current_dir(workdir.path())
         .args([
@@ -341,7 +360,7 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
 /// Run a command that must fail before it reaches a daemon.
 fn rejected(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args(args)
         .output()?;

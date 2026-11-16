@@ -19,11 +19,13 @@ use uuid::Uuid;
 use crate::claude::{self, ClaudeProcess, ClaudeTurns};
 use crate::codex::CodexConnection;
 use crate::codex_events::{self, CodexItems};
+use crate::config::{self, AuthMismatch};
 use crate::cursor;
 use crate::messages::{Decider, Decision, MessageBody};
 use crate::paths;
 use crate::protocol::{
-    ApprovalsMode, Request, Response, SessionRecord, SessionState, TurnRecord, TurnState,
+    ApprovalsMode, Auth, AuthPolicy, Request, Response, SessionRecord, SessionState, TurnRecord,
+    TurnState,
 };
 use crate::provider::{
     Agent, LaunchOptions, claude_command, claude_session_marker, codex_discovery_args,
@@ -519,6 +521,9 @@ impl Daemon {
         };
         let mut response = response;
         if let Some(error) = response.error.as_mut() {
+            if error.code == "AUTH_MISMATCH" {
+                error.hint = Some(config::AUTH_MISMATCH_HINT.to_owned());
+            }
             if let Some(correlation_id) =
                 request.params.get("correlation_id").and_then(Value::as_str)
             {
@@ -658,6 +663,22 @@ impl Daemon {
         }
         let model = params.get("model").and_then(Value::as_str);
         let effort = params.get("effort").and_then(Value::as_str);
+        let auth_policy = if agent == Agent::Claude {
+            params
+                .get("auth_policy")
+                .and_then(Value::as_str)
+                .map(AuthPolicy::parse)
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            if params
+                .get("auth_policy")
+                .is_some_and(|value| !value.is_null())
+            {
+                bail!("auth_policy is only valid for the Claude harness");
+            }
+            AuthPolicy::default()
+        };
         if agent == Agent::Claude {
             crate::claude_models::validate_model_effort(model, effort)?;
         }
@@ -682,6 +703,9 @@ impl Daemon {
             .transpose()?
             .unwrap_or(ApprovalsMode::Auto);
         let environment = launch_environment(params)?;
+        if agent == Agent::Claude {
+            config::validate_auth_environment(auth_policy, environment.iter())?;
+        }
         let mut id = generate_internal_id();
         let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
             .then(|| Uuid::new_v4().to_string());
@@ -700,7 +724,12 @@ impl Daemon {
                 approvals,
             });
             match inserted {
-                Ok(()) => break,
+                Ok(()) => {
+                    if agent == Agent::Claude {
+                        self.lock_store()?.set_auth_policy(&id, auth_policy);
+                    }
+                    break;
+                }
                 Err(error) if error.to_string().contains("session id already") && attempt < 15 => {
                     id = generate_internal_id();
                 }
@@ -784,7 +813,17 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => {
                 runtime.force_stop();
-                self.lock_store()?.set_session_failed(&id);
+                if self
+                    .resolve_session(&id)
+                    .is_ok_and(|session| session.state != SessionState::Stopped)
+                {
+                    self.lock_store()?.set_session_failed(&id);
+                }
+                let error = if session_has_auth_mismatch(&self.store, &id) {
+                    AuthMismatch.into()
+                } else {
+                    error
+                };
                 return Err(self.session_launch_failure(
                     &id,
                     &error.context("initial prompt acceptance failed"),
@@ -815,11 +854,28 @@ impl Daemon {
         let runtime = match spawned {
             Ok(runtime) => runtime,
             Err(failure) => {
+                let session_id = runtime_session_id
+                    .read()
+                    .map_or_else(|_| id.to_owned(), |id| id.clone());
                 let store = self.lock_store()?;
-                store.set_session_failed(id);
-                store.record_event(Some(id), None, "session.failed");
+                if failure.error.downcast_ref::<AuthMismatch>().is_some() {
+                    if store
+                        .get_session(&session_id)
+                        .is_some_and(|session| session.state != SessionState::Stopped)
+                    {
+                        store.set_session_stopped(&session_id);
+                        store.record_event(Some(&session_id), None, "session.stopped");
+                    }
+                } else {
+                    store.set_session_failed(&session_id);
+                    store.record_event(Some(&session_id), None, "session.failed");
+                }
                 drop(store);
-                return Err(self.session_launch_failure(id, &failure.error, failure.detail));
+                return Err(self.session_launch_failure(
+                    &session_id,
+                    &failure.error,
+                    failure.detail,
+                ));
             }
         };
         self.sessions
@@ -949,8 +1005,24 @@ impl Daemon {
                     json!(retained.approvals.requested.as_str()),
                 );
             }
+            if agent == Agent::Claude.as_str()
+                && object.get("auth_policy").is_none_or(Value::is_null)
+            {
+                object.insert(
+                    "auth_policy".to_owned(),
+                    json!(retained.auth_policy.unwrap_or_default().as_str()),
+                );
+            }
         } else {
             object.remove("alias");
+            if agent == Agent::Claude.as_str()
+                && object.get("auth_policy").is_none_or(Value::is_null)
+            {
+                object.insert(
+                    "auth_policy".to_owned(),
+                    json!(AuthPolicy::default().as_str()),
+                );
+            }
         }
         object.remove("resume");
         self.create_session(&create)
@@ -982,6 +1054,12 @@ impl Daemon {
             bail!("session cwd is not a directory: {}", cwd.display());
         }
         let environment = launch_environment(params)?;
+        if agent == Agent::Claude {
+            config::validate_auth_environment(
+                session.auth_policy.unwrap_or_default(),
+                environment.iter(),
+            )?;
+        }
         let startup_deadline = Instant::now() + startup_timeout(params);
 
         prepare_workspace(agent, &cwd)?;
@@ -1052,6 +1130,7 @@ impl Daemon {
         Ok(json!({"session": self.public_session(&current)?}))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_claude_runtime(
         &self,
         runtime_session_id: &Arc<RwLock<String>>,
@@ -1091,6 +1170,15 @@ impl Daemon {
             };
             for action in actions {
                 match action {
+                    claude::Action::AuthMismatch => {
+                        if let Some(process) = event_process.get().and_then(Weak::upgrade) {
+                            // The turn and Session are already terminalized in
+                            // `apply_event`. Send Claude's interrupt before
+                            // terminating its process group.
+                            let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
+                            process.stop();
+                        }
+                    }
                     claude::Action::Interrupt => {
                         if let Some(process) = event_process.get().and_then(Weak::upgrade) {
                             let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
@@ -1145,16 +1233,53 @@ impl Daemon {
 
         let process = ClaudeProcess::spawn(&spec, on_event, on_exit, &self.reaper)?;
         let _ = process_slot.set(Arc::downgrade(&process));
+        let session_id = runtime_session_id
+            .read()
+            .map(|id| id.clone())
+            .unwrap_or_default();
+        if session_has_auth_mismatch(&self.store, &session_id) {
+            interrupt_and_stop_claude(&process);
+            return Err(LaunchError {
+                error: AuthMismatch.into(),
+                detail: Some(process.final_stderr_tail()),
+            });
+        }
         // Claude answers `initialize` before any prompt, which proves the
         // stream-json control channel works and reports the mode it runs in.
-        let ready = process
-            .control(&json!({"subtype": "initialize"}), startup_timeout)
-            .map_err(|error| LaunchError {
-                error: error.context(
-                    "launch failed: Claude did not answer the stream-json initialize request",
-                ),
+        let ready = match process.control(&json!({"subtype": "initialize"}), startup_timeout) {
+            Ok(ready) => ready,
+            Err(error) => {
+                let id = runtime_session_id
+                    .read()
+                    .map(|id| id.clone())
+                    .unwrap_or_default();
+                let auth_mismatch = session_has_auth_mismatch(&self.store, &id);
+                if auth_mismatch {
+                    interrupt_and_stop_claude(&process);
+                }
+                return Err(LaunchError {
+                    error: if auth_mismatch {
+                        AuthMismatch.into()
+                    } else {
+                        error.context(
+                            "launch failed: Claude did not answer the stream-json initialize request",
+                        )
+                    },
+                    detail: Some(process.final_stderr_tail()),
+                });
+            }
+        };
+        let id = runtime_session_id
+            .read()
+            .map(|id| id.clone())
+            .unwrap_or_default();
+        if session_has_auth_mismatch(&self.store, &id) {
+            interrupt_and_stop_claude(&process);
+            return Err(LaunchError {
+                error: AuthMismatch.into(),
                 detail: Some(process.final_stderr_tail()),
-            })?;
+            });
+        }
         if let Some(mode) = ready.get("current_permission_mode").and_then(Value::as_str)
             && let Ok(session_id) = runtime_session_id.read()
             && let Ok(store) = self.store.lock()
@@ -1294,6 +1419,9 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     fn submit_turn(&self, params: &Value) -> Result<Value> {
         let (session, runtime) = self.live_session(params_string(params, "session")?)?;
+        if session_is_auth_mismatch(&session) {
+            return Err(AuthMismatch.into());
+        }
         if session.state == SessionState::Blocked {
             bail!("session blocked on input");
         }
@@ -1387,15 +1515,20 @@ impl Daemon {
                 }
             }
         }
-        let submission = if synchronously_confirmed
+        let confirmed = synchronously_confirmed
             || self
                 .wait_for_submission_confirmation(&turn_id)
-                .unwrap_or(false)
+                .unwrap_or(false);
+        if !confirmed
+            && self
+                .lock_store()?
+                .get_turn(&turn_id)
+                .and_then(|turn| turn.error)
+                .is_some_and(|error| error.starts_with("AUTH_MISMATCH:"))
         {
-            "confirmed"
-        } else {
-            "pending"
-        };
+            return Err(AuthMismatch.into());
+        }
+        let submission = if confirmed { "confirmed" } else { "pending" };
         let public_session = self
             .resolve_session(&session.id)
             .and_then(|current| self.public_session(&current))
@@ -2163,6 +2296,25 @@ fn launch_environment(params: &Value) -> Result<HashMap<String, String>> {
         .collect()
 }
 
+fn session_has_auth_mismatch(store: &Mutex<Store>, session_id: &str) -> bool {
+    store.lock().ok().is_some_and(|store| {
+        store
+            .get_session(session_id)
+            .is_some_and(|session| session_is_auth_mismatch(&session))
+    })
+}
+
+fn session_is_auth_mismatch(session: &SessionRecord) -> bool {
+    session.agent == Agent::Claude.as_str()
+        && session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription
+        && session.auth == Some(Auth::ApiKey)
+}
+
+fn interrupt_and_stop_claude(process: &ClaudeProcess) {
+    let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
+    process.stop();
+}
+
 fn startup_timeout(params: &Value) -> Duration {
     Duration::from_millis(
         params
@@ -2289,8 +2441,10 @@ fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
 }
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
-    let message = error.to_string();
-    if message.contains("SESSION_NOT_RUNNING") {
+    let message = format!("{error:#}");
+    if error.downcast_ref::<AuthMismatch>().is_some() || message.contains("AUTH_MISMATCH") {
+        "AUTH_MISMATCH"
+    } else if message.contains("SESSION_NOT_RUNNING") {
         "SESSION_NOT_RUNNING"
     } else if message.contains("CURSOR_EXPIRED") {
         "CURSOR_EXPIRED"
@@ -2408,6 +2562,9 @@ fn public_session_with_metrics(
     if let Some(auth) = session.auth {
         object.insert("auth".to_owned(), json!(auth));
     }
+    if let Some(auth_policy) = session.auth_policy {
+        object.insert("auth_policy".to_owned(), json!(auth_policy));
+    }
     if let Some(model) = &session.resolved_model {
         object.insert("resolved_model".to_owned(), json!(model));
     }
@@ -2456,10 +2613,14 @@ impl SessionLaunchFailure {
             session_id: session_id.to_owned(),
             code,
             message: format!("{error:#}"),
-            hint: "detail carries the provider's own stderr tail; if the provider needs a login, \
+            hint: if code == "AUTH_MISMATCH" {
+                config::AUTH_MISMATCH_HINT.to_owned()
+            } else {
+                "detail carries the provider's own stderr tail; if the provider needs a login, \
                    a trust decision, or first-run setup, run it once by hand in the Session's \
                    working directory and retry"
-                .to_owned(),
+                    .to_owned()
+            },
             action: agent.map(|agent| agent.as_str().to_owned()),
             detail: detail.filter(|detail| !detail.is_empty()),
         }

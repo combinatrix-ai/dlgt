@@ -34,10 +34,16 @@ if [ -n "${DLGT_FAKE_ROTATE_FILE:-}" ] && [ -f "$DLGT_FAKE_ROTATE_FILE" ] \
 fi
 key_source=none
 [ -n "${ANTHROPIC_API_KEY:-}" ] && key_source=ANTHROPIC_API_KEY
+[ -n "${DLGT_FAKE_API_KEY_SOURCE:-}" ] && key_source=$DLGT_FAKE_API_KEY_SOURCE
 
 if [ -n "${DLGT_FAKE_NO_INIT:-}" ]; then
   echo 'Not logged in · Please run /login' >&2
   exit 1
+fi
+
+if [ -n "$DLGT_FAKE_INIT_ON_START" ]; then
+  printf '{"type":"system","subtype":"init","session_id":"%s","model":"%s","permissionMode":"%s","apiKeySource":"%s"}\n' \
+    "$session" "$model" "$mode" "$key_source"
 fi
 
 holding=0

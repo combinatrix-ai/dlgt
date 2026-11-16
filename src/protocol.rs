@@ -124,6 +124,31 @@ impl ApprovalsMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPolicy {
+    #[default]
+    Subscription,
+    Any,
+}
+
+impl AuthPolicy {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "subscription" => Ok(Self::Subscription),
+            "any" => Ok(Self::Any),
+            _ => anyhow::bail!("invalid auth policy {value:?}; expected subscription or any"),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Any => "any",
+        }
+    }
+}
+
 /// The approvals mode a Session asked for and the one its provider runs.
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Approvals {
@@ -299,6 +324,8 @@ pub struct SessionRecord {
     pub approvals: Approvals,
     /// How the provider said it authenticated, once it has reported it.
     pub auth: Option<Auth>,
+    /// Claude launch policy retained for Session restart.
+    pub auth_policy: Option<AuthPolicy>,
     /// Model the provider resolved the launch selection to.
     pub resolved_model: Option<String>,
     pub active_turn_id: Option<String>,

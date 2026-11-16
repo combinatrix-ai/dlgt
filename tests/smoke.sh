@@ -22,12 +22,13 @@ trap cleanup EXIT INT TERM
 
 export DLGT_HOME="$state_dir"
 export HOME="$state_dir/home"
+export DLGT_CONFIG="$state_dir/config.toml"
 export DLGT_CLAUDE_BIN="$repo_root/tests/fixtures/fake-claude.sh"
 export DLGT_CODEX_BIN="$repo_root/tests/fixtures/fake-codex.sh"
 export DLGT_FAKE_ARGS_FILE="$state_dir/fake-args.log"
 export DLGT_FAKE_CODEX_LOG="$state_dir/fake-codex.log"
 export DLGT_FAKE_ROTATE_FILE="$state_dir/rotate"
-unset ANTHROPIC_API_KEY DLGT_FAKE_NO_INIT 2>/dev/null || true
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN DLGT_FAKE_NO_INIT DLGT_FAKE_API_KEY_SOURCE DLGT_FAKE_INIT_ON_START 2>/dev/null || true
 mkdir -p "$HOME"
 touch "$DLGT_FAKE_ARGS_FILE" "$DLGT_FAKE_CODEX_LOG"
 old_socket="$state_dir/run/old/dlgt.sock"
@@ -78,6 +79,112 @@ test -n "$version" || exit 1
 "$binary" server --foreground >"$state_dir/server.log" 2>&1 &
 server_pid=$!
 wait_for_socket "$state_dir/run/$version/dlgt.sock"
+
+# Defaults are inspectable; doctor applies semantic validation to the same
+# client-side config that Profiles use.
+defaults_json=$("$binary" profiles defaults)
+expect "$defaults_json" '"claude".*"auth":"subscription"'
+expect "$defaults_json" '"codex".*"approvals":"auto"'
+printf '[defaults]\nunknown = true\n' >"$DLGT_CONFIG"
+doctor_json=$("$binary" doctor --json)
+expect "$doctor_json" '"id":"config","status":"fail"'
+expect "$doctor_json" 'unknown key.*defaults'
+rm -f "$DLGT_CONFIG"
+
+# A subscription launch refuses inherited API keys before the provider runs.
+claude_args_before=$(wc -c <"$DLGT_FAKE_ARGS_FILE" | tr -d ' ')
+rejected 1 env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" new --title auth-blocked \
+  --harness claude --cwd "$repo_root" --request-id auth-blocked-1 -- blocked
+expect "$output" '"code":"AUTH_MISMATCH"'
+expect "$output" '--unset-env ANTHROPIC_API_KEY'
+expect "$output" '--auth any'
+refute "$output" 'dummy-not-a-key'
+claude_args_after=$(wc -c <"$DLGT_FAKE_ARGS_FILE" | tr -d ' ')
+test "$claude_args_before" -eq "$claude_args_after" \
+  || fail "Claude launched despite a pre-launch AUTH_MISMATCH"
+
+# The explicit opt-out runs and reports the provider's API-key authentication.
+any_json=$(env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" new --title auth-any \
+  --alias @auth-any --harness claude --auth any --cwd "$repo_root" \
+  --request-id auth-any-1 -- allowed-any)
+any_id=$(printf '%s\n' "$any_json" | field id)
+expect "$any_json" '"auth_policy":"any"'
+any_result=$("$binary" fetch "$any_id" --wait 5s)
+expect "$any_result" '"auth":"api_key"'
+expect "$any_result" '"final_text":"fake:allowed-any"'
+expect "$("$binary" show "$any_id")" '"auth":"api_key"'
+"$binary" stop "$any_id" --force >/dev/null
+wait_until_gone @auth-any
+any_restart_json=$(env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" restart "$any_id")
+expect "$any_restart_json" '"auth_policy":"any"'
+"$binary" send "$any_id" --request-id auth-any-restart-1 -- restarted-any >/dev/null
+any_restart_result=$("$binary" fetch "$any_id" --wait 5s)
+expect "$any_restart_result" '"auth":"api_key"'
+expect "$any_restart_result" '"final_text":"fake:restarted-any"'
+"$binary" stop "$any_id" --force >/dev/null
+any_resume_json=$(env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" send "$any_id" --resume \
+  --auth any --request-id auth-any-resume-1 -- resumed-any)
+expect "$any_resume_json" "\"id\":\"$any_id\""
+expect "$any_resume_json" '"auth_policy":"any"'
+any_resume_result=$("$binary" fetch "$any_id" --wait 5s)
+expect "$any_resume_result" '"auth":"api_key"'
+expect "$any_resume_result" '"final_text":"fake:resumed-any"'
+"$binary" stop "$any_id" --force >/dev/null
+
+# A defaults.claude unset_env removes the inherited key before Claude starts.
+cat >"$DLGT_CONFIG" <<'TOML'
+[defaults.claude]
+unset_env = ["ANTHROPIC_API_KEY"]
+TOML
+unset_json=$(env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" new --title auth-unset \
+  --alias @auth-unset --harness claude --cwd "$repo_root" \
+  --request-id auth-unset-1 -- allowed-unset)
+unset_id=$(printf '%s\n' "$unset_json" | field id)
+expect "$unset_json" '"auth":"subscription"'
+expect "$unset_json" '"auth_policy":"subscription"'
+"$binary" stop "$unset_id" --force >/dev/null
+wait_until_gone @auth-unset
+rm -f "$DLGT_CONFIG"
+rejected 1 env ANTHROPIC_API_KEY=dummy-not-a-key "$binary" restart "$unset_id"
+expect "$output" '"code":"AUTH_MISMATCH"'
+expect "$("$binary" show "$unset_id")" '"state":"stopped"'
+expect "$("$binary" show "$unset_id")" '"auth_policy":"subscription"'
+
+# Claude system/init is a backstop for API-key helpers and settings. It fails
+# the launch, retains the auth report, and stops the provider before acceptance.
+rejected 1 "$binary" new --title auth-init-mismatch --harness claude --cwd "$repo_root" \
+  --request-id auth-init-mismatch-1 --env DLGT_FAKE_API_KEY_SOURCE=apiKeyHelper -- blocked
+expect "$output" '"code":"AUTH_MISMATCH"'
+expect "$output" '--auth any'
+init_mismatch_id=$(printf '%s\n' "$output" | field session_id)
+test -n "$init_mismatch_id" || fail "AUTH_MISMATCH did not retain the Session ID: $output"
+expect "$("$binary" show "$init_mismatch_id")" '"state":"stopped"'
+expect "$("$binary" show "$init_mismatch_id")" '"auth":"api_key"'
+expect "$("$binary" show "$init_mismatch_id")" '"auth_policy":"subscription"'
+expect "$("$binary" fetch "$init_mismatch_id")" 'AUTH_MISMATCH'
+
+# Handle a provider that reports its auth source before the first prompt too.
+rejected 1 "$binary" new --title auth-startup-mismatch --harness claude --cwd "$repo_root" \
+  --request-id auth-startup-mismatch-1 --env DLGT_FAKE_INIT_ON_START=1 \
+  --env DLGT_FAKE_API_KEY_SOURCE=apiKeyHelper -- blocked
+expect "$output" '"code":"AUTH_MISMATCH"'
+startup_mismatch_id=$(printf '%s\n' "$output" | field session_id)
+if [ -z "$startup_mismatch_id" ]; then
+  startup_mismatch_id=$(printf '%s\n' "$output" | field launch_id)
+fi
+test -n "$startup_mismatch_id" || fail "startup AUTH_MISMATCH did not retain the failed launch: $output"
+expect "$("$binary" show "$startup_mismatch_id")" '"state":"stopped"'
+expect "$("$binary" show "$startup_mismatch_id")" '"auth":"api_key"'
+expect "$("$binary" show "$startup_mismatch_id")" '"auth_policy":"subscription"'
+
+# --auth is a Claude-only policy and is rejected before Codex can launch.
+codex_args_before=$(wc -c <"$DLGT_FAKE_CODEX_LOG" | tr -d ' ')
+rejected 1 "$binary" new --title codex-auth-invalid --harness codex --auth any \
+  --cwd "$repo_root" --request-id codex-auth-invalid-1 -- no-run
+expect "$output" '"code":"INVALID_ARGUMENT"'
+codex_args_after=$(wc -c <"$DLGT_FAKE_CODEX_LOG" | tr -d ' ')
+test "$codex_args_before" -eq "$codex_args_after" \
+  || fail "Codex launched despite Claude-only --auth"
 
 # `new` launches the provider, binds its Session ID, and accepts the prompt.
 printf '%s' 'smoke-initial' >"$state_dir/initial-prompt.md"
@@ -385,7 +492,7 @@ wait_until_gone @asker
 
 # A provider that does not honor the requested mode is reported, not hidden,
 # and so is a login that bills an API key.
-fallback_json=$("$binary" new --title fallback --harness claude --model no-auto-model \
+fallback_json=$("$binary" new --title fallback --harness claude --model no-auto-model --auth any \
   --cwd "$repo_root" --env ANTHROPIC_API_KEY=fake-key --request-id fallback-1 -- fallback-initial)
 fallback_id=$(printf '%s\n' "$fallback_json" | field id)
 expect "$fallback_json" '"approvals":{"effective":"ask","reason":"provider reported permission mode default","requested":"auto"}'
