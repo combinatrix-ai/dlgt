@@ -1181,6 +1181,7 @@ not the top-level transport `ok` field.
 dlgt profiles
 dlgt profiles list
 dlgt profiles show <NAME>
+dlgt profiles defaults
 ```
 
 Bare `dlgt profiles` is the same request as `dlgt profiles list`.
@@ -1188,7 +1189,26 @@ Bare `dlgt profiles` is the same request as `dlgt profiles list`.
 Profiles are client-side launch specifications. The client expands them before
 RPC so the daemon does not need to reread mutable configuration.
 
+The config file is `~/.config/dlgt/config.toml`; set `DLGT_CONFIG` to use a
+different path. It may contain a top-level `[defaults]` table and
+`[defaults.claude]` and `[defaults.codex]` subtables, alongside Profiles:
+
 ```toml
+[defaults]
+approvals = "auto"
+
+[defaults.claude]
+model = "sonnet"
+effort = "high"
+auth = "subscription"
+unset_env = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+pass_env = []
+clean_env = false
+
+[defaults.codex]
+model = "gpt-6-luna"
+effort = "max"
+
 [profiles.fable-review]
 harness = "claude"
 model = "best"
@@ -1203,17 +1223,30 @@ harness = "codex"
 harness_options = ['web_search="live"']
 ```
 
-Environment precedence:
+`[defaults]` accepts only `approvals`. A harness subtable or Profile accepts
+`model`, `effort`, `approvals`, `clean_env`, `pass_env`, `unset_env`, `env`,
+and `harness_options`; `auth` is Claude-only. `env` accepts a TOML table or an
+array of `KEY=VALUE` strings. Unknown keys and harness names are configuration
+errors, and `doctor` reports them in its config check.
+
+Launch precedence:
 
 ```text
-client snapshot or clean base < Profile < explicit launch options
+built-in < [defaults] < [defaults.<harness>] < Profile < explicit CLI flag
 ```
 
-Profile `harness_options` are followed by explicit `--harness-option` values.
+`pass_env`, `unset_env`, and `harness_options` lists concatenate in
+precedence order. Scalars are replaced by each higher layer. Environment
+assignments merge by key, with higher layers replacing the same key.
+`dlgt profiles defaults` shows the resolved defaults for both harnesses.
+
+Profile and default `harness_options` are followed by explicit
+`--harness-option` values.
 They configure the provider CLI rather than the launch environment. Claude
 bare entries become `--KEY` and keyed entries become `--KEY=VALUE`; Codex
 requires keyed entries and converts them to `--config KEY=VALUE`. An explicit
-`--approvals` replaces the Profile's `approvals`.
+`--approvals` replaces the Profile's `approvals`. Explicit CLI flags replace
+scalar Profile and default values.
 
 - Default launch environment is a snapshot of the invoking client's
   environment, never the daemon's startup environment.
@@ -1221,6 +1254,8 @@ requires keyed entries and converts them to `--config KEY=VALUE`. An explicit
 - `--pass-env KEY` copies one client value with `--clean-env`.
 - `--env KEY=VALUE` sets or overrides a value.
 - `--unset-env KEY` removes a value.
+- `pass_env` has the same effect as repeated `--pass-env` and only applies
+  with `clean_env`.
 - Environment options apply when creating or restarting a Session. Values are
   freshly snapshotted for each process launch and are never stored for replay.
 - dlgt applies final lifecycle safety overrides to owned Harness children:
@@ -1231,14 +1266,26 @@ requires keyed entries and converts them to `--config KEY=VALUE`. An explicit
   itself reported it:
 
   ```json
-  {"auth":"subscription"}
+  {"auth":"subscription","auth_policy":"subscription"}
   ```
 
   `auth` is `subscription` or `api_key`. A client environment that carries
-  `ANTHROPIC_API_KEY` makes Claude bill that key instead of the subscription.
-  Claude reports this on the first turn of a process, so the field is absent
-  until then, and an `api_key` login is also recorded as a `notice` message.
-  Codex Sessions have no `auth` field.
+  a non-empty `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` makes Claude use
+  that key instead of the subscription. `auth_policy` is Claude's retained
+  `subscription` or `any` launch policy and is shown by `show`; it defaults to
+  `subscription`, including when no config file exists. Use `--auth
+  subscription|any` on `new` or `send --resume` to override it. Under the
+  subscription policy, a non-empty API-key variable causes `AUTH_MISMATCH`
+  before Claude launches; remove it with `--unset-env ANTHROPIC_API_KEY` (or
+  `unset_env` in `[defaults.claude]`), or explicitly opt out with `--auth any`.
+  As a backstop, if Claude's `system/init` reports an `apiKeySource` other than
+  `none`, dlgt interrupts the turn, records it as failed, and stops the Session.
+  The same `AUTH_MISMATCH` is returned when this occurs during the `new` or
+  `send --resume` confirmation window. The observed `auth` and existing API-key
+  `notice` remain available in the stopped Session. With `any`, dlgt allows the
+  run and reports `auth: "api_key"` plus the notice. Claude reports `auth` on
+  the first turn of a process, so that field is absent until then. Codex
+  Sessions have no `auth` or `auth_policy` field.
 - Launch environment values are passed in RPC memory, never argv, and are never
   directly serialized into Session records, `list`, `show`, `fetch`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its
@@ -1262,6 +1309,7 @@ shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
 and `CURSOR_INVALID` use exit 1.
 `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
 idempotent exit-0 no-op.
+`AUTH_MISMATCH` uses exit 1.
 
 `fetch` never uses a non-zero exit to describe an execution. A failed,
 canceled, or interrupted execution is reported inside `results[].status`, and a
@@ -1285,6 +1333,7 @@ CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
+AUTH_MISMATCH          Claude's subscription policy rejected an API-key source
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```
@@ -1354,8 +1403,10 @@ can change the contract:
 - **Codex hooks that need review.** v1 stops at a `LAUNCH_BLOCKED` screen.
   `codex exec` skips untrusted hooks silently; the app-server path without a
   TUI was not measured.
-- **Claude environment.** Whether dlgt should strip `ANTHROPIC_API_KEY` and
-  the variables a Claude host injects (`CLAUDECODE`, `CLAUDE_CODE_*`) from the
-  default snapshot, or only report `auth`.
+- **Claude authentication policy.** Subscription authentication is the
+  built-in default. A non-empty `ANTHROPIC_API_KEY` or
+  `ANTHROPIC_AUTH_TOKEN` is rejected before launch unless the caller removes
+  it with `--unset-env`/`unset_env` or opts out with `--auth any`;
+  `system/init` is also checked before the first turn is accepted.
 - **Interactive-only features.** Which user slash commands, skills, plugins,
   and hooks load under `claude -p` with stream-json.

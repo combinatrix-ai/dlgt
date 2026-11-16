@@ -459,9 +459,11 @@ anything:
 Choose `--cwd` deliberately and constrain the worker in the prompt. A
 `completed` result with a non-zero `denied_requests` is not evidence the work
 was done: read the `approval` messages to see what was denied. The Session
-snapshot's `approvals.effective` says which mode the provider really runs,
-and `auth: "api_key"` on a Claude Session means it bills an API key from your
-environment instead of the subscription.
+snapshot's `approvals.effective` says which mode the provider really runs.
+Claude defaults to subscription authentication and refuses a non-empty
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; use `--unset-env` to remove it
+or `--auth any` to opt out. With `--auth any`, `auth: "api_key"` means Claude
+uses an API key from the environment instead of the subscription.
 
 ## Choose the lifecycle operation
 
