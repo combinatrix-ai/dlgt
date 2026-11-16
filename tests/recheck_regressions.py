@@ -889,6 +889,43 @@ class RecheckRegressions(unittest.TestCase):
         alone = h.rpc("session.answer", {"session": session, "request": "r2", "decision": "deny", "message": "no"})
         self.assertIs(alone.get("result", {}).get("request", {}).get("reason_delivered"), True, alone)
 
+    def test_configuration_failures_keep_configuration_codes(self) -> None:
+        h = self.harness
+        (h.home / ".claude.json").mkdir()
+        response = h.create("claude", "directory config")
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT", response)
+        (h.home / ".claude.json").rmdir()
+
+        def stdio_profiles(config: Path) -> dict:
+            proxy = subprocess.run(
+                [str(BIN), "rpc", "--stdio"],
+                input=json.dumps({"id": "p", "method": "profile.list", "params": {}}) + "\n",
+                env=dict(h.environment, DLGT_CONFIG=str(config)),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            return json.loads(next(line for line in proxy.stdout.splitlines() if line.strip()))
+
+        directory = h.root / "config-directory"
+        directory.mkdir()
+        self.assertEqual(stdio_profiles(directory).get("error", {}).get("code"), "INVALID_ARGUMENT")
+        scalar = h.root / "scalar.toml"
+        scalar.write_text("profiles = 3\n")
+        self.assertEqual(stdio_profiles(scalar).get("error", {}).get("code"), "INVALID_ARGUMENT")
+        typo = h.root / "typo.toml"
+        typo.write_text('[defualts.codex]\napprovals = "ask"\n')
+        self.assertEqual(stdio_profiles(typo).get("error", {}).get("code"), "INVALID_ARGUMENT")
+
+        missing = subprocess.run(
+            [str(BIN), "profiles", "show", "missing"],
+            env=dict(h.environment, DLGT_CONFIG=str(h.root / "none.toml")),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertIn('"NOT_FOUND"', missing.stdout + missing.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

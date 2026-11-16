@@ -488,29 +488,14 @@ fn public_rpc_method(method: &str) -> bool {
     )
 }
 
+/// Profile names for `profile.list`, from the same validated parse every
+/// other command uses.
 fn read_profiles() -> Result<Value> {
-    let path = std::env::var_os("DLGT_CONFIG").map_or_else(
-        || {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join(".config/dlgt/config.toml")
-        },
-        std::path::PathBuf::from,
-    );
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(json!({"profiles":{}})),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
-        }
-    };
-    let source = path.display().to_string();
-    let document = crate::config::parse_toml_document(&text, &source)?;
-    let names = document
-        .get("profiles")
-        .and_then(toml_edit::Item::as_table_like)
-        .map(|profiles| profiles.iter().map(|(name, _)| name).collect::<Vec<_>>())
+    let config = crate::config::load()?;
+    let names = config
+        .profiles_value()
+        .as_object()
+        .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     Ok(json!({"profiles":names}))
 }

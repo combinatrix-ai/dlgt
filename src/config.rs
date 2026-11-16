@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::error::{Code, coded};
+use crate::error::{Code, WithCode, coded};
 use serde_json::{Map, Value, json};
 use toml_edit::{DocumentMut, Item, TableLike};
 
@@ -199,7 +199,9 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config> {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            return Err(error)
+                .with_context(|| format!("failed to read {}", path.display()))
+                .code(Code::InvalidArgument);
         }
     };
     parse(&text).with_context(|| format!("invalid dlgt config at {}", path.display()))
@@ -269,6 +271,16 @@ fn parse_toml_document_as(text: &str, subject: &str) -> Result<DocumentMut> {
 
 fn parse_document(document: &toml_edit::Table) -> Result<Config> {
     let mut config = Config::default();
+    for (key, item) in document {
+        if !matches!(key, "defaults" | "profiles") {
+            at_item(
+                item,
+                Err(anyhow!(
+                    "unknown top-level key {key:?}; expected [defaults] or [profiles]"
+                )),
+            )?;
+        }
+    }
 
     if let Some(defaults) = document.get("defaults") {
         let table = at_item(
@@ -324,6 +336,7 @@ impl Config {
         self.profiles
             .get(name)
             .with_context(|| format!("profile not found: {name}"))
+            .code(Code::NotFound)
     }
 
     pub fn profiles_value(&self) -> Value {
@@ -904,6 +917,7 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
                 "[profiles.p]\nharness = \"claude\"\nunset_env = [\n  \"A\",\n  3,\n]",
                 "5:",
             ),
+            ("# c\n\n[defualts.codex]\napprovals = \"ask\"", "3:"),
         ] {
             let result = super::parse(text);
             assert!(

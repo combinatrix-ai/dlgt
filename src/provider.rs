@@ -285,7 +285,9 @@ fn trust_claude_workspace(home: &Path, cwd: &Path) -> Result<()> {
         Ok(existing) => existing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", state_path.display()));
+            return Err(error)
+                .with_context(|| format!("failed to read {}", state_path.display()))
+                .code(Code::InvalidArgument);
         }
     };
     let mut state = serde_json::from_str::<serde_json::Value>(&existing).map_err(|error| {
@@ -369,7 +371,9 @@ fn trust_codex_workspace(codex_home: &Path, cwd: &Path) -> Result<()> {
         Ok(existing) => existing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
+            return Err(error)
+                .with_context(|| format!("failed to read {}", config_path.display()))
+                .code(Code::InvalidArgument);
         }
     };
     let source = config_path.display().to_string();

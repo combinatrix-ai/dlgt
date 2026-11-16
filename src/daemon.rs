@@ -784,7 +784,7 @@ impl Daemon {
             )?;
         }
 
-        prepare_workspace(agent, &cwd, &environment)?;
+        prepare_workspace(agent, &cwd, &environment).code(Code::LaunchFailed)?;
         for attempt in 0..16 {
             let inserted = self.lock_store()?.insert_session(&NewSession {
                 id: &id,
@@ -1202,7 +1202,7 @@ impl Daemon {
             }
         }
 
-        prepare_workspace(agent, &cwd, &environment)?;
+        prepare_workspace(agent, &cwd, &environment).code(Code::LaunchFailed)?;
         if !self
             .lock_store()?
             .begin_session_restart(&session.id, expected_generation)?

@@ -33,7 +33,7 @@ fn main() {
         let failure = error.downcast_ref::<client::RpcFailure>();
         let auth_mismatch = error.downcast_ref::<config::AuthMismatch>();
         let code = failure.map_or_else(
-            || auth_mismatch.map_or("INVALID_ARGUMENT", |_| "AUTH_MISMATCH"),
+            || error::code_of(&error).map_or("INVALID_ARGUMENT", error::Code::as_str),
             |failure| failure.code.as_str(),
         );
         let message = failure.map_or_else(
