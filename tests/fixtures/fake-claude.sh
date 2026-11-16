@@ -212,6 +212,11 @@ while IFS= read -r line; do
           ask_id=$((ask_id + 1))
           printf '{"type":"control_request","request_id":"ask-%s","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","requires_user_interaction":true,"input":{"questions":[{"question":"Which color?","header":"Color","options":[{"label":"Red","description":"r"},{"label":"Blue","description":"b"}],"multiSelect":false}]}}}\n' "$ask_id"
           ;;
+        crash-hold*)
+          sleep 30 &
+          printf '%s\n' "$!" >"${DLGT_FAKE_HOLDER_PID_FILE:-/dev/null}"
+          exit 1
+          ;;
         crash*)
           echo 'fake provider crashed' >&2
           exit 1

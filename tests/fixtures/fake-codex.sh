@@ -94,6 +94,11 @@ while IFS= read -r line; do
       notify turn/started "{\"threadId\":\"$thread\",\"turn\":{\"id\":\"$turn\",\"items\":[]}}"
       case "$text" in
         hold*) holding=1 ;;
+        crash-hold*)
+          sleep 30 &
+          printf '%s\n' "$!" >"${DLGT_FAKE_HOLDER_PID_FILE:-/dev/null}"
+          exit 1
+          ;;
         empty*) finish_empty ;;
         form*)
           asking=1

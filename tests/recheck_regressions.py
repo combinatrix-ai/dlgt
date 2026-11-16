@@ -836,6 +836,21 @@ class RecheckRegressions(unittest.TestCase):
         followup = h.rpc("session.send", {"session": session, "request_id": "after-restarts", "prompt": "after"})
         self.assertIn("result", followup, followup)
 
+    def test_a_provider_exit_is_seen_while_a_descendant_holds_its_output(self) -> None:
+        h = self.harness
+        for harness in ("claude", "codex"):
+            holder_file = h.root / f"{harness}-holder.pid"
+            session = h.create(harness, "first", {"DLGT_FAKE_HOLDER_PID_FILE": str(holder_file)})["result"]["session"]["id"]
+            h.wait_state(session, "idle")
+            h.rpc("session.send", {"session": session, "request_id": f"{harness}-crash", "prompt": "crash-hold"})
+            h.wait_state(session, "failed", timeout=5)
+            time.sleep(0.2)
+            holder = int(holder_file.read_text())
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(holder)], check=False, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertTrue(not state or state.startswith("Z"), f"{harness} descendant survived: {state}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
