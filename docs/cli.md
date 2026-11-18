@@ -15,9 +15,10 @@ invariants, lifecycle rationale, security model, and acceptance criteria.
 
 ## Product definition
 
-`dlgt` is a local, single-binary runtime for live, addressable Codex and Claude
-subagents. It drives each provider through its structured interface and owns
-no terminal.
+`dlgt` is a local, single-binary runtime for live, addressable coding-agent
+subagents: Codex, Claude, and any agent that speaks the Agent Client Protocol.
+It drives each provider through its structured interface and owns no
+terminal.
 
 The only public runtime object is a **Session**:
 
@@ -31,6 +32,7 @@ Session
 
 ```text
 Codex    codex app-server, JSON-RPC over stdio
+ACP      the agent's ACP command, JSON-RPC over stdio
 Claude   claude -p with stream-json input and output, one long-lived process
 ```
 
@@ -41,7 +43,7 @@ have public IDs.
 Other terms:
 
 ```text
-Harness   The provider adapter, codex or claude
+Harness   The provider adapter: codex, claude, or an ACP Harness name
 Profile   A reusable client-side launch specification
 Alias     A human-readable address for an active Session
 Title     A non-unique human description used to generate an Alias
@@ -151,9 +153,9 @@ RUNTIME
 ```
 
 Removed from v1: `attach`, `scrollback`, `logs`, `harnesses`,
-`fetch --screen`, `--no-auto-approve`, and the `cursor`, `grok`, `opencode`,
-and `pi` Harnesses. `--harness` remains so that further Harnesses can return
-as values of the same option.
+`fetch --screen`, and `--no-auto-approve`. Cursor, Grok, OpenCode, and any
+other ACP agent return as [ACP Harnesses](#acp-harnesses); Pi needs an ACP
+adapter such as `pi-acp`.
 
 Each release uses its own socket at
 `$DLGT_HOME/run/<version>/dlgt.sock`. Most commands address the daemon for the
@@ -295,7 +297,7 @@ dlgt new
   --title <TITLE>
   [--alias <@ALIAS>]
   [--profile <PROFILE>]
-  [--harness codex|claude]
+  [--harness codex|claude|<ACP-NAME>]
   [--model <MODEL>]
   [--effort <LEVEL>]
   [--cwd <DIR>]
@@ -481,7 +483,7 @@ Rules:
 
 ```text
 dlgt send <SESSION_ID|@ALIAS>
-  [--steer]
+  [--steer [--interrupt]]
   --request-id <ID>         (required)
   [--pretty]
   [--prompt-file <PATH> | --stdin | -- <PROMPT>]   (required)
@@ -619,8 +621,10 @@ provider. A steer therefore cannot be lost between two executions. When a
 steer runs as a continuation, the execution's `final_text` is the text of each
 provider turn result in order, joined by a blank line.
 
-To replace the running work instead of adding to it, use `cancel` and then a
-plain `send`.
+To replace the running work instead of adding to it, use `send --steer
+--interrupt`, which cancels and sends in one command. ACP Harnesses cannot
+steer and accept only the `--interrupt` form; see
+[Steering](#steering).
 
 ## Retained result
 
@@ -1181,6 +1185,198 @@ Sessions, and `fetch` reports the ordered history of one.
 The versioned event schema and the complete event set are defined in
 [RPC](rpc.md#lifecycle-events).
 
+## ACP Harnesses
+
+Any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com)
+(ACP, protocol version 1, JSON-RPC over stdio) can be a Harness. Codex and
+Claude keep their native drivers; every other Harness is an ACP Harness.
+
+### Selecting an ACP Harness
+
+`--harness` accepts `codex`, `claude`, or an ACP Harness name. Four names are
+built in:
+
+| Name | Command | Login command named by `AUTH_REQUIRED` |
+| --- | --- | --- |
+| `cursor` | `cursor-agent acp` | `cursor-agent login` |
+| `grok` | `grok agent stdio` | `grok login` |
+| `opencode` | `opencode acp` | `opencode auth login` |
+| `gemini` | `gemini --acp` | `gemini` |
+
+`opencode` requires OpenCode 2. When `initialize` reports `agentInfo.version`
+with a major version below 2, launch fails with `LAUNCH_FAILED` and a hint to
+upgrade OpenCode.
+
+Any other ACP agent is added in the config file. A table may also replace a
+built-in name's command:
+
+```toml
+[harnesses.pi]
+command = ["npx", "pi-acp"]
+login = "pi"            # optional; shown in AUTH_REQUIRED
+
+[harnesses.goose]
+command = ["goose", "acp"]
+```
+
+Rules:
+
+- A Harness name matches `[a-z][a-z0-9-]{0,31}` and is not `codex` or
+  `claude`. `command` is a non-empty array; its first element is resolved on
+  the launch environment's `PATH`.
+- `[defaults.<name>]` and Profiles accept ACP Harness names. For an ACP
+  Harness they accept `model`, `effort`, `clean_env`, `pass_env`, `unset_env`,
+  and `env`. `approvals` and `harness_options` are configuration errors there.
+- The Session ID is `<name>:<ACP sessionId>`, for example
+  `opencode:ses_e14d64bd6ffe0CYTccyopWRmcw`. The provider ID limits in
+  [`new`](#new) apply.
+- `show` reports `harness`, the command's first element, and the agent's
+  `agentInfo` name and version when the agent supplied them. `resume_command`
+  is `null` for ACP Harnesses.
+
+### Lifecycle mapping
+
+dlgt starts one agent process per Session and holds one ACP session in it.
+
+```text
+new             initialize -> session/new -> model and effort -> session/prompt
+send            session/prompt
+cancel          session/cancel
+restart         new process -> initialize -> session/resume (or session/load)
+send --resume   same as restart, then session/prompt
+stop            session/close when supported, then the process group ends
+```
+
+- `initialize` advertises `fs.readTextFile: false`, `fs.writeTextFile: false`,
+  and `terminal: false`. dlgt answers any `fs/*` or `terminal/*` request with
+  JSON-RPC error `-32601`.
+- `session/new` and `session/resume` pass the Session's `cwd` and an empty
+  `mcpServers` list.
+- `--model` sets the config option whose `category` is `model` through
+  `session/set_config_option`. When the agent offers no such option but
+  returns a `models` list, dlgt uses `session/set_model`. Otherwise `--model`
+  fails with `UNSUPPORTED` and no Session is created. A value the agent
+  rejects is a `LAUNCH_FAILED` carrying the agent's message.
+- `--effort` sets the config option whose `category` is `thought_level`. An
+  agent without one makes `--effort` fail with `UNSUPPORTED`. Some agents put
+  the effort in the model ID instead (Cursor:
+  `claude-opus-5-5[effort=medium]`); pass that as `--model`.
+- `resolved_model` is the current value of the `model` option, or the current
+  model ID, as the agent last reported it.
+- `submission` is `confirmed` when the agent sends its first `session/update`
+  for the Session after the prompt is written, or answers the prompt. ACP v1
+  has no separate acceptance reply. Otherwise the five-second rule in
+  [`new`](#new) applies.
+- `restart` and `send --resume` use `session/resume` when the agent advertises
+  `sessionCapabilities.resume`, else `session/load` when it advertises
+  `loadSession`. History that `session/load` replays before its response is
+  discarded and never becomes messages. An agent with neither capability
+  returns `UNSUPPORTED`.
+
+### Results
+
+The `session/prompt` response ends the execution:
+
+| `stopReason` | `status` | `error` |
+| --- | --- | --- |
+| `end_turn` | `completed` | `null` |
+| `cancelled` | `canceled` | `null` |
+| `max_tokens`, `max_turn_requests`, `refusal` | `failed` | `{"code":"PROVIDER_STOP","message":"<stopReason>"}` |
+| JSON-RPC error response | `failed` | `{"code":"PROVIDER_ERROR","message":"<agent message>"}` |
+
+- A `cancelled` stop is a normal end whether or not dlgt sent
+  `session/cancel`. Some agents end the turn this way after a denied
+  approval; the denial is visible as an `approval` message and in
+  `denied_requests`. The Session returns to `idle`.
+- `final_text` is the concatenated `agent_message_chunk` text of the
+  execution, and `final_text_source` is `messages`, or `missing` when there
+  was none. ACP v1 turn results carry no text.
+- `usage` is the `usage` object of the prompt response when the agent
+  includes one, with its keys converted to snake_case
+  (`inputTokens` becomes `input_tokens`), and `null` otherwise.
+  `usage_update` notifications are context-window figures, not per-turn
+  usage, and are ignored.
+
+### Messages
+
+```text
+agent_message_chunk                  assistant (consecutive chunks join into one message)
+tool_call                            tool_call: tool is the title, else the kind; summary from rawInput
+tool_call_update completed / failed  tool_result: ok is true for completed
+notice                               notice
+everything else                      not recorded
+```
+
+### Requests
+
+- `session/request_permission` becomes an `approval` Request. `tool` is the
+  tool call's `kind`, `summary` its `title`, and `input` its `rawInput`.
+  `--allow` selects the `allow_once` option and `--deny` the `reject_once`
+  option. When the agent offers only the `_always` variant of a kind, dlgt
+  selects it and records a `notice`.
+- `--deny --message` cannot carry a reason: ACP has no field for it. The
+  denial is still delivered, and the receipt has `reason_delivered: false`
+  and `reason_error: "the ACP harness cannot deliver a denial reason"`.
+- `elicitation/create` in form mode becomes a `question` Request with the
+  form's schema, answered with `--json`. URL-mode elicitations are declined
+  with a `notice`.
+- `cancel`, `stop`, and `restart` answer every pending permission request with
+  the `cancelled` outcome before the turn ends, as ACP requires.
+
+### Approvals
+
+ACP has no approval policy, so ACP Harnesses do not accept `--approvals`. An
+explicit `--approvals` or a Profile's `approvals` is `UNSUPPORTED`;
+`[defaults] approvals` does not apply to them. The agent's own configuration
+decides what it asks, and dlgt forwards every request it raises:
+
+```json
+{"approvals":{"requested":null,"effective":"agent_default"}}
+```
+
+What the agent's configuration allows produces no Request. For OpenCode,
+`opencode.json` in the working directory overrides your
+`~/.config/opencode` settings, so a worker that writes that file in the
+repository can change its own permissions.
+
+### Steering
+
+ACP has no way to add a message to a running turn. `send --steer` on a busy
+ACP Session returns `UNSUPPORTED` with an action naming `--interrupt`:
+
+```json
+{"ok":false,"error":{"code":"UNSUPPORTED","message":"this harness cannot steer a running turn","action":"dlgt send opencode:ses_e14d... --steer --interrupt --request-id <ID> -- <PROMPT>"}}
+```
+
+`send --steer --interrupt` works on every Harness. It cancels the running
+execution exactly as [`cancel`](#cancel) does, waits for its result within the
+cancel timeout, and then sends the prompt as a new execution:
+
+```json
+{"ok":true,"session":{"id":"opencode:ses_e14d...","state":"busy"},"canceled_execution_seq":3,"execution_seq":4,"steer":"interrupted","submission":"confirmed","cursor":"12"}
+```
+
+- `--interrupt` requires `--steer`. On an idle Session it returns
+  `NO_ACTIVE_EXECUTION`. On a blocked Session it is accepted: the cancel closes
+  the pending Requests.
+- If the cancel times out, the command returns `CANCEL_TIMEOUT`, the prompt is
+  not sent, and the request ID is not consumed.
+- Work the agent had not finished in the canceled turn is lost. What the
+  agent already did, and the conversation so far, remain.
+
+### Authentication
+
+dlgt never calls `authenticate`. When `session/new` or `session/resume`
+fails because the agent requires authentication, launch fails with
+`AUTH_REQUIRED`, the agent's `authMethods` names, and the login command as the
+`action`:
+
+```json
+{"ok":false,"error":{"code":"AUTH_REQUIRED","message":"grok requires sign-in","auth_methods":["Grok"],"action":"grok login"}}
+```
+
+A table without `login` gives no `action`.
+
 ## Model discovery
 
 ```text
@@ -1190,8 +1386,21 @@ dlgt models --harness claude
 ```
 
 Without `--harness`, `dlgt models` queries every Harness and returns
-`{"harnesses":[...]}`. A Harness that cannot be reached reports
-`"discovery":"unavailable"` with its error rather than failing the command.
+`{"harnesses":[...]}`: Codex, Claude, and each built-in or configured ACP
+Harness whose command is found on `PATH`. A Harness that cannot be reached
+reports `"discovery":"unavailable"` with its error rather than failing the
+command.
+
+ACP has no model-list method outside a session. For an ACP Harness, dlgt
+starts the agent in the invoking directory, runs `initialize` and
+`session/new`, reads the `model` config option's choices (or the `models`
+list), then closes the session and ends the process. No prompt is sent.
+`source` is `acp`, and each model has `id` and `display_name`. An agent that
+needs sign-in reports `"discovery":"unavailable"` with `AUTH_REQUIRED`.
+
+```text
+dlgt models --harness opencode
+```
 
 Codex discovery uses app-server `model/list` and returns account-aware model
 IDs, display names, descriptions, defaults, supported reasoning efforts, input
@@ -1295,7 +1504,6 @@ approvals = "auto"
 [defaults.claude]
 model = "sonnet"
 effort = "high"
-auth = "subscription"
 unset_env = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
 pass_env = []
 clean_env = false
@@ -1320,7 +1528,8 @@ harness_options = ['web_search="live"']
 
 `[defaults]` accepts only `approvals`. A harness subtable or Profile accepts
 `model`, `effort`, `approvals`, `clean_env`, `pass_env`, `unset_env`, `env`,
-and `harness_options`; `auth` is Claude-only. `env` accepts a TOML table or an
+and `harness_options`; ACP Harnesses accept the subset listed in
+[ACP Harnesses](#selecting-an-acp-harness). `env` accepts a TOML table or an
 array of `KEY=VALUE` strings. Unknown keys and harness names are configuration
 errors, and `doctor` reports them in its config check.
 
@@ -1357,41 +1566,46 @@ scalar Profile and default values.
   `check_for_update_on_startup=false` for Codex and `DISABLE_AUTOUPDATER=1` for
   Claude. They cannot be overridden per Session and do not change provider
   global configuration.
-- The Session snapshot reports how Claude authenticated, as the provider
-  itself reported it:
+- dlgt never refuses a launch because of how a Harness authenticates. It
+  shows which credential-related environment variables the Harness process
+  receives, by name only, so an inherited API key is visible rather than
+  silent. `new`, `send --resume`, and `restart` receipts and `show` carry:
 
   ```json
-  {"auth":"subscription","auth_policy":"subscription"}
+  {"auth_env":["ANTHROPIC_API_KEY","ANTHROPIC_BASE_URL"]}
   ```
 
-  `auth` is `subscription` or `api_key`. A client environment that carries
-  a non-empty `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` makes Claude use
-  that key instead of the subscription. `auth_policy` is Claude's retained
-  `subscription` or `any` launch policy and is shown by `show`; it defaults to
-  `subscription`, including when no config file exists. Use `--auth
-  subscription|any` on `new` or `send --resume` to override it; `send --resume`
-  retains the Session's policy when no explicit `--auth` or Profile value is
-  supplied. Built-in and `[defaults]` values do not replace the stored policy.
-  Under `subscription`, dlgt runs `claude auth status` with inherited
-  environment variables cleared and requires `loggedIn: true` and
-  `authMethod: "claude.ai"`. The non-interactive status command reports its
-  result as JSON; see the [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference).
-  Preflight also rejects non-empty API, custom endpoint, and provider-routing
-  variables, including `ANTHROPIC_BASE_URL` and truthy `CLAUDE_CODE_USE_*`
-  flags. The provider variable list follows the current [Claude Code
-  environment-variable reference](https://code.claude.com/docs/en/env-vars).
-  `AUTH_MISMATCH` names every offending variable without printing its value;
-  remove each one with its matching `--unset-env <NAME>` option (or
-  `unset_env` in `[defaults.claude]`), or explicitly opt out with `--auth any`.
-  As a backstop, `system/init` must include `apiKeySource: "none"`; a missing
-  value or any other value causes dlgt to interrupt the turn, record a
-  structured failure, and stop the Session.
-  The same `AUTH_MISMATCH` is returned when this occurs during the `new` or
-  `send --resume` confirmation window. The observed `auth` and existing API-key
-  `notice` remain available in the stopped Session. With `any`, dlgt allows the
-  run and reports `auth: "api_key"` plus the notice. Claude reports `auth` on
-  the first turn of a process, so that field is absent until then. Codex
-  Sessions have no `auth` or `auth_policy` field.
+  `auth_env` lists the names from the Harness's list below that are set to a
+  non-empty value in the final launch environment, after `--clean-env`,
+  `--unset-env`, and `--env` apply. It is an empty array when none is set.
+  When it is not empty, the receipt also carries a `warning` and the Session
+  records a `notice` message naming the variables. Values are never shown.
+
+  ```text
+  claude    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+            CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+            CLAUDE_CODE_USE_FOUNDRY AWS_BEARER_TOKEN_BEDROCK ANTHROPIC_FOUNDRY_API_KEY
+  codex     OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL
+  cursor    CURSOR_API_KEY
+  grok      XAI_API_KEY
+  gemini    GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI
+            GOOGLE_APPLICATION_CREDENTIALS
+  opencode  every name matching [A-Z0-9_]+_API_KEY
+  other ACP every name matching [A-Z0-9_]+_API_KEY
+  ```
+
+  To run a Session on the subscription instead, remove the variables with
+  `--unset-env` or `unset_env` in `[defaults.<harness>]`.
+- A Claude Session snapshot also reports how Claude itself said it
+  authenticated, once the first turn of a process starts:
+
+  ```json
+  {"auth":"subscription"}
+  ```
+
+  `auth` is `subscription` when Claude's `system/init` reports
+  `apiKeySource: "none"`, and `api_key` otherwise. It is observation only and
+  never stops a Session. Other Harnesses have no `auth` field.
 - Launch environment values are passed in RPC memory, never argv, and are never
   directly serialized into Session records, `list`, `show`, `fetch`, Profiles,
   or error JSON. Provider output is untrusted and can deliberately echo its
@@ -1415,7 +1629,7 @@ shell-level summary. `SESSION_BLOCKED` uses exit 4 and `SESSION_BUSY` uses exit
 and `CURSOR_INVALID` use exit 1.
 `CANCEL_TIMEOUT` uses exit 3. Idle `cancel` is an
 idempotent exit-0 no-op.
-`AUTH_MISMATCH` uses exit 1.
+`UNSUPPORTED` and `AUTH_REQUIRED` use exit 1.
 
 `fetch` never uses a non-zero exit to describe an execution. A failed,
 canceled, or interrupted execution is reported inside `results[].status`, and a
@@ -1441,7 +1655,8 @@ CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-AUTH_MISMATCH          Claude subscription auth failed; blocking variables are named when present
+UNSUPPORTED            The Harness cannot do this; see ACP Harnesses
+AUTH_REQUIRED          The ACP agent needs sign-in; the action names the login command
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```
@@ -1511,10 +1726,10 @@ can change the contract:
 - **Codex hooks that need review.** v1 stops at a `LAUNCH_BLOCKED` screen.
   `codex exec` skips untrusted hooks silently; the app-server path without a
   TUI was not measured.
-- **Claude authentication policy.** Subscription authentication is the
-  built-in default. A non-empty `ANTHROPIC_API_KEY` or
-  `ANTHROPIC_AUTH_TOKEN` is rejected before launch unless the caller removes
-  it with `--unset-env`/`unset_env` or opts out with `--auth any`;
-  `system/init` is also checked before the first turn is accepted.
+- **ACP agent coverage.** OpenCode 2 was exercised end to end over ACP.
+  Cursor was exercised at the protocol level only (its account returned a plan
+  limit), Grok was not signed in, and Gemini's personal Code Assist service
+  refused new sessions. `grok`'s `XAI_API_KEY` entry in `auth_env` is
+  unverified.
 - **Interactive-only features.** Which user slash commands, skills, plugins,
   and hooks load under `claude -p` with stream-json.
