@@ -38,7 +38,7 @@ agent. The agent should not report completion after installing only the binary:
 the embedded skill must match the copies installed for Codex and Claude, and a
 counterpart Session must complete a simple delegated task through dlgt.
 
-Then ask either agent normally — neither prompt mentions dlgt. The installed
+Then ask either agent normally. Neither prompt mentions dlgt. The installed
 skill invokes it automatically, picks the counterpart model, and leaves effort
 to the harness default unless you request one:
 
@@ -75,29 +75,38 @@ for supported targets and verification steps.
 
 ## What dlgt does
 
-`dlgt` runs Codex, Claude, Cursor CLI, Grok Build, OpenCode, and Pi as live,
-addressable local Sessions. Each
-Session owns one harness process, one PTY, one terminal screen, and at most one
-active execution.
+`dlgt` runs Codex and Claude as live, addressable local Sessions. Each
+Session owns one provider process, driven over that provider's structured
+interface, and at most one active execution:
 
-- Provider lifecycle hooks report readiness and completion.
+```text
+Codex    codex app-server, JSON-RPC over stdio
+Claude   claude -p with stream-json input and output, one long-lived process
+```
+
+- Provider events report readiness, approvals, and completion.
 - Sessions survive across commands and follow-up prompts.
+- Approvals and questions the worker cannot settle reach the caller as
+  Requests, answered with `dlgt answer`. dlgt never approves on its own.
 - JSON output and JSONL RPC make delegation automatable.
-- State, events, results, and bounded terminal history stay local.
+- State, events, results, and bounded progress messages stay local.
 - The leader sees the counterpart's result and decides what to use.
+
+`dlgt` owns no terminal. There is no PTY, no screen, and no attach.
+`dlgt watch` follows a Session's progress as text, read-only.
 
 `dlgt` is not a planner, company simulator, workflow language, or multi-agent
 framework. It is the bridge between coding-agent harnesses.
 
 ## Why not the DIY routes
 
-- **`tmux send-keys`** — the leader polls `capture-pane` and burns tokens on
+- **`tmux send-keys`**: the leader polls `capture-pane` and burns tokens on
   screen dumps, or you script UI heuristics that break on a spinner.
-- **`claude -p` / `codex exec`** — every call is a cold start that throws away
-  context, and headless runs sometimes aren't covered by your subscription.
-- **`dlgt`** — completion is a lifecycle event, follow-ups keep their Session
-  context, the managed PTY returns JSON instead of screen scrapes, and it runs
-  on the plan you already pay for.
+- **`claude -p` / `codex exec`**: every call is a cold start that throws away
+  context, and approvals have nowhere to go.
+- **`dlgt`**: completion is a provider event, follow-ups keep their Session
+  context, approvals come back as answerable Requests, and progress is
+  structured JSON instead of screen scrapes.
 
 ## Direct CLI use
 
@@ -120,11 +129,11 @@ dlgt new \
 successful receipt with `submission: "confirmed" | "pending"`. `pending`
 means local delivery succeeded; follow its `action` and do not resend with a
 new request ID. `fetch` is the one observation command: it returns current
-state, new results, lifecycle events, and the forward screen delta from a
-cursor position. Chaining them prints two JSON documents, one per line; the
-first receipt carries the Session ID and cursor. For anything longer than a
-quick check, run the two commands separately so a lost read never costs you
-the receipt.
+state, pending Requests, new results, lifecycle events, and the forward
+message delta from a cursor position. Chaining them prints two JSON
+documents, one per line; the first receipt carries the Session ID and cursor.
+For anything longer than a quick check, run the two commands separately so a
+lost read never costs you the receipt.
 
 Create a Codex Session:
 
@@ -145,16 +154,30 @@ The command returns one provider-qualified Session ID, such as
 ```bash
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --wait 15m
 dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --request-id review-2 -- "Review the revision"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --steer --request-id review-3 -- "Focus on the parser"
 dlgt fetch codex:019f6307-341e-7e81-8a33-7ab61e804345 --cursor "$cursor"
+dlgt answer codex:019f6307-341e-7e81-8a33-7ab61e804345 r1 --deny --message "Do not push"
+dlgt watch codex:019f6307-341e-7e81-8a33-7ab61e804345
+dlgt cancel codex:019f6307-341e-7e81-8a33-7ab61e804345
 dlgt restart codex:019f6307-341e-7e81-8a33-7ab61e804345
-dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume --request-id review-3 -- "Continue the review"
+dlgt send codex:019f6307-341e-7e81-8a33-7ab61e804345 --resume --request-id review-4 -- "Continue the review"
 dlgt show codex:019f6307-341e-7e81-8a33-7ab61e804345
-dlgt scrollback codex:019f6307-341e-7e81-8a33-7ab61e804345 --lines 100
-dlgt attach codex:019f6307-341e-7e81-8a33-7ab61e804345
 dlgt stop codex:019f6307-341e-7e81-8a33-7ab61e804345
 ```
 
-The first client command starts the local daemon automatically.
+The first client command starts the local daemon automatically. To take a
+conversation over by hand, stop the Session and run the `resume_command` that
+`dlgt show` reports.
+
+## Approvals
+
+`--approvals auto|ask|bypass` decides who approves what a worker does. The
+default is `auto`: the provider's own reviewer decides, and only what it does
+not settle reaches the caller. `ask` sends every approval to the caller.
+`bypass` disables approvals, and the Codex sandbox, only when you ask for it.
+A pending approval or question blocks the Session until `dlgt answer`,
+`cancel`, or `stop`; it never times out into an approval. See
+[Approvals](docs/cli.md#approvals).
 
 ## Configuration
 
@@ -166,7 +189,8 @@ Store reusable launch profiles in `~/.config/dlgt/config.toml`, or point
 harness = "claude"
 model = "claude-fable-5"
 effort = "high"
-harness_options = ["chrome", "permission-mode=auto"]
+approvals = "auto"
+harness_options = ["chrome"]
 clean_env = true
 
 [profiles.codex-live-search]
@@ -176,61 +200,25 @@ harness_options = ['web_search="live"']
 
 Harness options map to the provider's native per-launch override: Claude
 receives a bare `KEY` as `--KEY` and `KEY=VALUE` as `--KEY=VALUE`. Codex
-requires `KEY=VALUE` and receives it as `--config KEY=VALUE` on both the
-managed app-server and remote TUI processes.
-
-dlgt launches Harnesses with their supported auto-approval settings by default. Opt out per Session with `--no-auto-approve` or
-per Profile with `auto_approve = false`.
+requires `KEY=VALUE` and receives it as `--config KEY=VALUE` on its
+app-server process. Options that would override the approvals mapping are
+rejected. See [Profiles and launch environment](docs/cli.md#profiles-and-launch-environment)
+for the full configuration, environment, and Claude authentication rules.
 
 Set `DLGT_HOME` to relocate the versioned runtime sockets. Set `DLGT_SOCKET` to
-override only the current version's socket. Session state is held in memory by
-the daemon that owns the Harness processes. The returned Session ID is also
-the provider conversation's durable resume selector: after that daemon exits,
-pass the same `codex:<id>`, `claude:<id>`, `cursor:<id>`, `grok:<id>`, `opencode:<id>`, or `pi:<id>` to `send --resume`. Plain `send`
-scans live versioned sockets first, so a binary update routes that same ID back
-to its owning daemon instead of creating a duplicate.
+override only the current version's socket. Set `DLGT_CODEX_BIN` or
+`DLGT_CLAUDE_BIN` if a harness executable is not on `PATH`. Session state is
+held in memory by the daemon that owns the Harness processes. The returned
+Session ID is also the provider conversation's durable resume selector: after
+that daemon exits, pass the same `codex:<id>` or `claude:<id>` to
+`send --resume`. Plain `send` scans live versioned sockets first, so a binary
+update routes that same ID back to its owning daemon instead of creating a
+duplicate.
 
 The daemon owns every provider process group. A sibling reaper runs in a
 separate process group and ignores ordinary shutdown signals; when the daemon
 is killed abruptly, loss of its control pipe terminates any provider groups
 that were still registered.
-
-## Cursor CLI
-
-Use `--harness cursor` to run the official interactive Cursor CLI in a PTY.
-New sessions, follow-ups, result retrieval, attach, cancellation, stop, and
-`send --resume` use the same Session commands. Install/login first; set
-`DLGT_CURSOR_BIN` on the daemon to override the `cursor-agent` executable.
-The adapter registers an inert-outside-dlgt bridge in `~/.cursor/hooks.json`.
-See [Cursor CLI details and limitations](docs/cli.md#cursor-interactive-cli)
-before use, including current model-discovery, restart, and permission-prompt
-limitations. Authenticated macOS E2E covers new sessions, follow-ups, resume,
-and cancellation; see the CLI documentation for the tested version.
-
-## Grok Build
-
-Use `--harness grok` to run the interactive Grok Build TUI in a PTY. Lifecycle
-completion comes from Claude-shaped hooks under `~/.grok/hooks/dlgt.json`
-(gated by `DLGT_GROK_LAUNCH`). Set `DLGT_GROK_BIN` to override the `grok`
-executable. Defaults pass `--always-approve --trust`; use `--no-auto-approve`
-to keep Grok's own prompts. ACP is not used by this harness.
-
-## OpenCode and Pi
-
-`--harness opencode` runs the OpenCode TUI (`opencode --auto`) in a PTY.
-`--harness pi` runs the Pi TUI (`pi --approve`) in a PTY. Both keep the
-conversation across `stop` and `send --resume`, and both support `restart`.
-Set `DLGT_OPENCODE_BIN` or `DLGT_PI_BIN` to override the executable.
-
-OpenCode models are `provider/model` (`--model xai/grok-4.7`). Pi takes
-`--model grok-4.7` with `--harness-option provider=xai`, or `--model xai/grok-4.7`.
-`--effort` maps to Pi's thinking level and is rejected for OpenCode.
-
-Both CLIs call xAI when `XAI_API_KEY` is the OIDC access JWT stored at
-`~/.grok/auth.json` under `key`. The JWT expires. Sign in with the Grok CLI
-again and export the new `key`. Do not print or commit the token. Pi stays on
-the interactive TUI: its extension waits for `agent_settled`, the same
-completion signal as `--mode rpc`, without replacing the PTY session.
 
 ## Build and verify
 
@@ -266,5 +254,3 @@ embedded skill without downloading another release:
 ```bash
 sh install.sh --register-skills-from target/release/dlgt --skill both
 ```
-
-The PTY and attach architecture is derived from the private `umux` project.

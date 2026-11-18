@@ -18,16 +18,12 @@ dbg_macro = "deny"
 [dependencies]
 anyhow = "1"
 attestation-verify = { git = "https://github.com/combinatrix-ai/attestation-verify", rev = "73d3b53ecbf2d3c71846ae4cab3fa6482be012eb" }
-base64 = "0.22"
 libc = "0.2"
-portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml_edit = "0.25"
-tungstenite = "0.28"
 ureq = "3"
 uuid = { version = "1", features = ["v4"] }
-vt100 = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

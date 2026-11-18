@@ -13,16 +13,14 @@ directory, and registers the embedded skill when a user-level Codex or Claude
 Harness is installed. Fresh Harness homes are created at the correct skill
 roots when needed.
 
-For Cursor CLI, Grok Build, OpenCode, and Pi prerequisites and commands, see
-the [CLI reference](cli.md).
-
 Normal users do not need Rust, Cargo, a compiler, or a source checkout. The
 published targets cover macOS and Linux on x86_64 and arm64, with both glibc
 and musl Linux packages.
 
 ## Prerequisites
 
-Install and authenticate at least one supported harness in the same shell:
+dlgt drives the Codex CLI and Claude Code. Install and log in to at least one
+of them in the same shell:
 
 ~~~sh
 for harness in codex claude; do
@@ -31,6 +29,12 @@ for harness in codex claude; do
   fi
 done
 ~~~
+
+- Codex must be logged in (`codex login`).
+- Claude Code must be logged in with your Claude subscription, unless the
+  Session is launched with `--auth any`. A client environment that carries
+  `ANTHROPIC_API_KEY` makes Claude bill that key instead. See
+  [Profiles and launch environment](cli.md#profiles-and-launch-environment).
 
 The installer requires curl, tar, and a SHA-256 utility (sha256sum on most
 Linux systems or shasum on macOS). It supports macOS and Linux only. It does
@@ -152,16 +156,17 @@ This is the recommended container-image setup because it guarantees that both
 Harnesses receive the skill embedded in the binary actually placed in the
 image.
 
-### Note: delegation runs auto-approved
+### Note: who approves a delegated worker
 
 The embedded skill lets an installed agent launch counterpart Sessions on its
-own. By default dlgt marks each Session working directory trusted and starts
-workers with approvals disabled
-(`--dangerously-bypass-approvals-and-sandbox` for Codex,
-`--permission-mode=auto` for Claude), so a delegated worker can edit
-files and run commands there without asking. Install and delegate only in
-workspaces you trust, and use `--no-auto-approve` or a Profile with
-`auto_approve = false` to keep the Harness's own permission prompts.
+own. dlgt marks each Session working directory trusted and starts workers
+with `--approvals auto` by default: the provider's own reviewer decides what
+runs (`auto_review` for Codex in its `workspace-write` sandbox, auto mode for
+Claude), and anything it does not settle is held as a Request for the caller
+to answer with `dlgt answer`. dlgt never approves on its own. Use
+`--approvals ask` to answer every approval yourself. `--approvals bypass`
+disables approvals and the Codex sandbox; use it only in workspaces you
+trust. See [Approvals](cli.md#approvals).
 
 ## Verify the installation
 
@@ -170,7 +175,6 @@ Run these checks in the shell where you will use dlgt:
 ~~~sh
 command -v dlgt
 dlgt version
-dlgt harnesses
 dlgt skill | grep -q '^name: dlgt$'
 ~~~
 
@@ -228,21 +232,23 @@ containing `DLGT_OK`. Retain the returned Session ID, stop that verification Ses
 verification succeeded. A launch failure, timeout, blocked Session, or missing
 result means verification did not pass.
 
-Codex and Claude may show first-run authentication, theme, security, trust, or
-permission-mode screens instead of accepting the delegated prompt. If a
-Session remains `starting` or `busy` without the expected lifecycle events,
-inspect it before retrying:
+dlgt has no terminal, so a Harness that needs a login, a trust decision, or
+first-run setup cannot start. `new` then fails with `LAUNCH_FAILED`: `detail`
+carries the provider's own stderr tail and `action` names the provider
+command, `codex` or `claude`, to run once by hand in the Session's working
+directory. Authentication requires the user. If the Session started but the
+result does not arrive, inspect it before retrying:
 
 ~~~sh
+dlgt show <SESSION_ID>
 dlgt fetch <SESSION_ID>
-dlgt scrollback <SESSION_ID> --lines 100
-dlgt attach <SESSION_ID>
+dlgt watch <SESSION_ID> --from-start
 ~~~
 
-Use `attach` to complete the visible first-run prompt, then detach with
-`Ctrl-b d`, stop the incomplete verification Session, and retry with a fresh
-Session. Authentication requires the user; do not claim end-to-end success
-until a later delegation completes with `DLGT_OK`.
+A `fetch` with `reason: "blocked"` carries a pending Request; this
+verification prompt should not need one. Stop the incomplete verification
+Session and retry with a fresh Session. Do not claim end-to-end success until
+a later delegation completes with `DLGT_OK`.
 
 The first client command starts the local dlgt daemon automatically. State
 and the Unix socket remain local under ~/.dlgt by default; use DLGT_HOME or
@@ -287,8 +293,10 @@ unauthenticated path.
   the installer replaced a different skill.
 - **A Session cannot start:** verify the relevant codex or claude command and
   its authentication in the same shell. Set DLGT_CODEX_BIN or DLGT_CLAUDE_BIN
-  if the harness executable is not on PATH. Use `events`, `scrollback`, and
-  `attach` to identify first-run Harness UI that is waiting for input.
+  if the harness executable is not on PATH. A `LAUNCH_FAILED` error carries
+  the provider's stderr tail in `detail` and the command to run once by hand
+  in `action`. `dlgt doctor` reports the installed Harness versions, daemon
+  sockets, and Skill copies.
 
 Once these checks pass, the active harness can use the registered dlgt skill to
 create, address, wait for, and inspect live Sessions. See the

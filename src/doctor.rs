@@ -8,7 +8,7 @@ use std::process::Command;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{client, paths, skill, update};
+use crate::{client, config, paths, skill, update};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
@@ -44,13 +44,6 @@ pub fn run(probe: bool) -> Report {
         "claude",
         &provider_program("DLGT_CLAUDE_BIN", "claude"),
     ));
-    checks.push(provider_check("cursor", &crate::cursor_agent::program()));
-    checks.push(provider_check("grok", &crate::grok_agent::program()));
-    checks.push(provider_check(
-        "opencode",
-        &crate::opencode_agent::program(),
-    ));
-    checks.push(provider_check("pi", &crate::pi_agent::program()));
     checks.push(skill_check("codex-skill", &codex_skill_path()));
     checks.push(skill_check("claude-skill", &claude_skill_path()));
     if probe {
@@ -107,24 +100,17 @@ fn binary_check() -> Check {
 }
 
 fn config_check() -> Check {
-    let path = config_path();
-    match fs::read_to_string(&path) {
-        Ok(text) => match text.parse::<toml_edit::DocumentMut>() {
-            Ok(_) => ok("config", format!("valid TOML at {}", path.display())),
-            Err(error) => fail(
-                "config",
-                format!("invalid TOML at {}: {error}", path.display()),
-                Some("fix the config before launching another Session"),
-            ),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ok(
+    let path = config::path();
+    match config::load_from_path(&path) {
+        Ok(_) if !path.exists() => ok(
             "config",
             format!("no config at {}; defaults apply", path.display()),
         ),
+        Ok(_) => ok("config", format!("valid config at {}", path.display())),
         Err(error) => fail(
             "config",
-            format!("cannot read {}: {error}", path.display()),
-            None,
+            format!("{error:#}"),
+            Some("fix the config before launching another Session"),
         ),
     }
 }
@@ -315,13 +301,6 @@ fn update_check() -> Check {
             Some("retry when network access is available"),
         ),
     }
-}
-
-fn config_path() -> PathBuf {
-    std::env::var_os("DLGT_CONFIG").map_or_else(
-        || home_dir().join(".config/dlgt/config.toml"),
-        PathBuf::from,
-    )
 }
 
 fn codex_skill_path() -> PathBuf {

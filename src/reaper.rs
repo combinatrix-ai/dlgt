@@ -122,3 +122,108 @@ pub fn run() -> Result<()> {
     }
     Ok(())
 }
+
+/// How long exit reporting waits for the provider's output to drain, so the
+/// events a provider wrote just before exiting are applied first.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reap a provider on its own thread, kill the rest of its process group,
+/// and report the exit. The report waits for the output reader to signal
+/// that it drained (by dropping its end of `drained`), but only for a short
+/// grace: a process that left the group while holding an inherited output
+/// pipe cannot delay the exit any longer than that.
+pub fn watch_exit(
+    mut child: std::process::Child,
+    name: &str,
+    drained: std::sync::mpsc::Receiver<()>,
+    on_exit: impl FnOnce(Option<std::process::ExitStatus>) + Send + 'static,
+) -> anyhow::Result<ExitWatch> {
+    use anyhow::Context as _;
+    let pid = child.id();
+    let watch = ExitWatch::default();
+    let exit_flag = std::sync::Arc::clone(&watch.exited);
+    let stop_output = std::sync::Arc::clone(&watch.stop_output);
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let status = child.wait().ok();
+            exit_flag.store(true, std::sync::atomic::Ordering::Release);
+            if let Ok(group) = i32::try_from(pid) {
+                // SAFETY: providers are spawned as leaders of their own
+                // process groups; signalling one touches no Rust memory.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
+            let _ = drained.recv_timeout(DRAIN_GRACE);
+            // Whatever is still unread after the grace belongs to a process
+            // outside the provider's group; stop reading it.
+            stop_output.store(true, std::sync::atomic::Ordering::Release);
+            on_exit(status);
+        })
+        .context("failed to start provider exit thread")?;
+    Ok(watch)
+}
+
+/// Flags shared between a provider's exit thread and its output reader.
+#[derive(Default)]
+pub struct ExitWatch {
+    pub exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub stop_output: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A provider output stream that ends when its provider's exit has been
+/// reported, even if a process outside the provider's group still holds the
+/// write end open.
+pub struct StoppableOutput<R> {
+    inner: R,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R> StoppableOutput<R> {
+    pub const fn new(inner: R, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { inner, stop }
+    }
+}
+
+impl<R: std::io::Read + std::os::fd::AsRawFd> std::io::Read for StoppableOutput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(0);
+            }
+            let mut ready = libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads one valid pollfd for this open descriptor.
+            let polled = unsafe { libc::poll(&raw mut ready, 1, 200) };
+            if polled > 0 {
+                return self.inner.read(buffer);
+            }
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// The provider closed its output. A provider that is still running after
+/// the drain grace cannot be talked to any more, so its process group is
+/// killed and the exit path reports it.
+pub fn output_closed(pid: u32, exited: &std::sync::atomic::AtomicBool) {
+    let deadline = std::time::Instant::now() + DRAIN_GRACE;
+    while std::time::Instant::now() < deadline {
+        if exited.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if let Ok(group) = i32::try_from(pid) {
+        // SAFETY: providers lead their own process groups; signalling one
+        // touches no Rust memory.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+}

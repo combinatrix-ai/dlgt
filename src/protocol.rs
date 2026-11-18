@@ -1,3 +1,4 @@
+use crate::error::fail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -96,6 +97,91 @@ impl std::fmt::Display for TurnState {
     }
 }
 
+/// Who approves what a worker does.
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalsMode {
+    Auto,
+    Ask,
+    Bypass,
+}
+
+impl ApprovalsMode {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "ask" => Ok(Self::Ask),
+            "bypass" => Ok(Self::Bypass),
+            _ => fail!(
+                InvalidArgument,
+                "invalid approvals mode {value:?}; expected auto, ask, or bypass"
+            ),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ask => "ask",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPolicy {
+    #[default]
+    Subscription,
+    Any,
+}
+
+impl AuthPolicy {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "subscription" => Ok(Self::Subscription),
+            "any" => Ok(Self::Any),
+            _ => fail!(
+                InvalidArgument,
+                "invalid auth policy {value:?}; expected subscription or any"
+            ),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Any => "any",
+        }
+    }
+}
+
+/// The approvals mode a Session asked for and the one its provider runs.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Approvals {
+    pub requested: ApprovalsMode,
+    pub effective: ApprovalsMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Approvals {
+    pub const fn new(requested: ApprovalsMode) -> Self {
+        Self {
+            requested,
+            effective: requested,
+            reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Auth {
+    Subscription,
+    ApiKey,
+}
+
 /// Longest caller-supplied acceptance idempotency key. The key is retained
 /// for the daemon's lifetime, so it is bounded.
 pub const MAX_ACCEPTANCE_REQUEST_ID_LEN: usize = 128;
@@ -155,9 +241,12 @@ pub struct RpcError {
     pub session_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// Rendered tail of the provider screen when a launch failed.
+    /// Pending Request IDs when the Session is blocked.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub screen: Option<Vec<String>>,
+    pub request_ids: Option<Vec<String>>,
+    /// Provider stderr tail and last reported error when a launch failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl Response {
@@ -187,7 +276,8 @@ impl Response {
                 hint: None,
                 session_state: None,
                 action: None,
-                screen: None,
+                request_ids: None,
+                detail: None,
             }),
             info: None,
         }
@@ -212,7 +302,8 @@ impl Response {
                 hint: None,
                 session_state: None,
                 action: None,
-                screen: None,
+                request_ids: None,
+                detail: None,
             }),
             info: None,
         }
@@ -232,14 +323,18 @@ pub struct SessionRecord {
     pub alias: String,
     pub title: String,
     pub agent: String,
-    #[serde(skip)]
-    pub cursor_launch_id: Option<String>,
     pub cwd: String,
     pub state: SessionState,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub harness_options: Vec<String>,
-    pub auto_approve: bool,
+    pub approvals: Approvals,
+    /// How the provider said it authenticated, once it has reported it.
+    pub auth: Option<Auth>,
+    /// Claude launch policy retained for Session restart.
+    pub auth_policy: Option<AuthPolicy>,
+    /// Model the provider resolved the launch selection to.
+    pub resolved_model: Option<String>,
     pub active_turn_id: Option<String>,
     pub pid: Option<u32>,
     pub created_at_ms: i64,
@@ -255,16 +350,19 @@ pub struct TurnRecord {
     pub state: TurnState,
     pub provider_turn_id: Option<String>,
     pub final_message: Option<String>,
-    /// The hook did not report the final message and it was recovered from
-    /// the provider transcript instead.
+    /// The provider's turn result carried no text and it was recovered from
+    /// the assistant messages streamed during this execution instead.
     pub final_text_recovered: bool,
+    /// Approvals denied during this execution, by any reviewer.
+    pub denied_requests: u32,
+    /// Denials dlgt recorded as messages, and the provider's own total.
+    /// Claude's total includes the caller's denials, so the public count is
+    /// the larger of the two rather than their sum.
     #[serde(skip)]
-    pub cursor_stop_status: Option<String>,
-    /// Provider transcript path and the byte offset recorded when this
-    /// execution was accepted, used only for that bounded recovery.
-    pub transcript_path: Option<String>,
-    pub transcript_offset: Option<u64>,
-    pub error: Option<String>,
+    pub recorded_denials: u32,
+    #[serde(skip)]
+    pub provider_denials: u32,
+    pub error: Option<Value>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,

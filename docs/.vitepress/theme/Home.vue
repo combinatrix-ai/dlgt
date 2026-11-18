@@ -81,14 +81,12 @@ onBeforeUnmount(() => {
   copyTimers.clear();
 });
 
-// Keep the examples short enough for the single-line ticker on mobile. Cursor
-// and OpenCode reject effort, so only show it for targets that support it.
-type TickerAgent = "sol" | "fable" | "luna" | "sonnet" | "grok" | "cursor" | "opencode" | "pi";
+// Keep the examples short enough for the single-line ticker on mobile.
+type TickerAgent = "sol" | "fable" | "luna" | "sonnet";
 type Delegation = { from: TickerAgent; to: TickerAgent; task: string; efforts?: string[] };
 type TickerPair = { from: TickerAgent; to: TickerAgent; task: string; effort: string | null };
 const tickerHarness: Record<TickerAgent, string> = {
   sol: "codex", luna: "codex", fable: "claude", sonnet: "claude",
-  grok: "grok", cursor: "cursor", opencode: "opencode", pi: "pi",
 };
 const tickerLogo = (agent: TickerAgent) => withBase(`/harness-logos/${tickerHarness[agent]}.svg`);
 const delegations: Delegation[] = [
@@ -96,10 +94,10 @@ const delegations: Delegation[] = [
   { from: "fable", to: "sol", task: "design the API", efforts: ["ultra", "max", "xhigh"] },
   { from: "fable", to: "luna", task: "rewrite the parser", efforts: ["max", "xhigh"] },
   { from: "sol", to: "sonnet", task: "build the sidebar", efforts: ["max", "xhigh"] },
-  { from: "sol", to: "grok", task: "audit the tests" },
-  { from: "fable", to: "cursor", task: "map the UX" },
-  { from: "sol", to: "opencode", task: "trace the bug" },
-  { from: "fable", to: "pi", task: "check the docs" },
+  { from: "sonnet", to: "luna", task: "audit the tests", efforts: ["max", "xhigh"] },
+  { from: "luna", to: "fable", task: "map the UX", efforts: ["max", "xhigh"] },
+  { from: "fable", to: "sol", task: "trace the bug", efforts: ["max", "xhigh"] },
+  { from: "sol", to: "sonnet", task: "check the docs", efforts: ["high", "max"] },
 ];
 
 // Static list for SSR; reshuffled with supported random efforts after mount.
@@ -108,19 +106,15 @@ const pairs = ref<TickerPair[]>([
   { from: "sol", to: "fable", effort: "max", task: "review the UX copy" },
   { from: "fable", to: "luna", effort: "xhigh", task: "rewrite the parser" },
   { from: "sol", to: "sonnet", effort: "max", task: "build the sidebar" },
-  { from: "sol", to: "grok", effort: null, task: "audit the tests" },
-  { from: "fable", to: "cursor", effort: null, task: "map the UX" },
-  { from: "sol", to: "opencode", effort: null, task: "trace the bug" },
-  { from: "fable", to: "pi", effort: null, task: "check the docs" },
+  { from: "sonnet", to: "luna", effort: "max", task: "audit the tests" },
+  { from: "luna", to: "fable", effort: "xhigh", task: "map the UX" },
+  { from: "fable", to: "sol", effort: "max", task: "trace the bug" },
+  { from: "sol", to: "sonnet", effort: "high", task: "check the docs" },
 ]);
 
 const harnesses = [
   { slug: "codex", label: "Codex" },
   { slug: "claude", label: "Claude" },
-  { slug: "cursor", label: "Cursor" },
-  { slug: "grok", label: "Grok" },
-  { slug: "opencode", label: "OpenCode" },
-  { slug: "pi", label: "Pi" },
 ];
 
 onMounted(() => {
@@ -177,8 +171,8 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
     <section id="harnesses" class="harnesses">
       <div class="harnesses-intro">
         <p class="eyebrow">Supported harnesses</p>
-        <h2>One bridge. Six harnesses.</h2>
-        <p>Run another coding agent in a live, addressable terminal Session. Follow up in the same conversation and read its provider-reported result.</p>
+        <h2>One bridge. Both directions.</h2>
+        <p>Run the other coding agent as a live, addressable Session. Follow up in the same conversation, steer it mid-turn, answer its approvals, and read its provider-reported result.</p>
       </div>
       <ul class="harness-logos" aria-label="Supported harnesses" tabindex="0">
         <li v-for="harness in harnesses" :key="harness.slug">
@@ -205,7 +199,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
           <strong>claude -p / codex exec</strong>
           <ul class="diy-points">
             <li>A cold start on every call — context is thrown away</li>
-            <li>Headless runs sometimes aren't covered by your subscription</li>
+            <li>Once a run starts you can't steer it, answer it, or cancel it cleanly</li>
           </ul>
         </li>
         <li class="diy-dlgt">
@@ -215,7 +209,7 @@ const tickerPairs = computed(() => [...pairs.value, pairs.value[0]]);
             <ul class="diy-points diy-yes">
               <li>Completion is a lifecycle event — done means done</li>
               <li>Durable sessions — follow-ups keep their context</li>
-              <li>Managed PTY, JSON results — no scraping, no tmux</li>
+              <li>Structured provider protocols, JSON results — no terminal, no scraping</li>
               <li>On the plan you already pay for</li>
             </ul>
           </div>

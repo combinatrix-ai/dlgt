@@ -1,112 +1,187 @@
+//! Codex transport: one `codex app-server` process per Session, driven with
+//! JSON-RPC over its stdio. There is no terminal and no remote TUI.
+
 use std::collections::{HashMap, HashSet};
-use std::io;
-use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
-use tungstenite::{Message, WebSocket, client};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Map, Value, json};
 
-use crate::provider::{codex_app_server_args, codex_program};
+use crate::provider::codex_program;
 use crate::reaper::{Reaper, Registration};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+const RESUME_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
+const TURN_RECONCILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const STDERR_TAIL_LIMIT: usize = 4096;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-type NotificationHandler = Arc<dyn Fn(Value) + Send + Sync>;
+/// Server requests that become Requests for the caller to answer. Anything
+/// else is refused on the spot, because nobody would ever answer it.
+const CALLER_REQUESTS: [&str; 5] = [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+];
 
-enum Outbound {
-    Request {
-        id: u64,
-        method: &'static str,
-        params: Value,
-        response: Sender<Result<Value, String>>,
-    },
-    Notification {
-        method: &'static str,
-        params: Value,
-    },
+type NotificationHandler = Arc<dyn Fn(Value) -> bool + Send + Sync>;
+type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
+
+#[derive(Debug)]
+enum WriteCommand {
+    Message(Vec<u8>, Option<Sender<Result<(), String>>>),
     Close,
 }
 
 pub struct CodexConnection {
-    outbound: Sender<Outbound>,
+    pid: u32,
+    writer: Sender<WriteCommand>,
+    closed: Arc<AtomicBool>,
+    pending: Pending,
     next_id: AtomicU64,
-    child: Mutex<Child>,
-    socket_path: PathBuf,
     handler: NotificationHandler,
     terminal_turns: Arc<Mutex<HashSet<String>>>,
-    joined: AtomicBool,
+    stderr_tail: Arc<Mutex<String>>,
     _reaper_registration: Registration,
 }
 
-struct ChildGuard(Option<Child>);
-
 impl CodexConnection {
+    #[allow(clippy::too_many_lines)]
     pub fn connect(
-        socket_path: PathBuf,
-        handler: NotificationHandler,
-        reaper: &Arc<Reaper>,
-    ) -> Result<Arc<Self>> {
-        Self::connect_with_environment(socket_path, handler, None, &[], reaper)
-    }
-
-    pub fn connect_with_environment(
-        socket_path: PathBuf,
         handler: NotificationHandler,
         environment: Option<&HashMap<String, String>>,
-        harness_options: &[String],
+        cwd: Option<&Path>,
+        args: &[String],
+        startup_timeout: Duration,
         reaper: &Arc<Reaper>,
     ) -> Result<Arc<Self>> {
-        let mut child_guard = ChildGuard(Some(spawn_app_server(
-            &socket_path,
-            environment,
-            harness_options,
-        )?));
-        let child = child_guard
-            .0
-            .as_ref()
+        let mut command = Command::new(codex_program());
+        if let Some(environment) = environment {
+            command.env_clear().envs(environment);
+        }
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = command
+            .args(args)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start the managed Codex app-server")?;
+        let pid = child.id();
+        let reaper_registration = reaper.watch(pid)?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("Codex app-server stdin was unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
             .context("Codex app-server child was unavailable")?;
-        let reaper_registration = reaper.watch(child.id())?;
-        let stream = UnixStream::connect(&socket_path)
-            .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .context("failed to configure Codex app-server socket")?;
-        let (websocket, _response) = client("ws://localhost/", stream)
-            .context("failed to establish Codex app-server WebSocket")?;
-        let (sender, receiver) = mpsc::channel();
-        let io_handler = Arc::clone(&handler);
+        let stderr = child
+            .stderr
+            .take()
+            .context("Codex app-server child was unavailable")?;
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let writer = spawn_writer(stdin, Arc::clone(&closed), pid)?;
+
+        let (drained, drained_signal) = std::sync::mpsc::channel::<()>();
+        let exit_handler = Arc::clone(&handler);
+        let exit_pending = Arc::clone(&pending);
+        let exit_closed = Arc::clone(&closed);
+        let exit_watch =
+            crate::reaper::watch_exit(child, "dlgt-codex-exit", drained_signal, move |status| {
+                let reason = status.map_or_else(
+                    || "Codex app-server closed the connection".to_owned(),
+                    |status| format!("Codex app-server exited: {status}"),
+                );
+                fail_pending(&exit_pending, &reason);
+                exit_closed.store(true, Ordering::Release);
+                exit_handler(transport_closed(&reason));
+            })?;
+
+        let tail = Arc::clone(&stderr_tail);
+        let stderr_stop = Arc::clone(&exit_watch.stop_output);
+        std::thread::Builder::new()
+            .name("dlgt-codex-stderr".to_owned())
+            .spawn(move || {
+                retain_tail(
+                    crate::reaper::StoppableOutput::new(stderr, stderr_stop),
+                    &tail,
+                );
+            })
+            .context("failed to start Codex stderr thread")?;
+
+        let io_handler = Arc::clone(&handler);
+        let io_pending = Arc::clone(&pending);
         let io_terminal_turns = Arc::clone(&terminal_turns);
+        let io_writer = writer.clone();
         std::thread::Builder::new()
             .name("dlgt-codex-app-server".to_owned())
-            .spawn(move || io_loop(websocket, &receiver, &io_handler, &io_terminal_turns))
+            .spawn(move || {
+                let stdout = crate::reaper::StoppableOutput::new(
+                    stdout,
+                    Arc::clone(&exit_watch.stop_output),
+                );
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Value>(&line) {
+                        Ok(message) => dispatch_message(
+                            &io_writer,
+                            &io_pending,
+                            &io_handler,
+                            &io_terminal_turns,
+                            message,
+                        ),
+                        Err(error) => {
+                            io_handler(json!({
+                                "method": "dlgt/protocol/error",
+                                "params": {"message": error.to_string()},
+                            }));
+                        }
+                    }
+                }
+                drop(drained);
+                crate::reaper::output_closed(pid, &exit_watch.exited);
+            })
             .context("failed to start Codex app-server I/O thread")?;
+
         let connection = Arc::new(Self {
-            outbound: sender,
+            pid,
+            writer,
+            closed,
+            pending,
             next_id: AtomicU64::new(1),
-            child: Mutex::new(
-                child_guard
-                    .0
-                    .take()
-                    .context("Codex app-server child was unavailable")?,
-            ),
-            socket_path,
             handler,
             terminal_turns,
-            joined: AtomicBool::new(false),
+            stderr_tail,
             _reaper_registration: reaper_registration,
         });
-        connection.request(
+        connection.initialize(startup_timeout)?;
+        Ok(connection)
+    }
+
+    fn initialize(&self, startup_timeout: Duration) -> Result<()> {
+        self.request_within(
             "initialize",
             json!({
                 "clientInfo": {
@@ -119,28 +194,74 @@ impl CodexConnection {
                     "requestAttestation": false,
                 },
             }),
+            startup_timeout,
         )?;
-        connection.notify("initialized", json!({}))?;
-        Ok(connection)
+        self.notify("initialized", json!({}))
+    }
+
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Start a new thread and return its ID together with what the provider
+    /// resolved the launch selection to.
+    pub fn start_thread(&self, params: Value, timeout: Duration) -> Result<(String, Value)> {
+        let response = self.request_within("thread/start", params, timeout)?;
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("Codex thread/start response had no thread id")?;
+        Ok((thread_id, response))
+    }
+
+    /// Load a stored thread into this app-server.
+    pub fn resume_thread(&self, params: &Value, timeout: Duration) -> Result<Value> {
+        let deadline = std::time::Instant::now() + RESUME_TIMEOUT.min(timeout);
+        loop {
+            match self.request_within("thread/resume", params.clone(), timeout) {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if is_rollout_not_ready(&error.to_string())
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn start_turn(&self, thread_id: &str, prompt: &str) -> Result<String> {
         let response = self.request(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": [],
-                }],
-            }),
+            json!({"threadId": thread_id, "input": [text_input(prompt)]}),
         )?;
         response
             .pointer("/turn/id")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("Codex turn/start response had no turn id")
+    }
+
+    /// Add input to the turn that is already running.
+    pub fn steer_turn(&self, thread_id: &str, turn_id: &str, text: &str) -> Result<()> {
+        self.request(
+            "turn/steer",
+            json!({
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
+                "input": [text_input(text)],
+            }),
+        )?;
+        Ok(())
     }
 
     pub fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
@@ -171,34 +292,44 @@ impl CodexConnection {
         Ok(json!({"data":data,"nextCursor":null}))
     }
 
-    pub fn join_thread(&self, thread_id: &str) -> Result<()> {
-        if self.joined.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let deadline = std::time::Instant::now() + SOCKET_TIMEOUT;
-        loop {
-            match self.request("thread/resume", json!({"threadId": thread_id})) {
-                Ok(_) => {
-                    self.joined.store(true, Ordering::Release);
-                    return Ok(());
-                }
-                Err(error)
-                    if is_rollout_not_ready(&error.to_string())
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     pub fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<()> {
         self.request(
             "turn/interrupt",
             json!({"threadId": thread_id, "turnId": turn_id}),
         )?;
         Ok(())
+    }
+
+    pub fn respond_delivery(
+        &self,
+        id: &Value,
+        result: &Value,
+    ) -> std::result::Result<(), crate::provider::DeliveryFailure> {
+        let line = serialize_message(&json!({"id": id, "result": result}))
+            .map_err(|error| crate::provider::DeliveryFailure::not_handed(error.to_string()))?;
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .writer
+            .send(WriteCommand::Message(line, Some(sender)))
+            .is_err()
+        {
+            return Err(crate::provider::DeliveryFailure::not_handed(
+                "Codex app-server writer is closed",
+            ));
+        }
+        match receiver.recv_timeout(WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => {
+                self.force_stop();
+                Err(crate::provider::DeliveryFailure::ambiguous(message))
+            }
+            Err(_) => {
+                self.force_stop();
+                Err(crate::provider::DeliveryFailure::ambiguous(
+                    "timed out writing to the Codex app-server",
+                ))
+            }
+        }
     }
 
     pub fn watch_turn(self: &Arc<Self>, thread_id: &str, turn_id: &str) -> Result<()> {
@@ -213,30 +344,45 @@ impl CodexConnection {
                     let Some(connection) = connection.upgrade() else {
                         return;
                     };
-                    let response = connection.request(
+                    // The turn's own terminal notification already settled
+                    // it; reconciling it again is only load.
+                    if is_terminal(&connection.terminal_turns, &turn_id) {
+                        return;
+                    }
+                    // Bounded so a worker notices its turn settled soon after,
+                    // even when a read goes unanswered.
+                    let response = connection.request_within(
                         "thread/read",
                         json!({"threadId": thread_id, "includeTurns": true}),
+                        TURN_RECONCILE_READ_TIMEOUT,
                     );
-                    if let Ok(response) = response
-                        && let Some(turn) = terminal_turn(&response, &turn_id)
-                    {
-                        if terminal_reconciliation_ready(&mut pending_terminal_status, &turn) {
-                            dispatch_notification(
-                                &connection.handler,
-                                &connection.terminal_turns,
-                                json!({
-                                    "method": "turn/completed",
-                                    "params": {
-                                        "threadId": thread_id,
-                                        "turn": turn,
-                                        "source": "thread/read",
-                                    },
-                                }),
-                            );
-                            return;
+                    match response {
+                        Ok(response) => {
+                            if let Some(turn) = terminal_turn(&response, &turn_id) {
+                                if terminal_reconciliation_ready(
+                                    &mut pending_terminal_status,
+                                    &turn,
+                                ) {
+                                    dispatch_notification(
+                                        &connection.handler,
+                                        &connection.terminal_turns,
+                                        json!({
+                                            "method": "turn/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turn": turn,
+                                                "source": "thread/read",
+                                            },
+                                        }),
+                                    );
+                                    return;
+                                }
+                            } else {
+                                pending_terminal_status = None;
+                            }
                         }
-                    } else {
-                        pending_terminal_status = None;
+                        Err(_) if connection.closed() => return,
+                        Err(_) => pending_terminal_status = None,
                     }
                     drop(connection);
                     std::thread::sleep(TURN_RECONCILE_INTERVAL);
@@ -246,27 +392,179 @@ impl CodexConnection {
         Ok(())
     }
 
+    pub fn stop(&self) {
+        self.close_writer();
+        self.signal(libc::SIGTERM);
+    }
+
+    pub fn force_stop(&self) {
+        self.close_writer();
+        self.signal(libc::SIGKILL);
+    }
+
+    fn close_writer(&self) {
+        let _ = self.writer.send(WriteCommand::Close);
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn signal(&self, signal: i32) {
+        if let Ok(pid) = i32::try_from(self.pid) {
+            // SAFETY: kill has no memory-safety preconditions. The app-server
+            // is spawned as the leader of its own process group.
+            unsafe {
+                libc::kill(-pid, signal);
+            }
+        }
+    }
+
     fn request(&self, method: &'static str, params: Value) -> Result<Value> {
+        self.request_within(method, params, REQUEST_TIMEOUT)
+    }
+
+    fn request_within(
+        &self,
+        method: &'static str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
-        self.outbound
-            .send(Outbound::Request {
-                id,
-                method,
-                params,
-                response: sender,
-            })
-            .context("Codex app-server connection closed")?;
-        receiver
-            .recv_timeout(REQUEST_TIMEOUT)
+        self.pending
+            .lock()
+            .map_err(|_| anyhow!("Codex request lock poisoned"))?
+            .insert(id, sender);
+        let message = Value::Object(Map::from_iter([
+            ("id".to_owned(), json!(id)),
+            ("method".to_owned(), json!(method)),
+            ("params".to_owned(), params),
+        ]));
+        if let Err(error) = write_message(&self.writer, &message) {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&id);
+            }
+            return Err(error);
+        }
+        let response = receiver.recv_timeout(timeout);
+        if response.is_err()
+            && let Ok(mut pending) = self.pending.lock()
+        {
+            // A reply that never came must not keep its slot forever.
+            pending.remove(&id);
+        }
+        response
             .with_context(|| format!("timed out waiting for Codex {method}"))?
             .map_err(|message| anyhow!("Codex {method} failed: {message}"))
     }
 
     fn notify(&self, method: &'static str, params: Value) -> Result<()> {
-        self.outbound
-            .send(Outbound::Notification { method, params })
-            .context("Codex app-server connection closed")
+        write_message(
+            &self.writer,
+            &Value::Object(Map::from_iter([
+                ("method".to_owned(), json!(method)),
+                ("params".to_owned(), params),
+            ])),
+        )
+    }
+}
+
+impl Drop for CodexConnection {
+    fn drop(&mut self) {
+        self.force_stop();
+    }
+}
+
+fn text_input(text: &str) -> Value {
+    json!({"type": "text", "text": text, "text_elements": []})
+}
+
+fn serialize_message(message: &Value) -> Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(message)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn queue_message(writer: &Sender<WriteCommand>, message: &Value) -> Result<()> {
+    writer
+        .send(WriteCommand::Message(serialize_message(message)?, None))
+        .context("Codex app-server writer closed")
+}
+
+fn write_message(writer: &Sender<WriteCommand>, message: &Value) -> Result<()> {
+    let line = serialize_message(message)?;
+    let (sender, receiver) = mpsc::channel();
+    writer
+        .send(WriteCommand::Message(line, Some(sender)))
+        .context("Codex app-server writer closed")?;
+    receiver
+        .recv_timeout(WRITE_TIMEOUT)
+        .context("timed out writing to the Codex app-server")?
+        .map_err(|message| anyhow!(message))
+}
+
+fn spawn_writer(
+    stdin: ChildStdin,
+    closed: Arc<AtomicBool>,
+    pid: u32,
+) -> Result<Sender<WriteCommand>> {
+    let (writer, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("dlgt-codex-writer".to_owned())
+        .spawn(move || writer_loop(stdin, receiver, &closed, pid))
+        .context("failed to start Codex writer thread")?;
+    Ok(writer)
+}
+
+fn writer_loop(
+    mut stdin: ChildStdin,
+    receiver: Receiver<WriteCommand>,
+    closed: &AtomicBool,
+    pid: u32,
+) {
+    for command in receiver {
+        match command {
+            WriteCommand::Close => break,
+            WriteCommand::Message(line, acknowledgment) => {
+                let result = stdin
+                    .write_all(&line)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| format!("Codex app-server connection closed: {error}"));
+                if let Some(acknowledgment) = acknowledgment {
+                    let _ = acknowledgment.send(result.clone());
+                }
+                if result.is_err() {
+                    closed.store(true, Ordering::Release);
+                    if let Ok(pid) = i32::try_from(pid) {
+                        // SAFETY: kill has no memory-safety preconditions; the
+                        // app-server owns a dedicated process group.
+                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    closed.store(true, Ordering::Release);
+}
+
+fn retain_tail(mut stream: impl Read, tail: &Mutex<String>) {
+    let mut buffer = [0_u8; 4096];
+    while let Ok(read) = stream.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let Ok(mut tail) = tail.lock() else { break };
+        tail.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        if tail.len() > STDERR_TAIL_LIMIT {
+            let mut cut = tail.len() - STDERR_TAIL_LIMIT;
+            while !tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            tail.drain(..cut);
+        }
     }
 }
 
@@ -279,142 +577,55 @@ fn is_rollout_not_ready(message: &str) -> bool {
         || message.contains("rollout") && message.contains("is empty")
 }
 
-impl Drop for CodexConnection {
-    fn drop(&mut self) {
-        let _ = self.outbound.send(Outbound::Close);
-        if let Ok(mut child) = self.child.lock() {
-            kill_child_group(&mut child);
-        }
-        if let Some(parent) = self.socket_path.parent() {
-            let _ = std::fs::remove_dir_all(parent);
-        }
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            kill_child_group(child);
-        }
-    }
-}
-
-fn kill_child_group(child: &mut Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // SAFETY: kill has no memory-safety preconditions. The app-server is
-        // spawned as the leader of this process group.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn io_loop(
-    mut websocket: WebSocket<UnixStream>,
-    outbound: &Receiver<Outbound>,
-    handler: &NotificationHandler,
-    terminal_turns: &Arc<Mutex<HashSet<String>>>,
-) {
-    let mut pending: HashMap<u64, Sender<Result<Value, String>>> = HashMap::new();
-    loop {
-        while let Ok(message) = outbound.try_recv() {
-            match message {
-                Outbound::Request {
-                    id,
-                    method,
-                    params,
-                    response,
-                } => {
-                    let payload = json!({"id": id, "method": method, "params": params});
-                    if let Err(error) = websocket.send(Message::text(payload.to_string())) {
-                        let _ = response.send(Err(error.to_string()));
-                        fail_pending(&mut pending, &error.to_string());
-                        handler(transport_closed(&error.to_string()));
-                        return;
-                    }
-                    pending.insert(id, response);
-                }
-                Outbound::Notification { method, params } => {
-                    let payload = json!({"method": method, "params": params});
-                    if let Err(error) = websocket.send(Message::text(payload.to_string())) {
-                        fail_pending(&mut pending, &error.to_string());
-                        handler(transport_closed(&error.to_string()));
-                        return;
-                    }
-                }
-                Outbound::Close => {
-                    let _ = websocket.close(None);
-                    fail_pending(&mut pending, "Codex app-server connection closed");
-                    return;
-                }
-            }
-        }
-
-        match websocket.read() {
-            Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
-                Ok(message) => dispatch_message(
-                    &mut websocket,
-                    &mut pending,
-                    handler,
-                    terminal_turns,
-                    message,
-                ),
-                Err(error) => handler(json!({
-                    "method": "dlgt/protocol/error",
-                    "params": {"message": error.to_string()},
-                })),
-            },
-            Ok(Message::Close(_)) => {
-                fail_pending(&mut pending, "Codex app-server closed the connection");
-                handler(transport_closed("Codex app-server closed the connection"));
-                return;
-            }
-            Ok(Message::Ping(payload)) => {
-                let _ = websocket.send(Message::Pong(payload));
-            }
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => {
-                fail_pending(&mut pending, &error.to_string());
-                handler(transport_closed(&error.to_string()));
-                return;
-            }
-        }
-    }
-}
-
 fn dispatch_message(
-    websocket: &mut WebSocket<UnixStream>,
-    pending: &mut HashMap<u64, Sender<Result<Value, String>>>,
+    writer: &Sender<WriteCommand>,
+    pending: &Pending,
     handler: &NotificationHandler,
     terminal_turns: &Arc<Mutex<HashSet<String>>>,
     message: Value,
 ) {
-    if message.get("method").is_some()
+    if let Some(method) = message.get("method").and_then(Value::as_str)
         && let Some(id) = message.get("id").cloned()
     {
-        handler(json!({
-            "method": "dlgt/server/request",
-            "params": {
-                "method": message.get("method"),
-                "id": id.clone(),
-            },
-        }));
-        let response = json!({
-            "id": id,
-            "error": {"code": -32601, "message": "dlgt does not handle server requests"},
-        });
-        let _ = websocket.send(Message::text(response.to_string()));
+        if CALLER_REQUESTS.contains(&method) {
+            let accepted = handler(json!({
+                "method": "dlgt/server/request",
+                "params": {
+                    "method": method,
+                    "id": id.clone(),
+                    "params": message.get("params"),
+                },
+            }));
+            if !accepted {
+                let _ = queue_message(
+                    writer,
+                    &json!({
+                        "id": id,
+                        "error": {"code": -32000, "message": "dlgt refused the request"},
+                    }),
+                );
+            }
+        } else {
+            let _ = queue_message(
+                writer,
+                &json!({
+                    "id": id,
+                    "error": {"code": -32601, "message": "dlgt does not handle this server request"},
+                }),
+            );
+            handler(json!({
+                "method": "dlgt/server/unsupported",
+                "params": {"method": method},
+            }));
+        }
         return;
     }
     if let Some(id) = message.get("id").and_then(Value::as_u64) {
-        if let Some(sender) = pending.remove(&id) {
+        let sender = pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&id));
+        if let Some(sender) = sender {
             let result = if let Some(error) = message.get("error") {
                 Err(error
                     .get("message")
@@ -446,16 +657,6 @@ fn dispatch_notification(
     }
     if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
         let turn = message.pointer("/params/turn");
-        if turn
-            .and_then(|turn| turn.get("status"))
-            .and_then(Value::as_str)
-            == Some("completed")
-            && turn
-                .and_then(final_agent_message_text)
-                .is_none_or(str::is_empty)
-        {
-            return;
-        }
         if let Some(turn_id) = turn.and_then(|turn| turn.get("id")).and_then(Value::as_str)
             && !mark_terminal_once(terminal_turns, turn_id)
         {
@@ -494,13 +695,10 @@ fn terminal_turn(response: &Value, turn_id: &str) -> Option<Value> {
             if turn.get("id").and_then(Value::as_str) != Some(turn_id) {
                 return false;
             }
-            match turn.get("status").and_then(Value::as_str) {
-                Some("failed" | "interrupted") => true,
-                Some("completed") => {
-                    final_agent_message_text(turn).is_some_and(|text| !text.is_empty())
-                }
-                _ => false,
-            }
+            matches!(
+                turn.get("status").and_then(Value::as_str),
+                Some("failed" | "interrupted" | "completed")
+            )
         })
         .cloned()
 }
@@ -530,55 +728,16 @@ pub(crate) fn final_agent_message_text(turn: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn fail_pending(pending: &mut HashMap<u64, Sender<Result<Value, String>>>, message: &str) {
-    for (_, sender) in pending.drain() {
-        let _ = sender.send(Err(message.to_owned()));
+fn fail_pending(pending: &Pending, message: &str) {
+    if let Ok(mut pending) = pending.lock() {
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(message.to_owned()));
+        }
     }
 }
 
 fn transport_closed(message: &str) -> Value {
     json!({"method": "dlgt/transport/closed", "params": {"message": message}})
-}
-
-fn spawn_app_server(
-    socket_path: &Path,
-    environment: Option<&HashMap<String, String>>,
-    harness_options: &[String],
-) -> Result<Child> {
-    let parent = socket_path.parent().context("Codex socket has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to secure {}", parent.display()))?;
-    let endpoint = format!("unix://{}", socket_path.display());
-    let mut command = Command::new(codex_program());
-    if let Some(environment) = environment {
-        command.env_clear().envs(environment);
-    }
-    let mut child = command
-        .args(codex_app_server_args(&endpoint, harness_options)?)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start the managed Codex app-server")?;
-    let deadline = std::time::Instant::now() + SOCKET_TIMEOUT;
-    while !socket_path.exists() {
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to inspect Codex app-server")?
-        {
-            bail!("Codex app-server exited before creating its socket: {status}");
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("timed out waiting for {}", socket_path.display());
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    Ok(child)
 }
 
 #[cfg(test)]
@@ -631,7 +790,10 @@ mod tests {
                 "turns": [{"id": "done", "status": "completed", "items": []}],
             },
         });
-        assert!(terminal_turn(&empty_completion, "done").is_none());
+        assert_eq!(
+            terminal_turn(&empty_completion, "done").and_then(|turn| turn.get("status").cloned()),
+            Some(json!("completed"))
+        );
         let successful_completion = json!({
             "thread": {
                 "status": {"type": "idle"},
@@ -664,6 +826,7 @@ mod tests {
         let handler_calls = Arc::clone(&calls);
         let handler: NotificationHandler = Arc::new(move |_message| {
             handler_calls.fetch_add(1, Ordering::Relaxed);
+            true
         });
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let notification = json!({
@@ -688,6 +851,7 @@ mod tests {
         let handler_calls = Arc::clone(&calls);
         let handler: NotificationHandler = Arc::new(move |_message| {
             handler_calls.fetch_add(1, Ordering::Relaxed);
+            true
         });
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let completed = json!({
@@ -714,11 +878,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_success_waits_for_reconciled_turn() {
+    fn completed_empty_turn_is_terminal() {
         let calls = Arc::new(AtomicUsize::new(0));
         let handler_calls = Arc::clone(&calls);
         let handler: NotificationHandler = Arc::new(move |_message| {
             handler_calls.fetch_add(1, Ordering::Relaxed);
+            true
         });
         let terminal_turns = Arc::new(Mutex::new(HashSet::new()));
         let incomplete = json!({
@@ -729,7 +894,7 @@ mod tests {
             },
         });
         dispatch_notification(&handler, &terminal_turns, incomplete);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let empty_message = json!({
             "method": "turn/completed",
@@ -743,7 +908,7 @@ mod tests {
             },
         });
         dispatch_notification(&handler, &terminal_turns, empty_message);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let unfinished_final_message = json!({
             "method": "turn/completed",
@@ -760,7 +925,7 @@ mod tests {
             },
         });
         dispatch_notification(&handler, &terminal_turns, unfinished_final_message);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let reconciled = json!({
             "method": "turn/completed",

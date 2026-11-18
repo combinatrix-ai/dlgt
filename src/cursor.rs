@@ -23,7 +23,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+use crate::error::fail;
 
 /// Vectors retained per single-Session scope.
 const MAX_SESSION_CURSORS: usize = 64;
@@ -42,13 +44,8 @@ pub struct Cursor {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionCursor {
-    /// Stable absolute row watermark: the last row delivered in full.
-    pub r: u64,
-    /// Bytes of row `r + 1` a previous response already delivered. Non-zero
-    /// only while one oversized row is being chunked across responses.
-    pub ro: u64,
-    /// Screen epoch observed when the cursor was issued.
-    pub ep: u64,
+    /// Message watermark: the last message sequence delivered.
+    pub m: u64,
     /// Highest fully delivered terminal result execution sequence.
     pub x: i64,
     /// Execution sequence of a partially delivered final text, if any.
@@ -62,9 +59,7 @@ impl Cursor {
         Self {
             e: 0,
             p: SessionCursor {
-                r: 0,
-                ro: 0,
-                ep: 0,
+                m: 0,
                 x: 0,
                 px: None,
                 po: 0,
@@ -144,11 +139,12 @@ impl CursorTable {
     /// one cursorless baseline fetch.
     pub fn resolve(&self, scope: &str, value: &str) -> Result<Cursor> {
         let Ok(number) = value.parse::<u64>() else {
-            bail!("CURSOR_INVALID: {value:?} is not a cursor position");
+            fail!(CursorInvalid, "{value:?} is not a cursor position");
         };
         let Some(cursor) = self.entries.get(&(scope.to_owned(), number)) else {
-            bail!(
-                "CURSOR_EXPIRED: this daemon no longer holds position {number}; fetch without --cursor to recover"
+            fail!(
+                CursorExpired,
+                "this daemon no longer holds position {number}; fetch without --cursor to recover"
             );
         };
         Ok(cursor.clone())
@@ -170,9 +166,7 @@ mod tests {
         let mut cursor = Cursor::new();
         cursor.e = 104;
         cursor.set_session(SessionCursor {
-            r: row,
-            ro: 0,
-            ep: 3,
+            m: row,
             x: 7,
             px: Some(8),
             po: 4_096,
@@ -238,7 +232,8 @@ mod tests {
             table
                 .resolve("su_other", "2")
                 .err()
-                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
+                .is_some_and(|error| crate::error::code_of(&error)
+                    == Some(crate::error::Code::CursorExpired))
         );
     }
 
@@ -253,7 +248,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{malformed:?} unexpectedly resolved"));
             assert!(
-                error.to_string().contains("CURSOR_INVALID"),
+                crate::error::code_of(&error) == Some(crate::error::Code::CursorInvalid),
                 "{malformed:?} produced {error}"
             );
         }
@@ -265,7 +260,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{unminted:?} unexpectedly resolved"));
             assert!(
-                error.to_string().contains("CURSOR_EXPIRED"),
+                crate::error::code_of(&error) == Some(crate::error::Code::CursorExpired),
                 "{unminted:?} produced {error}"
             );
         }
@@ -282,7 +277,8 @@ mod tests {
             table
                 .resolve("su_abc", &oldest.to_string())
                 .err()
-                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
+                .is_some_and(|error| crate::error::code_of(&error)
+                    == Some(crate::error::Code::CursorExpired))
         );
 
         // A busy Session cannot evict another scope's positions.
@@ -305,7 +301,8 @@ mod tests {
             fresh
                 .resolve("su_abc", &number.to_string())
                 .err()
-                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED")),
+                .is_some_and(|error| crate::error::code_of(&error)
+                    == Some(crate::error::Code::CursorExpired)),
             "a position this table has not minted is simply not held"
         );
         mint(&mut fresh, "su_abc", 222);
@@ -328,7 +325,8 @@ mod tests {
             table
                 .resolve("su_abc", &number.to_string())
                 .err()
-                .is_some_and(|error| error.to_string().contains("CURSOR_EXPIRED"))
+                .is_some_and(|error| crate::error::code_of(&error)
+                    == Some(crate::error::Code::CursorExpired))
         );
         assert_eq!(table.reserve("su_abc"), 1, "numbering restarts");
     }

@@ -1,34 +1,24 @@
 use std::process::Command;
 
 fn dlgt(args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new(env!("CARGO_BIN_EXE_dlgt")).args(args).output()
+    cli_command().args(args).output()
+}
+
+fn cli_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dlgt"));
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", std::env::temp_dir())
+        .env("DLGT_CONFIG", "/dev/null");
+    command
 }
 
 #[test]
 fn every_public_command_supports_both_help_spellings() -> Result<(), Box<dyn std::error::Error>> {
     let commands = [
-        "server",
-        "update",
-        "new",
-        "restart",
-        "send",
-        "fetch",
-        "cancel",
-        "list",
-        "ls",
-        "show",
-        "attach",
-        "stop",
-        "scrollback",
-        "logs",
-        "models",
-        "profiles",
-        "harnesses",
-        "doctor",
-        "skill",
-        "rpc",
-        "version",
-        "help",
+        "server", "update", "new", "restart", "send", "fetch", "answer", "cancel", "list", "ls",
+        "show", "watch", "stop", "models", "profiles", "doctor", "skill", "rpc", "version", "help",
     ];
 
     for command in commands {
@@ -111,6 +101,16 @@ fn acceptance_help_documents_prompt_files() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn auth_policy_help_covers_new_and_resume() -> Result<(), Box<dyn std::error::Error>> {
+    let new_help = String::from_utf8(cli_command().arg("new").arg("--help").output()?.stdout)?;
+    let send_help = String::from_utf8(cli_command().arg("send").arg("--help").output()?.stdout)?;
+    assert!(new_help.contains("--auth <subscription|any>"));
+    assert!(send_help.contains("--auth <subscription|any>"));
+    assert!(send_help.contains("--profile <PROFILE>"));
+    Ok(())
+}
+
+#[test]
 fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::error::Error>> {
     let output = dlgt(&["new", "--", "--help"])?;
 
@@ -123,7 +123,7 @@ fn prompt_named_help_is_not_treated_as_a_help_flag() -> Result<(), Box<dyn std::
 fn unknown_long_options_are_named_with_the_command_usage() -> Result<(), Box<dyn std::error::Error>>
 {
     let home = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args(["show", "codex:test-session", "--json"])
         .output()?;
@@ -150,7 +150,7 @@ fn acceptance_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Er
         vec!["new", "--title", "t", "--harness", "claude", "--", "hello"],
         vec!["send", "codex:test-session", "--", "hello"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        let output = cli_command()
             .env("DLGT_HOME", home.path())
             .args(&command)
             .output()?;
@@ -180,7 +180,7 @@ fn an_idempotency_key_is_validated_before_the_prompt_is_read()
         (over_limit.as_str(), true),
     ];
     for (key, rejected) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        let output = cli_command()
             .env("DLGT_HOME", home.path())
             .current_dir(workdir.path())
             // A missing --cwd fails after the key check, so it marks how far
@@ -224,7 +224,7 @@ fn an_idempotency_key_is_validated_before_the_prompt_is_read()
 fn prompt_file_errors_before_starting_a_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     let workdir = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .current_dir(workdir.path())
         .args([
@@ -255,7 +255,7 @@ fn prompt_sources_are_mutually_exclusive() -> Result<(), Box<dyn std::error::Err
     let home = tempfile::tempdir()?;
     let prompt = home.path().join("prompt.md");
     std::fs::write(&prompt, "from file")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args([
             "new",
@@ -285,7 +285,7 @@ fn prompt_sources_are_mutually_exclusive() -> Result<(), Box<dyn std::error::Err
 #[test]
 fn resuming_also_requires_an_idempotency_key() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .args(["send", "claude:some-session", "--resume", "--", "hello"])
         .output()?;
@@ -300,7 +300,7 @@ fn resuming_also_requires_an_idempotency_key() -> Result<(), Box<dyn std::error:
 fn send_no_longer_accepts_the_removed_wait_flags() -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     for flag in [["--wait", "--timeout"], ["--timeout", "1s"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+        let output = cli_command()
             .env("DLGT_HOME", home.path())
             .args([
                 "send",
@@ -328,7 +328,7 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
 -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;
     let workdir = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_dlgt"))
+    let output = cli_command()
         .env("DLGT_HOME", home.path())
         .current_dir(workdir.path())
         .args([
@@ -355,5 +355,182 @@ fn new_rejects_a_missing_relative_cwd_before_starting_a_daemon()
         "unexpected output: {stdout}"
     );
     assert!(!home.path().join("run").exists());
+    Ok(())
+}
+
+/// Run a command that must fail before it reaches a daemon.
+fn rejected(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let output = cli_command()
+        .env("DLGT_HOME", home.path())
+        .args(args)
+        .output()?;
+    assert!(!output.status.success(), "{args:?} was accepted");
+    assert!(
+        !home.path().join("run").exists(),
+        "{args:?} started a daemon before failing"
+    );
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+#[test]
+fn the_terminal_commands_and_options_are_gone() -> Result<(), Box<dyn std::error::Error>> {
+    let usage = String::from_utf8(dlgt(&["help"])?.stdout)?;
+    for command in ["attach", "scrollback", "logs", "harnesses"] {
+        assert!(
+            !usage.contains(command),
+            "top-level help still lists {command}"
+        );
+        let stdout = rejected(&[command, "codex:test-session"])?;
+        assert!(
+            stdout.contains("unknown command"),
+            "unexpected output for {command}: {stdout}"
+        );
+        assert!(!dlgt(&["help", command])?.status.success());
+    }
+    for command in ["answer", "watch"] {
+        assert!(usage.contains(command), "top-level help omits {command}");
+    }
+    assert!(!usage.to_lowercase().contains("screen"));
+
+    for args in [
+        &["fetch", "codex:test-session", "--screen"][..],
+        &["fetch", "codex:test-session", "--no-screen"],
+        &[
+            "new",
+            "--title",
+            "t",
+            "--harness",
+            "claude",
+            "--request-id",
+            "r1",
+            "--no-auto-approve",
+            "--",
+            "hello",
+        ],
+    ] {
+        let stdout = rejected(args)?;
+        assert!(
+            stdout.contains("unknown option"),
+            "unexpected output for {args:?}: {stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn approvals_are_documented_and_validated_before_launch() -> Result<(), Box<dyn std::error::Error>>
+{
+    for command in ["new", "send"] {
+        let help = String::from_utf8(dlgt(&[command, "--help"])?.stdout)?;
+        assert!(help.contains("--approvals <auto|ask|bypass>"));
+        assert!(!help.contains("auto-approve"));
+    }
+    let stdout = rejected(&[
+        "new",
+        "--title",
+        "t",
+        "--harness",
+        "claude",
+        "--approvals",
+        "yolo",
+        "--request-id",
+        "r1",
+        "--",
+        "hello",
+    ])?;
+    assert!(
+        stdout.contains("invalid approvals mode") && stdout.contains("INVALID_ARGUMENT"),
+        "unexpected output: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn steer_is_a_send_mode_that_cannot_launch() -> Result<(), Box<dyn std::error::Error>> {
+    let help = String::from_utf8(dlgt(&["send", "--help"])?.stdout)?;
+    assert!(help.contains("--steer"));
+
+    let stdout = rejected(&[
+        "send",
+        "claude:test-session",
+        "--steer",
+        "--resume",
+        "--request-id",
+        "r1",
+        "--",
+        "hello",
+    ])?;
+    assert!(
+        stdout.contains("--steer and --resume are mutually exclusive"),
+        "unexpected output: {stdout}"
+    );
+    for option in [["--model", "haiku"], ["--approvals", "ask"]] {
+        let stdout = rejected(&[
+            "send",
+            "claude:test-session",
+            option[0],
+            option[1],
+            "--request-id",
+            "r1",
+            "--",
+            "hello",
+        ])?;
+        assert!(
+            stdout.contains("accepted only with --resume"),
+            "unexpected output for {option:?}: {stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn answer_takes_exactly_one_kind_of_answer() -> Result<(), Box<dyn std::error::Error>> {
+    let help = String::from_utf8(dlgt(&["answer", "--help"])?.stdout)?;
+    for option in [
+        "--allow",
+        "--deny",
+        "--message <TEXT>",
+        "--text <TEXT>",
+        "--choice <N>",
+    ] {
+        assert!(help.contains(option), "answer help omits {option}");
+    }
+    for (args, expected) in [
+        (&["answer", "claude:s", "r1"][..], "exactly one of"),
+        (
+            &["answer", "claude:s", "r1", "--allow", "--deny"],
+            "exactly one of",
+        ),
+        (
+            &["answer", "claude:s", "r1", "--allow", "--message", "x"],
+            "only with --deny",
+        ),
+        (
+            &["answer", "claude:s", "r1", "--choice", "0"],
+            "invalid --choice",
+        ),
+        (&["answer", "claude:s", "--allow"], "Request ID"),
+    ] {
+        let stdout = rejected(args)?;
+        assert!(
+            stdout.contains(expected),
+            "unexpected output for {args:?}: {stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fetch_help_documents_messages_and_requests() -> Result<(), Box<dyn std::error::Error>> {
+    let help = String::from_utf8(dlgt(&["fetch", "--help"])?.stdout)?;
+    assert!(help.contains("--messages[=<MAX>]"));
+    assert!(help.contains("--no-messages"));
+    assert!(help.contains("dlgt answer"));
+    let stdout = rejected(&["fetch", "claude:s", "--messages", "--no-messages"])?;
+    assert!(
+        stdout.contains("mutually exclusive"),
+        "unexpected output: {stdout}"
+    );
     Ok(())
 }

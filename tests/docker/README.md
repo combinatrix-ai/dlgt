@@ -21,6 +21,13 @@ The E2E passes only when Codex installs the binary and both embedded skill
 copies, launches Claude through dlgt, observes `DLGT_OK`, and stops the
 verification Session.
 
+dlgt drives both Harnesses over their structured interfaces and owns no
+terminal, so it cannot complete Harness onboarding itself. A Harness that
+still needs login or first-run setup makes `dlgt new` fail with
+`LAUNCH_FAILED`; run the command named in its `action` once in the container
+and retry. Claude must be logged in with the subscription unless the Session
+is launched with `--auth any`.
+
 `DLGT_HOME` points at `/tmp/dlgt` because Docker Desktop bind mounts do not
 support the Unix-socket permission operation used by the daemon. Credentials,
 Harness onboarding, and installed skills remain persistent under

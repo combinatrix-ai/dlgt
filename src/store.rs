@@ -3,17 +3,27 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cursor::{Cursor, CursorTable};
-use crate::protocol::{EventRecord, SessionRecord, SessionState, TurnRecord, TurnState};
-use crate::screen::{EpochReason, LIVE_ROW_LIMIT, ScreenStore, StablePage};
+use crate::lifecycle::{
+    CancelProgress, Effect, Event, Execution, Generation, Lifecycle, Outcome as RunOutcome, Phase,
+    Refusal,
+};
+use crate::messages::{MessageBody, MessageLog, MessagePage};
+use crate::protocol::{
+    Approvals, ApprovalsMode, Auth, EventRecord, SessionRecord, SessionState, TurnRecord, TurnState,
+};
+use crate::requests::{
+    Answer, AnswerClaim, Outcome, RequestDraft, RequestRecord, RequestTable, Resolution,
+};
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+
+use crate::error::{Code, WithCode, fail};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub struct Store {
     state: RefCell<MemoryState>,
 }
 
-const OUTPUT_CHUNK_LIMIT: usize = 8192;
 /// Lifecycle events retained per daemon before the oldest are evicted.
 const EVENT_RETENTION: usize = 50_000;
 /// Terminal results retained per Session.
@@ -34,45 +44,36 @@ struct MemoryState {
     evicted_event_seq: i64,
     /// Highest execution sequence whose result was evicted, per Session UID.
     evicted_result_seq: HashMap<String, i64>,
-    screens: HashMap<String, ScreenStore>,
+    /// Messages and Requests, per Session UID.
+    messages: HashMap<String, MessageLog>,
+    requests: HashMap<String, RequestTable>,
+    steer_attempts: HashMap<String, SteerAttempt>,
     /// Observation positions and the watermarks behind them. Held here so
     /// minting a position is atomic with the state capture it describes.
     cursors: CursorTable,
-    outputs: HashMap<String, VecDeque<OutputChunk>>,
     next_event_seq: i64,
-    next_input_seq: i64,
-    next_output_seq: i64,
 }
 
 struct StoredSession {
     record: SessionRecord,
+    /// The authority for this Session's phase and owning provider
+    /// generation; `record.state` and `record.active_turn_id` mirror it.
+    lifecycle: Lifecycle,
     /// Immutable internal identity. Public Session IDs rotate when Claude
     /// reports a new provider session, so cursors bind to this instead.
     uid: String,
-    terminal_rows: u16,
-    terminal_cols: u16,
+    /// When the provider last emitted any event.
+    last_provider_event_ms: Option<i64>,
     /// Diagnostics retained when the Session failed before it became ready.
     launch_failure: Option<Value>,
 }
 
-/// Live screen projection: a replaceable snapshot, never cursor history.
-#[derive(Debug, Default)]
-pub struct LiveScreen {
-    pub epoch: u64,
-    pub reset_reason: Option<&'static str>,
-    pub rows: Vec<String>,
-    pub truncated: bool,
-}
-
-struct OutputChunk {
-    seq: i64,
-    data: Vec<u8>,
-}
-
-pub struct OutputPage {
-    pub data: Vec<u8>,
-    pub next_after: i64,
-    pub has_more: bool,
+#[derive(Clone)]
+struct SteerAttempt {
+    session_uid: String,
+    runtime_generation: u64,
+    turn_id: String,
+    execution_seq: i64,
 }
 
 struct FinishTurn<'a> {
@@ -81,7 +82,7 @@ struct FinishTurn<'a> {
     state: TurnState,
     final_message: Option<&'a str>,
     recovered: bool,
-    error: Option<&'a str>,
+    error: Option<&'a Value>,
 }
 
 pub struct NewSession<'a> {
@@ -93,7 +94,7 @@ pub struct NewSession<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub harness_options: &'a [String],
-    pub auto_approve: bool,
+    pub approvals: ApprovalsMode,
 }
 
 impl Store {
@@ -111,12 +112,11 @@ impl Store {
         if state.sessions.values().any(|existing| {
             existing.record.alias == session.alias && !existing.record.state.is_terminal()
         }) {
-            bail!("active session alias already exists");
+            fail!(AliasInUse, "active session alias already exists");
         }
         let now = now_ms();
         let uid = format!("su_{}", Uuid::new_v4().simple());
         state.uid_index.insert(session.id.to_owned(), uid.clone());
-        state.screens.insert(uid.clone(), ScreenStore::new(24, 80));
         state.sessions.insert(
             session.id.to_owned(),
             StoredSession {
@@ -125,129 +125,255 @@ impl Store {
                     alias: session.alias.to_owned(),
                     title: session.title.to_owned(),
                     agent: session.agent.to_owned(),
-                    cursor_launch_id: (session.agent == "cursor").then(|| session.id.to_owned()),
                     cwd: session.cwd.to_owned(),
                     state: SessionState::Starting,
                     model: session.model.map(str::to_owned),
                     effort: session.effort.map(str::to_owned),
                     harness_options: session.harness_options.to_vec(),
-                    auto_approve: session.auto_approve,
+                    approvals: Approvals::new(session.approvals),
+                    auth: None,
+                    auth_policy: None,
+                    resolved_model: None,
                     active_turn_id: None,
                     pid: None,
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
+                lifecycle: Lifecycle::new(),
                 uid,
-                terminal_rows: 24,
-                terminal_cols: 80,
+                last_provider_event_ms: None,
                 launch_failure: None,
             },
         );
         Ok(())
     }
 
-    pub fn set_session_running(&self, id: &str, pid: Option<u32>) -> bool {
-        let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get_mut(id) else {
-            return false;
-        };
-        if !(matches!(
-            session.record.state,
-            SessionState::Starting | SessionState::Idle
-        ) || matches!(session.record.agent.as_str(), "cursor" | "opencode")
-            && session.record.state == SessionState::Busy)
+    /// The provider process for `generation` exists.
+    pub fn spawned(&self, id: &str, generation: Generation, pid: Option<u32>) -> bool {
+        if self
+            .transition(id, generation, &Event::Spawned, None)
+            .is_err()
         {
             return false;
         }
-        if session.record.state == SessionState::Starting {
-            session.record.state = SessionState::Running;
-        }
-        session.record.pid = pid;
-        session.record.updated_at_ms = now_ms();
-        true
-    }
-
-    pub fn begin_session_restart(&self, id: &str) -> Result<bool> {
-        let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get(id) else {
-            return Ok(false);
-        };
-        if matches!(
-            session.record.state,
-            SessionState::Starting | SessionState::Stopping | SessionState::Restarting
-        ) {
-            return Ok(false);
-        }
-        let alias = session.record.alias.clone();
-        if state.sessions.values().any(|candidate| {
-            candidate.record.id != id
-                && candidate.record.alias == alias
-                && !candidate.record.state.is_terminal()
-        }) {
-            bail!("active session alias already exists");
-        }
-        let Some(session) = state.sessions.get_mut(id) else {
-            return Ok(false);
-        };
-        session.record.state = SessionState::Restarting;
-        session.record.updated_at_ms = now_ms();
-        Ok(true)
-    }
-
-    pub fn finish_session_restart_stop(&self, id: &str) {
-        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id)
-            && session.record.state == SessionState::Restarting
-        {
-            session.record.pid = None;
-            session.record.active_turn_id = None;
-            session.record.updated_at_ms = now_ms();
-        }
-    }
-
-    pub fn start_restarted_session(&self, id: &str) -> bool {
-        let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get_mut(id) else {
-            return false;
-        };
-        if session.record.state != SessionState::Restarting {
-            return false;
-        }
-        session.record.state = SessionState::Starting;
-        session.record.pid = None;
-        session.record.active_turn_id = None;
-        session.record.updated_at_ms = now_ms();
-        true
-    }
-
-    pub fn set_session_state(&self, id: &str, state: SessionState) -> bool {
-        let mut memory = self.state.borrow_mut();
-        let Some(session) = memory.sessions.get_mut(id) else {
-            return false;
-        };
-        if matches!(
-            session.record.state,
-            SessionState::Stopped
-                | SessionState::Failed
-                | SessionState::Stopping
-                | SessionState::Restarting
-        ) {
-            return false;
-        }
-        session.record.state = state;
-        session.record.updated_at_ms = now_ms();
-        true
-    }
-
-    pub fn set_session_stopped(&self, id: &str) {
-        set_terminal_session(&mut self.state.borrow_mut(), id, SessionState::Stopped);
-    }
-
-    pub fn set_session_failed(&self, id: &str) {
-        set_terminal_session(&mut self.state.borrow_mut(), id, SessionState::Failed);
-    }
-
-    pub fn set_launch_failure(&self, id: &str, failure: Value) {
         if let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
+            session.record.pid = pid;
+        }
+        true
+    }
+
+    /// The provider process for `generation` is ready for prompts.
+    pub fn ready(&self, id: &str, generation: Generation) -> bool {
+        let ready = self.transition(id, generation, &Event::Ready, None).is_ok();
+        if ready && let Some(session) = self.state.borrow_mut().sessions.get_mut(id) {
+            // A launch that succeeded replaces any earlier launch's diagnostics.
+            session.launch_failure = None;
+        }
+        ready
+    }
+
+    /// The provider process for `generation` exited. An execution it was
+    /// running gets a result carrying `reason`.
+    pub fn exited(&self, id: &str, generation: Generation, reason: &str) {
+        let _ = self.transition(
+            id,
+            generation,
+            &Event::Exited,
+            Some(("provider_exit", reason)),
+        );
+    }
+
+    /// The provider or its transport failed for `generation`. An active
+    /// execution gets a failed result carrying `code` and `message`.
+    pub fn fail_session(
+        &self,
+        id: &str,
+        generation: Generation,
+        code: &str,
+        message: &str,
+    ) -> bool {
+        self.transition(
+            id,
+            generation,
+            &Event::Fail { seq: None },
+            Some((code, message)),
+        )
+        .is_ok()
+    }
+
+    pub fn begin_stop(&self, id: &str, generation: Generation, force: bool) -> Result<(), Refusal> {
+        self.transition(id, generation, &Event::Stop { force }, None)
+    }
+
+    /// Give up a restart whose replacement never launched.
+    pub fn abandon_restart(&self, id: &str, generation: Generation) {
+        let _ = self.transition(id, generation, &Event::RestartTimeout, None);
+    }
+
+    pub fn lifecycle(&self, id: &str) -> Option<Lifecycle> {
+        self.state
+            .borrow()
+            .sessions
+            .get(id)
+            .map(|session| session.lifecycle.clone())
+    }
+
+    #[cfg(test)]
+    pub fn set_session_running(&self, id: &str, pid: Option<u32>) -> bool {
+        let generation = self.runtime_generation(id).unwrap_or_default();
+        self.spawned(id, generation, pid)
+    }
+
+    /// Test shorthand for the transitions the old state setter covered.
+    #[cfg(test)]
+    pub fn set_session_state(&self, id: &str, state: SessionState) -> bool {
+        let generation = self.runtime_generation(id).unwrap_or_default();
+        match state {
+            SessionState::Idle => self.ready(id, generation),
+            SessionState::Busy => self
+                .lifecycle(id)
+                .is_some_and(|lifecycle| lifecycle.active().is_some()),
+            other => panic!("tests drive {other:?} through lifecycle events"),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_session_stopped(&self, id: &str) {
+        let generation = self.runtime_generation(id).unwrap_or_default();
+        let _ = self.begin_stop(id, generation, false);
+        self.exited(id, generation, "stopped");
+    }
+
+    #[cfg(test)]
+    pub fn set_session_failed(&self, id: &str) {
+        let generation = self.runtime_generation(id).unwrap_or_default();
+        self.fail_session(id, generation, "test", "test failure");
+    }
+
+    #[cfg(test)]
+    pub fn insert_turn(&self, id: &str, session_id: &str, prompt: &str) -> Result<TurnRecord> {
+        let generation = self.runtime_generation(session_id).unwrap_or_default();
+        self.submit_turn(id, session_id, generation, prompt, false)
+    }
+
+    /// Apply one lifecycle event and carry out its effects. Nothing changes
+    /// when the lifecycle refuses the event. `detail` names the error code and
+    /// message for an execution this event terminalizes.
+    fn transition(
+        &self,
+        session_id: &str,
+        generation: Generation,
+        event: &Event<'_>,
+        detail: Option<(&str, &str)>,
+    ) -> Result<(), Refusal> {
+        let records = {
+            let mut state = self.state.borrow_mut();
+            let Some(session) = state.sessions.get_mut(session_id) else {
+                return Err(Refusal::Stale);
+            };
+            let effects = session.lifecycle.apply(generation, event)?;
+            session.record.state = session.lifecycle.public_state();
+            session.record.active_turn_id = session
+                .lifecycle
+                .active()
+                .map(|execution| execution.turn_id.clone());
+            if matches!(
+                session.lifecycle.phase(),
+                Phase::Stopped | Phase::Failed | Phase::Starting { spawned: false }
+            ) {
+                session.record.pid = None;
+            }
+            session.record.updated_at_ms = now_ms();
+            let mut records = Vec::new();
+            for effect in effects {
+                match effect {
+                    Effect::Record { kind, turn_id } => records.push((kind, turn_id)),
+                    Effect::CloseRequests => close_requests(&mut state, session_id),
+                    Effect::EndTurn {
+                        turn_id,
+                        outcome,
+                        reason,
+                    } => end_turn(&mut state, &turn_id, outcome, reason, detail),
+                }
+            }
+            enforce_result_retention(&mut state, session_id);
+            records
+        };
+        for (kind, turn_id) in records {
+            self.record_event(Some(session_id), turn_id.as_deref(), kind);
+        }
+        Ok(())
+    }
+
+    /// Apply an execution-scoped event for the execution `turn_id` names. Its
+    /// execution sequence decides ownership, so the current generation is
+    /// used: a turn of a replaced generation never matches the active one.
+    fn transition_turn(
+        &self,
+        turn_id: &str,
+        event: impl FnOnce(i64) -> Event<'static>,
+        detail: Option<(&str, &str)>,
+    ) -> Result<(), Refusal> {
+        let (session_id, generation, seq) = {
+            let state = self.state.borrow();
+            let turn = state.turns.get(turn_id).ok_or(Refusal::Stale)?;
+            let session = state.sessions.get(&turn.session_id).ok_or(Refusal::Stale)?;
+            (
+                turn.session_id.clone(),
+                session.lifecycle.generation(),
+                turn.execution_seq,
+            )
+        };
+        self.transition(&session_id, generation, &event(seq), detail)
+    }
+
+    pub fn runtime_generation(&self, id: &str) -> Option<u64> {
+        self.state
+            .borrow()
+            .sessions
+            .get(id)
+            .map(|session| session.lifecycle.generation())
+    }
+
+    pub fn runtime_generation_is_current(&self, id: &str, generation: u64) -> bool {
+        self.runtime_generation(id) == Some(generation)
+    }
+
+    /// Claim a restart for the runtime generation the caller observed. A
+    /// restart that another one already completed meanwhile is refused.
+    pub fn begin_session_restart(&self, id: &str, expected_generation: u64) -> Result<bool> {
+        {
+            let state = self.state.borrow();
+            let Some(session) = state.sessions.get(id) else {
+                return Ok(false);
+            };
+            let alias = &session.record.alias;
+            if state.sessions.values().any(|candidate| {
+                candidate.record.id != id
+                    && candidate.record.alias == *alias
+                    && !candidate.record.state.is_terminal()
+            }) {
+                fail!(AliasInUse, "active session alias already exists");
+            }
+        }
+        Ok(self
+            .transition(id, expected_generation, &Event::Restart, None)
+            .is_ok())
+    }
+
+    /// Launch the replacement under the next generation once the old process
+    /// is gone.
+    pub fn start_restarted_session(&self, id: &str, generation: Generation) -> bool {
+        self.transition(id, generation, &Event::RestartLaunch, None)
+            .is_ok()
+    }
+
+    /// Keep the diagnostics of a launch that failed, only while that launch's
+    /// generation still owns the Session.
+    pub fn set_launch_failure(&self, id: &str, generation: Generation, failure: Value) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(id)
+            && session.lifecycle.generation() == generation
+        {
             session.launch_failure = Some(failure);
         }
     }
@@ -268,7 +394,8 @@ impl Store {
                 .sessions
                 .contains_key(from)
                 .then_some(())
-                .context("session not found");
+                .context("session not found")
+                .code(Code::NotFound);
         }
 
         let mut state = self.state.borrow_mut();
@@ -283,27 +410,34 @@ impl Store {
         // internal launch ID stay exactly as they were written and are never
         // published; the canonical timeline is materialized at bind time.
         let replaced = state.sessions.remove(to);
-        let mut session = state.sessions.remove(from).context("session not found")?;
+        let mut session = state
+            .sessions
+            .remove(from)
+            .context("session not found")
+            .code(Code::NotFound)?;
         if let Some(replaced) = replaced {
             session.record.created_at_ms = session
                 .record
                 .created_at_ms
                 .min(replaced.record.created_at_ms);
             // Resuming a retained provider conversation continues one logical
-            // Session. Adopt its immutable identity so cursors, screen
-            // history, and retention floors survive the replacement process,
-            // and retire the launch identity that was only ever a placeholder.
+            // Session. Adopt its immutable identity so cursors, messages, and
+            // retention floors survive the replacement process, and retire
+            // the launch identity that was only ever a placeholder.
             let launch_uid = std::mem::replace(&mut session.uid, replaced.uid.clone());
-            state.screens.remove(&launch_uid);
+            if let Some(launched) = state.messages.remove(&launch_uid) {
+                state
+                    .messages
+                    .entry(session.uid.clone())
+                    .or_default()
+                    .absorb(launched);
+            }
+            state.requests.remove(&launch_uid);
             state.cursors.forget(&launch_uid);
             state.evicted_result_seq.remove(&launch_uid);
             state
                 .uid_index
                 .retain(|_, uid| uid.as_str() != launch_uid.as_str());
-            // A replacement PTY is still a new terminal generation.
-            if let Some(screen) = state.screens.get_mut(&session.uid) {
-                screen.restart();
-            }
         }
         to.clone_into(&mut session.record.id);
         session.record.updated_at_ms = now_ms();
@@ -317,17 +451,6 @@ impl Store {
             if turn.session_id == from {
                 to.clone_into(&mut turn.session_id);
             }
-        }
-        let mut merged = state.outputs.remove(to).unwrap_or_default();
-        if let Some(mut launched) = state.outputs.remove(from) {
-            merged.append(&mut launched);
-        }
-        if !merged.is_empty() {
-            merged.make_contiguous().sort_by_key(|chunk| chunk.seq);
-            while merged.len() > OUTPUT_CHUNK_LIMIT {
-                merged.pop_front();
-            }
-            state.outputs.insert(to.to_owned(), merged);
         }
         Ok(())
     }
@@ -362,34 +485,35 @@ impl Store {
         }
     }
 
-    pub fn set_terminal_size(&self, session_id: &str, rows: u16, cols: u16) {
-        let mut state = self.state.borrow_mut();
-        let Some(session) = state.sessions.get_mut(session_id) else {
-            return;
-        };
-        session.terminal_rows = rows;
-        session.terminal_cols = cols;
-        session.record.updated_at_ms = now_ms();
-        let uid = session.uid.clone();
-        if let Some(screen) = state.screens.get_mut(&uid) {
-            screen.resize(rows, cols);
+    /// The Session's current key for `session_id`, which may be an ID it had
+    /// before a provider rotation. Work that captured the old ID, such as an
+    /// answer receipt, still finds its Session.
+    fn session_key(&self, session_id: &str) -> String {
+        let state = self.state.borrow();
+        if state.sessions.contains_key(session_id) {
+            return session_id.to_owned();
         }
-    }
-
-    /// Start a new terminal generation for a replacement provider process.
-    pub fn restart_screen(&self, session_id: &str) {
-        let mut state = self.state.borrow_mut();
-        let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
-            return;
-        };
-        if let Some(screen) = state.screens.get_mut(&uid) {
-            screen.restart();
-        }
+        state
+            .uid_index
+            .get(session_id)
+            .and_then(|uid| state.sessions.values().find(|session| session.uid == *uid))
+            .map_or_else(
+                || session_id.to_owned(),
+                |session| session.record.id.clone(),
+            )
     }
 
     pub fn get_session(&self, selector: &str) -> Option<SessionRecord> {
         let state = self.state.borrow();
         if let Some(session) = state.sessions.get(selector) {
+            return Some(session.record.clone());
+        }
+        // A public ID the Session had before Claude rotated it still
+        // addresses it. Internal launch IDs were never published.
+        if !selector.starts_with("internal:")
+            && let Some(uid) = state.uid_index.get(selector)
+            && let Some(session) = state.sessions.values().find(|session| session.uid == *uid)
+        {
             return Some(session.record.clone());
         }
         state
@@ -414,84 +538,99 @@ impl Store {
         sessions
     }
 
-    pub fn insert_cursor_initial_turn(
-        &mut self,
+    /// Accept a prompt: reserve its execution and move the Session to busy
+    /// as one step. `acknowledged` is true when the provider itself started
+    /// the execution.
+    pub fn submit_turn(
+        &self,
         id: &str,
         session_id: &str,
+        generation: Generation,
         prompt: &str,
-        previous: Option<&str>,
+        acknowledged: bool,
     ) -> Result<TurnRecord> {
-        let session = self
-            .get_session(session_id)
-            .context("Cursor launch missing")?;
-        if !matches!(session.agent.as_str(), "cursor" | "opencode")
-            || session.state != SessionState::Starting
-        {
-            bail!("invalid prepared launch state");
-        }
-        let next = previous
-            .and_then(|id| self.latest_turn(id))
-            .map_or(1, |turn| turn.execution_seq + 1);
-        self.set_session_state(session_id, SessionState::Idle);
-        let result = self.insert_turn(id, session_id, prompt);
-        self.set_session_state(session_id, SessionState::Starting);
-        let mut turn = result?;
-        turn.execution_seq = next;
+        let turn = {
+            let state = self.state.borrow();
+            if state.turns.contains_key(id) {
+                bail!("turn id already exists");
+            }
+            if !state.sessions.contains_key(session_id) {
+                fail!(NotFound, "session not found");
+            }
+            let execution_seq = state
+                .turns
+                .values()
+                .filter(|turn| turn.session_id == session_id)
+                .map(|turn| turn.execution_seq)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let now = now_ms();
+            TurnRecord {
+                id: id.to_owned(),
+                session_id: session_id.to_owned(),
+                execution_seq,
+                prompt: prompt.to_owned(),
+                state: if acknowledged {
+                    TurnState::Running
+                } else {
+                    TurnState::Submitted
+                },
+                provider_turn_id: None,
+                final_message: None,
+                final_text_recovered: false,
+                denied_requests: 0,
+                recorded_denials: 0,
+                provider_denials: 0,
+                error: None,
+                created_at_ms: now,
+                started_at_ms: acknowledged.then_some(now),
+                completed_at_ms: None,
+                usage: None,
+            }
+        };
+        // The turn must exist before the transition records its events.
         self.state
             .borrow_mut()
             .turns
             .insert(id.to_owned(), turn.clone());
-        Ok(turn)
-    }
-
-    pub fn insert_turn(&mut self, id: &str, session_id: &str, prompt: &str) -> Result<TurnRecord> {
-        let mut state = self.state.borrow_mut();
-        if state.turns.contains_key(id) {
-            bail!("turn id already exists");
-        }
-        let now = now_ms();
-        let Some(session) = state.sessions.get(session_id) else {
-            bail!("session not found");
-        };
-        if session.record.active_turn_id.is_some() || session.record.state != SessionState::Idle {
-            bail!("session already has an active turn or is not ready");
-        }
-        let execution_seq = state
-            .turns
-            .values()
-            .filter(|turn| turn.session_id == session_id)
-            .map(|turn| turn.execution_seq)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let turn = TurnRecord {
-            id: id.to_owned(),
-            session_id: session_id.to_owned(),
-            execution_seq,
-            prompt: prompt.to_owned(),
-            state: TurnState::Submitted,
-            provider_turn_id: None,
-            final_message: None,
-            final_text_recovered: false,
-            cursor_stop_status: None,
-            transcript_path: None,
-            transcript_offset: None,
-            error: None,
-            created_at_ms: now,
-            started_at_ms: None,
-            completed_at_ms: None,
-            usage: None,
-        };
-        state.turns.insert(id.to_owned(), turn.clone());
-        if let Some(session) = state.sessions.get_mut(session_id) {
-            session.record.active_turn_id = Some(id.to_owned());
-            session.record.updated_at_ms = now;
+        let submitted = self.transition(
+            session_id,
+            generation,
+            &Event::Submit {
+                turn_id: id,
+                seq: turn.execution_seq,
+                acknowledged,
+            },
+            None,
+        );
+        if let Err(refusal) = submitted {
+            self.state.borrow_mut().turns.remove(id);
+            return Err(refusal.into_error(session_id));
         }
         Ok(turn)
     }
 
     pub fn get_turn(&self, id: &str) -> Option<TurnRecord> {
         self.state.borrow().turns.get(id).cloned()
+    }
+
+    /// The execution bound to `provider_turn_id` in this Session, if any.
+    pub fn execution_for_provider_turn(
+        &self,
+        session_id: &str,
+        provider_turn_id: &str,
+    ) -> Option<i64> {
+        let session_id = self.session_key(session_id);
+        self.state
+            .borrow()
+            .turns
+            .values()
+            .find(|turn| {
+                turn.session_id == session_id
+                    && turn.provider_turn_id.as_deref() == Some(provider_turn_id)
+            })
+            .map(|turn| turn.execution_seq)
     }
 
     pub fn turn_for_execution(&self, session_id: &str, execution_seq: i64) -> Option<TurnRecord> {
@@ -525,38 +664,26 @@ impl Store {
             .cloned()
     }
 
-    pub fn provider_turn_seen(&self, session_id: &str, provider_turn_id: &str) -> bool {
-        self.state.borrow().turns.values().any(|turn| {
-            turn.session_id == session_id
-                && turn.provider_turn_id.as_deref() == Some(provider_turn_id)
-        })
-    }
-
-    pub fn record_cursor_response(&self, id: &str, text: &str) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.final_message = Some(text.to_owned());
-        }
-    }
-
-    pub fn record_cursor_stop(&self, id: &str, status: &str) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.cursor_stop_status = Some(status.to_owned());
-        }
-    }
-
     pub fn mark_turn_started(&self, id: &str, provider_turn_id: Option<&str>) -> bool {
-        let mut state = self.state.borrow_mut();
-        let Some(turn) = state.turns.get_mut(id) else {
-            return false;
-        };
-        if turn.state != TurnState::Submitted {
-            return false;
+        {
+            let mut state = self.state.borrow_mut();
+            let Some(turn) = state.turns.get_mut(id) else {
+                return false;
+            };
+            if !matches!(turn.state, TurnState::Submitted | TurnState::Canceled) {
+                return false;
+            }
+            if turn.state == TurnState::Submitted {
+                turn.state = TurnState::Running;
+            }
+            if turn.provider_turn_id.is_none() {
+                turn.provider_turn_id = provider_turn_id.map(str::to_owned);
+            }
+            if !turn.state.is_terminal() {
+                turn.started_at_ms.get_or_insert_with(now_ms);
+            }
         }
-        turn.state = TurnState::Running;
-        if turn.provider_turn_id.is_none() {
-            turn.provider_turn_id = provider_turn_id.map(str::to_owned);
-        }
-        turn.started_at_ms.get_or_insert_with(now_ms);
+        let _ = self.transition_turn(id, |seq| Event::Started { seq }, None);
         true
     }
 
@@ -583,7 +710,7 @@ impl Store {
         provider_turn_id: Option<&str>,
         state: TurnState,
         final_message: Option<&str>,
-        error: Option<&str>,
+        error: Option<&Value>,
     ) -> Result<bool> {
         self.finish_turn(&FinishTurn {
             id,
@@ -595,15 +722,9 @@ impl Store {
         })
     }
 
-    /// Record the provider transcript boundary for an execution, so a later
-    /// fallback can never read a previous turn's assistant message.
-    pub fn set_turn_transcript(&self, id: &str, path: &str, offset: Option<u64>) {
-        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
-            turn.transcript_path = Some(path.to_owned());
-            turn.transcript_offset = offset;
-        }
-    }
-
+    /// Record the provider's terminal result for `finish.id`. A canceled
+    /// execution keeps its canceled result; the provider's report only
+    /// tells the lifecycle that the provider side has settled.
     fn finish_turn(&self, finish: &FinishTurn<'_>) -> Result<bool> {
         let FinishTurn {
             id,
@@ -614,99 +735,198 @@ impl Store {
             error,
         } = *finish;
         if !state.is_provider_terminal() {
-            bail!("invalid terminal turn state {:?}", state.as_str());
+            fail!(
+                InvalidArgument,
+                "invalid terminal turn state {:?}",
+                state.as_str()
+            );
         }
-        let mut memory = self.state.borrow_mut();
-        let turn = memory.turns.get_mut(id).context("turn not found")?;
-        if !turn.state.is_active()
-            || provider_turn_id.is_some()
+        let outcome = match state {
+            TurnState::Completed => RunOutcome::Completed,
+            TurnState::Failed => RunOutcome::Failed,
+            _ => RunOutcome::Interrupted,
+        };
+        let canceled = {
+            let mut memory = self.state.borrow_mut();
+            let turn = memory
+                .turns
+                .get_mut(id)
+                .context("turn not found")
+                .code(Code::NotFound)?;
+            if provider_turn_id.is_some()
                 && turn.provider_turn_id.is_some()
                 && turn.provider_turn_id.as_deref() != provider_turn_id
-        {
-            return Ok(false);
-        }
-        let session_id = turn.session_id.clone();
-        turn.state = state;
-        if turn.provider_turn_id.is_none() {
-            turn.provider_turn_id = provider_turn_id.map(str::to_owned);
-        }
-        turn.final_message = final_message.map(str::to_owned);
-        turn.final_text_recovered = recovered;
-        turn.error = error.map(str::to_owned);
-        turn.completed_at_ms = Some(now_ms());
-        if let Some(session) = memory.sessions.get_mut(&session_id)
-            && session.record.active_turn_id.as_deref() == Some(id)
-        {
-            session.record.active_turn_id = None;
-            session.record.updated_at_ms = now_ms();
-        }
-        enforce_result_retention(&mut memory, &session_id);
-        Ok(true)
+            {
+                return Ok(false);
+            }
+            if turn.state == TurnState::Canceled {
+                true
+            } else if turn.state.is_active() {
+                turn.state = state;
+                if turn.provider_turn_id.is_none() {
+                    turn.provider_turn_id = provider_turn_id.map(str::to_owned);
+                }
+                turn.final_message = final_message.map(str::to_owned);
+                turn.final_text_recovered = recovered;
+                turn.error = error.cloned();
+                turn.completed_at_ms = Some(now_ms());
+                false
+            } else {
+                return Ok(false);
+            }
+        };
+        let settled = self
+            .transition_turn(id, |seq| Event::Finished { seq, outcome }, None)
+            .is_ok();
+        Ok(settled && !canceled)
     }
 
-    pub fn interrupt_active_turn(&self, session_id: &str, error: &str) -> Option<String> {
-        let mut state = self.state.borrow_mut();
-        let session = state.sessions.get(session_id)?;
-        let turn_id = session.record.active_turn_id.clone()?;
-        let turn = state.turns.get_mut(&turn_id)?;
-        if !turn.state.is_active() {
-            return None;
-        }
-        turn.state = TurnState::Interrupted;
-        turn.error = Some(error.to_owned());
-        turn.completed_at_ms = Some(now_ms());
-        if let Some(session) = state.sessions.get_mut(session_id) {
-            session.record.active_turn_id = None;
-            session.record.updated_at_ms = now_ms();
-        }
-        enforce_result_retention(&mut state, session_id);
-        Some(turn_id)
-    }
-
+    #[cfg(test)]
     pub fn cancel_turn(&mut self, id: &str) -> Result<bool> {
-        let mut state = self.state.borrow_mut();
-        let Some(turn) = state.turns.get_mut(id) else {
-            bail!("turn not found");
+        let generation = self
+            .runtime_generation_for_turn(id)
+            .context("turn runtime generation is missing")?;
+        self.cancel_turn_with_controls(id, generation, 0)
+    }
+
+    pub fn cancel_turn_with_controls(
+        &mut self,
+        id: &str,
+        runtime_generation: u64,
+        controls: usize,
+    ) -> Result<bool> {
+        let (session_id, seq) = {
+            let state = self.state.borrow();
+            let Some(turn) = state.turns.get(id) else {
+                fail!(NotFound, "turn not found");
+            };
+            if !turn.state.is_active() {
+                return Ok(false);
+            }
+            (turn.session_id.clone(), turn.execution_seq)
         };
-        if !turn.state.is_active() {
+        if self
+            .transition(
+                &session_id,
+                runtime_generation,
+                &Event::Cancel { seq, controls },
+                None,
+            )
+            .is_err()
+        {
             return Ok(false);
         }
-        turn.state = TurnState::Canceled;
-        turn.completed_at_ms = Some(now_ms());
-        let session_id = turn.session_id.clone();
-        if let Some(session) = state.sessions.get_mut(&session_id)
-            && session.record.active_turn_id.as_deref() == Some(id)
-        {
-            session.record.state = SessionState::Quiescing;
-            session.record.updated_at_ms = now_ms();
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id) {
+            turn.state = TurnState::Canceled;
+            turn.completed_at_ms = Some(now_ms());
         }
-        enforce_result_retention(&mut state, &session_id);
         Ok(true)
     }
 
-    pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
-        let mut state = self.state.borrow_mut();
-        let turn = state.turns.get(id).context("turn not found")?;
-        if turn.state != TurnState::Canceled
-            || provider_turn_id.is_some()
-                && turn.provider_turn_id.is_some()
-                && turn.provider_turn_id.as_deref() != provider_turn_id
-        {
-            return Ok(false);
-        }
-        let session_id = turn.session_id.clone();
-        let Some(session) = state.sessions.get_mut(&session_id) else {
-            return Ok(false);
+    pub fn reserve_cancel_control(&self, id: &str) -> bool {
+        self.transition_turn(id, |seq| Event::ControlReserved { seq }, None)
+            .is_ok()
+    }
+
+    /// Settle one dispatched cancel control and report whether that settled
+    /// the cancel.
+    pub fn finish_cancel_control(&self, id: &str) -> bool {
+        self.transition_turn(id, |seq| Event::ControlDone { seq }, None)
+            .is_ok()
+            && self.cancel_execution_complete(id)
+    }
+
+    pub fn cancel_controls_pending(&self, id: &str) -> bool {
+        self.canceling_execution(id)
+            .is_some_and(|cancel| cancel.pending_controls > 0)
+    }
+
+    fn canceling_execution(&self, id: &str) -> Option<CancelProgress> {
+        let state = self.state.borrow();
+        let turn = state.turns.get(id)?;
+        let execution = state.sessions.get(&turn.session_id)?.lifecycle.active()?;
+        (execution.seq == turn.execution_seq)
+            .then_some(execution.cancel)
+            .flatten()
+    }
+
+    /// The execution `id` names is terminal and no longer owns its Session.
+    pub fn cancel_execution_complete(&self, id: &str) -> bool {
+        let state = self.state.borrow();
+        let Some(turn) = state.turns.get(id) else {
+            return false;
         };
-        if session.record.active_turn_id.as_deref() != Some(id)
-            || session.record.state != SessionState::Quiescing
+        turn.state.is_terminal()
+            && state
+                .sessions
+                .get(&turn.session_id)
+                .and_then(|session| session.lifecycle.active())
+                .is_none_or(|execution| execution.seq != turn.execution_seq)
+    }
+
+    /// The provider failed while `id` was active, in any state including
+    /// canceling: the Session fails and the execution gets a failed result.
+    pub fn fail_execution(
+        &self,
+        id: &str,
+        runtime_generation: u64,
+        code: &str,
+        message: &str,
+    ) -> bool {
+        let Some((session_id, seq)) = self
+            .state
+            .borrow()
+            .turns
+            .get(id)
+            .map(|turn| (turn.session_id.clone(), turn.execution_seq))
+        else {
+            return false;
+        };
+        self.transition(
+            &session_id,
+            runtime_generation,
+            &Event::Fail { seq: Some(seq) },
+            Some((code, message)),
+        )
+        .is_ok()
+    }
+
+    /// The provider reported the canceled execution's own result.
+    pub fn settle_canceled_turn(&self, id: &str, provider_turn_id: Option<&str>) -> Result<bool> {
         {
-            return Ok(false);
+            let state = self.state.borrow();
+            let turn = state
+                .turns
+                .get(id)
+                .context("turn not found")
+                .code(Code::NotFound)?;
+            if turn.state != TurnState::Canceled
+                || provider_turn_id.is_some()
+                    && turn.provider_turn_id.is_some()
+                    && turn.provider_turn_id.as_deref() != provider_turn_id
+            {
+                return Ok(false);
+            }
         }
-        session.record.active_turn_id = None;
-        session.record.state = SessionState::Idle;
-        session.record.updated_at_ms = now_ms();
-        Ok(true)
+        let _ = self.transition_turn(
+            id,
+            |seq| Event::Finished {
+                seq,
+                outcome: RunOutcome::Interrupted,
+            },
+            None,
+        );
+        Ok(self.cancel_execution_complete(id))
+    }
+
+    #[cfg(test)]
+    fn runtime_generation_for_turn(&self, id: &str) -> Option<u64> {
+        let state = self.state.borrow();
+        let turn = state.turns.get(id)?;
+        state
+            .sessions
+            .get(&turn.session_id)
+            .map(|session| session.lifecycle.generation())
     }
 
     pub fn record_event(&self, session_id: Option<&str>, turn_id: Option<&str>, kind: &str) -> i64 {
@@ -765,60 +985,6 @@ impl Store {
             }
         }
         seq
-    }
-
-    /// Allocate an acknowledgement sequence without retaining input bytes or
-    /// metadata. The sequence is emitted in the corresponding input event.
-    pub fn allocate_input_sequence(&self) -> i64 {
-        let mut state = self.state.borrow_mut();
-        state.next_input_seq += 1;
-        state.next_input_seq
-    }
-
-    pub fn record_output(&self, session_id: &str, data: &[u8]) {
-        let mut state = self.state.borrow_mut();
-        state.next_output_seq += 1;
-        let seq = state.next_output_seq;
-        let chunks = state.outputs.entry(session_id.to_owned()).or_default();
-        chunks.push_back(OutputChunk {
-            seq,
-            data: data.to_vec(),
-        });
-        while chunks.len() > OUTPUT_CHUNK_LIMIT {
-            chunks.pop_front();
-        }
-        let uid = state.sessions.get(session_id).map(|s| s.uid.clone());
-        if let Some(screen) = uid.and_then(|uid| state.screens.get_mut(&uid)) {
-            screen.feed(data);
-        }
-    }
-
-    pub fn read_output_page(&self, session_id: &str, after: i64, limit_bytes: usize) -> OutputPage {
-        let state = self.state.borrow();
-        let chunks = state.outputs.get(session_id);
-        let mut output = Vec::new();
-        let mut next_after = after;
-        for chunk in chunks
-            .into_iter()
-            .flatten()
-            .filter(|chunk| chunk.seq > after)
-        {
-            if !output.is_empty() && output.len().saturating_add(chunk.data.len()) > limit_bytes {
-                break;
-            }
-            output.extend(&chunk.data);
-            next_after = chunk.seq;
-            if output.len() >= limit_bytes {
-                break;
-            }
-        }
-        let has_more =
-            chunks.is_some_and(|chunks| chunks.iter().any(|chunk| chunk.seq > next_after));
-        OutputPage {
-            data: output,
-            next_after,
-            has_more,
-        }
     }
 
     /// Events after `after`, optionally scoped to one immutable Session UID.
@@ -951,102 +1117,641 @@ impl Store {
             .unwrap_or(0)
     }
 
-    pub fn screen_epoch(&self, uid: &str) -> u64 {
+    pub fn message_head(&self, uid: &str) -> u64 {
         self.state
             .borrow()
-            .screens
+            .messages
             .get(uid)
-            .map_or(0, ScreenStore::epoch)
+            .map_or(0, MessageLog::head)
     }
 
-    pub fn stable_page(&self, uid: &str, after: u64, limit: usize) -> StablePage {
+    pub fn messages_after(&self, uid: &str, after: u64, limit: usize) -> MessagePage {
         self.state
             .borrow()
-            .screens
+            .messages
             .get(uid)
-            .map_or_else(StablePage::default, |screen| {
-                screen.stable_page(after, limit)
-            })
+            .map_or_else(MessagePage::default, |log| log.page_after(after, limit))
     }
 
-    pub fn stable_tail(&self, uid: &str, limit: usize) -> StablePage {
+    pub fn messages_tail(&self, uid: &str, limit: usize) -> MessagePage {
         self.state
             .borrow()
-            .screens
+            .messages
             .get(uid)
-            .map_or_else(StablePage::default, |screen| screen.stable_tail(limit))
+            .map_or_else(MessagePage::default, |log| log.tail(limit))
     }
 
-    pub fn stable_head(&self, uid: &str) -> u64 {
-        self.state
-            .borrow()
-            .screens
-            .get(uid)
-            .map_or(0, ScreenStore::head_row_id)
-    }
-
-    pub fn live_screen(&self, uid: &str, limit: usize) -> LiveScreen {
-        let state = self.state.borrow();
-        let Some(screen) = state.screens.get(uid) else {
-            return LiveScreen::default();
-        };
-        let (rows, truncated) = screen.live_rows(limit.min(LIVE_ROW_LIMIT));
-        LiveScreen {
-            epoch: screen.epoch(),
-            reset_reason: screen.last_reset_reason().map(EpochReason::as_str),
-            rows,
-            truncated,
-        }
-    }
-
-    /// Rendered rows addressed by absolute row ID, live grid included.
-    pub fn rendered_rows(&self, uid: &str, before: Option<u64>, lines: usize) -> RenderedRows {
-        let state = self.state.borrow();
-        let Some(screen) = state.screens.get(uid) else {
-            return RenderedRows::default();
-        };
-        let head = screen.head_row_id();
-        let (live, _) = screen.live_rows(usize::MAX);
-        let live_len = u64::try_from(live.len()).unwrap_or(0);
-        let (rows, cols) = screen.size();
-        let end = before
-            .unwrap_or(head + live_len + 1)
-            .min(head + live_len + 1);
-        let floor = screen.floor_row_id();
-        let start = end
-            .saturating_sub(u64::try_from(lines).unwrap_or(0))
-            .max(floor);
-        let mut selected = Vec::new();
-        if start < end.min(head + 1) {
-            let page = screen.stable_page(
-                start - 1,
-                usize::try_from(end.min(head + 1) - start).unwrap_or(0),
-            );
-            selected.extend(page.lines);
-        }
-        for (index, row) in live.into_iter().enumerate() {
-            let id = head + u64::try_from(index).unwrap_or(0) + 1;
-            if id >= start && id < end {
-                selected.push(row);
+    /// Record a message against the Session's active execution, if any. A
+    /// refused approval is counted on that execution's result.
+    pub fn append_message(&self, session_id: &str, body: MessageBody) -> Option<u64> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let mut state = self.state.borrow_mut();
+        let session = state.sessions.get(session_id)?;
+        let uid = session.uid.clone();
+        let turn_id = session.record.active_turn_id.clone();
+        let refuses = body.refuses();
+        let execution_seq = turn_id.and_then(|id| {
+            let turn = state.turns.get_mut(&id)?;
+            if refuses && !turn.state.is_terminal() {
+                turn.recorded_denials += 1;
+                turn.denied_requests = turn
+                    .denied_requests
+                    .max(turn.recorded_denials.max(turn.provider_denials));
             }
+            Some(turn.execution_seq)
+        });
+        Some(
+            state
+                .messages
+                .entry(uid)
+                .or_default()
+                .push(execution_seq, body),
+        )
+    }
+
+    /// Append a message that belongs to a known execution, whatever execution
+    /// is active now. A Request's outcome can commit after its execution ended.
+    pub fn append_execution_message(
+        &self,
+        session_id: &str,
+        execution_seq: Option<i64>,
+        body: MessageBody,
+    ) -> Option<u64> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let Some(execution_seq) = execution_seq else {
+            return self.append_message(session_id, body);
+        };
+        let mut state = self.state.borrow_mut();
+        let uid = state.sessions.get(session_id)?.uid.clone();
+        if body.refuses()
+            && let Some(turn) = state.turns.values_mut().find(|turn| {
+                turn.session_id == session_id
+                    && turn.execution_seq == execution_seq
+                    && !turn.state.is_terminal()
+            })
+        {
+            turn.recorded_denials += 1;
+            turn.denied_requests = turn
+                .denied_requests
+                .max(turn.recorded_denials.max(turn.provider_denials));
         }
-        RenderedRows {
-            rows,
-            cols,
-            lines: selected,
-            truncated: start > floor || floor > 1,
-            before: (start > floor).then_some(start),
+        Some(
+            state
+                .messages
+                .entry(uid)
+                .or_default()
+                .push(Some(execution_seq), body),
+        )
+    }
+
+    pub fn begin_steer_attempt(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+        attempt_id: &str,
+        text: &str,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get(session_id) else {
+            return false;
+        };
+        if session.lifecycle.generation() != runtime_generation
+            || session.record.state != SessionState::Busy
+            || session.record.active_turn_id.as_deref() != Some(turn_id)
+            || !state
+                .turns
+                .get(turn_id)
+                .is_some_and(|turn| turn.state.is_active() && turn.execution_seq == execution_seq)
+            || state.steer_attempts.contains_key(attempt_id)
+        {
+            return false;
+        }
+        let uid = session.uid.clone();
+        state.steer_attempts.insert(
+            attempt_id.to_owned(),
+            SteerAttempt {
+                session_uid: uid.clone(),
+                runtime_generation,
+                turn_id: turn_id.to_owned(),
+                execution_seq,
+            },
+        );
+        state
+            .messages
+            .entry(uid)
+            .or_default()
+            .push(Some(execution_seq), MessageBody::steer(text, false, false));
+        true
+    }
+
+    pub fn finish_steer_attempt(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        attempt_id: &str,
+        text: &str,
+        delivered: bool,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(attempt) = state.steer_attempts.get(attempt_id).cloned() else {
+            return false;
+        };
+        let Some(session) = state.sessions.get(session_id) else {
+            state.steer_attempts.remove(attempt_id);
+            return false;
+        };
+        let uid = session.uid.clone();
+        let session_generation = session.lifecycle.generation();
+        let session_state = session.record.state;
+        let active_turn_id = session.record.active_turn_id.clone();
+        let owned_attempt = attempt.session_uid == uid
+            && attempt.runtime_generation == runtime_generation
+            && state.turns.get(&attempt.turn_id).is_some_and(|turn| {
+                turn.execution_seq == attempt.execution_seq && (delivered || turn.state.is_active())
+            });
+        let session_owns_generation = session_generation == runtime_generation;
+        let execution_is_active = session_state == SessionState::Busy
+            && active_turn_id.as_deref() == Some(attempt.turn_id.as_str());
+        state.steer_attempts.remove(attempt_id);
+        if !owned_attempt || !session_owns_generation || !delivered && !execution_is_active {
+            return false;
+        }
+        state.messages.entry(uid).or_default().push(
+            Some(attempt.execution_seq),
+            MessageBody::steer(text, delivered, !delivered),
+        );
+        true
+    }
+
+    pub fn expire_steer_attempt(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        attempt_id: &str,
+        text: &str,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(attempt) = state.steer_attempts.get(attempt_id).cloned() else {
+            return false;
+        };
+        let Some(session) = state.sessions.get(session_id) else {
+            state.steer_attempts.remove(attempt_id);
+            return false;
+        };
+        let uid = session.uid.clone();
+        let session_generation = session.lifecycle.generation();
+        let active_turn_id = session.record.active_turn_id.clone();
+        let session_state = session.record.state;
+        let owns_generation = attempt.session_uid == uid
+            && attempt.runtime_generation == runtime_generation
+            && attempt.runtime_generation == session_generation
+            && active_turn_id.as_deref() == Some(attempt.turn_id.as_str())
+            && matches!(session_state, SessionState::Busy | SessionState::Quiescing)
+            && state
+                .turns
+                .get(&attempt.turn_id)
+                .is_some_and(|turn| turn.execution_seq == attempt.execution_seq);
+        state.steer_attempts.remove(attempt_id);
+        if !owns_generation {
+            return false;
+        }
+        state.messages.entry(uid).or_default().push(
+            Some(attempt.execution_seq),
+            MessageBody::steer(text, false, true),
+        );
+        true
+    }
+
+    /// Note that the provider emitted something, for `quiet_for_ms`.
+    pub fn touch_provider(&self, session_id: &str) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.last_provider_event_ms = Some(now_ms());
         }
     }
-}
 
-#[derive(Debug, Default)]
-pub struct RenderedRows {
-    pub rows: u16,
-    pub cols: u16,
-    pub lines: Vec<String>,
-    pub truncated: bool,
-    pub before: Option<u64>,
+    pub fn last_provider_event_ms(&self, session_id: &str) -> Option<i64> {
+        self.state
+            .borrow()
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.last_provider_event_ms)
+    }
+
+    /// Open a Request and block the Session on it. A Session that is not
+    /// running an execution cannot be blocked, so the Request is not opened.
+    pub fn open_request(&self, session_id: &str, draft: RequestDraft) -> Option<RequestRecord> {
+        let (generation, seq, uid) = {
+            let state = self.state.borrow();
+            let session = state.sessions.get(session_id)?;
+            let execution = session.lifecycle.active()?;
+            if execution.cancel.is_some() {
+                return None;
+            }
+            (
+                session.lifecycle.generation(),
+                execution.seq,
+                session.uid.clone(),
+            )
+        };
+        let record = self
+            .state
+            .borrow_mut()
+            .requests
+            .entry(uid)
+            .or_default()
+            .open(draft, Some(seq), now_ms());
+        let _ = self.transition(session_id, generation, &Event::Blocked { seq }, None);
+        Some(record)
+    }
+
+    pub fn request(&self, session_id: &str, id: &str) -> Option<RequestRecord> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let state = self.state.borrow();
+        let uid = &state.sessions.get(session_id)?.uid;
+        state.requests.get(uid)?.get(id).cloned()
+    }
+
+    pub fn pending_requests(&self, uid: &str) -> Vec<RequestRecord> {
+        self.state
+            .borrow()
+            .requests
+            .get(uid)
+            .map(RequestTable::pending)
+            .unwrap_or_default()
+    }
+
+    pub fn begin_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        answer: &Answer,
+    ) -> Option<AnswerClaim> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let mut state = self.state.borrow_mut();
+        let uid = state.sessions.get(session_id)?.uid.clone();
+        state.requests.get_mut(&uid)?.begin_answer(id, answer)
+    }
+
+    pub fn answer_attempt_status(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+    ) -> Option<(crate::requests::AnswerAttemptState, Option<Resolution>)> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let state = self.state.borrow();
+        let uid = &state.sessions.get(session_id)?.uid;
+        state
+            .requests
+            .get(uid)?
+            .answer_attempt_status(id, attempt_id)
+    }
+
+    pub fn answer_attempt_owns_execution(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        request_id: &str,
+        attempt_id: u64,
+        turn_id: &str,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let state = self.state.borrow();
+        let Some(session) = state.sessions.get(session_id) else {
+            return false;
+        };
+        if session.lifecycle.generation() != runtime_generation
+            || !matches!(
+                session.record.state,
+                SessionState::Busy | SessionState::Blocked
+            )
+            || session.record.active_turn_id.as_deref() != Some(turn_id)
+        {
+            return false;
+        }
+        let Some(turn) = state.turns.get(turn_id) else {
+            return false;
+        };
+        if !turn.state.is_active() {
+            return false;
+        }
+        let Some(request) = state
+            .requests
+            .get(&session.uid)
+            .and_then(|table| table.get(request_id))
+        else {
+            return false;
+        };
+        request.answer_state == crate::requests::AnswerState::Sending
+            && request.answer_attempt_id == Some(attempt_id)
+            && request.execution_seq == Some(turn.execution_seq)
+    }
+
+    /// `turn_id` is the running execution of `runtime_generation`: busy, not
+    /// blocked, not canceling.
+    pub fn execution_is_current(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        self.owned_execution(session_id, runtime_generation, turn_id, execution_seq)
+            .is_some_and(|execution| !execution.blocked && execution.cancel.is_none())
+    }
+
+    fn owned_execution(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+    ) -> Option<Execution> {
+        let state = self.state.borrow();
+        let session = state.sessions.get(session_id)?;
+        let execution = session.lifecycle.active()?;
+        (session.lifecycle.generation() == runtime_generation
+            && execution.turn_id == turn_id
+            && execution.seq == execution_seq)
+            .then(|| execution.clone())
+    }
+
+    pub fn execution_can_cancel(
+        &self,
+        session_id: &str,
+        runtime_generation: u64,
+        turn_id: &str,
+        execution_seq: i64,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        self.owned_execution(session_id, runtime_generation, turn_id, execution_seq)
+            .is_some_and(|execution| execution.cancel.is_none())
+    }
+
+    pub fn release_answer_waiter(&mut self, session_id: &str, id: &str, attempt_id: u64) {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return;
+        };
+        if let Some(table) = state.requests.get_mut(&uid) {
+            table.release_answer_waiter(id, attempt_id);
+        }
+    }
+
+    pub fn finish_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+        outcome: Outcome,
+        receipt: Value,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let resolved = {
+            let mut state = self.state.borrow_mut();
+            let Some(uid) = state
+                .sessions
+                .get(session_id)
+                .map(|session| session.uid.clone())
+            else {
+                return false;
+            };
+            state
+                .requests
+                .get_mut(&uid)
+                .and_then(|table| {
+                    table.deliver_with_receipt(
+                        id,
+                        attempt_id,
+                        answer,
+                        Resolution {
+                            outcome,
+                            answer: Some(answer.clone()),
+                        },
+                        receipt,
+                    )
+                })
+                .is_some()
+        };
+        if resolved {
+            self.unblock_if_settled(session_id);
+        }
+        resolved
+    }
+
+    pub fn retry_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return false;
+        };
+        state
+            .requests
+            .get_mut(&uid)
+            .is_some_and(|table| table.retry_answer(id, attempt_id, answer))
+    }
+
+    pub fn fail_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return false;
+        };
+        state
+            .requests
+            .get_mut(&uid)
+            .is_some_and(|table| table.fail_answer(id, attempt_id, answer))
+    }
+
+    /// Settle an old delivery failure only when the provider has already
+    /// withdrawn the Request. This deliberately does not change Session or
+    /// execution state, which may belong to a replacement runtime.
+    pub fn fail_withdrawn_request_answer(
+        &self,
+        session_id: &str,
+        id: &str,
+        attempt_id: u64,
+        answer: &Answer,
+    ) -> bool {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let mut state = self.state.borrow_mut();
+        let Some(uid) = state
+            .sessions
+            .get(session_id)
+            .map(|session| session.uid.clone())
+        else {
+            return false;
+        };
+        state
+            .requests
+            .get_mut(&uid)
+            .is_some_and(|table| table.fail_withdrawn_answer(id, attempt_id, answer))
+    }
+
+    /// Close pending Requests as canceled: all of them, or the one the
+    /// provider withdrew.
+    pub fn cancel_requests(
+        &self,
+        session_id: &str,
+        provider_key: Option<&str>,
+    ) -> Vec<RequestRecord> {
+        let session_id = self.session_key(session_id);
+        let session_id = session_id.as_str();
+        let closed = {
+            let mut state = self.state.borrow_mut();
+            let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone()) else {
+                return Vec::new();
+            };
+            state
+                .requests
+                .get_mut(&uid)
+                .map(|table| table.cancel(provider_key))
+                .unwrap_or_default()
+        };
+        if !closed.is_empty() {
+            self.unblock_if_settled(session_id);
+        }
+        closed
+    }
+
+    fn unblock_if_settled(&self, session_id: &str) {
+        let (generation, seq) = {
+            let state = self.state.borrow();
+            let Some(session) = state.sessions.get(session_id) else {
+                return;
+            };
+            let Some(execution) = session.lifecycle.active() else {
+                return;
+            };
+            if state
+                .requests
+                .get(&session.uid)
+                .is_some_and(RequestTable::has_pending)
+            {
+                return;
+            }
+            (session.lifecycle.generation(), execution.seq)
+        };
+        let _ = self.transition(session_id, generation, &Event::Unblocked { seq }, None);
+    }
+
+    /// Record the mode the provider says it runs, when it differs from the
+    /// one the Session asked for.
+    pub fn set_effective_approvals(
+        &self,
+        session_id: &str,
+        effective: ApprovalsMode,
+        reason: &str,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let approvals = &mut session.record.approvals;
+        if approvals.effective == effective {
+            return false;
+        }
+        approvals.effective = effective;
+        approvals.reason = (effective != approvals.requested).then(|| reason.to_owned());
+        session.record.updated_at_ms = now_ms();
+        true
+    }
+
+    /// Returns whether the reported authentication is new information.
+    pub fn set_auth(&self, session_id: &str, auth: Auth) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let changed = session.record.auth != Some(auth);
+        session.record.auth = Some(auth);
+        changed
+    }
+
+    pub fn set_auth_policy(&self, session_id: &str, auth_policy: crate::protocol::AuthPolicy) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.auth_policy = Some(auth_policy);
+        }
+    }
+
+    pub fn set_resolved_model(&self, session_id: &str, model: &str) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.resolved_model = Some(model.to_owned());
+        }
+    }
+
+    /// Replace the launch selection a restart or resume reuses.
+    pub fn set_requested_approvals(&self, session_id: &str, requested: ApprovalsMode) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.approvals = Approvals::new(requested);
+        }
+    }
+
+    // A published result never changes. Reports that arrive after an
+    // execution became terminal (late usage, late denials, a late start
+    // acknowledgement for a canceled execution) are not applied to it.
+
+    pub fn set_turn_usage(&self, id: &str, usage: Value) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id)
+            && !turn.state.is_terminal()
+        {
+            turn.usage = Some(usage);
+        }
+    }
+
+    /// Raise an execution's denial count to what the provider itself counted.
+    pub fn raise_denied_requests(&self, id: &str, count: u32) {
+        if let Some(turn) = self.state.borrow_mut().turns.get_mut(id)
+            && !turn.state.is_terminal()
+        {
+            turn.provider_denials = turn.provider_denials.max(count);
+            turn.denied_requests = turn
+                .denied_requests
+                .max(turn.recorded_denials.max(turn.provider_denials));
+        }
+    }
 }
 
 /// Evict the oldest retained results once a Session exceeds either bound.
@@ -1083,13 +1788,52 @@ fn enforce_result_retention(state: &mut MemoryState, session_id: &str) {
     }
 }
 
-fn set_terminal_session(state: &mut MemoryState, id: &str, terminal_state: SessionState) {
-    if let Some(session) = state.sessions.get_mut(id) {
-        session.record.state = terminal_state;
-        session.record.pid = None;
-        session.record.active_turn_id = None;
-        session.record.updated_at_ms = now_ms();
+fn close_requests(state: &mut MemoryState, session_id: &str) {
+    if let Some(uid) = state.sessions.get(session_id).map(|s| s.uid.clone())
+        && let Some(table) = state.requests.get_mut(&uid)
+    {
+        table.cancel(None);
     }
+}
+
+/// Give an execution whose process is going away its terminal result.
+fn end_turn(
+    state: &mut MemoryState,
+    turn_id: &str,
+    outcome: RunOutcome,
+    reason: &str,
+    detail: Option<(&str, &str)>,
+) {
+    let Some(turn) = state.turns.get_mut(turn_id) else {
+        return;
+    };
+    // A published result never changes: a canceled execution stays
+    // canceled even if its provider fails afterwards.
+    if !turn.state.is_active() {
+        return;
+    }
+    let (code, message) = detail.unwrap_or(match reason {
+        "session_restarted" => (
+            "interrupted",
+            "session restarted before execution completed",
+        ),
+        "session_stopped" => ("interrupted", "session stopped before execution completed"),
+        "provider_exited" => (
+            "provider_exited",
+            "the provider process exited before execution completed",
+        ),
+        _ => (
+            "provider_error",
+            "the provider failed before execution completed",
+        ),
+    });
+    turn.state = match outcome {
+        RunOutcome::Completed => TurnState::Completed,
+        RunOutcome::Failed => TurnState::Failed,
+        RunOutcome::Interrupted => TurnState::Interrupted,
+    };
+    turn.error = Some(json!({"code": code, "message": message}));
+    turn.completed_at_ms = Some(now_ms());
 }
 
 pub fn now_ms() -> i64 {
@@ -1102,7 +1846,9 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{NewSession, Store};
-    use crate::protocol::{SessionState, TurnState};
+    use crate::messages::{Decider, Decision, MessageBody};
+    use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnState};
+    use crate::requests::{Answer, Outcome, ProviderRequest, RequestDraft, RequestKind};
 
     fn ready_store() -> Store {
         let store = Store::new();
@@ -1116,7 +1862,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(store.set_session_running("codex:thread-1", Some(42)));
@@ -1130,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_explicit_auto_approve_opt_out() {
+    fn retains_the_requested_approvals_mode() {
         let store = Store::new();
         store
             .insert_session(&NewSession {
@@ -1142,18 +1888,92 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: false,
+                approvals: ApprovalsMode::Ask,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         let session = store
             .get_session("claude:thread-1")
             .unwrap_or_else(|| panic!("session missing"));
-        assert!(!session.auto_approve);
+        assert_eq!(session.approvals.requested, ApprovalsMode::Ask);
+        assert_eq!(session.approvals.effective, ApprovalsMode::Ask);
+        assert!(session.approvals.reason.is_none());
     }
 
     #[test]
-    fn retains_session_turn_event_and_input_sequence() {
-        let mut store = Store::new();
+    fn stale_delivery_failure_cannot_fail_a_replaced_execution() {
+        let store = ready_store();
+        let first = store
+            .insert_turn("turn_1", "codex:thread-1", "first")
+            .unwrap_or_else(|error| panic!("failed to insert first turn: {error}"));
+        let generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_else(|| panic!("runtime generation missing"));
+        assert!(store.mark_turn_started("turn_1", Some("provider-1")));
+        assert!(
+            store
+                .complete_turn_if_matching("turn_1", Some("provider-1"), Some("done"), false)
+                .unwrap_or_else(|error| panic!("failed to complete first turn: {error}"))
+        );
+        assert!(
+            store
+                .begin_session_restart(
+                    "codex:thread-1",
+                    store
+                        .runtime_generation("codex:thread-1")
+                        .unwrap_or_default()
+                )
+                .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
+        );
+        let old_generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_default();
+        store.exited("codex:thread-1", old_generation, "replaced");
+        assert!(store.start_restarted_session("codex:thread-1", old_generation));
+        mark_ready(&store, "codex:thread-1");
+        store
+            .insert_turn("turn_2", "codex:thread-1", "second")
+            .unwrap_or_else(|error| panic!("failed to insert second turn: {error}"));
+        assert!(store.mark_turn_started("turn_2", Some("provider-2")));
+        assert!(store.set_session_state("codex:thread-1", SessionState::Busy));
+
+        // A stale delivery callback may mutate only while its generation and
+        // execution still own the Session.
+        if store.execution_is_current("codex:thread-1", generation, &first.id, first.execution_seq)
+        {
+            store.set_session_failed("codex:thread-1");
+        }
+
+        let current_generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_else(|| panic!("runtime generation missing after restart"));
+        assert!(
+            store.execution_is_current(
+                "codex:thread-1",
+                current_generation,
+                "turn_2",
+                store
+                    .get_turn("turn_2")
+                    .unwrap_or_else(|| panic!("second turn missing"))
+                    .execution_seq,
+            )
+        );
+
+        assert_eq!(
+            store
+                .get_session("codex:thread-1")
+                .map(|session| session.state),
+            Some(SessionState::Busy),
+            "a stale callback changed the newer execution"
+        );
+        assert_eq!(
+            store.get_turn("turn_2").map(|turn| turn.state),
+            Some(TurnState::Running)
+        );
+    }
+
+    #[test]
+    fn retains_session_turn_and_event() {
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "codex:thread-1",
@@ -1164,7 +1984,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1172,14 +1992,16 @@ mod tests {
             .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         assert_eq!(turn.state, TurnState::Submitted);
-        store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.submitted");
-        assert_eq!(store.allocate_input_sequence(), 1);
-        assert_eq!(store.allocate_input_sequence(), 2);
+        let next_seq = store.latest_event_seq() + 1;
+        assert_eq!(
+            store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.submitted"),
+            next_seq
+        );
     }
 
     #[test]
     fn canceled_turn_is_not_a_provider_finish_state() {
-        let mut store = Store::new();
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "codex:thread-1",
@@ -1190,7 +2012,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1225,20 +2047,23 @@ mod tests {
     #[test]
     fn unscoped_event_reads_include_session_events() {
         let store = ready_store();
-        store.record_event(Some("codex:thread-1"), None, "session.started");
-        store.record_event(None, None, "runtime.started");
         let uid = store
             .session_uid("codex:thread-1")
             .unwrap_or_else(|| panic!("session uid missing"));
+        let (all_before, session_before) = (
+            store.read_events(None, 0).len(),
+            store.read_events(Some(&uid), 0).len(),
+        );
+        store.record_event(Some("codex:thread-1"), None, "session.started");
+        store.record_event(None, None, "runtime.started");
 
-        let events = store.read_events(None, 0);
-        assert_eq!(events.len(), 2);
-        assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
+        assert_eq!(store.read_events(None, 0).len(), all_before + 2);
+        assert_eq!(store.read_events(Some(&uid), 0).len(), session_before + 1);
     }
 
     #[test]
     fn a_running_execution_never_hides_the_previous_result() {
-        let mut store = ready_store();
+        let store = ready_store();
         store
             .insert_turn("turn_1", "codex:thread-1", "first")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
@@ -1279,7 +2104,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store.record_event(Some("internal:LAUNCH01"), None, "session.created");
@@ -1305,7 +2130,7 @@ mod tests {
 
     #[test]
     fn retained_events_survive_result_eviction_and_rekey_unchanged() {
-        let mut store = ready_store();
+        let store = ready_store();
         store
             .insert_turn("turn_1", "codex:thread-1", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
@@ -1315,11 +2140,14 @@ mod tests {
                 .complete_turn_if_matching("turn_1", Some("provider-turn"), Some("done"), false)
                 .unwrap_or_else(|error| panic!("failed to complete turn: {error}"))
         );
-        store.record_event(Some("codex:thread-1"), Some("turn_1"), "turn.completed");
         let uid = store
             .session_uid("codex:thread-1")
             .unwrap_or_else(|| panic!("session uid missing"));
-        let before = store.read_events(Some(&uid), 0);
+        let before = store
+            .read_events(Some(&uid), 0)
+            .into_iter()
+            .filter(|event| event.kind == "turn.completed")
+            .collect::<Vec<_>>();
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].execution_seq, Some(1));
         assert_eq!(before[0].result_status, Some(TurnState::Completed));
@@ -1330,7 +2158,11 @@ mod tests {
             .rekey_session("codex:thread-1", "codex:thread-2")
             .unwrap_or_else(|error| panic!("failed to rekey: {error}"));
 
-        let after = store.read_events(Some(&uid), 0);
+        let after = store
+            .read_events(Some(&uid), 0)
+            .into_iter()
+            .filter(|event| event.kind == "turn.completed")
+            .collect::<Vec<_>>();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].execution_seq, Some(1));
         assert_eq!(after[0].result_status, Some(TurnState::Completed));
@@ -1368,7 +2200,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:old-session");
@@ -1383,7 +2215,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to reuse alias: {error}"));
         let archived = store
@@ -1413,7 +2245,7 @@ mod tests {
                 model: Some("gpt-test"),
                 effort: Some("high"),
                 harness_options: &harness_options,
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "claude:provider-thread");
@@ -1421,7 +2253,12 @@ mod tests {
 
         assert!(
             store
-                .begin_session_restart("claude:provider-thread")
+                .begin_session_restart(
+                    "claude:provider-thread",
+                    store
+                        .runtime_generation("claude:provider-thread")
+                        .unwrap_or_default()
+                )
                 .unwrap_or_else(|error| panic!("failed to restart session: {error}"))
         );
         let session = store
@@ -1433,10 +2270,22 @@ mod tests {
         assert_eq!(session.harness_options, harness_options);
         assert!(
             !store
-                .begin_session_restart("claude:provider-thread")
+                .begin_session_restart(
+                    "claude:provider-thread",
+                    store
+                        .runtime_generation("claude:provider-thread")
+                        .unwrap_or_default()
+                )
                 .unwrap_or(false)
         );
-        assert!(store.start_restarted_session("claude:provider-thread"));
+        assert!(
+            store.start_restarted_session(
+                "claude:provider-thread",
+                store
+                    .runtime_generation("claude:provider-thread")
+                    .unwrap_or_default()
+            )
+        );
         assert_eq!(
             store
                 .get_session("claude:provider-thread")
@@ -1460,7 +2309,7 @@ mod tests {
                     model: None,
                     effort: None,
                     harness_options: &[],
-                    auto_approve: true,
+                    approvals: ApprovalsMode::Auto,
                 })
                 .unwrap_or_else(|error| panic!("failed to insert {id}: {error}"));
             mark_ready(&store, id);
@@ -1469,7 +2318,12 @@ mod tests {
             }
         }
         let error = store
-            .begin_session_restart("codex:old-session")
+            .begin_session_restart(
+                "codex:old-session",
+                store
+                    .runtime_generation("codex:old-session")
+                    .unwrap_or_default(),
+            )
             .err()
             .unwrap_or_else(|| panic!("alias-conflicting restart unexpectedly succeeded"));
         assert!(
@@ -1492,14 +2346,19 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
 
         assert!(
             store
-                .begin_session_restart("codex:thread-1")
+                .begin_session_restart(
+                    "codex:thread-1",
+                    store
+                        .runtime_generation("codex:thread-1")
+                        .unwrap_or_default()
+                )
                 .unwrap_or_else(|error| panic!("failed to begin restart: {error}"))
         );
         assert_eq!(
@@ -1528,7 +2387,7 @@ mod tests {
                     model: None,
                     effort: None,
                     harness_options: &[],
-                    auto_approve: true,
+                    approvals: ApprovalsMode::Auto,
                 })
                 .is_err()
         );
@@ -1536,35 +2395,6 @@ mod tests {
 
     #[test]
     fn process_exit_interrupts_active_turn() {
-        let mut store = Store::new();
-        store
-            .insert_session(&NewSession {
-                id: "codex:thread-1",
-                alias: "@worker",
-                title: "worker",
-                agent: "codex",
-                cwd: "/tmp",
-                model: None,
-                effort: None,
-                harness_options: &[],
-                auto_approve: true,
-            })
-            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        mark_ready(&store, "codex:thread-1");
-        store
-            .insert_turn("turn_1", "codex:thread-1", "hello")
-            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
-        let interrupted = store.interrupt_active_turn("codex:thread-1", "agent exited");
-        assert_eq!(interrupted.as_deref(), Some("turn_1"));
-        let turn = store
-            .get_turn("turn_1")
-            .unwrap_or_else(|| panic!("turn missing"));
-        assert_eq!(turn.state, TurnState::Interrupted);
-        assert_eq!(turn.error.as_deref(), Some("agent exited"));
-    }
-
-    #[test]
-    fn output_reads_are_paginated() {
         let store = Store::new();
         store
             .insert_session(&NewSession {
@@ -1576,22 +2406,103 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
-        store.record_output("codex:thread-1", b"first");
-        store.record_output("codex:thread-1", b"second");
-        let first = store.read_output_page("codex:thread-1", 0, 5);
-        assert_eq!(first.data, b"first");
-        assert!(first.has_more);
-        let second = store.read_output_page("codex:thread-1", first.next_after, 5);
-        assert_eq!(second.data, b"second");
-        assert!(!second.has_more);
+        mark_ready(&store, "codex:thread-1");
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_default();
+        store.exited("codex:thread-1", generation, "agent exited");
+        let turn = store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"));
+        assert_eq!(turn.state, TurnState::Failed);
+        assert_eq!(
+            turn.error.as_ref().map(|error| error["message"].as_str()),
+            Some(Some("agent exited"))
+        );
+    }
+
+    #[test]
+    fn a_terminal_result_ignores_every_late_report() {
+        let mut store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let generation = store
+            .runtime_generation("codex:thread-1")
+            .unwrap_or_default();
+        assert!(
+            store
+                .cancel_turn_with_controls("turn_1", generation, 1)
+                .unwrap_or(false)
+        );
+        let published = store.get_turn("turn_1").map(|turn| format!("{turn:?}"));
+
+        store.set_turn_usage("turn_1", serde_json::json!({"output_tokens": 9}));
+        store.raise_denied_requests("turn_1", 3);
+        store.mark_turn_started("turn_1", Some("provider-late"));
+        store.append_execution_message(
+            "codex:thread-1",
+            Some(1),
+            MessageBody::approval(
+                Decision::Denied,
+                Decider::Caller,
+                None,
+                Some("r1"),
+                "Bash",
+                "x",
+            ),
+        );
+        store.exited("codex:thread-1", generation, "late exit");
+
+        let mut after = store
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"));
+        // The provider's own turn ID is routing data, not part of the result.
+        after.provider_turn_id = None;
+        assert_eq!(Some(format!("{after:?}")), published);
+    }
+
+    #[test]
+    fn an_answer_started_before_a_rotation_commits_after_it() {
+        let store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let request = store
+            .open_request("codex:thread-1", approval_draft("provider-1"))
+            .unwrap_or_else(|| panic!("request was not opened"));
+        let Some(crate::requests::AnswerClaim::Started(attempt)) =
+            store.begin_request_answer("codex:thread-1", &request.id, &Answer::Allow)
+        else {
+            panic!("answer was not started");
+        };
+        store
+            .rekey_session("codex:thread-1", "codex:thread-2")
+            .unwrap_or_else(|error| panic!("failed to rekey: {error}"));
+        assert!(store.finish_request_answer(
+            "codex:thread-1",
+            &request.id,
+            attempt,
+            &Answer::Allow,
+            Outcome::Allowed,
+            serde_json::json!({}),
+        ));
+        assert!(
+            store
+                .pending_requests(&store.session_uid("codex:thread-2").unwrap_or_default())
+                .is_empty()
+        );
     }
 
     #[test]
     fn only_one_turn_can_claim_a_session() {
-        let mut store = Store::new();
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "codex:thread-1",
@@ -1602,7 +2513,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1618,7 +2529,7 @@ mod tests {
 
     #[test]
     fn claude_cannot_claim_a_turn_before_session_start() {
-        let mut store = Store::new();
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "claude:session",
@@ -1629,7 +2540,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert!(store.set_session_running("claude:session", Some(42)));
@@ -1643,7 +2554,7 @@ mod tests {
 
     #[test]
     fn stop_must_match_a_running_provider_turn() {
-        let mut store = Store::new();
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "codex:thread-1",
@@ -1654,7 +2565,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1687,7 +2598,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1727,7 +2638,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         mark_ready(&store, "codex:thread-1");
@@ -1771,7 +2682,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         store.set_session_stopped("codex:thread-1");
@@ -1795,7 +2706,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
         assert_eq!(
@@ -1812,7 +2723,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn launch_id_rekeys_every_retained_session_record() {
-        let mut store = Store::new();
+        let store = Store::new();
         store
             .insert_session(&NewSession {
                 id: "codex:thread-1",
@@ -1823,11 +2734,11 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert old Session: {error}"));
         mark_ready(&store, "codex:thread-1");
-        store.record_output("codex:thread-1", b"old");
+        store.append_message("codex:thread-1", MessageBody::notice("old"));
         store.set_session_stopped("codex:thread-1");
 
         store
@@ -1840,7 +2751,7 @@ mod tests {
                 model: None,
                 effort: None,
                 harness_options: &[],
-                auto_approve: true,
+                approvals: ApprovalsMode::Auto,
             })
             .unwrap_or_else(|error| panic!("failed to insert launch Session: {error}"));
         mark_ready(&store, "internal:ABC12345");
@@ -1848,7 +2759,7 @@ mod tests {
             .insert_turn("turn_rekey", "internal:ABC12345", "hello")
             .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
         store.record_event(Some("internal:ABC12345"), Some(&turn.id), "turn.submitted");
-        store.record_output("internal:ABC12345", b"new");
+        store.append_message("internal:ABC12345", MessageBody::notice("new"));
 
         store
             .rekey_session("internal:ABC12345", "codex:thread-1")
@@ -1868,12 +2779,200 @@ mod tests {
             .unwrap_or_else(|| panic!("session uid missing"));
         // The launch event keeps the identity it was written with; the
         // canonical timeline is recorded after binding.
-        assert!(store.read_events(Some(&uid), 0).is_empty());
+        let launch_events = store.read_events(Some(&uid), 0).len();
         store.record_event(Some("codex:thread-1"), None, "session.created");
-        assert_eq!(store.read_events(Some(&uid), 0).len(), 1);
+        assert_eq!(store.read_events(Some(&uid), 0).len(), launch_events + 1);
+        let messages = store.messages_after(&uid, 0, 64).messages;
         assert_eq!(
-            store.read_output_page("codex:thread-1", 0, 64).data,
-            b"oldnew"
+            messages
+                .iter()
+                .map(|message| (message.seq, message.execution_seq, message.body.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (1, None, MessageBody::notice("old")),
+                (2, Some(1), MessageBody::notice("new")),
+            ],
+            "the resumed Session continues one message history"
         );
+    }
+
+    fn approval_draft(provider_key: &str) -> RequestDraft {
+        RequestDraft {
+            kind: RequestKind::Approval,
+            provider_key: provider_key.to_owned(),
+            provider: ProviderRequest::CodexCommand,
+            tool: "exec".to_owned(),
+            summary: "touch a".to_owned(),
+            input: serde_json::json!({"command": "touch a"}),
+            cwd: None,
+            reason: None,
+            text: None,
+            choices: Vec::new(),
+        }
+    }
+
+    fn busy_store() -> Store {
+        let store = ready_store();
+        store
+            .insert_turn("turn_1", "codex:thread-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.set_session_state("codex:thread-1", SessionState::Busy));
+        store
+    }
+
+    fn state(store: &Store) -> SessionState {
+        store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|| panic!("session missing"))
+            .state
+    }
+
+    #[test]
+    fn a_session_is_blocked_exactly_while_a_request_is_pending() {
+        let store = busy_store();
+        let first = store
+            .open_request("codex:thread-1", approval_draft("p1"))
+            .unwrap_or_else(|| panic!("request was not opened"));
+        let second = store
+            .open_request("codex:thread-1", approval_draft("p2"))
+            .unwrap_or_else(|| panic!("request was not opened"));
+        assert_eq!((first.id.as_str(), second.id.as_str()), ("r1", "r2"));
+        assert_eq!(first.execution_seq, Some(1));
+        assert_eq!(state(&store), SessionState::Blocked);
+
+        let allowed = Answer::Allow;
+        let Some(crate::requests::AnswerClaim::Started(first_attempt)) =
+            store.begin_request_answer("codex:thread-1", "r1", &allowed)
+        else {
+            panic!("first answer attempt did not start");
+        };
+        assert!(store.finish_request_answer(
+            "codex:thread-1",
+            "r1",
+            first_attempt,
+            &allowed,
+            Outcome::Allowed,
+            serde_json::json!({"resolution": "allowed"}),
+        ));
+        assert_eq!(state(&store), SessionState::Blocked, "r2 is still pending");
+        assert!(
+            !store.finish_request_answer(
+                "codex:thread-1",
+                "r1",
+                first_attempt,
+                &allowed,
+                Outcome::Allowed,
+                serde_json::json!({"resolution": "allowed"}),
+            ),
+            "a Request is resolved once"
+        );
+        let Some(crate::requests::AnswerClaim::Started(second_attempt)) =
+            store.begin_request_answer("codex:thread-1", "r2", &allowed)
+        else {
+            panic!("second answer attempt did not start");
+        };
+        assert!(store.finish_request_answer(
+            "codex:thread-1",
+            "r2",
+            second_attempt,
+            &allowed,
+            Outcome::Allowed,
+            serde_json::json!({"resolution": "allowed"}),
+        ));
+        assert_eq!(state(&store), SessionState::Busy);
+
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let kinds = store
+            .read_events(Some(&uid), 0)
+            .into_iter()
+            .map(|event| event.kind)
+            .filter(|kind| matches!(kind.as_str(), "session.blocked" | "session.resumed"))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["session.blocked", "session.resumed"]);
+    }
+
+    #[test]
+    fn an_idle_session_cannot_be_blocked() {
+        let store = ready_store();
+        assert!(
+            store
+                .open_request("codex:thread-1", approval_draft("p1"))
+                .is_none()
+        );
+        assert_eq!(state(&store), SessionState::Idle);
+    }
+
+    #[test]
+    fn ending_the_execution_closes_its_pending_requests_as_canceled() {
+        let mut store = busy_store();
+        store.open_request("codex:thread-1", approval_draft("p1"));
+        assert!(
+            store
+                .cancel_turn("turn_1")
+                .unwrap_or_else(|error| panic!("failed to cancel: {error}"))
+        );
+        let uid = store
+            .session_uid("codex:thread-1")
+            .unwrap_or_else(|| panic!("session uid missing"));
+        assert!(store.pending_requests(&uid).is_empty());
+        assert_eq!(
+            store
+                .request("codex:thread-1", "r1")
+                .and_then(|request| request.resolution)
+                .map(|resolution| resolution.outcome),
+            Some(Outcome::Canceled)
+        );
+        assert_eq!(state(&store), SessionState::Quiescing);
+    }
+
+    #[test]
+    fn a_refused_approval_is_counted_on_the_running_execution() {
+        let store = busy_store();
+        for decision in [Decision::Approved, Decision::Denied, Decision::TimedOut] {
+            store.append_message(
+                "codex:thread-1",
+                MessageBody::approval(decision, Decider::ProviderReviewer, None, None, "exec", "x"),
+            );
+        }
+        assert_eq!(
+            store.get_turn("turn_1").map(|turn| turn.denied_requests),
+            Some(2)
+        );
+        store.raise_denied_requests("turn_1", 1);
+        assert_eq!(
+            store.get_turn("turn_1").map(|turn| turn.denied_requests),
+            Some(2),
+            "the provider's own count never lowers what dlgt observed"
+        );
+    }
+
+    #[test]
+    fn the_effective_approvals_mode_reports_why_it_differs() {
+        let store = ready_store();
+        assert!(store.set_effective_approvals(
+            "codex:thread-1",
+            ApprovalsMode::Ask,
+            "provider reported permission mode default"
+        ));
+        let approvals = store
+            .get_session("codex:thread-1")
+            .unwrap_or_else(|| panic!("session missing"))
+            .approvals;
+        assert_eq!(approvals.requested, ApprovalsMode::Auto);
+        assert_eq!(approvals.effective, ApprovalsMode::Ask);
+        assert_eq!(
+            approvals.reason.as_deref(),
+            Some("provider reported permission mode default")
+        );
+        assert!(store.set_effective_approvals("codex:thread-1", ApprovalsMode::Auto, "back"));
+        assert!(
+            store
+                .get_session("codex:thread-1")
+                .is_some_and(|session| session.approvals.reason.is_none())
+        );
+        assert!(store.set_auth("codex:thread-1", Auth::Subscription));
+        assert!(!store.set_auth("codex:thread-1", Auth::Subscription));
     }
 }

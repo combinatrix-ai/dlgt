@@ -7,8 +7,8 @@ Research snapshot: 2026-07-14.
 `dlgt` is best described as a **provider-aware local Session runtime**, not as
 an end-to-end agent orchestrator.
 
-It owns a Codex or Claude process, PTY, terminal screen, lifecycle state, and
-retained result. It exposes those through a small JSON-first CLI and local JSONL
+It owns a Codex or Claude process, its structured control channel, lifecycle
+state, and retained result. It exposes those through a small JSON-first CLI and local JSONL
 RPC. It deliberately does not decide what work should happen, decompose tasks,
 route dependencies, isolate branches, merge code, or coordinate a team.
 
@@ -51,7 +51,7 @@ something a user could script externally.
 
 | Project | Primary public object | Owns agent process | Durable semantic follow-up | Lifecycle source | Team mail | Task graph / routing | Worktree / merge / CI | Main operator surface |
 | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
-| **dlgt** | Session | yes | yes | Codex app-server and Claude lifecycle hooks; PTY is presentation/fallback | no | no | no | JSON CLI, JSONL RPC, attach |
+| **dlgt** | Session | yes | yes | Codex app-server notifications and Claude stream-json events; no terminal | no | no | no | JSON CLI, JSONL RPC, read-only watch |
 | **agmsg** | Team member and message | only optional peer spawn; no child ownership contract | message delivery to independent peers | hook or monitor delivery around a shared SQLite mailbox | yes | no | no | agent skill and shell scripts |
 | **Agent Deck** | tmux-backed session | yes | interactive session control | UI-oriented status detection; no normalized lifecycle RPC contract documented | no; conductor is the coordination mechanism | conductor-driven, not a deterministic task graph | worktrees and optional Docker; no built-in PR factory | TUI, tmux, optional Telegram/Slack conductor |
 | **OpenDray** | persistent remote session | yes | yes, including replies from remote channels | persistent PTY/session infrastructure | external chat channels, not peer-agent mail | no | no | web/mobile and six messaging channels |
@@ -76,11 +76,11 @@ and superficially easy to confuse.
 | Core promise | Stop humans copy-pasting messages between agents | Keep a coding-agent Session alive, addressable, observable, and controllable |
 | Identity | Team + named peer | Immutable Session ID + active human alias |
 | Transport | Shared WAL-mode SQLite mailbox | Local mode-0600 Unix socket and JSONL RPC |
-| Process ownership | `spawn` launches an independent peer; agmsg explicitly does not manage it as a child | Daemon owns the harness process group, PTY, screen, controller, cancellation and stop |
+| Process ownership | `spawn` launches an independent peer; agmsg explicitly does not manage it as a child | Daemon owns the harness process group, structured control channel, cancellation and stop |
 | Completion | A message or delivery event is coordination state, not proof that provider work completed | Official provider lifecycle terminalizes a retained execution result |
-| Input | Agent-to-agent messages surfaced by hooks/monitor modes | Semantic `send` to an idle Session; Codex uses app-server `turn/start`, Claude uses guarded terminal input |
+| Input | Agent-to-agent messages surfaced by hooks/monitor modes | Semantic `send` to an idle Session; Codex uses app-server `turn/start`, Claude receives a stream-json user message |
 | Concurrency | Multiple peers communicate through the shared floor | One controller and at most one active execution per Session; busy work is rejected, never queued |
-| History | Durable room/message history and replay | Session metadata, events, results, input audit, rendered scrollback and bounded raw PTY history |
+| History | Durable room/message history and replay | Session metadata, events, results, Requests and bounded progress messages |
 | Best role | Coordination plane | Execution plane |
 
 A clean composition is:
@@ -97,7 +97,7 @@ agmsg ---------------------- team identity, peer mail, handoff
 dlgt ---------------------- Session lifecycle, semantic send, wait, cancel
         |
         v
-Codex app-server / Claude CLI + hooks
+Codex app-server / Claude stream-json
 ```
 
 Neither project needs to absorb the other. A thin adapter can register an
@@ -109,13 +109,13 @@ turn normalized dlgt lifecycle events into coordination messages.
 ### 1. Provider-authoritative completion
 
 Many session managers can keep a tmux pane alive and show terminal output.
-dlgt instead treats Codex app-server notifications and Claude lifecycle hooks
-as authoritative. PTY silence, spinner disappearance, and screen text do not
-prove completion. Loss of the authoritative transport fails closed.
+dlgt instead treats Codex app-server notifications and Claude stream-json
+events as authoritative and owns no terminal. Provider silence and output text
+do not prove completion. Loss of the authoritative transport fails closed.
 
-Among the surveyed projects, this combination of an attachable real PTY with a
-small, normalized, provider-backed lifecycle API is dlgt's clearest technical
-wedge.
+Among the surveyed projects, this small, normalized, provider-backed lifecycle
+API, with approvals returned to the caller as answerable Requests, is dlgt's
+clearest technical wedge.
 
 ### 2. A deliberately small public state model
 
@@ -135,8 +135,9 @@ discovering stale prompts hidden in a runtime queue.
 ### 4. Machine-first local control with a human escape hatch
 
 Control-plane commands emit deterministic JSON by default, and the public RPC
-surface is allowlisted. At the same time, the same owned PTY supports rendered
-scrollback and exclusive live attach. Competitors tend to optimize either for
+surface is allowlisted. A human follows the same Session read-only with
+`watch`, and takes a conversation over by stopping it and running the
+provider's own resume command. Competitors tend to optimize either for
 a human dashboard/terminal or for headless workflow automation; dlgt keeps the
 boundary between those surfaces unusually explicit.
 
@@ -180,7 +181,7 @@ Suggested longer description:
 
 > dlgt gives an orchestrator live, addressable Codex and Claude Sessions
 > with semantic input, provider-authoritative completion, structured events,
-> bounded waits, cancellation, scrollback, and live attach - without imposing a
+> bounded waits, cancellation, and caller-answered approvals - without imposing a
 > task graph, worktree policy, queue, or UI.
 
 This avoids competing with mature products on their broadest surface. It also
