@@ -18,45 +18,6 @@ if [ -n "${DLGT_FAKE_ARGS_FILE:-}" ]; then
   printf '%s\n' "$@" >>"$DLGT_FAKE_ARGS_FILE"
 fi
 
-if [ "$1" = auth ] && [ "${2:-}" = status ]; then
-  if [ -f "$HOME/.fake-auth-delay" ]; then
-    delay=$(cat "$HOME/.fake-auth-delay")
-    printf '%s\n' "$$" >"$HOME/.fake-auth-parent-pid"
-    sleep "$delay" &
-    auth_child=$!
-    printf '%s\n' "$auth_child" >"$HOME/.fake-auth-child-pid"
-    wait "$auth_child"
-  fi
-  if [ -f "$HOME/.fake-auth-status" ]; then
-    if [ -f "$HOME/.fake-auth-output-bytes" ]; then
-      output_bytes=$(cat "$HOME/.fake-auth-output-bytes")
-      awk -v count="$output_bytes" 'BEGIN { for (i = 0; i < count; i++) printf " " }'
-    fi
-    cat "$HOME/.fake-auth-status"
-    if [ -f "$HOME/.fake-auth-trailing-bytes" ]; then
-      trailing=$(cat "$HOME/.fake-auth-trailing-bytes")
-      awk -v count="$trailing" 'BEGIN { for (i = 0; i < count; i++) printf " "; printf "not json" }'
-    fi
-    if [ -f "$HOME/.fake-auth-linger" ]; then
-      sleep 20 </dev/null >/dev/null 2>&1 &
-      printf '%s\n' "$!" >"$HOME/.fake-auth-linger-pid"
-    fi
-    if [ -f "$HOME/.fake-auth-escape" ]; then
-      python3 -c 'import os, time; os.setpgid(0, 0); time.sleep(20)' &
-      printf '%s\n' "$!" >>"$HOME/.fake-auth-escape-pids"
-      exit 0
-    fi
-    if [ -f "$HOME/.fake-auth-hold-stdout" ]; then
-      sleep "$(cat "$HOME/.fake-auth-hold-stdout")" &
-      printf '%s\n' "$!" >"$HOME/.fake-auth-holder-pid"
-      exit 0
-    fi
-  else
-    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
-  fi
-  exit 0
-fi
-
 if [ -n "${DLGT_FAKE_PID_FILE:-}" ]; then
   printf '%s\n' "$$" >"$DLGT_FAKE_PID_FILE"
 fi

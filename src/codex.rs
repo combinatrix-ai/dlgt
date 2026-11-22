@@ -36,7 +36,15 @@ const CALLER_REQUESTS: [&str; 5] = [
 ];
 
 type NotificationHandler = Arc<dyn Fn(Value) -> bool + Send + Sync>;
-type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
+type OnResult = Box<dyn FnOnce(&Value) + Send>;
+
+struct PendingRequest {
+    reply: Sender<Result<Value, String>>,
+    /// Runs on the reader thread before it reads the next message.
+    on_result: Option<OnResult>,
+}
+
+type Pending = Arc<Mutex<HashMap<u64, PendingRequest>>>;
 
 #[derive(Debug)]
 enum WriteCommand {
@@ -239,14 +247,25 @@ impl CodexConnection {
         }
     }
 
-    pub fn start_turn(&self, thread_id: &str, prompt: &str) -> Result<String> {
-        let response = self.request(
+    /// `on_started` receives the provider turn ID on the reader thread, so
+    /// the turn is bound before any later message that names it is handled.
+    pub fn start_turn(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        on_started: impl FnOnce(&str) + Send + 'static,
+    ) -> Result<String> {
+        let response = self.request_with(
             "turn/start",
             json!({"threadId": thread_id, "input": [text_input(prompt)]}),
+            REQUEST_TIMEOUT,
+            Some(Box::new(move |result: &Value| {
+                if let Some(turn_id) = started_turn_id(result) {
+                    on_started(turn_id);
+                }
+            })),
         )?;
-        response
-            .pointer("/turn/id")
-            .and_then(Value::as_str)
+        started_turn_id(&response)
             .map(str::to_owned)
             .context("Codex turn/start response had no turn id")
     }
@@ -431,12 +450,22 @@ impl CodexConnection {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        self.request_with(method, params, timeout, None)
+    }
+
+    fn request_with(
+        &self,
+        method: &'static str,
+        params: Value,
+        timeout: Duration,
+        on_result: Option<OnResult>,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::channel();
         self.pending
             .lock()
             .map_err(|_| anyhow!("Codex request lock poisoned"))?
-            .insert(id, sender);
+            .insert(id, PendingRequest { reply, on_result });
         let message = Value::Object(Map::from_iter([
             ("id".to_owned(), json!(id)),
             ("method".to_owned(), json!(method)),
@@ -621,11 +650,11 @@ fn dispatch_message(
         return;
     }
     if let Some(id) = message.get("id").and_then(Value::as_u64) {
-        let sender = pending
+        let request = pending
             .lock()
             .ok()
             .and_then(|mut pending| pending.remove(&id));
-        if let Some(sender) = sender {
+        if let Some(request) = request {
             let result = if let Some(error) = message.get("error") {
                 Err(error
                     .get("message")
@@ -635,7 +664,10 @@ fn dispatch_message(
             } else {
                 Ok(message.get("result").cloned().unwrap_or(Value::Null))
             };
-            let _ = sender.send(result);
+            if let (Ok(value), Some(on_result)) = (&result, request.on_result) {
+                on_result(value);
+            }
+            let _ = request.reply.send(result);
         }
         return;
     }
@@ -728,10 +760,14 @@ pub(crate) fn final_agent_message_text(turn: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn started_turn_id(response: &Value) -> Option<&str> {
+    response.pointer("/turn/id").and_then(Value::as_str)
+}
+
 fn fail_pending(pending: &Pending, message: &str) {
     if let Ok(mut pending) = pending.lock() {
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(message.to_owned()));
+        for (_, request) in pending.drain() {
+            let _ = request.reply.send(Err(message.to_owned()));
         }
     }
 }

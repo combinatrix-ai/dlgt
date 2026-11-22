@@ -29,6 +29,7 @@ pub struct RpcFailure {
     pub hint: Option<String>,
     pub session_state: Option<String>,
     pub action: Option<String>,
+    pub auth_methods: Option<Vec<String>>,
     pub request_ids: Option<Vec<String>>,
     pub detail: Option<String>,
 }
@@ -106,9 +107,17 @@ pub struct LiveSessionRoute {
 }
 
 pub fn find_live_session(selector: &str) -> Result<Option<LiveSessionRoute>> {
-    let canonical = selector
-        .split_once(':')
-        .filter(|(harness, id)| matches!(*harness, "codex" | "claude") && !id.is_empty());
+    let canonical = selector.split_once(':').filter(|(harness, id)| {
+        !id.is_empty()
+            && harness.len() <= 32
+            && harness
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_lowercase())
+            && harness.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            })
+    });
     if canonical.is_none() {
         return Ok(None);
     }
@@ -397,6 +406,7 @@ fn rpc_unavailable_failure(message: String, offer_sandbox_retry: bool) -> RpcFai
         hint: offer_sandbox_retry.then(|| SANDBOX_RETRY_HINT.to_owned()),
         session_state: None,
         action: None,
+        auth_methods: None,
         request_ids: None,
         detail: None,
     }
@@ -482,6 +492,7 @@ fn transport_lost(message: String) -> anyhow::Error {
         hint: None,
         session_state: None,
         action: None,
+        auth_methods: None,
         request_ids: None,
         detail: None,
     }
@@ -508,6 +519,7 @@ fn decode_response(line: &str) -> Result<Value> {
             hint: error.hint,
             session_state: error.session_state,
             action: error.action,
+            auth_methods: error.auth_methods,
             request_ids: error.request_ids,
             detail: error.detail,
         }

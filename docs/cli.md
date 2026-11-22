@@ -220,6 +220,9 @@ supplies a replacement; built-in and `[defaults]` values do not replace it.
 | `ask` | `--permission-mode manual` | `sandbox=workspace-write`, `approvalPolicy=on-request`, `approvalsReviewer=user` | Every approval request |
 | `bypass` | `--dangerously-skip-permissions` | `sandbox=danger-full-access`, `approvalPolicy=never` | Nothing |
 
+An ACP Harness maps these modes to its agent's own modes, or takes none; see
+[ACP Harnesses](#approvals-1).
+
 In `ask`, dlgt forwards every approval request the provider raises. Allow rules
 in your own provider configuration, such as Claude's `settings.json`, can mean
 the provider raises no requests for those tools.
@@ -1201,7 +1204,11 @@ built in:
 | `cursor` | `cursor-agent acp` | `cursor-agent login` |
 | `grok` | `grok agent stdio` | `grok login` |
 | `opencode` | `opencode acp` | `opencode auth login` |
-| `gemini` | `gemini --acp` | `gemini` |
+| `agy` | `agy acp` | `agy acp --login` |
+
+`agy` is Google's Antigravity CLI. It is also built in with an approvals
+mapping (`auto = "auto"`, `ask = "default"`) and the resume command
+`agy --conversation {id}`.
 
 `opencode` requires OpenCode 2. When `initialize` reports `agentInfo.version`
 with a major version below 2, launch fails with `LAUNCH_FAILED` and a hint to
@@ -1217,32 +1224,47 @@ login = "pi"            # optional; shown in AUTH_REQUIRED
 
 [harnesses.goose]
 command = ["goose", "acp"]
+
+[harnesses.x]
+command = ["x", "acp"]
+approvals = { auto = "auto", ask = "default" }   # optional; see Approvals below
+resume = ["x", "--conversation", "{id}"]         # optional; show's resume_command
 ```
+
+A table for a built-in name replaces only the keys it sets.
 
 Rules:
 
 - A Harness name matches `[a-z][a-z0-9-]{0,31}` and is not `codex` or
   `claude`. `command` is a non-empty array; its first element is resolved on
   the launch environment's `PATH`.
+- `approvals` is a table from `auto`, `ask`, or `bypass` to a value of the
+  agent's `mode` config option. `resume` is a non-empty argv array; `{id}` in
+  it is replaced by the ACP sessionId.
 - `[defaults.<name>]` and Profiles accept ACP Harness names. For an ACP
   Harness they accept `model`, `effort`, `clean_env`, `pass_env`, `unset_env`,
-  and `env`. `approvals` and `harness_options` are configuration errors there.
+  and `env`, and `approvals` when the Harness has an approvals mapping.
+  `harness_options`, and `approvals` without a mapping, are configuration
+  errors there.
 - The Session ID is `<name>:<ACP sessionId>`, for example
   `opencode:ses_e14d64bd6ffe0CYTccyopWRmcw`. The provider ID limits in
   [`new`](#new) apply.
 - `show` reports `harness`, the command's first element, and the agent's
   `agentInfo` name and version when the agent supplied them. `resume_command`
-  is `null` for ACP Harnesses.
+  is the Harness's `resume` argv joined by spaces, for example
+  `agy --conversation 8f6c2f2e-6a2b-4c58-9d0e-1f3b7a9c4d21`, and `null` for a
+  Harness without one.
 
 ### Lifecycle mapping
 
 dlgt starts one agent process per Session and holds one ACP session in it.
 
 ```text
-new             initialize -> session/new -> model and effort -> session/prompt
+new             initialize -> session/new -> model, effort, mode -> session/prompt
 send            session/prompt
 cancel          session/cancel
 restart         new process -> initialize -> session/resume (or session/load)
+                -> model, effort, mode
 send --resume   same as restart, then session/prompt
 stop            session/close when supported, then the process group ends
 ```
@@ -1263,13 +1285,22 @@ stop            session/close when supported, then the process group ends
   `claude-opus-5-5[effort=medium]`); pass that as `--model`.
 - `resolved_model` is the current value of the `model` option, or the current
   model ID, as the agent last reported it.
-- `submission` is `confirmed` when the agent sends its first `session/update`
-  for the Session after the prompt is written, or answers the prompt. ACP v1
-  has no separate acceptance reply. Otherwise the five-second rule in
-  [`new`](#new) applies.
+- With an approvals mapping, the Session's approvals mode sets the config
+  option whose `category` is `mode`, after model and effort. See
+  [Approvals](#approvals-1).
+- `submission` is `confirmed` when, after the prompt is written, the agent
+  sends a `session/update` that the prompt caused (`agent_message_chunk`,
+  `agent_thought_chunk`, `user_message_chunk`, `tool_call`,
+  `tool_call_update`, or `plan`), raises a Request, or answers the prompt.
+  Updates such as `config_option_update`, `available_commands_update`,
+  `usage_update`, and `session_info_update` arrive unprompted and confirm
+  nothing. ACP v1 has no separate acceptance reply, and an agent can take
+  longer than the five-second rule in [`new`](#new) to produce its first
+  update: the receipt is then `pending` and `fetch` reports the result.
 - `restart` and `send --resume` use `session/resume` when the agent advertises
-  `sessionCapabilities.resume`, else `session/load` when it advertises
-  `loadSession`. History that `session/load` replays before its response is
+  `agentCapabilities.sessionCapabilities.resume`, else `session/load` when it
+  advertises `agentCapabilities.loadSession`. `stop` uses `session/close` when
+  the agent advertises `agentCapabilities.sessionCapabilities.close`. History that `session/load` replays before its response is
   discarded and never becomes messages. An agent with neither capability
   returns `UNSUPPORTED`.
 
@@ -1302,7 +1333,7 @@ The `session/prompt` response ends the execution:
 ```text
 agent_message_chunk                  assistant (consecutive chunks join into one message)
 tool_call                            tool_call: tool is the title, else the kind; summary from rawInput
-tool_call_update completed / failed  tool_result: ok is true for completed
+tool_call_update completed / failed  tool_result: ok is true for completed; summary is its text content
 notice                               notice
 everything else                      not recorded
 ```
@@ -1325,10 +1356,43 @@ everything else                      not recorded
 
 ### Approvals
 
-ACP has no approval policy, so ACP Harnesses do not accept `--approvals`. An
-explicit `--approvals` or a Profile's `approvals` is `UNSUPPORTED`;
-`[defaults] approvals` does not apply to them. The agent's own configuration
-decides what it asks, and dlgt forwards every request it raises:
+ACP has no approval policy. Many agents expose one as a config option whose
+`category` is `mode`, and a Harness's `approvals` mapping names that option's
+value for each approvals mode it supports:
+
+```toml
+[harnesses.x]
+command = ["x", "acp"]
+approvals = { auto = "auto", ask = "default" }
+```
+
+| Harness | `auto` | `ask` | `bypass` |
+| --- | --- | --- | --- |
+| `agy` (built in) | `auto` | `default` | not mapped |
+
+With a mapping, `--approvals`, a Profile's `approvals`, `[defaults.<name>]`
+and `[defaults] approvals` apply as they do for Codex and Claude, and the
+default is `auto`. At `new`, `restart`, and `send --resume`, after model and
+effort, dlgt sets the `mode` option to the mapped value with
+`session/set_config_option`. The snapshot reports the mode as `requested` and
+`effective`:
+
+```json
+{"approvals":{"requested":"ask","effective":"ask"}}
+```
+
+- A mode the mapping does not name is `UNSUPPORTED`, and no Session is
+  created. The built-in `agy` therefore rejects `--approvals bypass`.
+- An agent without a `mode` option, or one that rejects the value, fails the
+  launch with `LAUNCH_FAILED` carrying the agent's message.
+- What a mode approves is the agent's definition, not dlgt's. agy's `auto`
+  approves edits and safe commands and still asks before irreversible
+  actions; its `default` asks before edits and commands.
+
+Without a mapping, the Harness does not accept `--approvals`. An explicit
+`--approvals` or a Profile's `approvals` is `UNSUPPORTED`; `[defaults]
+approvals` does not apply. The agent's own configuration decides what it
+asks, and dlgt forwards every request it raises:
 
 ```json
 {"approvals":{"requested":null,"effective":"agent_default"}}
@@ -1367,15 +1431,17 @@ cancel timeout, and then sends the prompt as a new execution:
 ### Authentication
 
 dlgt never calls `authenticate`. When `session/new` or `session/resume`
-fails because the agent requires authentication, launch fails with
-`AUTH_REQUIRED`, the agent's `authMethods` names, and the login command as the
+fails with ACP's `auth_required` error (JSON-RPC code `-32000`, or a message
+saying authentication is required), launch fails with `AUTH_REQUIRED`, the agent's `authMethods` names, and the login command as the
 `action`:
 
 ```json
 {"ok":false,"error":{"code":"AUTH_REQUIRED","message":"grok requires sign-in","auth_methods":["Grok"],"action":"grok login"}}
 ```
 
-A table without `login` gives no `action`.
+A table without `login` gives no `action`. Any other failure of those
+requests is `LAUNCH_FAILED`: agents list `authMethods` whether or not they are
+signed in, so the list alone says nothing.
 
 ## Model discovery
 
@@ -1383,6 +1449,7 @@ A table without `login` gives no `action`.
 dlgt models [--include-hidden]
 dlgt models --harness codex [--include-hidden]
 dlgt models --harness claude
+dlgt models --harness <ACP-NAME>
 ```
 
 Without `--harness`, `dlgt models` queries every Harness and returns
@@ -1395,8 +1462,10 @@ ACP has no model-list method outside a session. For an ACP Harness, dlgt
 starts the agent in the invoking directory, runs `initialize` and
 `session/new`, reads the `model` config option's choices (or the `models`
 list), then closes the session and ends the process. No prompt is sent.
-`source` is `acp`, and each model has `id` and `display_name`. An agent that
-needs sign-in reports `"discovery":"unavailable"` with `AUTH_REQUIRED`.
+`source` is `acp`, and each model has `id` and `display_name`. The agent runs
+with the launch environment `new` would give it, without a Profile. An agent
+that needs sign-in reports `"discovery":"unavailable"` with an `error` object
+whose `code` is `AUTH_REQUIRED`.
 
 ```text
 dlgt models --harness opencode
@@ -1588,7 +1657,7 @@ scalar Profile and default values.
   codex     OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL
   cursor    CURSOR_API_KEY
   grok      XAI_API_KEY
-  gemini    GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI
+  agy       GEMINI_API_KEY GOOGLE_API_KEY AGY_ADC_AUTH
             GOOGLE_APPLICATION_CREDENTIALS
   opencode  every name matching [A-Z0-9_]+_API_KEY
   other ACP every name matching [A-Z0-9_]+_API_KEY

@@ -44,7 +44,8 @@ class Harness:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             sockets = list((self.root / "dlgt/run").glob("*/dlgt.sock"))
-            if sockets:
+            # The socket file exists from bind(); connecting proves listen().
+            if sockets and self.accepts(sockets[0]):
                 self.socket_path = sockets[0]
                 break
             if self.server.poll() is not None:
@@ -52,6 +53,15 @@ class Harness:
             time.sleep(0.01)
         else:
             raise RuntimeError("daemon socket did not appear")
+
+    @staticmethod
+    def accepts(path: Path) -> bool:
+        with socket.socket(socket.AF_UNIX) as probe:
+            try:
+                probe.connect(str(path))
+            except (ConnectionRefusedError, FileNotFoundError):
+                return False
+        return True
 
     def pending(self, method: str, params: dict, timeout: float = 45) -> socket.socket:
         connection = socket.socket(socket.AF_UNIX)
@@ -109,13 +119,7 @@ class Harness:
                     break
 
     def close(self) -> None:
-        for path in [
-            *self.root.glob("*.pid"),
-            self.home / ".fake-auth-child-pid",
-            self.home / ".fake-auth-parent-pid",
-            self.home / ".fake-auth-holder-pid",
-            self.home / ".fake-auth-linger-pid",
-        ]:
+        for path in self.root.glob("*.pid"):
             self.stop_provider_pid_file(path)
         try:
             if self.server.poll() is None:
@@ -128,13 +132,6 @@ class Harness:
             self.server.kill()
             self.server.wait(timeout=3)
         self.log.close()
-        escaped = self.home / ".fake-auth-escape-pids"
-        if escaped.exists():
-            for line in escaped.read_text().split():
-                try:
-                    os.kill(int(line), signal.SIGKILL)
-                except (ProcessLookupError, ValueError):
-                    pass
         import shutil
 
         shutil.rmtree(self.root, ignore_errors=True)
@@ -147,33 +144,27 @@ class RecheckRegressions(unittest.TestCase):
     def tearDown(self) -> None:
         self.harness.close()
 
-    def test_subscription_auth_checks_the_selected_home_in_both_directions(self) -> None:
-        h = self.harness
-        selected = h.root / "selected-home"
-        selected.mkdir()
-        daemon_status = h.home / ".fake-auth-status"
-        selected_status = selected / ".fake-auth-status"
-
-        daemon_status.write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        selected_status.write_text('{"loggedIn":false,"authMethod":"none"}')
-        rejected = h.create("claude", "selected-home-must-fail", {"HOME": str(selected)})
-        if "result" in rejected:
-            session = rejected["result"]["session"]["id"]
-            h.wait_state(session, "idle")
-            h.rpc("session.stop", {"session": session, "force": True})
-
-        daemon_status.write_text('{"loggedIn":false,"authMethod":"none"}')
-        selected_status.write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        accepted = h.create("claude", "selected-home-must-pass", {"HOME": str(selected)})
-        if "result" in accepted:
-            session = accepted["result"]["session"]["id"]
-            h.wait_state(session, "idle")
-            h.rpc("session.stop", {"session": session, "force": True})
+    def test_auth_env_reads_the_launch_environment_in_both_directions(self) -> None:
+        h = Harness(daemon_env={"ANTHROPIC_API_KEY": "daemon-key"})
+        try:
+            from_daemon = h.create("claude", "daemon-key-must-not-show")
+            from_launch = h.create("claude", "launch-key-must-show", {"ANTHROPIC_API_KEY": "launch-key"})
+            for response in (from_daemon, from_launch):
+                if "result" in response:
+                    h.rpc("session.stop", {"session": response["result"]["session"]["id"], "force": True})
+        finally:
+            h.close()
         self.assertEqual(
-            (rejected.get("error", {}).get("code"), "result" in accepted),
-            ("AUTH_MISMATCH", True),
-            {"selected_home_rejected": rejected, "selected_home_accepted": accepted},
+            (
+                from_daemon["result"]["session"]["auth_env"],
+                "warning" in from_daemon["result"],
+                from_launch["result"]["session"]["auth_env"],
+                "ANTHROPIC_API_KEY" in from_launch["result"].get("warning", ""),
+            ),
+            ([], False, ["ANTHROPIC_API_KEY"], True),
+            {"daemon_key_only": from_daemon, "launch_key": from_launch},
         )
+        self.assertNotIn("launch-key", json.dumps(from_launch))
 
     def test_managed_permission_options_return_invalid_argument_over_rpc(self) -> None:
         h = self.harness
@@ -568,147 +559,6 @@ class RecheckRegressions(unittest.TestCase):
         self.assertEqual(final["execution_seq"], 2, final)
         self.assertEqual(final["final_text"], "fake:after-queues", final)
 
-    def test_auth_status_obeys_startup_deadline_and_server_stop_owns_its_process(self) -> None:
-        h = self.harness
-        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (h.home / ".fake-auth-delay").write_text("20")
-        launch = h.pending(
-            "session.create",
-            {
-                "title": "slow auth",
-                "harness": "claude",
-                "cwd": str(h.root),
-                "environment": h.provider_env(),
-                "request_id": "slow-auth",
-                "prompt": "hello",
-                "startup_timeout_ms": 1000,
-            },
-            timeout=5,
-        )
-        child_file = h.home / ".fake-auth-child-pid"
-        parent_file = h.home / ".fake-auth-parent-pid"
-        deadline = time.monotonic() + 3
-        def written(path: Path) -> bool:
-            return path.exists() and path.read_text().strip() != ""
-
-        while not (written(child_file) and written(parent_file)) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(child_file.exists(), "auth child did not start")
-        first_pids = [int(child_file.read_text()), int(parent_file.read_text())]
-        launch.settimeout(3)
-        timeout_response = h.receive(launch)
-        self.assertEqual(timeout_response.get("error", {}).get("code"), "LAUNCH_FAILED", timeout_response)
-        for pid in first_pids:
-            state = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(pid)],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            self.assertTrue(not state or state.startswith("Z"), f"auth process {pid} survived startup timeout: {state}")
-
-        child_file.unlink()
-        parent_file.unlink()
-        second_launch = h.pending(
-            "session.create",
-            {
-                "title": "auth stopped with daemon",
-                "harness": "claude",
-                "cwd": str(h.root),
-                "environment": h.provider_env(),
-                "request_id": "slow-auth-stop",
-                "prompt": "hello",
-                "startup_timeout_ms": 10_000,
-            },
-            timeout=5,
-        )
-        deadline = time.monotonic() + 3
-        while not (written(child_file) and written(parent_file)) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(child_file.exists(), "second auth child did not start")
-        second_pids = [int(child_file.read_text()), int(parent_file.read_text())]
-        h.rpc("server.stop", {}, timeout=3)
-        h.server.wait(timeout=3)
-        second_launch.close()
-        for pid in second_pids:
-            state = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(pid)],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            self.assertTrue(not state or state.startswith("Z"), f"auth process {pid} survived daemon stop: {state}")
-
-    def test_auth_status_retains_only_bounded_output(self) -> None:
-        h = self.harness
-        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (h.home / ".fake-auth-output-bytes").write_text("131072")
-
-        response = h.create("claude", "oversized auth status output")
-        if "result" in response:
-            session = response["result"]["session"]["id"]
-            h.wait_state(session, "idle")
-            h.rpc("session.stop", {"session": session, "force": True})
-
-        self.assertEqual(response.get("error", {}).get("code"), "AUTH_MISMATCH", response)
-
-    def test_auth_status_rejects_a_valid_prefix_followed_by_discarded_bytes(self) -> None:
-        h = self.harness
-        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (h.home / ".fake-auth-trailing-bytes").write_text("70000")
-        response = h.create("claude", "valid prefix then garbage")
-        self.assertEqual(response.get("error", {}).get("code"), "AUTH_MISMATCH", response)
-
-    def test_auth_status_deadline_covers_a_descendant_holding_stdout(self) -> None:
-        h = self.harness
-        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (h.home / ".fake-auth-hold-stdout").write_text("20")
-        started = time.monotonic()
-        response = h.create("claude", "held stdout", startup_timeout_ms=1000)
-        elapsed = time.monotonic() - started
-        self.assertEqual(response.get("error", {}).get("code"), "LAUNCH_FAILED", response)
-        self.assertLess(elapsed, 3, elapsed)
-        holder = int((h.home / ".fake-auth-holder-pid").read_text())
-        time.sleep(0.2)
-        state = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(holder)], check=False, capture_output=True, text=True
-        ).stdout.strip()
-        self.assertTrue(not state or state.startswith("Z"), f"stdout holder survived: {state}")
-
-    def test_a_successful_auth_check_leaves_no_process_in_its_group(self) -> None:
-        h = self.harness
-        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (h.home / ".fake-auth-linger").write_text("")
-        response = h.create("claude", "lingering auth child")
-        self.assertIn("result", response, response)
-        lingering = int((h.home / ".fake-auth-linger-pid").read_text())
-        time.sleep(0.2)
-        state = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(lingering)], check=False, capture_output=True, text=True
-        ).stdout.strip()
-        self.assertTrue(not state or state.startswith("Z"), f"auth group member survived: {state}")
-
-    def test_auth_readers_end_when_an_escaped_process_holds_the_pipes(self) -> None:
-        h = self.harness
-        (h.home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (h.home / ".fake-auth-escape").write_text("")
-
-        def threads() -> int:
-            task_dir = Path(f"/proc/{h.server.pid}/task")
-            if task_dir.exists():
-                return len(list(task_dir.iterdir()))
-            listing = subprocess.run(
-                ["ps", "-M", "-p", str(h.server.pid)], check=False, capture_output=True, text=True
-            ).stdout
-            return len(listing.splitlines()) - 1
-
-        baseline = threads()
-        for attempt in range(3):
-            response = h.create("claude", f"escaped {attempt}", startup_timeout_ms=500)
-            self.assertEqual(response.get("error", {}).get("code"), "LAUNCH_FAILED", response)
-        time.sleep(0.3)
-        self.assertLessEqual(threads(), baseline + 1, "auth reader threads leaked")
-
     def test_oversized_session_metadata_is_rejected_at_the_rpc_boundary(self) -> None:
         h = self.harness
         created = h.create("claude", "big title", title="t" * 300_000)
@@ -814,15 +664,11 @@ class RecheckRegressions(unittest.TestCase):
         h = self.harness
         session = h.create("claude", "hello")["result"]["session"]["id"]
         h.wait_state(session, "idle")
-        slow_home = h.root / "slow-home"
-        slow_home.mkdir()
-        (slow_home / ".fake-auth-status").write_text('{"loggedIn":true,"authMethod":"claude.ai"}')
-        (slow_home / ".fake-auth-delay").write_text("1.5")
         stale = h.pending(
             "session.restart",
             {
                 "session": session,
-                "environment": h.provider_env({"HOME": str(slow_home)}),
+                "environment": h.provider_env({"DLGT_TEST_PAUSE_BEFORE_RESTART_CLAIM_MS": "1500"}),
                 "startup_timeout_ms": 10_000,
             },
             timeout=20,

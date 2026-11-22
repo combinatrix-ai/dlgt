@@ -18,16 +18,17 @@ use crate::error::{Code, WithCode, coded, fail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::acp::{self, AcpConnection};
 use crate::claude::{self, ClaudeProcess, ClaudeTurns};
 use crate::codex::CodexConnection;
 use crate::codex_events::{self, CodexItems};
-use crate::config::{self, AuthMismatch};
+use crate::config;
 use crate::cursor;
 use crate::lifecycle::Phase;
 use crate::messages::{Decider, Decision, MessageBody};
 use crate::paths;
 use crate::protocol::{
-    ApprovalsMode, Auth, AuthPolicy, Request, Response, SessionRecord, SessionState, TurnRecord,
+    ApprovalsMode, HarnessSpec, Request, Response, SessionRecord, SessionState, TurnRecord,
     TurnState,
 };
 use crate::provider::{
@@ -36,8 +37,8 @@ use crate::provider::{
 };
 use crate::reaper::Reaper;
 use crate::requests::{
-    Answer, AnswerClaim, Outcome, PUBLISHED_REQUEST_LIMIT, ProviderRequest, RequestKind,
-    RequestRecord,
+    Answer, AnswerClaim, Outcome, PUBLISHED_REQUEST_LIMIT, ProviderRequest, RequestDraft,
+    RequestKind, RequestRecord,
 };
 use crate::store::{NewSession, Store, now_ms};
 use crate::update;
@@ -280,7 +281,6 @@ pub fn run() -> Result<()> {
         store: Arc::new(Mutex::new(store)),
         submission_changed: Arc::new(Condvar::new()),
         sessions: Arc::new(RwLock::new(HashMap::new())),
-        auth_processes: Arc::new(crate::provider::AuthProcessGroups::default()),
         shutting_down: AtomicBool::new(false),
         update_notice: Arc::new(RwLock::new(None)),
         update_shutdown,
@@ -385,7 +385,6 @@ struct Daemon {
     store: Arc<Mutex<Store>>,
     submission_changed: Arc<Condvar>,
     sessions: SessionMap,
-    auth_processes: Arc<crate::provider::AuthProcessGroups>,
     shutting_down: AtomicBool,
     update_notice: Arc<RwLock<Option<Value>>>,
     update_shutdown: SyncSender<()>,
@@ -397,7 +396,6 @@ type SessionMap = Arc<RwLock<HashMap<String, Arc<AgentRuntime>>>>;
 impl Daemon {
     fn request_shutdown(&self) {
         signal_shutdown(&self.shutting_down, &self.update_shutdown);
-        self.auth_processes.terminate_all();
     }
 }
 
@@ -427,6 +425,59 @@ enum AgentRuntime {
         turns: Arc<Mutex<ClaudeTurns>>,
         generation: u64,
     },
+    Acp {
+        control: Arc<AcpConnection>,
+        session_id: String,
+        close_supported: bool,
+        turn: Arc<Mutex<AcpTurnState>>,
+        generation: u64,
+    },
+}
+
+#[derive(Debug, Default)]
+struct AcpTurnState {
+    turn_id: Option<String>,
+    execution_seq: Option<i64>,
+    final_text: String,
+    pending_chunks: String,
+    /// Titles by `toolCallId`: a `tool_call_update` may omit the title.
+    tool_titles: HashMap<String, String>,
+}
+
+impl AcpTurnState {
+    fn begin(&mut self, turn_id: &str, execution_seq: i64) {
+        self.turn_id = Some(turn_id.to_owned());
+        self.execution_seq = Some(execution_seq);
+        self.final_text.clear();
+        self.pending_chunks.clear();
+        self.tool_titles.clear();
+    }
+
+    fn chunk(&mut self, text: &str) {
+        self.final_text.push_str(text);
+        self.pending_chunks.push_str(text);
+    }
+
+    fn flush_chunks(&mut self) -> Option<(Option<i64>, String)> {
+        if self.pending_chunks.is_empty() {
+            return None;
+        }
+        Some((self.execution_seq, std::mem::take(&mut self.pending_chunks)))
+    }
+
+    fn end(&mut self) -> (Option<i64>, String, String) {
+        let result = (
+            self.execution_seq,
+            self.final_text.clone(),
+            std::mem::take(&mut self.pending_chunks),
+        );
+        self.turn_id = None;
+        self.execution_seq = None;
+        self.final_text.clear();
+        self.pending_chunks.clear();
+        self.tool_titles.clear();
+        result
+    }
 }
 
 struct SteerDelivery<'a> {
@@ -440,7 +491,9 @@ struct SteerDelivery<'a> {
 impl AgentRuntime {
     fn generation(&self) -> u64 {
         match self {
-            Self::Codex { generation, .. } | Self::Claude { generation, .. } => *generation,
+            Self::Codex { generation, .. }
+            | Self::Claude { generation, .. }
+            | Self::Acp { generation, .. } => *generation,
         }
     }
 
@@ -448,6 +501,7 @@ impl AgentRuntime {
         match self {
             Self::Codex { control, .. } => control.pid(),
             Self::Claude { process, .. } => process.pid(),
+            Self::Acp { control, .. } => control.pid(),
         }
     }
 
@@ -455,6 +509,17 @@ impl AgentRuntime {
         match self {
             Self::Codex { control, .. } => control.stop(),
             Self::Claude { process, .. } => process.stop(),
+            Self::Acp {
+                control,
+                session_id,
+                close_supported,
+                ..
+            } => {
+                if *close_supported {
+                    let _ = control.close_session(session_id);
+                }
+                control.stop();
+            }
         }
     }
 
@@ -462,6 +527,7 @@ impl AgentRuntime {
         match self {
             Self::Codex { control, .. } => control.force_stop(),
             Self::Claude { process, .. } => process.force_stop(),
+            Self::Acp { control, .. } => control.force_stop(),
         }
     }
 
@@ -469,6 +535,7 @@ impl AgentRuntime {
         match self {
             Self::Codex { control, .. } => control.stderr_tail(),
             Self::Claude { process, .. } => process.stderr_tail(),
+            Self::Acp { control, .. } => control.stderr_tail(),
         }
     }
 }
@@ -479,6 +546,20 @@ struct LaunchError {
     /// The provider's stderr tail, when the process got far enough to write.
     detail: Option<String>,
 }
+
+#[derive(Debug)]
+struct ActionHint {
+    message: String,
+    action: String,
+}
+
+impl std::fmt::Display for ActionHint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ActionHint {}
 
 impl From<anyhow::Error> for LaunchError {
     fn from(error: anyhow::Error) -> Self {
@@ -533,7 +614,6 @@ impl Daemon {
                 ),
             );
         }
-        let mut direct_auth_hint = None;
         let response = match self.dispatch(&request.method, &request.params) {
             Ok(result) => Response::ok(request.id, result).with_info(
                 self.update_notice
@@ -542,21 +622,22 @@ impl Daemon {
                     .and_then(|notice| notice.clone()),
             ),
             Err(error) => {
-                direct_auth_hint = error.downcast_ref::<AuthMismatch>().map(AuthMismatch::hint);
                 if let Some(failure) = error.downcast_ref::<SessionLaunchFailure>() {
                     failure.response(request.id)
                 } else {
-                    Response::error(request.id, classify_error(&error), format!("{error:#}"))
+                    let mut response =
+                        Response::error(request.id, classify_error(&error), format!("{error:#}"));
+                    if let Some(action) = error.downcast_ref::<ActionHint>()
+                        && let Some(rpc_error) = response.error.as_mut()
+                    {
+                        rpc_error.action = Some(action.action.clone());
+                    }
+                    response
                 }
             }
         };
         let mut response = response;
         if let Some(error) = response.error.as_mut() {
-            if error.code == "AUTH_MISMATCH"
-                && let Some(hint) = direct_auth_hint
-            {
-                error.hint = Some(hint);
-            }
             if let Some(correlation_id) =
                 request.params.get("correlation_id").and_then(Value::as_str)
             {
@@ -651,9 +732,14 @@ impl Daemon {
                         "invalid send: --steer and --resume are mutually exclusive"
                     );
                 }
+                if flag("interrupt") && !flag("steer") {
+                    fail!(InvalidArgument, "--interrupt requires --steer");
+                }
                 self.accept_once(params, |params| {
                     if flag("resume") {
                         self.resume_session(params)
+                    } else if flag("interrupt") {
+                        self.steer_interrupt(params)
                     } else if flag("steer") {
                         self.steer_turn(params)
                     } else {
@@ -714,25 +800,6 @@ impl Daemon {
         }
         let model = params.get("model").and_then(Value::as_str);
         let effort = params.get("effort").and_then(Value::as_str);
-        let auth_policy = if agent == Agent::Claude {
-            params
-                .get("auth_policy")
-                .and_then(Value::as_str)
-                .map(AuthPolicy::parse)
-                .transpose()?
-                .unwrap_or_default()
-        } else {
-            if params
-                .get("auth_policy")
-                .is_some_and(|value| !value.is_null())
-            {
-                fail!(
-                    InvalidArgument,
-                    "auth_policy is only valid for the Claude harness"
-                );
-            }
-            AuthPolicy::default()
-        };
         if agent == Agent::Claude {
             crate::claude_models::validate_model_effort(model, effort)?;
         }
@@ -752,24 +819,26 @@ impl Daemon {
                 .code(Code::InvalidArgument)?,
             Some(_) => fail!(InvalidArgument, "harness_options must be an array"),
         };
-        crate::provider::validate_harness_options(agent, &harness_options)?;
-        let approvals = params
+        crate::provider::validate_harness_options(&agent, &harness_options)?;
+        let harness_spec = harness_spec_param(&agent, params)?;
+        let requested_approvals = params
             .get("approvals")
             .and_then(Value::as_str)
             .map(ApprovalsMode::parse)
-            .transpose()?
-            .unwrap_or(ApprovalsMode::Auto);
-        let environment = launch_environment(params)?;
-        if agent == Agent::Claude {
-            config::validate_auth_environment(auth_policy, environment.iter())?;
+            .transpose()?;
+        if let Some(spec) = &harness_spec {
+            check_acp_approvals(agent.as_str(), spec, requested_approvals)?;
         }
+        let approvals = requested_approvals.unwrap_or(ApprovalsMode::Auto);
+        let environment = launch_environment(params)?;
+        let auth_env = config::auth_env_names(agent.as_str(), environment.iter());
         let startup_deadline = Instant::now() + startup_timeout(params);
         let mut id = generate_internal_id();
         let new_provider_id = (agent == Agent::Claude && resume_provider_id.is_none())
             .then(|| Uuid::new_v4().to_string());
 
         let options = LaunchOptions {
-            agent,
+            agent: agent.clone(),
             title,
             cwd: &cwd,
             model,
@@ -779,19 +848,10 @@ impl Daemon {
             resume_provider_id,
             environment: &environment,
             approvals,
+            harness_spec: harness_spec.as_ref(),
         };
-        if agent == Agent::Claude && auth_policy == AuthPolicy::Subscription {
-            let spec = crate::provider::claude_command(&options)?;
-            crate::provider::verify_claude_subscription_login(
-                &spec,
-                startup_deadline,
-                &self.reaper,
-                &self.auth_processes,
-                &self.shutting_down,
-            )?;
-        }
 
-        prepare_workspace(agent, &cwd, &environment).code(Code::LaunchFailed)?;
+        prepare_workspace(&agent, &cwd, &environment).code(Code::LaunchFailed)?;
         for attempt in 0..16 {
             let inserted = self.lock_store()?.insert_session(&NewSession {
                 id: &id,
@@ -806,9 +866,9 @@ impl Daemon {
             });
             match inserted {
                 Ok(()) => {
-                    if agent == Agent::Claude {
-                        self.lock_store()?.set_auth_policy(&id, auth_policy);
-                    }
+                    let store = self.lock_store()?;
+                    store.set_auth_env(&id, auth_env.clone());
+                    store.set_harness_spec(&id, harness_spec.clone());
                     break;
                 }
                 Err(error) if error.to_string().contains("session id already") && attempt < 15 => {
@@ -853,6 +913,7 @@ impl Daemon {
                 .or(new_provider_id.as_deref())
                 .context("Claude launch had no provider session ID")?
                 .to_owned(),
+            AgentRuntime::Acp { session_id, .. } => session_id.clone(),
         };
         let canonical_id = canonical_session_id(agent.as_str(), &provider_id);
         if let Err(error) = promote_session(
@@ -880,6 +941,12 @@ impl Daemon {
             let store = self.lock_store()?;
             store.record_event(Some(&id), None, "session.created");
             store.record_event(Some(&id), None, "session.ready");
+            if !auth_env.is_empty() {
+                store.append_message(
+                    &id,
+                    crate::messages::MessageBody::notice(&auth_env_notice(&auth_env)),
+                );
+            }
         }
         let correlation_id = params
             .get("correlation_id")
@@ -898,11 +965,6 @@ impl Daemon {
             Err(error) => {
                 runtime.force_stop();
                 self.fail_unpublished(&id, generation, "initial prompt acceptance failed");
-                let error = if session_has_auth_mismatch(&self.store, &id) {
-                    AuthMismatch::default().into()
-                } else {
-                    error
-                };
                 return Err(self.session_launch_failure(
                     generation,
                     &id,
@@ -913,6 +975,9 @@ impl Daemon {
         };
         if !correlation_id.is_empty() {
             response["correlation_id"] = json!(correlation_id);
+        }
+        if !auth_env.is_empty() {
+            response["warning"] = json!(auth_env_notice(&auth_env));
         }
         Ok(response)
     }
@@ -944,12 +1009,15 @@ impl Daemon {
             );
             return Err(self.session_launch_failure(generation, id, &error, None));
         }
-        let spawned = match options.agent {
+        let spawned = match &options.agent {
             Agent::Claude => {
                 self.spawn_claude_runtime(runtime_session_id, options, timeout, generation)
             }
             Agent::Codex => {
                 self.spawn_codex_runtime(runtime_session_id, options, timeout, generation)
+            }
+            Agent::Acp(_) => {
+                self.spawn_acp_runtime(runtime_session_id, options, timeout, generation)
             }
         };
         let runtime = match spawned {
@@ -959,22 +1027,12 @@ impl Daemon {
                     .read()
                     .map_or_else(|_| id.to_owned(), |id| id.clone());
                 let store = self.lock_store()?;
-                if failure.error.downcast_ref::<AuthMismatch>().is_some() {
-                    // A refused login is a deliberate stop, not a crash.
-                    let _ = store.begin_stop(&session_id, generation, false);
-                    store.exited(
-                        &session_id,
-                        generation,
-                        "Claude login is not the subscription",
-                    );
-                } else {
-                    store.fail_session(
-                        &session_id,
-                        generation,
-                        "launch_failed",
-                        "the provider did not start",
-                    );
-                }
+                store.fail_session(
+                    &session_id,
+                    generation,
+                    "launch_failed",
+                    "the provider did not start",
+                );
                 drop(store);
                 return Err(self.session_launch_failure(
                     generation,
@@ -1031,12 +1089,21 @@ impl Daemon {
         error: &anyhow::Error,
         detail: Option<String>,
     ) -> anyhow::Error {
-        let agent = self.lock_store().ok().and_then(|store| {
-            store
-                .get_session(session_id)
-                .and_then(|session| Agent::parse(&session.agent).ok())
-        });
-        let failure = SessionLaunchFailure::new(session_id, agent, error, detail);
+        let session = self
+            .lock_store()
+            .ok()
+            .and_then(|store| store.get_session(session_id));
+        let agent = session
+            .as_ref()
+            .and_then(|session| Agent::parse(&session.agent).ok());
+        let spec = session
+            .as_ref()
+            .and_then(|session| session.harness_spec.as_ref());
+        let command = spec
+            .map(|spec| spec.command.join(" "))
+            .or_else(|| agent.as_ref().map(|agent| agent.as_str().to_owned()));
+        let login = spec.and_then(|spec| spec.login.clone());
+        let failure = SessionLaunchFailure::new(session_id, agent, command, login, error, detail);
         if let Ok(store) = self.lock_store() {
             store.set_launch_failure(session_id, generation, failure.to_json());
         }
@@ -1089,7 +1156,9 @@ impl Daemon {
 
         let (agent, provider_id) = selector
             .split_once(':')
-            .filter(|(agent, id)| provider_qualified(agent, id))
+            // Not provider_qualified: the launch validates the ID's shape and
+            // reports a malformed one as INVALID_ARGUMENT, not SESSION_NOT_RUNNING.
+            .filter(|(agent, id)| config::validate_harness_name(agent).is_ok() && !id.is_empty())
             .context(
                 "no live Session matches selector; use codex:<id> or claude:<id> with --resume",
             )
@@ -1133,31 +1202,20 @@ impl Daemon {
                 );
             }
             // The approvals mode is stored with the Session and reused
-            // unless this command supplies a new one.
-            if object.get("approvals").is_none_or(Value::is_null) {
+            // unless this command supplies a new one. A Harness without an
+            // approvals mapping has none to reuse.
+            let takes_approvals = retained
+                .harness_spec
+                .as_ref()
+                .is_none_or(|spec| !spec.approvals.is_empty());
+            if takes_approvals && object.get("approvals").is_none_or(Value::is_null) {
                 object.insert(
                     "approvals".to_owned(),
                     json!(retained.approvals.requested.as_str()),
                 );
             }
-            if agent == Agent::Claude.as_str()
-                && object.get("auth_policy").is_none_or(Value::is_null)
-            {
-                object.insert(
-                    "auth_policy".to_owned(),
-                    json!(retained.auth_policy.unwrap_or_default().as_str()),
-                );
-            }
         } else {
             object.remove("alias");
-            if agent == Agent::Claude.as_str()
-                && object.get("auth_policy").is_none_or(Value::is_null)
-            {
-                object.insert(
-                    "auth_policy".to_owned(),
-                    json!(AuthPolicy::default().as_str()),
-                );
-            }
         }
         object.remove("resume");
         self.create_session(&create)
@@ -1186,12 +1244,15 @@ impl Daemon {
             .map_err(|_| anyhow!("session map lock poisoned"))?
             .get(&session.id)
             .cloned();
+        if let Some(runtime) = &previous_runtime {
+            self.answer_pending_acp_permissions(&session.id, runtime)?;
+        }
         let provider_id = provider_id_from_session(&session)
             .context("session is unavailable because it has no provider conversation to resume")
             .code(Code::SessionUnavailable)?
             .to_owned();
         let agent = Agent::parse(&session.agent)?;
-        crate::provider::validate_harness_options(agent, &session.harness_options)?;
+        crate::provider::validate_harness_options(&agent, &session.harness_options)?;
         let cwd = PathBuf::from(&session.cwd)
             .canonicalize()
             .context("session cwd does not exist")
@@ -1205,8 +1266,9 @@ impl Daemon {
         }
         let startup_deadline = Instant::now() + startup_timeout(params);
         let environment = launch_environment(params)?;
+        let auth_env = config::auth_env_names(agent.as_str(), environment.iter());
         let options = LaunchOptions {
-            agent,
+            agent: agent.clone(),
             title: &session.title,
             cwd: &cwd,
             model: session.model.as_deref(),
@@ -1216,25 +1278,18 @@ impl Daemon {
             resume_provider_id: Some(&provider_id),
             environment: &environment,
             approvals: session.approvals.requested,
+            harness_spec: session.harness_spec.as_ref(),
         };
-        if agent == Agent::Claude {
-            config::validate_auth_environment(
-                session.auth_policy.unwrap_or_default(),
-                environment.iter(),
-            )?;
-            if session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription {
-                let spec = crate::provider::claude_command(&options)?;
-                crate::provider::verify_claude_subscription_login(
-                    &spec,
-                    startup_deadline,
-                    &self.reaper,
-                    &self.auth_processes,
-                    &self.shutting_down,
-                )?;
-            }
+        prepare_workspace(&agent, &cwd, &environment).code(Code::LaunchFailed)?;
+        // Read from this request's launch environment, not the daemon's, so a
+        // test can stall one of two racing restarts.
+        if cfg!(debug_assertions)
+            && let Some(milliseconds) = environment
+                .get("DLGT_TEST_PAUSE_BEFORE_RESTART_CLAIM_MS")
+                .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(milliseconds));
         }
-
-        prepare_workspace(agent, &cwd, &environment).code(Code::LaunchFailed)?;
         if !self
             .lock_store()?
             .begin_session_restart(&session.id, expected_generation)?
@@ -1298,9 +1353,12 @@ impl Daemon {
                 "restart launch timed out before starting the replacement process"
             );
         }
-        // The replacement process reports its own effective mode.
-        self.lock_store()?
-            .set_requested_approvals(&session.id, session.approvals.requested);
+        {
+            let store = self.lock_store()?;
+            // The replacement process reports its own effective mode.
+            store.set_requested_approvals(&session.id, session.approvals.requested);
+            store.set_auth_env(&session.id, auth_env.clone());
+        }
         let runtime_session_id = Arc::new(RwLock::new(session.id.clone()));
         self.launch_runtime(&session.id, &runtime_session_id, &options, startup_deadline)
             .map_err(|error| {
@@ -1310,7 +1368,15 @@ impl Daemon {
                 )
             })?;
         let current = self.resolve_session(&session.id)?;
-        Ok(json!({"session": self.public_session(&current)?}))
+        let mut response = json!({"session": self.public_session(&current)?});
+        if !auth_env.is_empty() {
+            self.lock_store()?.append_message(
+                &session.id,
+                crate::messages::MessageBody::notice(&auth_env_notice(&auth_env)),
+            );
+            response["warning"] = json!(auth_env_notice(&auth_env));
+        }
+        Ok(response)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1358,15 +1424,6 @@ impl Daemon {
             };
             for action in actions {
                 match action {
-                    claude::Action::AuthMismatch => {
-                        if let Some(process) = event_process.get().and_then(Weak::upgrade) {
-                            // The turn and Session are already terminalized in
-                            // `apply_event`. Send Claude's interrupt before
-                            // terminating its process group.
-                            let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
-                            process.stop();
-                        }
-                    }
                     claude::Action::Interrupt { turn_id } => {
                         if let Some(process) = event_process.get().and_then(Weak::upgrade) {
                             spawn_claude_cancel_control(
@@ -1432,53 +1489,19 @@ impl Daemon {
 
         let process = ClaudeProcess::spawn(&spec, on_event, on_exit, &self.reaper)?;
         let _ = process_slot.set(Arc::downgrade(&process));
-        let session_id = runtime_session_id
-            .read()
-            .map(|id| id.clone())
-            .unwrap_or_default();
-        if session_has_auth_mismatch(&self.store, &session_id) {
-            interrupt_and_stop_claude(&process);
-            return Err(LaunchError {
-                error: AuthMismatch::default().into(),
-                detail: Some(process.final_stderr_tail()),
-            });
-        }
         // Claude answers `initialize` before any prompt, which proves the
         // stream-json control channel works and reports the mode it runs in.
         let ready = match process.control(&json!({"subtype": "initialize"}), startup_timeout) {
             Ok(ready) => ready,
             Err(error) => {
-                let id = runtime_session_id
-                    .read()
-                    .map(|id| id.clone())
-                    .unwrap_or_default();
-                let auth_mismatch = session_has_auth_mismatch(&self.store, &id);
-                if auth_mismatch {
-                    interrupt_and_stop_claude(&process);
-                }
                 return Err(LaunchError {
-                    error: if auth_mismatch {
-                        AuthMismatch::default().into()
-                    } else {
-                        error.context(
-                            "launch failed: Claude did not answer the stream-json initialize request",
-                        )
-                    },
+                    error: error.context(
+                        "launch failed: Claude did not answer the stream-json initialize request",
+                    ),
                     detail: Some(process.final_stderr_tail()),
                 });
             }
         };
-        let id = runtime_session_id
-            .read()
-            .map(|id| id.clone())
-            .unwrap_or_default();
-        if session_has_auth_mismatch(&self.store, &id) {
-            interrupt_and_stop_claude(&process);
-            return Err(LaunchError {
-                error: AuthMismatch::default().into(),
-                detail: Some(process.final_stderr_tail()),
-            });
-        }
         if let Some(mode) = ready.get("current_permission_mode").and_then(Value::as_str)
             && let Ok(session_id) = runtime_session_id.read()
             && let Ok(store) = self.store.lock()
@@ -1488,6 +1511,190 @@ impl Daemon {
         Ok(Arc::new(AgentRuntime::Claude {
             process,
             turns,
+            generation,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spawn_acp_runtime(
+        &self,
+        runtime_session_id: &Arc<RwLock<String>>,
+        options: &LaunchOptions<'_>,
+        startup_timeout: Duration,
+        generation: u64,
+    ) -> Result<Arc<AgentRuntime>, LaunchError> {
+        let harness = options.agent.as_str().to_owned();
+        let spec = options.harness_spec.ok_or_else(|| LaunchError {
+            error: coded(
+                Code::InvalidArgument,
+                format!("ACP Harness {harness:?} has no configured command"),
+            ),
+            detail: None,
+        })?;
+        let turn = Arc::new(Mutex::new(AcpTurnState::default()));
+        let discard_replay = Arc::new(AtomicBool::new(false));
+        let connection_slot: Arc<OnceLock<Weak<AcpConnection>>> = Arc::new(OnceLock::new());
+        let event_store = Arc::clone(&self.store);
+        let event_sessions = Arc::clone(&self.sessions);
+        let event_session_id = Arc::clone(runtime_session_id);
+        let event_turn = Arc::clone(&turn);
+        let event_connection = Arc::clone(&connection_slot);
+        let event_discard_replay = Arc::clone(&discard_replay);
+        let event_changed = Arc::clone(&self.submission_changed);
+        let on_event: acp::NotificationHandler = Arc::new(move |message: Value| {
+            let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+            let Ok(session_id) = event_session_id.read().map(|id| id.clone()) else {
+                return message.get("id").is_none();
+            };
+            let accepted = match method {
+                "dlgt/transport/closed" => {
+                    let reason = message
+                        .pointer("/params/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ACP Harness connection closed");
+                    let detail = event_connection
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .map(|connection| connection.stderr_tail());
+                    record_session_exit(
+                        &event_store,
+                        &event_sessions,
+                        &session_id,
+                        generation,
+                        reason,
+                        detail.as_deref(),
+                    );
+                    true
+                }
+                "session/update" if event_discard_replay.load(Ordering::Acquire) => true,
+                "session/update" => {
+                    handle_acp_update(&event_store, &session_id, generation, &event_turn, &message)
+                }
+                "session/request_permission" | "elicitation/create" => handle_acp_request(
+                    &event_store,
+                    &session_id,
+                    generation,
+                    &event_turn,
+                    event_connection.get().and_then(Weak::upgrade).as_deref(),
+                    &message,
+                ),
+                _ => message.get("id").is_none(),
+            };
+            event_changed.notify_all();
+            accepted
+        });
+
+        let (control, initialized) = AcpConnection::connect(
+            &spec.command,
+            options.cwd,
+            options.environment,
+            startup_timeout,
+            &on_event,
+            &self.reaper,
+        )
+        .map_err(|error| LaunchError {
+            error: crate::error::with_code(
+                error.context("launch failed: ACP initialize"),
+                Code::LaunchFailed,
+            ),
+            detail: None,
+        })?;
+        let _ = connection_slot.set(Arc::downgrade(&control));
+
+        if harness == "opencode"
+            && let Some(version) = initialized
+                .pointer("/agentInfo/version")
+                .and_then(Value::as_str)
+            && version
+                .split('.')
+                .next()
+                .and_then(|major| major.parse::<u64>().ok())
+                .is_some_and(|major| major < 2)
+        {
+            control.force_stop();
+            return Err(LaunchError {
+                error: coded(
+                    Code::LaunchFailed,
+                    format!("OpenCode {version} is unsupported; upgrade to OpenCode 2 or later"),
+                ),
+                detail: Some(control.stderr_tail()),
+            });
+        }
+
+        let session_response = if let Some(provider_id) = options.resume_provider_id {
+            let params = json!({
+                "sessionId":provider_id,
+                "cwd":options.cwd.to_string_lossy(),
+                "mcpServers":[],
+            });
+            if acp::session_capability(&initialized, "resume") {
+                control.request("session/resume", &params, startup_timeout)
+            } else if acp::load_session_capability(&initialized) {
+                discard_replay.store(true, Ordering::Release);
+                let loaded = control.request("session/load", &params, startup_timeout);
+                discard_replay.store(false, Ordering::Release);
+                loaded
+            } else {
+                control.force_stop();
+                return Err(LaunchError {
+                    error: coded(
+                        Code::Unsupported,
+                        "ACP agent supports neither session/resume nor session/load",
+                    ),
+                    detail: Some(control.stderr_tail()),
+                });
+            }
+        } else {
+            control.request(
+                "session/new",
+                &json!({"cwd":options.cwd.to_string_lossy(),"mcpServers":[]}),
+                startup_timeout,
+            )
+        }
+        .map_err(|error| acp_launch_error(error, &harness, &initialized, &control))?;
+        let provider_session_id = session_response
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or(options.resume_provider_id)
+            .filter(|id| valid_provider_id(id))
+            .context("ACP session response had no valid sessionId")
+            .map_err(|error| LaunchError {
+                error: crate::error::with_code(
+                    error.context("launch failed: ACP session response"),
+                    Code::LaunchFailed,
+                ),
+                detail: Some(control.stderr_tail()),
+            })?
+            .to_owned();
+
+        let mode = spec.approvals.get(&options.approvals).map(String::as_str);
+        let resolved_model = apply_acp_launch_options(
+            &control,
+            &provider_session_id,
+            &session_response,
+            &AcpSelection {
+                model: options.model,
+                effort: options.effort,
+                mode,
+            },
+        )
+        .map_err(|error| LaunchError {
+            error,
+            detail: Some(control.stderr_tail()),
+        })?;
+        if let Ok(session_id) = runtime_session_id.read()
+            && let Ok(store) = self.store.lock()
+        {
+            store.set_agent_info(&session_id, initialized.get("agentInfo").cloned());
+            if let Some(model) = resolved_model.as_deref() {
+                store.set_resolved_model(&session_id, model);
+            }
+        }
+        Ok(Arc::new(AgentRuntime::Acp {
+            control,
+            session_id: provider_session_id,
+            close_supported: acp::session_capability(&initialized, "close"),
+            turn,
             generation,
         }))
     }
@@ -1609,6 +1816,43 @@ impl Daemon {
         Ok(public_session_locked(&store, session))
     }
 
+    fn answer_pending_acp_permissions(
+        &self,
+        session_id: &str,
+        runtime: &AgentRuntime,
+    ) -> Result<()> {
+        let AgentRuntime::Acp { control, .. } = runtime else {
+            return Ok(());
+        };
+        let permissions = {
+            let store = self.lock_store()?;
+            let Some(uid) = store.session_uid(session_id) else {
+                return Ok(());
+            };
+            store
+                .pending_requests(&uid)
+                .into_iter()
+                .filter(|request| {
+                    matches!(
+                        &request.draft.provider,
+                        ProviderRequest::AcpPermission { .. }
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for permission in permissions {
+            control
+                .respond_server_request(
+                    &permission.draft.provider_key,
+                    &json!({"outcome":{"outcome":"cancelled"}}),
+                )
+                .with_context(|| {
+                    format!("failed to cancel pending ACP permission {}", permission.id)
+                })?;
+        }
+        Ok(())
+    }
+
     fn stop_session(&self, params: &Value) -> Result<Value> {
         let session = self.resolve_session(params_string(params, "session")?)?;
         let runtime = self.runtime(&session.id)?;
@@ -1616,6 +1860,7 @@ impl Daemon {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        self.answer_pending_acp_permissions(&session.id, &runtime)?;
         // Stop the generation this request found; a restart in between owns
         // the Session now. A stop already in progress can still be forced.
         self.lock_store()?
@@ -1677,9 +1922,6 @@ impl Daemon {
         let (session, runtime) = self.live_session(params_string(params, "session")?)?;
         if generation.is_some_and(|generation| generation != runtime.generation()) {
             return Err(crate::lifecycle::Refusal::Stale.into_error(&session.id));
-        }
-        if session_is_auth_mismatch(&session) {
-            return Err(AuthMismatch::default().into());
         }
         if session.state == SessionState::Blocked {
             fail!(SessionBlocked, "session blocked on input");
@@ -1743,6 +1985,22 @@ impl Daemon {
                 turns.begin(claude_uuid.as_deref().unwrap_or_default());
                 (turn, acceptance_cursor)
             }
+            AgentRuntime::Acp { turn: acp_turn, .. } => {
+                let mut acp_turn = acp_turn
+                    .lock()
+                    .map_err(|_| anyhow!("ACP turn state lock poisoned"))?;
+                let store = self.lock_store()?;
+                let acceptance_cursor = Self::acceptance_cursor(&store, &session.id)?;
+                let turn = store.submit_turn(
+                    &turn_id,
+                    &session.id,
+                    runtime.generation(),
+                    prompt,
+                    false,
+                )?;
+                acp_turn.begin(&turn_id, turn.execution_seq);
+                (turn, acceptance_cursor)
+            }
         };
         // Build a receipt-safe snapshot before provider delivery. After the
         // delivery boundary, internal observation failures must degrade to a
@@ -1798,21 +2056,34 @@ impl Daemon {
                     return Err(crate::error::with_code(error, Code::SessionUnavailable));
                 }
             }
+            AgentRuntime::Acp {
+                control,
+                session_id: provider_session_id,
+                turn: acp_turn,
+                ..
+            } => {
+                let worker = AcpPrompt {
+                    store: Arc::clone(&self.store),
+                    control: Arc::clone(control),
+                    provider_session_id: provider_session_id.clone(),
+                    session_id: session.id.clone(),
+                    turn_id: turn_id.clone(),
+                    generation: runtime.generation(),
+                    turn: Arc::clone(acp_turn),
+                    submission_changed: Arc::clone(&self.submission_changed),
+                    prompt: prompt.to_owned(),
+                };
+                std::thread::Builder::new()
+                    .name("dlgt-acp-session-prompt".to_owned())
+                    .spawn(move || worker.run())
+                    .context("failed to start ACP prompt worker")?;
+            }
         }
         let confirmed = synchronously_confirmed
             || (!window_spent
                 && self
                     .wait_for_submission_confirmation(&turn_id, receipt_deadline)
                     .unwrap_or(false));
-        if !confirmed
-            && self
-                .lock_store()?
-                .get_turn(&turn_id)
-                .and_then(|turn| turn.error)
-                .is_some_and(|error| error["code"] == "AUTH_MISMATCH")
-        {
-            return Err(AuthMismatch::default().into());
-        }
         let submission = if confirmed { "confirmed" } else { "pending" };
         let public_session = self
             .resolve_session(&session.id)
@@ -1859,6 +2130,16 @@ impl Daemon {
                 other.public_name()
             ),
         }
+        if matches!(runtime.as_ref(), AgentRuntime::Acp { .. }) {
+            return Err(ActionHint {
+                message: "this harness cannot steer a running turn".to_owned(),
+                action: format!(
+                    "dlgt send {} --steer --interrupt --request-id <ID> -- <PROMPT>",
+                    session.id
+                ),
+            }
+            .into());
+        }
         let turn = session
             .active_turn_id
             .as_deref()
@@ -1883,6 +2164,7 @@ impl Daemon {
                 turns: turn_state,
                 ..
             } => self.steer_claude(&delivery, process, turn_state)?,
+            AgentRuntime::Acp { .. } => unreachable!("ACP steering returned UNSUPPORTED above"),
         };
         let current = self.resolve_session(&session.id)?;
         Ok(json!({
@@ -1891,6 +2173,48 @@ impl Daemon {
             "steer": "accepted",
             "cursor": cursor,
         }))
+    }
+
+    fn steer_interrupt(&self, params: &Value) -> Result<Value> {
+        let (session, _) = self.live_session(params_string(params, "session")?)?;
+        if session.state == SessionState::Idle {
+            fail!(
+                NoActiveExecution,
+                "Session {} has no running execution to interrupt",
+                session.id
+            );
+        }
+        if !matches!(
+            session.state,
+            SessionState::Busy | SessionState::Blocked | SessionState::Quiescing
+        ) {
+            fail!(
+                SessionUnavailable,
+                "session is unavailable in state {}",
+                session.state.public_name()
+            );
+        }
+        let old_turn = session
+            .active_turn_id
+            .as_deref()
+            .and_then(|id| self.lock_store().ok()?.get_turn(id))
+            .context("Session has no active execution to interrupt")
+            .code(Code::NoActiveExecution)?;
+        let canceled = self.cancel_session(&json!({
+            "session":session.id,
+            "timeout_ms":30_000,
+        }))?;
+        if canceled.get("canceled").and_then(Value::as_bool) != Some(true) {
+            fail!(
+                NoActiveExecution,
+                "execution {} ended before it could be interrupted",
+                old_turn.execution_seq
+            );
+        }
+        let mut result = self.submit_turn(params)?;
+        result["canceled_execution_seq"] = json!(old_turn.execution_seq);
+        result["steer"] = json!("interrupted");
+        Ok(result)
     }
 
     fn steer_codex(
@@ -2231,6 +2555,9 @@ impl Daemon {
             AgentRuntime::Claude { process, .. } => {
                 process.respond_delivery(&record.draft.provider_key, payload)
             }
+            AgentRuntime::Acp { control, .. } => control
+                .respond_server_request(&record.draft.provider_key, payload)
+                .map_err(|error| crate::provider::DeliveryFailure::ambiguous(error.to_string())),
             AgentRuntime::Codex {
                 control, thread_id, ..
             } => {
@@ -2275,6 +2602,29 @@ impl Daemon {
             }
         };
         provider_delivery?;
+        if let ProviderRequest::AcpPermission { options } = &record.draft.provider {
+            if matches!(answer, Answer::Deny { message: Some(_) }) {
+                receipt_extra.insert("reason_delivered".to_owned(), json!(false));
+                receipt_extra.insert(
+                    "reason_error".to_owned(),
+                    json!("the ACP harness cannot deliver a denial reason"),
+                );
+            }
+            let allow = matches!(answer, Answer::Allow);
+            if let Some(choice) = crate::requests::acp_permission_choice(options, allow)
+                && choice.always
+            {
+                let text = format!("ACP offered only {}; selected that option", choice.kind);
+                if let Ok(store) = self.lock_store() {
+                    store.append_execution_message(
+                        &session.id,
+                        record.execution_seq,
+                        MessageBody::notice(&text),
+                    );
+                }
+                receipt_extra.insert("notice".to_owned(), json!(text));
+            }
+        }
         Ok(receipt_extra)
     }
 
@@ -2433,10 +2783,8 @@ impl Daemon {
             "result": result.as_ref().map(public_result),
             "execution_seq": latest.as_ref().map(|turn| turn.execution_seq),
         });
-        if let Some(provider_id) = provider_id_from_session(&session)
-            && let Ok(agent) = Agent::parse(&session.agent)
-        {
-            value["resume_command"] = json!(agent.resume_command(provider_id));
+        if provider_id_from_session(&session).is_some() {
+            value["resume_command"] = json!(resume_command(&session));
         }
         if let Some(launch_failure) = launch_failure {
             value["launch_failure"] = launch_failure;
@@ -2517,6 +2865,18 @@ impl Daemon {
                 &turn,
                 Arc::clone(process),
                 Arc::clone(turns),
+                runtime_generation,
+            ),
+            AgentRuntime::Acp {
+                control,
+                session_id: provider_session_id,
+                ..
+            } => self.interrupt_acp_turn(
+                session,
+                turn_id,
+                &turn,
+                control,
+                provider_session_id,
                 runtime_generation,
             ),
         }
@@ -2702,6 +3062,88 @@ impl Daemon {
                 }
             })
             .context("failed to start Claude cancellation worker")?;
+        Ok(())
+    }
+
+    fn interrupt_acp_turn(
+        &self,
+        session: &SessionRecord,
+        turn_id: &str,
+        turn: &TurnRecord,
+        control: &AcpConnection,
+        provider_session_id: &str,
+        runtime_generation: u64,
+    ) -> Result<()> {
+        let permissions = {
+            let mut store = self.lock_store()?;
+            if turn.state == TurnState::Canceled && session.state == SessionState::Quiescing {
+                return Ok(());
+            }
+            let uid = store
+                .session_uid(&session.id)
+                .context("ACP Session identity is unavailable")?;
+            let permissions = store
+                .pending_requests(&uid)
+                .into_iter()
+                .filter(|request| {
+                    matches!(
+                        &request.draft.provider,
+                        ProviderRequest::AcpPermission { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !store.execution_can_cancel(
+                &session.id,
+                runtime_generation,
+                turn_id,
+                turn.execution_seq,
+            ) || !store.cancel_turn_with_controls(
+                turn_id,
+                runtime_generation,
+                permissions.len() + 1,
+            )? {
+                fail!(
+                    NoActiveExecution,
+                    "turn is already terminal or no longer active"
+                );
+            }
+            permissions
+        };
+
+        for permission in permissions {
+            if let Err(error) = control.respond_server_request(
+                &permission.draft.provider_key,
+                &json!({"outcome":{"outcome":"cancelled"}}),
+            ) {
+                fail_cancelled_turn(
+                    &self.store,
+                    &session.id,
+                    turn_id,
+                    runtime_generation,
+                    &error.to_string(),
+                );
+                control.force_stop();
+                return Err(crate::error::with_code(error, Code::SessionUnavailable));
+            }
+            if let Ok(store) = self.store.lock() {
+                store.finish_cancel_control(turn_id);
+            }
+        }
+
+        if let Err(error) = control.cancel_prompt(provider_session_id) {
+            fail_cancelled_turn(
+                &self.store,
+                &session.id,
+                turn_id,
+                runtime_generation,
+                &error.to_string(),
+            );
+            control.force_stop();
+            return Err(crate::error::with_code(error, Code::SessionUnavailable));
+        }
+        if let Ok(store) = self.store.lock() {
+            store.finish_cancel_control(turn_id);
+        }
         Ok(())
     }
 
@@ -3032,8 +3474,83 @@ impl Daemon {
                     json!({"harness":"codex","source":"app-server","discovery":"complete","models":models}),
                 )
             }
-            other => fail!(InvalidArgument, "unsupported harness {other:?}"),
+            other => {
+                let agent = Agent::parse(other)?;
+                let spec = harness_spec_param(&agent, params)?
+                    .with_context(|| format!("unsupported harness {other:?}"))
+                    .code(Code::InvalidArgument)?;
+                self.list_acp_models(other, &spec, params)
+            }
         }
+    }
+
+    /// ACP lists models only inside a session, so discovery opens one in the
+    /// invoking directory, reads its choices, and ends the agent unprompted.
+    fn list_acp_models(&self, harness: &str, spec: &HarnessSpec, params: &Value) -> Result<Value> {
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map_or_else(std::env::current_dir, |value| Ok(PathBuf::from(value)))?;
+        let environment = launch_environment(params)?;
+        let timeout = Duration::from_mins(1);
+        let (control, initialized) = AcpConnection::connect(
+            &spec.command,
+            &cwd,
+            &environment,
+            timeout,
+            &(Arc::new(|message: Value| message.get("id").is_none()) as acp::NotificationHandler),
+            &self.reaper,
+        )
+        .context("launch failed: ACP initialize")
+        .code(Code::LaunchFailed)?;
+        let session = match control.request(
+            "session/new",
+            &json!({"cwd":cwd.to_string_lossy(),"mcpServers":[]}),
+            timeout,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                let Some(required) = error
+                    .downcast_ref::<acp::AcpRpcError>()
+                    .and_then(|rpc| acp::auth_required(rpc, harness, &initialized))
+                else {
+                    return Err(crate::error::with_code(
+                        error.context("launch failed: ACP session/new"),
+                        Code::LaunchFailed,
+                    ));
+                };
+                let mut failure = json!({
+                    "code": Code::AuthRequired.as_str(),
+                    "message": required.to_string(),
+                    "auth_methods": required
+                        .downcast_ref::<acp::AcpAuthRequired>()
+                        .map(|auth| auth.auth_methods.clone())
+                        .unwrap_or_default(),
+                });
+                if let Some(login) = &spec.login {
+                    failure["action"] = json!(login);
+                }
+                return Ok(json!({
+                    "harness": harness,
+                    "source": "acp",
+                    "discovery": "unavailable",
+                    "models": [],
+                    "error": failure,
+                }));
+            }
+        };
+        if acp::session_capability(&initialized, "close")
+            && let Some(session_id) = session.get("sessionId").and_then(Value::as_str)
+        {
+            let _ = control.close_session(session_id);
+        }
+        control.stop();
+        Ok(json!({
+            "harness": harness,
+            "source": "acp",
+            "discovery": "complete",
+            "models": acp::session_models(&session),
+        }))
     }
 
     fn resolve_session(&self, selector: &str) -> Result<SessionRecord> {
@@ -3147,23 +3664,439 @@ fn launch_environment(params: &Value) -> Result<HashMap<String, String>> {
         .collect()
 }
 
-fn session_has_auth_mismatch(store: &Mutex<Store>, session_id: &str) -> bool {
-    store.lock().ok().is_some_and(|store| {
-        store
-            .get_session(session_id)
-            .is_some_and(|session| session_is_auth_mismatch(&session))
-    })
+fn auth_env_notice(names: &[String]) -> String {
+    format!(
+        "The Harness received credential-related environment variables: {}",
+        names.join(", ")
+    )
 }
 
-fn session_is_auth_mismatch(session: &SessionRecord) -> bool {
-    session.agent == Agent::Claude.as_str()
-        && session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription
-        && session.auth == Some(Auth::ApiKey)
+fn valid_provider_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "-_.".contains(ch))
 }
 
-fn interrupt_and_stop_claude(process: &ClaudeProcess) {
-    let _ = process.control_nowait(&json!({"subtype": "interrupt"}));
-    process.stop();
+fn acp_launch_error(
+    error: anyhow::Error,
+    harness: &str,
+    initialized: &Value,
+    control: &AcpConnection,
+) -> LaunchError {
+    let mapped = error
+        .downcast_ref::<acp::AcpRpcError>()
+        .and_then(|rpc| acp::auth_required(rpc, harness, initialized))
+        .unwrap_or_else(|| crate::error::with_code(error, Code::LaunchFailed));
+    LaunchError {
+        error: mapped,
+        detail: Some(control.stderr_tail()),
+    }
+}
+
+/// What a launch asks the agent to select, each through its config option.
+struct AcpSelection<'a> {
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    /// The agent's `mode` value for the Session's approvals mode.
+    mode: Option<&'a str>,
+}
+
+/// Apply the launch selection to a new or resumed ACP session and return the
+/// model the agent then reports.
+fn apply_acp_launch_options(
+    control: &AcpConnection,
+    session_id: &str,
+    session_response: &Value,
+    selection: &AcpSelection<'_>,
+) -> Result<Option<String>> {
+    let mut configuration = session_response.clone();
+    if let Some(model) = selection.model {
+        if acp::config_option(&configuration, "model").is_some() {
+            set_acp_config_option(control, session_id, &mut configuration, "model", model)?;
+        } else if !acp::session_models(&configuration).is_empty() {
+            control
+                .request(
+                    "session/set_model",
+                    &json!({"sessionId":session_id,"modelId":model}),
+                    acp::REQUEST_TIMEOUT,
+                )
+                .map_err(|error| crate::error::with_code(error, Code::LaunchFailed))?;
+            configuration["models"]["currentModelId"] = json!(model);
+        } else {
+            fail!(Unsupported, "ACP agent does not expose model selection");
+        }
+    }
+    if let Some(effort) = selection.effort {
+        if acp::config_option(&configuration, "thought_level").is_none() {
+            fail!(
+                Unsupported,
+                "ACP agent does not expose a thought_level option for --effort"
+            );
+        }
+        set_acp_config_option(
+            control,
+            session_id,
+            &mut configuration,
+            "thought_level",
+            effort,
+        )?;
+    }
+    if let Some(mode) = selection.mode {
+        if acp::config_option(&configuration, "mode").is_none() {
+            fail!(
+                LaunchFailed,
+                "launch failed: ACP agent does not expose a mode option for --approvals"
+            );
+        }
+        set_acp_config_option(control, session_id, &mut configuration, "mode", mode)?;
+    }
+    Ok(acp::config_option(&configuration, "model")
+        .and_then(|option| option.get("currentValue"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            configuration
+                .pointer("/models/currentModelId")
+                .and_then(Value::as_str)
+        })
+        .or(selection.model)
+        .map(str::to_owned))
+}
+
+/// Set the config option of `category`, which the caller found, and keep the
+/// option list the agent answers with.
+fn set_acp_config_option(
+    control: &AcpConnection,
+    session_id: &str,
+    configuration: &mut Value,
+    category: &str,
+    value: &str,
+) -> Result<()> {
+    let config_id = acp::config_option(configuration, category)
+        .and_then(|option| option.get("id"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("launch failed: ACP {category} config option has no id"))
+        .code(Code::LaunchFailed)?;
+    let response = control
+        .request(
+            "session/set_config_option",
+            &json!({"sessionId":session_id,"configId":config_id,"value":value}),
+            acp::REQUEST_TIMEOUT,
+        )
+        .with_context(|| format!("launch failed: ACP agent rejected {category} {value:?}"))
+        .code(Code::LaunchFailed)?;
+    if let Some(options) = response.get("configOptions") {
+        configuration["configOptions"] = options.clone();
+    }
+    Ok(())
+}
+
+/// The ACP Harness description the client resolved, for an ACP Harness only.
+fn harness_spec_param(agent: &Agent, params: &Value) -> Result<Option<HarnessSpec>> {
+    let spec = params.get("harness_spec").filter(|spec| !spec.is_null());
+    if !agent.is_acp() {
+        if spec.is_some() {
+            fail!(
+                InvalidArgument,
+                "harness_spec is only valid for ACP Harnesses"
+            );
+        }
+        return Ok(None);
+    }
+    let spec: HarnessSpec = spec
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .ok()
+        .flatten()
+        .with_context(|| format!("ACP Harness {:?} needs a harness_spec", agent.as_str()))
+        .code(Code::InvalidArgument)?;
+    if spec.command.first().is_none_or(String::is_empty) {
+        fail!(InvalidArgument, "harness_spec.command must name a program");
+    }
+    Ok(Some(spec))
+}
+
+/// An ACP Harness takes an approvals mode only through its mapping to the
+/// agent's `mode` option, and only the modes that mapping names.
+fn check_acp_approvals(
+    harness: &str,
+    spec: &HarnessSpec,
+    requested: Option<ApprovalsMode>,
+) -> Result<()> {
+    if spec.approvals.is_empty() {
+        if requested.is_some() {
+            fail!(
+                Unsupported,
+                "Harness {harness:?} has no approvals mapping and does not support --approvals"
+            );
+        }
+        return Ok(());
+    }
+    let mode = requested.unwrap_or(ApprovalsMode::Auto);
+    if !spec.approvals.contains_key(&mode) {
+        fail!(
+            Unsupported,
+            "Harness {harness:?} has no approvals mapping for {:?}",
+            mode.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// The provider's own command for opening the Session's conversation by
+/// hand, when the Harness has one.
+fn resume_command(session: &SessionRecord) -> Option<String> {
+    let provider_id = provider_id_from_session(session)?;
+    Agent::parse(&session.agent)
+        .ok()?
+        .resume_command(provider_id)
+        .or_else(|| session.harness_spec.as_ref()?.resume_command(provider_id))
+}
+
+/// The approvals part of a Session snapshot. An ACP Harness without an
+/// approvals mapping runs under the agent's own configuration.
+fn public_approvals(session: &SessionRecord) -> Value {
+    match &session.harness_spec {
+        Some(spec) if spec.approvals.is_empty() => {
+            json!({"requested": null, "effective": "agent_default"})
+        }
+        _ => json!(session.approvals),
+    }
+}
+
+fn handle_acp_update(
+    store: &Mutex<Store>,
+    session_id: &str,
+    generation: u64,
+    turn: &Mutex<AcpTurnState>,
+    message: &Value,
+) -> bool {
+    let update = message.pointer("/params/update").unwrap_or(&Value::Null);
+    let kind = update
+        .get("sessionUpdate")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Ok(mut turn) = turn.lock() else {
+        return false;
+    };
+    let Some(turn_id) = turn.turn_id.clone() else {
+        return true;
+    };
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    if !store.runtime_generation_is_current(session_id, generation) {
+        return true;
+    }
+    store.touch_provider(session_id);
+    if acp::update_confirms_prompt(kind) {
+        store.mark_turn_started(&turn_id, None);
+    }
+    let tool_title = |turn: &AcpTurnState| {
+        update
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                let id = update.get("toolCallId").and_then(Value::as_str)?;
+                turn.tool_titles.get(id).cloned()
+            })
+            .or_else(|| {
+                update
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "tool".to_owned())
+    };
+    let body = match kind {
+        "agent_message_chunk" => {
+            let text = update
+                .pointer("/content/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            turn.chunk(text);
+            None
+        }
+        "tool_call" => {
+            let tool = tool_title(&turn);
+            if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                turn.tool_titles.insert(id.to_owned(), tool.clone());
+            }
+            let summary = update
+                .get("rawInput")
+                .filter(|input| !input.is_null())
+                .map_or_else(String::new, Value::to_string);
+            Some(MessageBody::tool_call(&tool, &summary))
+        }
+        "tool_call_update" => {
+            let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+            matches!(status, "completed" | "failed").then(|| {
+                let summary = update
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|block| block.pointer("/content/text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                MessageBody::tool_result(&tool_title(&turn), status == "completed", &summary)
+            })
+        }
+        "notice" => Some(MessageBody::notice(
+            update
+                .get("content")
+                .and_then(Value::as_str)
+                .or_else(|| update.get("text").and_then(Value::as_str))
+                .unwrap_or_default(),
+        )),
+        _ => None,
+    };
+    if let Some(body) = body {
+        // Chunks join until another message interrupts them.
+        if let Some((seq, text)) = turn.flush_chunks() {
+            store.append_execution_message(session_id, seq, MessageBody::assistant(&text));
+        }
+        store.append_execution_message(session_id, turn.execution_seq, body);
+    }
+    true
+}
+
+fn acp_permission_draft(id: &str, params: &Value, cwd: Option<String>) -> RequestDraft {
+    let tool_call = params.get("toolCall").unwrap_or(&Value::Null);
+    let text = |key: &str| tool_call.get(key).and_then(Value::as_str);
+    RequestDraft {
+        kind: RequestKind::Approval,
+        provider_key: id.to_owned(),
+        provider: ProviderRequest::AcpPermission {
+            options: params.get("options").cloned().unwrap_or_else(|| json!([])),
+        },
+        tool: text("kind").or(text("title")).unwrap_or("tool").to_owned(),
+        summary: text("title").unwrap_or("Approval required").to_owned(),
+        input: tool_call.get("rawInput").cloned().unwrap_or(Value::Null),
+        cwd,
+        reason: None,
+        text: None,
+        choices: Vec::new(),
+    }
+}
+
+fn handle_acp_request(
+    store: &Mutex<Store>,
+    session_id: &str,
+    generation: u64,
+    turn: &Mutex<AcpTurnState>,
+    connection: Option<&AcpConnection>,
+    message: &Value,
+) -> bool {
+    let Some(connection) = connection else {
+        return false;
+    };
+    let Some(id) = message.get("id") else {
+        return false;
+    };
+    let id = id.to_string();
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let Ok(mut turn) = turn.lock() else {
+        return false;
+    };
+    let Some(turn_id) = turn.turn_id.clone() else {
+        return false;
+    };
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    if !store.runtime_generation_is_current(session_id, generation) {
+        return false;
+    }
+    store.mark_turn_started(&turn_id, None);
+    store.touch_provider(session_id);
+    if let Some((seq, text)) = turn.flush_chunks() {
+        store.append_execution_message(session_id, seq, MessageBody::assistant(&text));
+    }
+    let session = store.get_session(session_id);
+    let cwd = session.as_ref().map(|session| session.cwd.clone());
+    let draft = match method {
+        "session/request_permission" => acp_permission_draft(&id, &params, cwd),
+        "elicitation/create" => {
+            let form = params
+                .get("mode")
+                .and_then(|mode| mode.get("form").or(Some(mode)))
+                .is_some_and(|mode| mode.as_str() == Some("form") || mode.get("schema").is_some());
+            if !form {
+                let _ = connection.respond_server_request(&id, &json!({"action":"decline"}));
+                store.append_execution_message(
+                    session_id,
+                    turn.execution_seq,
+                    MessageBody::notice("ACP URL-mode elicitation was declined"),
+                );
+                return true;
+            }
+            let schema = params
+                .pointer("/mode/schema")
+                .or_else(|| params.get("requestedSchema"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object"}));
+            RequestDraft {
+                kind: RequestKind::Question,
+                provider_key: id.clone(),
+                provider: ProviderRequest::AcpElicitation { schema },
+                tool: "elicitation".to_owned(),
+                summary: params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Additional input requested")
+                    .to_owned(),
+                input: params.clone(),
+                cwd,
+                reason: None,
+                text: params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                choices: Vec::new(),
+            }
+        }
+        _ => return false,
+    };
+    if store.open_request(session_id, draft).is_none() {
+        let canceled = if method == "session/request_permission" {
+            json!({"outcome":{"outcome":"cancelled"}})
+        } else {
+            json!({"action":"decline"})
+        };
+        let _ = connection.respond_server_request(&id, &canceled);
+    }
+    true
+}
+
+fn usage_to_snake(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (camel_to_snake(key), usage_to_snake(value)))
+                .collect(),
+        ),
+        Value::Array(array) => Value::Array(array.iter().map(usage_to_snake).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn camel_to_snake(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_uppercase() {
+            output.push('_');
+            output.push(character.to_ascii_lowercase());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn startup_timeout(params: &Value) -> Duration {
@@ -3297,6 +4230,94 @@ fn spawn_claude_cancel_control(
 
 /// One `turn/start` request and the bookkeeping for its outcome, run off the
 /// RPC thread so a slow acknowledgement cannot hold the submit receipt.
+struct AcpPrompt {
+    store: Arc<Mutex<Store>>,
+    control: Arc<AcpConnection>,
+    provider_session_id: String,
+    session_id: String,
+    turn_id: String,
+    generation: u64,
+    turn: Arc<Mutex<AcpTurnState>>,
+    submission_changed: Arc<Condvar>,
+    prompt: String,
+}
+
+impl AcpPrompt {
+    fn run(self) {
+        let response = self.control.prompt(&self.provider_session_id, &self.prompt);
+        let (execution_seq, final_text, pending_chunks) = self
+            .turn
+            .lock()
+            .map(|mut turn| turn.end())
+            .unwrap_or_default();
+        let Ok(store) = self.store.lock() else { return };
+        if !store.runtime_generation_is_current(&self.session_id, self.generation) {
+            return;
+        }
+        store.mark_turn_started(&self.turn_id, None);
+        self.submission_changed.notify_all();
+        if !pending_chunks.is_empty() {
+            store.append_execution_message(
+                &self.session_id,
+                execution_seq,
+                MessageBody::assistant(&pending_chunks),
+            );
+        }
+        let final_message = (!final_text.is_empty()).then_some(final_text.as_str());
+        match response {
+            Ok(response) => {
+                if let Some(usage) = response.get("usage") {
+                    store.set_turn_usage(&self.turn_id, usage_to_snake(usage));
+                }
+                let stop_reason = response
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let (state, error) = match stop_reason {
+                    "end_turn" => (TurnState::Completed, None),
+                    "cancelled" => (TurnState::Canceled, None),
+                    "max_tokens" | "max_turn_requests" | "refusal" => (
+                        TurnState::Failed,
+                        Some(json!({"code":"PROVIDER_STOP","message":stop_reason})),
+                    ),
+                    _ => (
+                        TurnState::Failed,
+                        Some(json!({
+                            "code":"PROVIDER_ERROR",
+                            "message":format!("ACP returned unknown stopReason {stop_reason:?}"),
+                        })),
+                    ),
+                };
+                let _ = store.finish_provider_turn_if_matching(
+                    &self.turn_id,
+                    None,
+                    state,
+                    final_message,
+                    final_message.is_some(),
+                    error.as_ref(),
+                );
+            }
+            Err(error) => {
+                let error = json!({
+                    "code":"PROVIDER_ERROR",
+                    "message":sanitize_message(&error.to_string()),
+                });
+                let _ = store.finish_provider_turn_if_matching(
+                    &self.turn_id,
+                    None,
+                    TurnState::Failed,
+                    final_message,
+                    final_message.is_some(),
+                    Some(&error),
+                );
+            }
+        }
+        self.submission_changed.notify_all();
+    }
+}
+
+/// One `turn/start` request and the bookkeeping for its outcome, run off the
+/// RPC thread so a slow acknowledgement cannot hold the submit receipt.
 struct CodexStart {
     store: Arc<Mutex<Store>>,
     control: Arc<CodexConnection>,
@@ -3308,23 +4329,23 @@ struct CodexStart {
 
 impl CodexStart {
     fn run(self) -> Result<()> {
+        let binding_store = Arc::clone(&self.store);
+        let binding_turn_id = self.turn_id.clone();
         let started = self
             .control
-            .start_turn(&self.thread_id, &self.prompt)
-            .and_then(|turn| {
-                self.control.watch_turn(&self.thread_id, &turn)?;
-                Ok(turn)
+            .start_turn(&self.thread_id, &self.prompt, move |provider_turn_id| {
+                if let Ok(store) = binding_store.lock() {
+                    store.mark_turn_started(&binding_turn_id, Some(provider_turn_id));
+                }
             })
+            .and_then(|turn| self.control.watch_turn(&self.thread_id, &turn))
             .code(Code::SessionUnavailable);
         let store = self
             .store
             .lock()
             .map_err(|_| anyhow!("session store lock poisoned"))?;
         match started {
-            Ok(provider_turn_id) => {
-                store.mark_turn_started(&self.turn_id, Some(&provider_turn_id));
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
                 // A rejected start fails the execution it was for, also while
                 // that execution is being canceled: no turn ID will come.
@@ -3409,12 +4430,20 @@ fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
 }
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
-    crate::error::code_of(error).map_or("INTERNAL", Code::as_str)
+    if error.downcast_ref::<ActionHint>().is_some() {
+        "UNSUPPORTED"
+    } else {
+        crate::error::code_of(error).map_or("INTERNAL", Code::as_str)
+    }
 }
 
 fn answer_action(request: &RequestRecord) -> &'static str {
     match (&request.draft.kind, &request.draft.provider) {
-        (_, ProviderRequest::CodexElicitation { form: true, .. }) => "--json <OBJECT>",
+        (
+            _,
+            ProviderRequest::CodexElicitation { form: true, .. }
+            | ProviderRequest::AcpElicitation { .. },
+        ) => "--json <OBJECT>",
         (RequestKind::Approval, _) => "--allow|--deny",
         (RequestKind::Question, _) => "--text <TEXT>|--choice <N>",
     }
@@ -3481,7 +4510,7 @@ fn public_session_with_metrics(
         "state": session.state.public_name(),
         "model": session.model,
         "effort": session.effort,
-        "approvals": session.approvals,
+        "approvals": public_approvals(session),
         "created_at_ms": session.created_at_ms,
         "updated_at_ms": session.updated_at_ms,
     });
@@ -3491,8 +4520,16 @@ fn public_session_with_metrics(
     if let Some(auth) = session.auth {
         object.insert("auth".to_owned(), json!(auth));
     }
-    if let Some(auth_policy) = session.auth_policy {
-        object.insert("auth_policy".to_owned(), json!(auth_policy));
+    object.insert("auth_env".to_owned(), json!(session.auth_env));
+    if let Some(command) = session
+        .harness_spec
+        .as_ref()
+        .and_then(|spec| spec.command.first())
+    {
+        object.insert("command".to_owned(), json!(command));
+    }
+    if let Some(agent_info) = &session.agent_info {
+        object.insert("agent_info".to_owned(), agent_info.clone());
     }
     if let Some(model) = &session.resolved_model {
         object.insert("resolved_model".to_owned(), json!(model));
@@ -3521,6 +4558,7 @@ struct SessionLaunchFailure {
     message: String,
     hint: String,
     action: Option<String>,
+    auth_methods: Option<Vec<String>>,
     detail: Option<String>,
 }
 
@@ -3528,31 +4566,48 @@ impl SessionLaunchFailure {
     fn new(
         session_id: &str,
         agent: Option<Agent>,
+        command: Option<String>,
+        login: Option<String>,
         error: &anyhow::Error,
         detail: Option<String>,
     ) -> Self {
         // Without a terminal there is no startup screen for a human to
         // answer, so a provider that needs interaction to start is a failed
         // launch that names the command to run once by hand.
-        let code = match classify_error(error) {
-            "INTERNAL" | "NOT_FOUND" | "SESSION_UNAVAILABLE" => "LAUNCH_FAILED",
-            code => code,
+        let code = match crate::error::code_of(error) {
+            Some(Code::AuthRequired) => "AUTH_REQUIRED",
+            None | Some(Code::NotFound | Code::SessionUnavailable) => "LAUNCH_FAILED",
+            Some(code) => code.as_str(),
+        };
+        let auth_methods = error
+            .downcast_ref::<acp::AcpAuthRequired>()
+            .map(|required| required.auth_methods.clone());
+        let action = if code == "AUTH_REQUIRED" {
+            login
+        } else {
+            command.or_else(|| agent.map(|agent| agent.as_str().to_owned()))
+        };
+        let hint = if code == "AUTH_REQUIRED" {
+            "run the Harness login command and retry".to_owned()
+        } else if format!("{error:#}").contains("OpenCode") {
+            "upgrade OpenCode to version 2 or later".to_owned()
+        } else {
+            "detail carries the provider's own stderr tail; if the provider needs a login, \
+               a trust decision, or first-run setup, run it once by hand in the Session's \
+               working directory and retry"
+                .to_owned()
         };
         Self {
             session_id: session_id.to_owned(),
             code,
-            message: format!("{error:#}"),
-            hint: if code == "AUTH_MISMATCH" {
-                error
-                    .downcast_ref::<AuthMismatch>()
-                    .map_or_else(|| AuthMismatch::default().hint(), AuthMismatch::hint)
+            message: if code == "AUTH_REQUIRED" {
+                error.to_string()
             } else {
-                "detail carries the provider's own stderr tail; if the provider needs a login, \
-                   a trust decision, or first-run setup, run it once by hand in the Session's \
-                   working directory and retry"
-                    .to_owned()
+                format!("{error:#}")
             },
-            action: agent.map(|agent| agent.as_str().to_owned()),
+            hint,
+            action,
+            auth_methods,
             detail: detail.filter(|detail| !detail.is_empty()),
         }
     }
@@ -3573,6 +4628,7 @@ impl SessionLaunchFailure {
         if let Some(error) = response.error.as_mut() {
             error.hint = Some(self.hint.clone());
             error.action.clone_from(&self.action);
+            error.auth_methods.clone_from(&self.auth_methods);
             error.detail.clone_from(&self.detail);
         }
         response
@@ -3584,6 +4640,7 @@ impl SessionLaunchFailure {
             "message": self.message,
             "hint": self.hint,
             "action": self.action,
+            "auth_methods": self.auth_methods,
             "detail": self.detail,
         })
     }
@@ -3637,7 +4694,7 @@ fn generate_internal_id() -> String {
 }
 
 fn provider_qualified(agent: &str, id: &str) -> bool {
-    matches!(agent, "codex" | "claude") && !id.is_empty()
+    config::validate_harness_name(agent).is_ok() && valid_provider_id(id)
 }
 
 fn canonical_session_id(agent: &str, provider_id: &str) -> String {
@@ -4699,6 +5756,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
+    use super::{AcpTurnState, check_acp_approvals, handle_acp_update, resume_command};
     use super::{
         Agent, BucketSource, BusyMetrics, Cut, DaemonLock, FETCH_DEFAULT_MAX_BYTES,
         FETCH_EVENT_PAGE, FETCH_HARD_MAX_BYTES, FETCH_MESSAGE_PAGE, FetchOptions,
@@ -4710,7 +5768,7 @@ mod tests {
         signal_shutdown, socket_identity, validate_alias, validate_continuation,
         wait_for_update_check,
     };
-    use crate::protocol::{ApprovalsMode, SessionState, TurnState};
+    use crate::protocol::{ApprovalsMode, HarnessSpec, SessionState, TurnState};
     use crate::store::{NewSession, Store};
 
     fn ready_store(agent: &str) -> Store {
@@ -4852,6 +5910,8 @@ mod tests {
         let failure = SessionLaunchFailure::new(
             "internal:ABC12345",
             Some(Agent::Claude),
+            Some("claude".to_owned()),
+            None,
             &anyhow::anyhow!("Claude did not answer the initialize control request"),
             Some("Invalid API key · Please run /login".to_owned()),
         );
@@ -4878,6 +5938,8 @@ mod tests {
         let quiet = SessionLaunchFailure::new(
             "codex:thread-1",
             Some(Agent::Codex),
+            Some("codex".to_owned()),
+            None,
             &crate::error::coded(
                 crate::error::Code::AliasInUse,
                 "active session alias already exists",
@@ -6191,5 +7253,197 @@ mod tests {
             ..crate::cursor::SessionCursor::default()
         };
         assert!(validate_continuation(&stale, std::slice::from_ref(&turn)).is_ok());
+    }
+
+    const AGY_SESSION: &str = "agy:thread-1";
+
+    fn agy_spec() -> HarnessSpec {
+        crate::config::Config::default()
+            .harness_spec("agy")
+            .unwrap_or_else(|error| panic!("agy is not built in: {error}"))
+    }
+
+    /// An agy Session with one submitted, unconfirmed execution.
+    fn prompted_agy() -> (Mutex<Store>, Mutex<AcpTurnState>, u64) {
+        let store = ready_store("agy");
+        let turn = store
+            .insert_turn("turn_1", AGY_SESSION, "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        let generation = store
+            .runtime_generation(AGY_SESSION)
+            .unwrap_or_else(|| panic!("generation missing"));
+        let mut acp_turn = AcpTurnState::default();
+        acp_turn.begin("turn_1", turn.execution_seq);
+        (Mutex::new(store), Mutex::new(acp_turn), generation)
+    }
+
+    fn agy_update(update: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "cfa001bc-3ba3-4c63-b172-5f7f3a85bfd8", "update": update},
+        })
+    }
+
+    fn turn_state(store: &Mutex<Store>) -> TurnState {
+        store
+            .lock()
+            .unwrap_or_else(|_| panic!("store lock poisoned"))
+            .get_turn("turn_1")
+            .unwrap_or_else(|| panic!("turn missing"))
+            .state
+    }
+
+    #[test]
+    fn acp_updates_the_prompt_did_not_cause_leave_the_submission_unconfirmed() {
+        let (store, turn, generation) = prompted_agy();
+        for update in [
+            json!({"sessionUpdate": "config_option_update", "configOptions": []}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+            json!({"sessionUpdate": "usage_update", "used": 0, "size": 1_048_576}),
+            json!({"sessionUpdate": "session_info_update", "title": "Reply marker"}),
+        ] {
+            assert!(handle_acp_update(
+                &store,
+                AGY_SESSION,
+                generation,
+                &turn,
+                &agy_update(&update)
+            ));
+            assert_eq!(turn_state(&store), TurnState::Submitted, "{update}");
+        }
+        assert!(handle_acp_update(
+            &store,
+            AGY_SESSION,
+            generation,
+            &turn,
+            &agy_update(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "ALPHA-731"},
+            })),
+        ));
+        assert_eq!(turn_state(&store), TurnState::Running);
+    }
+
+    #[test]
+    fn acp_message_chunks_join_until_a_tool_call_interrupts_them() {
+        let (store, turn, generation) = prompted_agy();
+        let tool = json!({
+            "toolCallId": "call_670380651062977068",
+            "kind": "execute",
+            "title": "touch probe-allow.txt",
+            "rawInput": {"CommandLine": "touch probe-allow.txt"},
+        });
+        let with = |extra: Value| {
+            let mut update = tool.clone();
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                update[key] = value.clone();
+            }
+            update
+        };
+        for update in [
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ALPHA"}}),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "-731"}}),
+            with(json!({"sessionUpdate": "tool_call", "status": "in_progress"})),
+            with(json!({"sessionUpdate": "tool_call_update", "status": "pending"})),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "call_670380651062977068",
+                   "status": "completed",
+                   "content": [{"type": "content", "content": {"type": "text", "text": "Command exited with code 0."}}]}),
+        ] {
+            handle_acp_update(&store, AGY_SESSION, generation, &turn, &agy_update(&update));
+        }
+        let store = store
+            .lock()
+            .unwrap_or_else(|_| panic!("store lock poisoned"));
+        let uid = store
+            .session_uid(AGY_SESSION)
+            .unwrap_or_else(|| panic!("session uid missing"));
+        let messages = store
+            .messages_after(&uid, 0, 16)
+            .messages
+            .iter()
+            .map(|message| serde_json::to_value(message).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let kinds = messages
+            .iter()
+            .map(|message| message["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["assistant", "tool_call", "tool_result"]);
+        assert_eq!(messages[0]["text"], "ALPHA-731");
+        assert_eq!(messages[1]["tool"], "touch probe-allow.txt");
+        assert_eq!(messages[2]["tool"], "touch probe-allow.txt");
+        assert_eq!(messages[2]["ok"], true);
+        assert_eq!(messages[2]["summary"], "Command exited with code 0.");
+    }
+
+    #[test]
+    fn an_acp_session_without_an_approvals_mapping_reports_the_agent_default() {
+        let store = ready_store("opencode");
+        store.set_harness_spec(
+            "opencode:thread-1",
+            Some(HarnessSpec {
+                command: vec!["opencode".to_owned(), "acp".to_owned()],
+                ..HarnessSpec::default()
+            }),
+        );
+        let session = store
+            .get_session("opencode:thread-1")
+            .unwrap_or_else(|| panic!("session missing"));
+        let public = public_session(&session);
+        assert_eq!(
+            public["approvals"],
+            json!({"requested": null, "effective": "agent_default"})
+        );
+        assert_eq!(public["command"], "opencode");
+        assert_eq!(resume_command(&session), None);
+    }
+
+    #[test]
+    fn an_acp_session_with_an_approvals_mapping_reports_its_mode_and_resume_command() {
+        let store = ready_store("agy");
+        store.set_harness_spec(AGY_SESSION, Some(agy_spec()));
+        store.set_requested_approvals(AGY_SESSION, ApprovalsMode::Ask);
+        let session = store
+            .get_session(AGY_SESSION)
+            .unwrap_or_else(|| panic!("session missing"));
+        assert_eq!(
+            public_session(&session)["approvals"],
+            json!({"requested": "ask", "effective": "ask"})
+        );
+        assert_eq!(
+            resume_command(&session).as_deref(),
+            Some("agy --conversation thread-1")
+        );
+    }
+
+    #[test]
+    fn acp_approvals_are_limited_to_the_modes_the_harness_maps() {
+        let code = |result: anyhow::Result<()>| {
+            result.err().and_then(|error| crate::error::code_of(&error))
+        };
+        let agy = agy_spec();
+        assert!(check_acp_approvals("agy", &agy, None).is_ok());
+        assert!(check_acp_approvals("agy", &agy, Some(ApprovalsMode::Ask)).is_ok());
+        assert_eq!(
+            code(check_acp_approvals(
+                "agy",
+                &agy,
+                Some(ApprovalsMode::Bypass)
+            )),
+            Some(crate::error::Code::Unsupported)
+        );
+        let unmapped = HarnessSpec {
+            command: vec!["opencode".to_owned(), "acp".to_owned()],
+            ..HarnessSpec::default()
+        };
+        assert!(check_acp_approvals("opencode", &unmapped, None).is_ok());
+        assert_eq!(
+            code(check_acp_approvals(
+                "opencode",
+                &unmapped,
+                Some(ApprovalsMode::Auto)
+            )),
+            Some(crate::error::Code::Unsupported)
+        );
     }
 }

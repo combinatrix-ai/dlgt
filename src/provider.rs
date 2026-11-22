@@ -1,14 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write as _};
+use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -19,45 +15,11 @@ use crate::protocol::ApprovalsMode;
 use toml_edit::{DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
-use crate::reaper::{Reaper, Registration};
-
 static CODEX_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static CLAUDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 const CODEX_UPDATE_SUPPRESSION: &str = "check_for_update_on_startup=false";
 const CLAUDE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
-const AUTH_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
-
-#[derive(Default)]
-pub struct AuthProcessGroups {
-    groups: Mutex<HashSet<i32>>,
-}
-
-impl AuthProcessGroups {
-    fn insert(&self, group: i32) {
-        if let Ok(mut groups) = self.groups.lock() {
-            groups.insert(group);
-        }
-    }
-
-    fn remove(&self, group: i32) {
-        if let Ok(mut groups) = self.groups.lock() {
-            groups.remove(&group);
-        }
-    }
-
-    pub fn terminate_all(&self) {
-        if let Ok(groups) = self.groups.lock() {
-            for group in groups.iter().copied() {
-                // SAFETY: auth checks are spawned as leaders of their process groups.
-                unsafe {
-                    libc::kill(-group, libc::SIGKILL);
-                }
-            }
-        }
-    }
-}
-
 const CLAUDE_SESSION_MARKER_HEX_LEN: usize = 12;
 
 fn hex_provider_id(provider_id: &str) -> String {
@@ -80,11 +42,12 @@ pub fn claude_session_marker(provider_id: &str) -> String {
     format!("dlgt:{suffix}")
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
 pub enum Agent {
     Codex,
     Claude,
+    Acp(String),
 }
 
 impl Agent {
@@ -92,27 +55,39 @@ impl Agent {
         match value {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
-            _ => fail!(
-                InvalidArgument,
-                "unsupported agent {value:?}; expected codex or claude"
-            ),
+            _ if valid_harness_name(value) => Ok(Self::Acp(value.to_owned())),
+            _ => fail!(InvalidArgument, "invalid Harness name {value:?}"),
         }
     }
 
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Acp(name) => name,
         }
     }
 
+    pub const fn is_acp(&self) -> bool {
+        matches!(self, Self::Acp(_))
+    }
+
     /// The provider's own command for opening a conversation by hand.
-    pub fn resume_command(self, provider_id: &str) -> String {
+    pub fn resume_command(&self, provider_id: &str) -> Option<String> {
         match self {
-            Self::Codex => format!("codex resume {provider_id}"),
-            Self::Claude => format!("claude --resume {provider_id}"),
+            Self::Codex => Some(format!("codex resume {provider_id}")),
+            Self::Claude => Some(format!("claude --resume {provider_id}")),
+            Self::Acp(_) => None,
         }
     }
+}
+
+fn valid_harness_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_lowercase())
+        && value.len() <= 32
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        && !matches!(value, "claude" | "codex")
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +103,8 @@ pub struct LaunchOptions<'a> {
     pub resume_provider_id: Option<&'a str>,
     pub environment: &'a HashMap<String, String>,
     pub approvals: ApprovalsMode,
+    /// Present for an ACP Harness.
+    pub harness_spec: Option<&'a crate::protocol::HarnessSpec>,
 }
 
 pub(crate) fn provider_display_name(title: &str) -> String {
@@ -241,7 +218,7 @@ pub(crate) fn codex_thread_params(options: &LaunchOptions<'_>) -> serde_json::Va
 /// Mark `cwd` trusted in the configuration the provider will actually read,
 /// which the launch environment selects, not the daemon's own.
 pub fn prepare_workspace(
-    agent: Agent,
+    agent: &Agent,
     cwd: &Path,
     environment: &HashMap<String, String>,
 ) -> Result<()> {
@@ -272,6 +249,7 @@ pub fn prepare_workspace(
             };
             trust_claude_workspace(&config_dir, cwd)?;
         }
+        Agent::Acp(_) => {}
     }
     Ok(())
 }
@@ -587,236 +565,6 @@ pub fn claude_command(options: &LaunchOptions<'_>) -> Result<CommandSpec> {
     })
 }
 
-/// Confirm subscription auth using the exact resolved command context that
-/// will launch the provider. Captured output is drained but retained only up
-/// to a fixed limit, and the process group is owned by the daemon reaper.
-#[allow(clippy::too_many_lines)]
-pub fn verify_claude_subscription_login(
-    spec: &CommandSpec,
-    deadline: Instant,
-    reaper: &Arc<Reaper>,
-    auth_processes: &Arc<AuthProcessGroups>,
-    shutting_down: &AtomicBool,
-) -> Result<()> {
-    if shutting_down.load(Ordering::Acquire) {
-        fail!(
-            LaunchFailed,
-            "launch failed: daemon is stopping before Claude auth status"
-        );
-    }
-    let mut command = Command::new(&spec.program);
-    command
-        .args(["auth", "status"])
-        .current_dir(&spec.cwd)
-        .env_clear()
-        .envs(&spec.environment)
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("launch failed: could not start Claude auth status")
-        .code(Code::LaunchFailed)?;
-    let pid = child.id();
-    let group = i32::try_from(pid).context("Claude auth status pid is too large")?;
-    let registration = match reaper.watch(pid) {
-        Ok(registration) => registration,
-        Err(error) => {
-            kill_process_group(group);
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    auth_processes.insert(group);
-    let readers_stop = Arc::new(AtomicBool::new(false));
-    let mut group_guard = AuthGroupGuard {
-        group,
-        auth_processes,
-        readers_stop: Arc::clone(&readers_stop),
-        readers: Vec::new(),
-        _registration: registration,
-    };
-    if shutting_down.load(Ordering::Acquire) {
-        kill_process_group(group);
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .context("Claude auth status stdout was unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("Claude auth status stderr was unavailable")?;
-    let stdout_reader = match drain_bounded("dlgt-auth-stdout", stdout, Arc::clone(&readers_stop)) {
-        Ok((output, thread)) => {
-            group_guard.readers.push(thread);
-            output
-        }
-        Err(error) => {
-            kill_process_group(group);
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    let stderr_reader = match drain_bounded("dlgt-auth-stderr", stderr, Arc::clone(&readers_stop)) {
-        Ok((output, thread)) => {
-            group_guard.readers.push(thread);
-            output
-        }
-        Err(error) => {
-            kill_process_group(group);
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-
-    // The check is done when the process has exited and both streams reached
-    // EOF. A descendant can hold a stream open after the parent exits, so the
-    // deadline covers the reads too; on expiry the whole group is killed and
-    // the readers finish on their own once the last writer is gone.
-    let mut status = None;
-    let mut stdout = None;
-    let mut stderr_done = false;
-    while status.is_none() || stdout.is_none() || !stderr_done {
-        if shutting_down.load(Ordering::Acquire) || Instant::now() >= deadline {
-            kill_process_group(group);
-            let _ = child.wait();
-            if shutting_down.load(Ordering::Acquire) {
-                fail!(
-                    LaunchFailed,
-                    "launch failed: daemon stopped during Claude auth status"
-                );
-            }
-            fail!(
-                LaunchFailed,
-                "launch failed: Claude auth status exceeded the startup deadline"
-            );
-        }
-        if status.is_none() {
-            status = child
-                .try_wait()
-                .context("failed to wait for Claude auth status")?;
-        }
-        if stdout.is_none() {
-            stdout = stdout_reader.try_recv().ok();
-        }
-        stderr_done = stderr_done || stderr_reader.try_recv().is_ok();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let (Some(status), Some(stdout)) = (status, stdout) else {
-        return Err(anyhow!("Claude auth status ended without its result"));
-    };
-    if stdout.overflowed {
-        return Err(crate::config::AuthMismatch::default().into());
-    }
-    let stdout = stdout.retained;
-    if !status.success() {
-        return Err(crate::config::AuthMismatch::default().into());
-    }
-    let Ok(status) = serde_json::from_slice::<serde_json::Value>(&stdout) else {
-        return Err(crate::config::AuthMismatch::default().into());
-    };
-    let confirmed = status.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(true)
-        && status.get("authMethod").and_then(serde_json::Value::as_str) == Some("claude.ai");
-    if !confirmed {
-        return Err(crate::config::AuthMismatch::default().into());
-    }
-    Ok(())
-}
-
-/// Owns an auth check's process group for the length of the check. However
-/// the check ends, the rest of the group is killed and the output readers are
-/// told to stop, so neither a lingering descendant nor a reader blocked on a
-/// pipe that an escaped process still holds outlives it.
-struct AuthGroupGuard<'a> {
-    group: i32,
-    auth_processes: &'a AuthProcessGroups,
-    readers_stop: Arc<AtomicBool>,
-    readers: Vec<std::thread::JoinHandle<()>>,
-    _registration: Registration,
-}
-
-impl Drop for AuthGroupGuard<'_> {
-    fn drop(&mut self) {
-        kill_process_group(self.group);
-        self.readers_stop.store(true, Ordering::Release);
-        // Readers poll a nonblocking pipe and check `stop` on every pass, so
-        // joining here waits at most one poll interval.
-        for reader in self.readers.drain(..) {
-            let _ = reader.join();
-        }
-        self.auth_processes.remove(self.group);
-    }
-}
-
-struct BoundedOutput {
-    retained: Vec<u8>,
-    overflowed: bool,
-}
-
-/// Read a stream to EOF on its own thread, keeping at most the output limit
-/// and recording whether anything beyond it was discarded.
-fn drain_bounded<R: Read + std::os::fd::AsRawFd + Send + 'static>(
-    name: &str,
-    mut reader: R,
-    stop: Arc<AtomicBool>,
-) -> Result<(
-    std::sync::mpsc::Receiver<BoundedOutput>,
-    std::thread::JoinHandle<()>,
-)> {
-    // Nonblocking, so the reader can notice `stop` while a process outside
-    // the killed group still holds the write end open.
-    // SAFETY: fcntl only reads and sets the status flags of this valid fd.
-    let nonblocking = unsafe {
-        let fd = reader.as_raw_fd();
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
-    };
-    if !nonblocking {
-        return Err(anyhow!(
-            "could not make Claude auth status output nonblocking"
-        ));
-    }
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let reader = std::thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(move || {
-            let mut output = BoundedOutput {
-                retained: Vec::with_capacity(AUTH_STATUS_OUTPUT_LIMIT),
-                overflowed: false,
-            };
-            let mut buffer = [0_u8; 8192];
-            while !stop.load(Ordering::Acquire) {
-                let size = match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(size) => size,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                let remaining = AUTH_STATUS_OUTPUT_LIMIT.saturating_sub(output.retained.len());
-                output.overflowed |= size > remaining;
-                output
-                    .retained
-                    .extend_from_slice(&buffer[..size.min(remaining)]);
-            }
-            let _ = sender.send(output);
-        })
-        .context("failed to start Claude auth status output reader")?;
-    Ok((receiver, reader))
-}
-
-fn kill_process_group(group: i32) {
-    // SAFETY: auth checks are spawned as leaders of their process groups.
-    unsafe {
-        libc::kill(-group, libc::SIGKILL);
-    }
-}
-
 fn claude_harness_args(options: &[String]) -> Result<Vec<String>> {
     options
         .iter()
@@ -956,10 +704,12 @@ fn holds_table(value: &toml_edit::Value) -> bool {
     }
 }
 
-pub fn validate_harness_options(agent: Agent, options: &[String]) -> Result<()> {
+pub fn validate_harness_options(agent: &Agent, options: &[String]) -> Result<()> {
     match agent {
         Agent::Claude => claude_harness_args(options).map(|_| ()),
         Agent::Codex => codex_harness_args(options).map(|_| ()),
+        Agent::Acp(_) if options.is_empty() => Ok(()),
+        Agent::Acp(_) => fail!(Unsupported, "ACP Harnesses do not support harness_options"),
     }
 }
 
@@ -1006,6 +756,7 @@ mod tests {
             resume_provider_id: None,
             environment,
             approvals,
+            harness_spec: None,
         }
     }
 
@@ -1333,25 +1084,6 @@ harness_options = ["approval_policy=never"]
     }
 
     #[test]
-    fn an_auth_reader_stops_on_request_even_while_input_keeps_arriving() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let zero = std::fs::File::open("/dev/zero")
-            .unwrap_or_else(|error| panic!("failed to open /dev/zero: {error}"));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (output, reader) = super::drain_bounded("test-zero", zero, Arc::clone(&stop))
-            .unwrap_or_else(|error| panic!("{error}"));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        stop.store(true, Ordering::Release);
-        let stopped = output
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap_or_else(|_| panic!("reader kept reading after stop"));
-        assert!(stopped.overflowed);
-        reader.join().unwrap_or_else(|_| panic!("reader panicked"));
-    }
-
-    #[test]
     fn json_members_are_located_by_decoded_path() {
         let text = "{\n  \"nested\": {\"projects\": {}},\n  \"pro\\u006aects\": {\n    \"/w\": 3\n  }\n}\n";
         let line = |offset: usize| text[..offset].matches('\n').count() + 1;
@@ -1368,8 +1100,14 @@ harness_options = ["approval_policy=never"]
 
     #[test]
     fn resume_commands_are_the_providers_own() {
-        assert_eq!(Agent::Claude.resume_command("abc"), "claude --resume abc");
-        assert_eq!(Agent::Codex.resume_command("abc"), "codex resume abc");
+        assert_eq!(
+            Agent::Claude.resume_command("abc").as_deref(),
+            Some("claude --resume abc")
+        );
+        assert_eq!(
+            Agent::Codex.resume_command("abc").as_deref(),
+            Some("codex resume abc")
+        );
     }
 
     #[test]

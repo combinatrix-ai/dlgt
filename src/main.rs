@@ -1,3 +1,4 @@
+mod acp;
 mod claude;
 mod claude_models;
 mod client;
@@ -32,19 +33,13 @@ use uuid::Uuid;
 fn main() {
     if let Err(error) = run() {
         let failure = error.downcast_ref::<client::RpcFailure>();
-        let auth_mismatch = error.downcast_ref::<config::AuthMismatch>();
         let code = failure.map_or_else(
             || error::code_of(&error).map_or("INVALID_ARGUMENT", error::Code::as_str),
             |failure| failure.code.as_str(),
         );
-        let message = failure.map_or_else(
-            || auth_mismatch.map_or_else(|| format!("{error:#}"), std::string::ToString::to_string),
-            |failure| failure.message.clone(),
-        );
+        let message =
+            failure.map_or_else(|| format!("{error:#}"), |failure| failure.message.clone());
         let mut error_json = json!({"code":code,"message":message});
-        if let Some(auth_mismatch) = auth_mismatch {
-            error_json["hint"] = json!(auth_mismatch.hint());
-        }
         if let Some(failure) = failure
             && let Some(error_object) = error_json.as_object_mut()
         {
@@ -65,6 +60,9 @@ fn main() {
             }
             if let Some(action) = &failure.action {
                 error_object.insert("action".to_owned(), json!(action));
+            }
+            if let Some(auth_methods) = &failure.auth_methods {
+                error_object.insert("auth_methods".to_owned(), json!(auth_methods));
             }
             if let Some(request_ids) = &failure.request_ids {
                 error_object.insert("request_ids".to_owned(), json!(request_ids));
@@ -178,9 +176,6 @@ fn command_new(args: &[String]) -> Result<()> {
     let client_environment = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
     let launch =
         configuration.resolve(harness, profile.as_ref(), &explicit, &client_environment)?;
-    if harness == "claude" {
-        config::validate_auth_environment(launch.auth, launch.environment.iter())?;
-    }
     let cwd = launch_cwd(&parsed)?;
     let prompt = prompt_from(&parsed, 0)?
         .context("missing initial prompt; use --prompt-file, --stdin, or -- PROMPT")?;
@@ -195,8 +190,8 @@ fn command_new(args: &[String]) -> Result<()> {
             "model": launch.model,
             "effort": launch.effort,
             "harness_options": launch.harness_options,
-            "approvals": launch.approvals.as_str(),
-            "auth_policy": (harness == "claude").then_some(launch.auth.as_str()),
+            "approvals": launch.approvals,
+            "harness_spec": launch.harness_spec,
             "prompt": prompt,
             "startup_timeout_ms": parsed.one("--startup-timeout")
                 .map(parse_duration).transpose()?.unwrap_or(Duration::from_mins(1)).as_millis(),
@@ -215,13 +210,6 @@ fn approvals_option(parsed: &Args) -> Result<Option<&str>> {
     Ok(Some(mode))
 }
 
-fn auth_option(parsed: &Args) -> Result<Option<protocol::AuthPolicy>> {
-    parsed
-        .one("--auth")
-        .map(protocol::AuthPolicy::parse)
-        .transpose()
-}
-
 fn explicit_launch(parsed: &Args) -> Result<config::PartialLaunch> {
     let mut launch = config::PartialLaunch {
         model: parsed.one("--model").map(str::to_owned),
@@ -229,7 +217,6 @@ fn explicit_launch(parsed: &Args) -> Result<config::PartialLaunch> {
         approvals: approvals_option(parsed)?
             .map(protocol::ApprovalsMode::parse)
             .transpose()?,
-        auth: auth_option(parsed)?,
         clean_env: parsed.flag("--clean-env").then_some(true),
         pass_env: parsed.many("--pass-env").map(str::to_owned).collect(),
         unset_env: parsed.many("--unset-env").map(str::to_owned).collect(),
@@ -253,7 +240,14 @@ fn command_send(args: &[String]) -> Result<()> {
     let parsed = Args::parse(
         "send",
         args,
-        &["--stdin", "--pretty", "--resume", "--steer", "--clean-env"],
+        &[
+            "--stdin",
+            "--pretty",
+            "--resume",
+            "--steer",
+            "--interrupt",
+            "--clean-env",
+        ],
         &options,
     )?;
     let session = parsed
@@ -266,6 +260,9 @@ fn command_send(args: &[String]) -> Result<()> {
     }
     if parsed.flag("--steer") && parsed.flag("--resume") {
         bail!("--steer and --resume are mutually exclusive");
+    }
+    if parsed.flag("--interrupt") && !parsed.flag("--steer") {
+        bail!("--interrupt requires --steer");
     }
     if !parsed.flag("--resume")
         && let Some(option) = LAUNCH_OPTIONS
@@ -283,12 +280,14 @@ fn command_send(args: &[String]) -> Result<()> {
         "request_id": request_id,
         "resume": parsed.flag("--resume"),
         "steer": parsed.flag("--steer"),
+        "interrupt": parsed.flag("--interrupt"),
     });
     if parsed.flag("--resume") {
         let (harness, _) = session
             .split_once(':')
-            .filter(|(harness, id)| matches!(*harness, "claude" | "codex") && !id.is_empty())
-            .context("--resume requires a provider-qualified codex:<id> or claude:<id> selector")?;
+            .filter(|(_, id)| !id.is_empty())
+            .context("--resume requires a provider-qualified <harness>:<id> selector")?;
+        config::validate_harness_name(harness)?;
         apply_resume_launch_options(&parsed, &mut params, harness)?;
     } else {
         let prompt = prompt_from(&parsed, 1)?
@@ -359,11 +358,9 @@ fn apply_resume_launch_options(parsed: &Args, params: &mut Value, harness: &str)
         object.insert("harness_options".to_owned(), json!(options));
     }
     if approvals_option(parsed)?.is_some() || profile_has("approvals") {
-        object.insert("approvals".to_owned(), json!(launch.approvals.as_str()));
+        object.insert("approvals".to_owned(), json!(launch.approvals));
     }
-    if harness == "claude" && (auth_option(parsed)?.is_some() || profile_has("auth")) {
-        object.insert("auth_policy".to_owned(), json!(launch.auth.as_str()));
-    }
+    object.insert("harness_spec".to_owned(), json!(launch.harness_spec));
     object.insert(
         "startup_timeout_ms".to_owned(),
         json!(
@@ -387,9 +384,6 @@ fn command_restart(args: &[String]) -> Result<()> {
         LAUNCH_OPTIONS,
     )?;
     let session = parsed.one_positional("Session selector")?;
-    if parsed.one("--auth").is_some() {
-        bail!("--auth is accepted only with new or send --resume");
-    }
     let environment = launch_environment(&parsed)?;
     let result = client::call(
         "session.restart",
@@ -565,23 +559,47 @@ fn command_models(args: &[String]) -> Result<()> {
     )?;
     parsed.no_positionals()?;
     let include_hidden = parsed.flag("--include-hidden");
+    let configuration = config::load()?;
+    let client_environment = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+    // An ACP agent lists models only inside a session, so its discovery
+    // starts the agent here, with the launch environment a `new` would use.
+    let list = |harness: &str| -> Result<Value> {
+        let mut params = json!({"harness":harness,"include_hidden":include_hidden});
+        if config::is_acp_harness(harness) {
+            let launch = configuration.resolve(
+                harness,
+                None,
+                &config::PartialLaunch::default(),
+                &client_environment,
+            )?;
+            params["harness_spec"] = json!(launch.harness_spec);
+            params["cwd"] = json!(std::env::current_dir()?);
+            params["environment"] = json!(launch.environment);
+        }
+        client::call("model.list", params)
+    };
     if let Some(harness) = parsed.one("--harness") {
-        let result = client::call(
-            "model.list",
-            json!({"harness":harness,"include_hidden":include_hidden}),
-        )?;
-        return print_success(result, parsed.flag("--pretty"));
+        return print_success(list(harness)?, parsed.flag("--pretty"));
     }
     // Bare `dlgt models` is a discovery request, not an assertion that every
     // Harness is reachable: one unavailable provider must not hide the other.
-    let harnesses = ["codex", "claude"]
+    let installed = |harness: &String| {
+        configuration.harness_spec(harness).is_ok_and(|spec| {
+            spec.command
+                .first()
+                .is_some_and(|program| on_path(program, client_environment.get("PATH")))
+        })
+    };
+    let harnesses = ["codex".to_owned(), "claude".to_owned()]
         .into_iter()
+        .chain(
+            configuration
+                .acp_harness_names()
+                .into_iter()
+                .filter(installed),
+        )
         .map(|harness| {
-            client::call(
-                "model.list",
-                json!({"harness":harness,"include_hidden":include_hidden}),
-            )
-            .unwrap_or_else(|error| {
+            list(&harness).unwrap_or_else(|error| {
                 json!({
                     "harness": harness,
                     "discovery": "unavailable",
@@ -592,6 +610,15 @@ fn command_models(args: &[String]) -> Result<()> {
         })
         .collect::<Vec<_>>();
     print_success(json!({"harnesses":harnesses}), parsed.flag("--pretty"))
+}
+
+fn on_path(program: &str, path: Option<&String>) -> bool {
+    if program.contains('/') {
+        return std::path::Path::new(program).is_file();
+    }
+    path.is_some_and(|path| {
+        std::env::split_paths(path).any(|directory| directory.join(program).is_file())
+    })
 }
 
 fn command_profiles(args: &[String]) -> Result<()> {
@@ -653,7 +680,6 @@ const LAUNCH_OPTIONS: &[&str] = &[
     "--effort",
     "--cwd",
     "--approvals",
-    "--auth",
     "--harness-option",
     "--startup-timeout",
     "--request-id",
@@ -948,13 +974,13 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt update - install the latest release and embedded Skills\n\nUSAGE\n  dlgt update [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"
         }
         "new" => {
-            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <codex|claude>       Provider Harness (required without a Profile)\n  --model <MODEL>                Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --approvals <auto|ask|bypass>  Who approves what the worker does (default: auto)\n  --auth <subscription|any>      Claude authentication policy (default: subscription)\n  --harness-option <KEY[=VALUE]> Harness option (repeatable)\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help\n\nAPPROVALS\n  auto     The provider's own reviewer decides; only what it does not settle is asked\n  ask      Every approval becomes a Request for `dlgt answer`\n  bypass   Nothing is asked and the provider sandbox is off"
+            "dlgt new - create a Session and submit its first prompt\n\nUSAGE\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt new --title <TITLE> --request-id <ID> [OPTIONS] --stdin\n\nOPTIONS\n  --title <TITLE>                 Human-readable Session title (required)\n  --alias <@ALIAS>               Exact active Session alias\n  --profile <PROFILE>            Reusable launch Profile\n  --harness <NAME>               codex, claude, or an ACP Harness (required without a Profile)\n  --model <MODEL>                Provider model\n  --effort <LEVEL>               Provider reasoning effort\n  --cwd <DIR>                    Working directory (default: current directory)\n  --approvals <auto|ask|bypass>  Who approves what the worker does (default: auto)\n  --harness-option <KEY[=VALUE]> Harness option (repeatable)\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help\n\nAPPROVALS\n  auto     The provider's own reviewer decides; only what it does not settle is asked\n  ask      Every approval becomes a Request for `dlgt answer`\n  bypass   Nothing is asked and the provider sandbox is off\n\nAn ACP Harness takes --approvals only when its approvals mapping names the\nmode; agy maps auto and ask."
         }
         "restart" => {
             "dlgt restart - replace a Session process and resume its provider conversation\n\nUSAGE\n  dlgt restart <SESSION_ID> [OPTIONS]\n\nOPTIONS\n  --startup-timeout <DURATION>   Startup timeout (default: 60s)\n  --clean-env                    Start with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help"
         }
         "send" => {
-            "dlgt send - send work to an idle Session, steer a busy one, or resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt send <SESSION_ID|@ALIAS> --steer --request-id <ID> -- <PROMPT>\n  dlgt send <codex:ID|claude:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --steer                        Add the prompt to the execution that is already running\n  --resume                       Resume a stopped provider conversation\n  --profile <PROFILE>            Reusable launch Profile for resume\n  --model <MODEL>                Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --approvals <auto|ask|bypass>  Approvals mode for resume (default: auto)\n  --auth <subscription|any>      Claude authentication policy for resume (default: subscription)\n  --harness-option <KEY[=VALUE]> Harness option for resume (repeatable)\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help\n\nA busy Session rejects a plain send with SESSION_BUSY; --steer needs a busy\nSession and never creates an execution. Launch options need --resume."
+            "dlgt send - send work to an idle Session, steer a busy one, or resume a provider conversation\n\nUSAGE\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] -- <PROMPT>\n  dlgt send <SESSION_ID|@ALIAS> --request-id <ID> [OPTIONS] --prompt-file <PATH>\n  dlgt send <SESSION_ID|@ALIAS> --steer [--interrupt] --request-id <ID> -- <PROMPT>\n  dlgt send <HARNESS:ID> --resume --request-id <ID> [OPTIONS] -- <PROMPT>\n\nOPTIONS\n  --steer                        Add the prompt to the execution that is already running\n  --interrupt                    With --steer: cancel that execution, then send the prompt\n  --resume                       Resume a stopped provider conversation\n  --profile <PROFILE>            Reusable launch Profile for resume\n  --model <MODEL>                Model override for resume\n  --effort <LEVEL>               Reasoning effort override for resume\n  --cwd <DIR>                    Working directory for resume (default: current directory)\n  --approvals <auto|ask|bypass>  Approvals mode for resume (default: auto)\n  --harness-option <KEY[=VALUE]> Harness option for resume (repeatable)\n  --startup-timeout <DURATION>   Resume startup timeout (default: 60s)\n  --clean-env                    Resume with an empty environment\n  --pass-env <KEY>               Pass a host variable with --clean-env (repeatable)\n  --env <KEY=VALUE>              Set an environment variable (repeatable)\n  --unset-env <KEY>              Remove an environment variable (repeatable)\n  --request-id <ID>              Idempotency key (required); a retry replays the receipt\n  --prompt-file <PATH>           Read the required prompt from a file\n  --stdin                        Read the required prompt from stdin\n  --pretty                       Pretty-print JSON output\n  -h, --help                     Print this help\n\nA busy Session rejects a plain send with SESSION_BUSY; --steer needs a busy\nSession and never creates an execution, unless --interrupt replaces the running\none. ACP Harnesses accept only --steer --interrupt. Launch options need --resume."
         }
         "fetch" => {
             "dlgt fetch - read one Session since a cursor in one call\n\nUSAGE\n  dlgt fetch <SESSION_ID|@ALIAS> [OPTIONS]\n\nOPTIONS\n  --cursor <N>            Observation position from a previous response\n  --wait <DURATION>       Wait for the active/latest execution's terminal result (max 24h)\n  --messages[=<MAX>]      Messages per response (default: 64, max: 512)\n  --no-messages           Omit messages\n  --max-bytes <BYTES>     Serialized response budget (default: 32768, max: 262144)\n  --pretty                Pretty-print JSON output\n  -h, --help              Print this help\n\nEvery observation exits 0. Omit --cursor to recover a bounded baseline.\nA pending Request returns at once with reason \"blocked\"; answer it with dlgt answer."
@@ -978,7 +1004,7 @@ fn command_usage(command: &str) -> Result<&'static str> {
             "dlgt watch - follow a Session's messages as text\n\nUSAGE\n  dlgt watch <SESSION_ID|@ALIAS> [--from-start] [--until-idle]\n\nOPTIONS\n  --from-start   Replay the retained messages before following new ones\n  --until-idle   Exit when the current execution ends\n  -h, --help     Print this help\n\nRead-only: it sends nothing to the worker. The text is for humans and is not a\nstable format; agents use dlgt fetch."
         }
         "models" => {
-            "dlgt models - discover models supported by a Harness\n\nUSAGE\n  dlgt models [OPTIONS]\n  dlgt models --harness <codex|claude> [OPTIONS]\n\nOPTIONS\n  --harness <codex|claude>   Query one Harness; omitted queries all\n  --include-hidden           Include hidden models\n  --pretty                   Pretty-print JSON output\n  -h, --help                 Print this help\n\nWithout --harness the response lists every Harness, and one that cannot be\nreached reports discovery: \"unavailable\" instead of failing the command."
+            "dlgt models - discover models supported by a Harness\n\nUSAGE\n  dlgt models [OPTIONS]\n  dlgt models --harness <NAME> [OPTIONS]\n\nOPTIONS\n  --harness <NAME>           Query one Harness; omitted queries all installed\n  --include-hidden           Include hidden models\n  --pretty                   Pretty-print JSON output\n  -h, --help                 Print this help\n\nWithout --harness the response lists every Harness, and one that cannot be\nreached reports discovery: \"unavailable\" instead of failing the command. An\nACP Harness is queried by starting its agent in the current directory."
         }
         "profiles" => {
             "dlgt profiles - list Profiles or show launch defaults\n\nUSAGE\n  dlgt profiles list [--pretty]\n  dlgt profiles show <NAME> [--pretty]\n  dlgt profiles defaults [--pretty]\n\nOPTIONS\n  --pretty     Pretty-print JSON output\n  -h, --help   Print this help"

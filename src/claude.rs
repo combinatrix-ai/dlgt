@@ -18,9 +18,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::config::AuthMismatch;
 use crate::messages::{Decider, Decision, MessageBody, one_line};
-use crate::protocol::{ApprovalsMode, Auth, AuthPolicy, SessionState, TurnState};
+use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnState};
 use crate::provider::CommandSpec;
 use crate::reaper::{Reaper, Registration};
 use crate::requests::{ProviderRequest, RequestDraft, RequestKind};
@@ -297,14 +296,6 @@ impl ClaudeProcess {
         Ok(response.get("response").cloned().unwrap_or(Value::Null))
     }
 
-    /// Send a control request without waiting, for use on the event thread.
-    pub fn control_nowait(&self, request: &Value) -> Result<()> {
-        let id = format!("dlgt_{}", self.next_control.fetch_add(1, Ordering::Relaxed));
-        self.write_line_nowait(
-            &json!({"type": "control_request", "request_id": id, "request": request}),
-        )
-    }
-
     /// Tell Claude a control request will not be answered.
     pub fn refuse(&self, request_id: &str, reason: &str) -> Result<()> {
         self.write_line_nowait(&json!({
@@ -449,8 +440,6 @@ pub struct ClaudeTurns {
     /// Claude has started this execution's own prompt. A `result` before
     /// that belongs to a turn dlgt did not start and cannot end this one.
     engaged: bool,
-    /// The first provider auth report was checked before accepting a turn.
-    auth_checked: bool,
     result_texts: Vec<String>,
     last_assistant: Option<String>,
     failure: Option<String>,
@@ -464,8 +453,6 @@ pub struct ClaudeTurns {
 pub enum Action {
     /// The provider reports a different session ID than the one launched.
     Rekey(String),
-    /// Claude reported API-key authentication under the subscription policy.
-    AuthMismatch,
     /// A canceled execution's leftover message started a provider turn.
     Interrupt { turn_id: String },
     /// A control request nobody can answer: an unsupported kind, or a
@@ -479,11 +466,7 @@ pub enum Action {
 
 impl ClaudeTurns {
     pub fn begin(&mut self, uuid: &str) {
-        // `system/init` is a process-level event. Keep its result across turns
-        // accepted by this long-lived provider process.
-        let auth_checked = self.auth_checked;
         *self = Self::default();
-        self.auth_checked = auth_checked;
         self.turn_open = true;
         self.unread.push(Unread {
             uuid: uuid.to_owned(),
@@ -590,9 +573,7 @@ impl ClaudeTurns {
         if let Some(kind) = unmatched {
             store.record_event(Some(session_id), Some(&turn_id), kind);
         }
-        let auth_checked = self.auth_checked;
         *self = Self::default();
-        self.auth_checked = auth_checked;
         Ok(())
     }
 }
@@ -640,25 +621,6 @@ pub fn apply_event(
                 }
             }
             apply_permission_mode(store, session_id, text("permissionMode"));
-            turns.auth_checked = true;
-            let auth_mismatch = session.auth_policy.unwrap_or_default() == AuthPolicy::Subscription
-                && text("apiKeySource") != Some("none");
-            if auth_mismatch {
-                let error = json!({"code": "AUTH_MISMATCH", "message": AuthMismatch::default().to_string()});
-                if let Some(turn_id) = session.active_turn_id.as_deref() {
-                    store.finish_turn_if_matching(
-                        turn_id,
-                        None,
-                        TurnState::Failed,
-                        None,
-                        Some(&error),
-                    )?;
-                }
-                // The daemon stops this process; the Session stops with it.
-                let _ = store.begin_stop(session_id, runtime_generation, false);
-                actions.push(Action::AuthMismatch);
-                return Ok(actions);
-            }
             if turns.engaged {
                 confirm_started(store, session_id);
             }
@@ -737,10 +699,7 @@ pub fn apply_event(
                         turns.engaged = true;
                         // Claude dequeued the prompt and began the turn: that
                         // is its acceptance, ahead of the model reading it.
-                        let subscription_not_checked = session.auth_policy.unwrap_or_default()
-                            == AuthPolicy::Subscription
-                            && !turns.auth_checked;
-                        if unread.steer.is_none() && !subscription_not_checked {
+                        if unread.steer.is_none() {
                             confirm_started(store, session_id);
                         }
                     }
@@ -1051,7 +1010,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{Action, ClaudeTurns, apply_event};
-    use crate::protocol::{ApprovalsMode, Auth, AuthPolicy, SessionState, TurnRecord, TurnState};
+    use crate::protocol::{ApprovalsMode, Auth, SessionState, TurnRecord, TurnState};
     use crate::store::{NewSession, Store};
 
     const SESSION: &str = "claude:s1";
@@ -1169,14 +1128,13 @@ mod tests {
         apply(&store, &mut turns, &lifecycle("u-prompt", "queued"));
         assert!(turn(&store).started_at_ms.is_none());
         apply(&store, &mut turns, &lifecycle("u-prompt", "started"));
-        assert_eq!(turn(&store).state, TurnState::Submitted);
+        assert_eq!(turn(&store).state, TurnState::Running);
         apply(
             &store,
             &mut turns,
             &json!({"type": "system", "subtype": "init", "session_id": "s1",
                     "apiKeySource": "none"}),
         );
-        assert_eq!(turn(&store).state, TurnState::Running);
         apply(&store, &mut turns, &replay("u-prompt"));
         apply(
             &store,
@@ -1489,7 +1447,6 @@ mod tests {
     #[test]
     fn the_mode_and_login_claude_reports_are_recorded_and_announced() {
         let (store, mut turns) = busy_session(ApprovalsMode::Auto);
-        store.set_auth_policy(SESSION, AuthPolicy::Any);
         let actions = apply(
             &store,
             &mut turns,
@@ -1525,32 +1482,22 @@ mod tests {
     }
 
     #[test]
-    fn subscription_auth_mismatch_fails_and_stops_before_confirmation() {
+    fn api_key_auth_is_observed_without_stopping_the_session() {
         let (store, mut turns) = busy_session(ApprovalsMode::Auto);
         apply(&store, &mut turns, &lifecycle("u-prompt", "started"));
-        assert_eq!(turn(&store).state, TurnState::Submitted);
         let actions = apply(
             &store,
             &mut turns,
             &json!({"type": "system", "subtype": "init", "session_id": "s1",
                     "apiKeySource": "apiKeyHelper"}),
         );
-        assert_eq!(actions, [Action::AuthMismatch]);
-        assert_eq!(turn(&store).state, TurnState::Failed);
-        assert_eq!(
-            turn(&store)
-                .error
-                .as_ref()
-                .map(|error| error["code"].as_str()),
-            Some(Some("AUTH_MISMATCH"))
-        );
+        assert!(actions.is_empty());
+        assert_eq!(turn(&store).state, TurnState::Running);
         let session = store
             .get_session(SESSION)
             .unwrap_or_else(|| panic!("session missing"));
-        // The process is still alive until the daemon stops it.
-        assert_eq!(session.state, SessionState::Stopping);
+        assert_eq!(session.state, SessionState::Busy);
         assert_eq!(session.auth, Some(Auth::ApiKey));
-        assert_eq!(session.auth_policy, None);
         assert!(
             messages(&store)
                 .iter()
@@ -1559,23 +1506,16 @@ mod tests {
     }
 
     #[test]
-    fn subscription_auth_mismatch_when_init_omits_api_key_source() {
+    fn missing_auth_observation_does_not_block_a_session() {
         let (store, mut turns) = busy_session(ApprovalsMode::Auto);
-        store.set_auth_policy(SESSION, AuthPolicy::Subscription);
         let actions = apply(
             &store,
             &mut turns,
             &json!({"type": "system", "subtype": "init", "session_id": "s1",
                     "model": "claude-test", "permissionMode": "auto"}),
         );
-        assert_eq!(actions, [Action::AuthMismatch]);
-        assert_eq!(
-            turn(&store)
-                .error
-                .as_ref()
-                .map(|error| error["code"].as_str()),
-            Some(Some("AUTH_MISMATCH"))
-        );
+        assert!(actions.is_empty());
+        assert_eq!(turn(&store).state, TurnState::Submitted);
         assert_eq!(
             store.get_session(SESSION).and_then(|session| session.auth),
             None
@@ -1593,7 +1533,6 @@ mod tests {
         );
         apply(&store, &mut turns, &replay("u-prompt"));
         apply(&store, &mut turns, &result("first"));
-        assert!(turns.auth_checked);
         let session = store
             .get_session(SESSION)
             .unwrap_or_else(|| panic!("session missing"));
@@ -1606,7 +1545,6 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to insert second turn: {error}"));
         assert!(store.set_session_state(SESSION, SessionState::Busy));
         turns.begin("u-second");
-        assert!(turns.auth_checked);
         apply(&store, &mut turns, &replay("u-second"));
         apply(&store, &mut turns, &result("second"));
         let session = store
@@ -1664,7 +1602,6 @@ mod tests {
     #[test]
     fn a_rotated_provider_session_id_asks_for_a_rekey() {
         let (store, mut turns) = busy_session(ApprovalsMode::Ask);
-        store.set_auth_policy(SESSION, AuthPolicy::Any);
         assert_eq!(
             apply(
                 &store,

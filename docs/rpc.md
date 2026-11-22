@@ -73,16 +73,16 @@ it as a `fetch` option.
 
 | Method | Parameters |
 | --- | --- |
-| `session.create` | `title`, optional `alias`, `harness`, optional `cwd`, optional `model`, optional `effort`, optional `approvals` (`auto`, `ask`, or `bypass`; default `auto`), optional `harness_options`, required non-empty `prompt`, required `request_id`, optional `startup_timeout_ms`, launch `environment`; `title`, `alias`, `model`, `effort`, and `cwd` are at most 200, 64, 128, 32, and 4,096 characters; a resumed provider ID is at most 128 of `[A-Za-z0-9._-]` |
+| `session.create` | `title`, optional `alias`, `harness`, optional `cwd`, optional `model`, optional `effort`, optional `approvals` (`auto`, `ask`, or `bypass`; default `auto`), optional `harness_options`, `harness_spec` for an ACP Harness (`command` array, optional `login`, optional `approvals` mapping, optional `resume` argv; see [CLI](cli.md#selecting-an-acp-harness)), required non-empty `prompt`, required `request_id`, optional `startup_timeout_ms`, launch `environment`; `title`, `alias`, `model`, `effort`, and `cwd` are at most 200, 64, 128, 32, and 4,096 characters; a resumed provider ID is at most 128 of `[A-Za-z0-9._-]` |
 | `session.restart` | `session`, optional `startup_timeout_ms`, fresh launch `environment` |
-| `session.send` | `session`, required non-empty `prompt`, required `request_id`, optional `steer` boolean, optional `resume` boolean; with `resume:true`, the launch parameters of `session.create` except `title`, `alias`, and `harness` |
+| `session.send` | `session`, required non-empty `prompt`, required `request_id`, optional `steer` boolean, optional `interrupt` boolean with `steer`, optional `resume` boolean; with `resume:true`, the launch parameters of `session.create` except `title`, `alias`, and `harness` |
 | `session.answer` | `session`, `request` (a Request ID such as `r3`), `decision` (`allow`, `deny`, `text`, `choice`, or `json`), `message` with `deny`, `text` with `text`, `choice` (1-based) with `choice`, `json` object with `json` |
 | `session.fetch` | `session`, optional `cursor` (a position, as a number or a string of digits), optional `wait_ms` (max 86,400,000), optional `messages` (boolean or a positive count), optional `max_bytes`, optional `from_start` boolean |
 | `session.cancel` | `session`, optional `timeout_ms` with a 30-second default |
 | `session.list` | optional `all` boolean |
 | `session.read` | `session` |
 | `session.stop` | `session`, optional `force` boolean |
-| `model.list` | `harness`, optional `include_hidden` |
+| `model.list` | `harness`, optional `include_hidden`; for an ACP Harness also `harness_spec`, `cwd`, and launch `environment` |
 | `profile.list` | no parameters |
 
 `steer` and `resume` are mutually exclusive. Profiles are expanded by the
@@ -233,6 +233,7 @@ A public Session contains:
   "resolved_model": "claude-fable-5",
   "approvals": {"requested": "auto", "effective": "auto"},
   "auth": "subscription",
+  "auth_env": [],
   "marker": "dlgt:8bc7859c4c82",
   "created_at_ms": 1784024104395,
   "updated_at_ms": 1784024252019,
@@ -249,6 +250,11 @@ execution row IDs are excluded.
 - `resolved_model` is the model the provider reported, present once known.
 - `approvals.effective` is the mode the provider reports it runs. When it
   differs from `requested`, `approvals.reason` says why.
+- `auth_env` names the credential-related environment variables the current
+  process was launched with, and is empty when there are none. When it is not
+  empty, the `session.create`, `session.restart`, and resuming `session.send`
+  result also carries a `warning`. See
+  [CLI](cli.md#profiles-and-launch-environment).
 - `auth` is `subscription` or `api_key`, present only for Claude and only after
   the first turn of a process. See
   [CLI](cli.md#profiles-and-launch-environment).
@@ -557,7 +563,8 @@ CURSOR_EXPIRED         Cursor position was never minted or is no longer held
 CURSOR_INVALID         Cursor value is not a position number
 CANCEL_TIMEOUT         Cancel wait expired; cancellation continues
 LAUNCH_FAILED          Harness startup or initial prompt acceptance failed
-AUTH_MISMATCH          Claude subscription auth failed; blocking variables are named when present
+AUTH_REQUIRED          An ACP Harness needs sign-in; action is its login command
+UNSUPPORTED            The Harness cannot do what was asked
 RPC_UNAVAILABLE        Daemon transport is unavailable; retry may succeed
 INTERNAL               dlgt runtime invariant failure
 ```
