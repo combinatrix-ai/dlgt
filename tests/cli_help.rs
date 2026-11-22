@@ -101,12 +101,46 @@ fn acceptance_help_documents_prompt_files() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn auth_policy_help_covers_new_and_resume() -> Result<(), Box<dyn std::error::Error>> {
+fn launch_help_covers_acp_harnesses_and_drops_the_auth_policy()
+-> Result<(), Box<dyn std::error::Error>> {
     let new_help = String::from_utf8(cli_command().arg("new").arg("--help").output()?.stdout)?;
     let send_help = String::from_utf8(cli_command().arg("send").arg("--help").output()?.stdout)?;
-    assert!(new_help.contains("--auth <subscription|any>"));
-    assert!(send_help.contains("--auth <subscription|any>"));
+    let models_help =
+        String::from_utf8(cli_command().arg("models").arg("--help").output()?.stdout)?;
+    assert!(new_help.contains("--harness <NAME>"));
+    assert!(new_help.contains("agy maps auto and ask"));
+    assert!(send_help.contains("--steer [--interrupt]"));
+    assert!(send_help.contains("dlgt send <HARNESS:ID> --resume"));
     assert!(send_help.contains("--profile <PROFILE>"));
+    assert!(models_help.contains("--harness <NAME>"));
+    for help in [&new_help, &send_help] {
+        assert!(!help.contains("--auth"));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_removed_gemini_harness_and_unmapped_approvals_are_rejected_before_launch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let rejected_with = |extra: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let mut args = vec!["new", "--title", "t", "--request-id", "r1"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "hello"]);
+        let output = cli_command()
+            .env("DLGT_HOME", home.path())
+            .args(&args)
+            .output()?;
+        assert!(!output.status.success(), "{extra:?} was accepted");
+        Ok(String::from_utf8(output.stdout)? + &String::from_utf8(output.stderr)?)
+    };
+    assert!(rejected_with(&["--harness", "gemini"])?.contains("unknown Harness"));
+    assert!(rejected_with(&["--harness", "claude", "--auth", "any"])?.contains("--auth"));
+    assert!(rejected_with(&["--harness", "agy", "--approvals", "bypass"])?.contains("UNSUPPORTED"));
+    assert!(
+        rejected_with(&["--harness", "opencode", "--approvals", "ask"])?.contains("UNSUPPORTED")
+    );
+    assert!(!home.path().join("run").exists(), "a daemon was started");
     Ok(())
 }
 

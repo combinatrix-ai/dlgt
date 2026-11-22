@@ -31,9 +31,10 @@ done
 ~~~
 
 - Codex must be logged in (`codex login`).
-- Claude Code must be logged in with your Claude subscription, unless the
-  Session is launched with `--auth any`. A client environment that carries
-  `ANTHROPIC_API_KEY` makes Claude bill that key instead. See
+- Claude Code must be logged in. A client environment that carries
+  `ANTHROPIC_API_KEY` makes Claude bill that key instead of your subscription;
+  dlgt names such variables in the launch receipt's `auth_env` and `warning`
+  but does not refuse the launch. See
   [Profiles and launch environment](cli.md#profiles-and-launch-environment).
 
 The installer requires curl, tar, and a SHA-256 utility (sha256sum on most

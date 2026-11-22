@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::error::fail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -85,10 +87,6 @@ impl TurnState {
             Self::Completed | Self::Failed | Self::Canceled | Self::Interrupted
         )
     }
-
-    pub const fn is_provider_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Interrupted)
-    }
 }
 
 impl std::fmt::Display for TurnState {
@@ -98,7 +96,7 @@ impl std::fmt::Display for TurnState {
 }
 
 /// Who approves what a worker does.
-#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalsMode {
     Auto,
@@ -128,34 +126,6 @@ impl ApprovalsMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthPolicy {
-    #[default]
-    Subscription,
-    Any,
-}
-
-impl AuthPolicy {
-    pub fn parse(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "subscription" => Ok(Self::Subscription),
-            "any" => Ok(Self::Any),
-            _ => fail!(
-                InvalidArgument,
-                "invalid auth policy {value:?}; expected subscription or any"
-            ),
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Subscription => "subscription",
-            Self::Any => "any",
-        }
-    }
-}
-
 /// The approvals mode a Session asked for and the one its provider runs.
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Approvals {
@@ -172,6 +142,33 @@ impl Approvals {
             effective: requested,
             reason: None,
         }
+    }
+}
+
+/// How dlgt runs one ACP Harness. The client resolves it from configuration
+/// and the daemon keeps it with the Session.
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HarnessSpec {
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// The agent's `mode` config option value for each approvals mode.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub approvals: BTreeMap<ApprovalsMode, String>,
+    /// Argv of the agent's own resume command; `{id}` is the ACP sessionId.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Vec<String>>,
+}
+
+impl HarnessSpec {
+    pub fn resume_command(&self, provider_id: &str) -> Option<String> {
+        let argv = self.resume.as_ref()?;
+        Some(
+            argv.iter()
+                .map(|argument| argument.replace("{id}", provider_id))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 }
 
@@ -241,6 +238,9 @@ pub struct RpcError {
     pub session_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Authentication methods advertised by an ACP agent that requires login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_methods: Option<Vec<String>>,
     /// Pending Request IDs when the Session is blocked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_ids: Option<Vec<String>>,
@@ -276,6 +276,7 @@ impl Response {
                 hint: None,
                 session_state: None,
                 action: None,
+                auth_methods: None,
                 request_ids: None,
                 detail: None,
             }),
@@ -302,6 +303,7 @@ impl Response {
                 hint: None,
                 session_state: None,
                 action: None,
+                auth_methods: None,
                 request_ids: None,
                 detail: None,
             }),
@@ -331,8 +333,12 @@ pub struct SessionRecord {
     pub approvals: Approvals,
     /// How the provider said it authenticated, once it has reported it.
     pub auth: Option<Auth>,
-    /// Claude launch policy retained for Session restart.
-    pub auth_policy: Option<AuthPolicy>,
+    /// Credential-related environment variable names received at launch.
+    pub auth_env: Vec<String>,
+    /// How to run this Session's ACP Harness, retained for restart.
+    pub harness_spec: Option<HarnessSpec>,
+    /// ACP agent identity, when supplied by initialize.
+    pub agent_info: Option<Value>,
     /// Model the provider resolved the launch selection to.
     pub resolved_model: Option<String>,
     pub active_turn_id: Option<String>,

@@ -146,6 +146,12 @@ pub enum ProviderRequest {
         schema: Value,
         form: bool,
     },
+    AcpPermission {
+        options: Value,
+    },
+    AcpElicitation {
+        schema: Value,
+    },
 }
 
 /// A Request as the provider adapter describes it, before it has an ID.
@@ -284,7 +290,9 @@ impl RequestRecord {
                         ),
                     );
                 }
-                if let ProviderRequest::CodexElicitation { schema, form: true } = &draft.provider {
+                if let ProviderRequest::CodexElicitation { schema, form: true }
+                | ProviderRequest::AcpElicitation { schema } = &draft.provider
+                {
                     value.insert("schema".to_owned(), schema.clone());
                 }
             }
@@ -360,21 +368,29 @@ impl RequestRecord {
                     return Ok((outcome, json!({"action": "accept"})));
                 }
                 let content = match answer {
-                    Answer::Json(Value::Object(object)) => Value::Object(object.clone()),
-                    Answer::Text(text) => match serde_json::from_str::<Value>(text) {
-                        Ok(Value::Object(object)) => Value::Object(object),
-                        _ => fail!(
-                            InvalidArgument,
-                            "invalid answer: this form requires --json with a JSON object"
-                        ),
-                    },
-                    _ => fail!(
-                        InvalidArgument,
-                        "invalid answer: this form requires --json with a JSON object"
-                    ),
+                    Answer::Json(value) => form_object(Some(value))?,
+                    Answer::Text(text) => form_object(serde_json::from_str(text).ok().as_ref())?,
+                    _ => form_object(None)?,
                 };
                 validate_form_answer(schema, &content)?;
                 json!({"action": "accept", "content": content})
+            }
+            ProviderRequest::AcpPermission { options } => {
+                let Some(choice) = acp_permission_choice(options, allow) else {
+                    fail!(
+                        Unsupported,
+                        "ACP permission request has no compatible option"
+                    );
+                };
+                json!({"outcome":{"outcome":"selected","optionId":choice.option_id}})
+            }
+            ProviderRequest::AcpElicitation { schema } => {
+                let content = match answer {
+                    Answer::Json(value) => form_object(Some(value))?,
+                    _ => form_object(None)?,
+                };
+                validate_form_answer(schema, &content)?;
+                json!({"action":"accept","content":content})
             }
         };
         Ok((outcome, payload))
@@ -761,6 +777,47 @@ impl RequestTable {
             true
         });
     }
+}
+
+/// A form answer is a JSON object.
+fn form_object(value: Option<&Value>) -> Result<Value> {
+    match value {
+        Some(object @ Value::Object(_)) => Ok(object.clone()),
+        _ => fail!(
+            InvalidArgument,
+            "invalid answer: this form requires --json with a JSON object"
+        ),
+    }
+}
+
+/// The option that answers an ACP permission request.
+pub struct AcpPermissionChoice<'a> {
+    pub option_id: &'a str,
+    pub kind: &'static str,
+    /// The agent offered no once-only option of this kind.
+    pub always: bool,
+}
+
+/// Prefer the once-only option; an agent may offer only the `_always` one.
+pub fn acp_permission_choice(options: &Value, allow: bool) -> Option<AcpPermissionChoice<'_>> {
+    let kinds = if allow {
+        ["allow_once", "allow_always"]
+    } else {
+        ["reject_once", "reject_always"]
+    };
+    kinds.into_iter().enumerate().find_map(|(index, kind)| {
+        let option_id = options
+            .as_array()?
+            .iter()
+            .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))?
+            .get("optionId")?
+            .as_str()?;
+        Some(AcpPermissionChoice {
+            option_id,
+            kind,
+            always: index == 1,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1265,5 +1322,26 @@ mod tests {
                 .map(|r| r.outcome),
             Some(Outcome::Canceled)
         );
+    }
+
+    #[test]
+    fn an_acp_permission_answer_selects_the_once_option_and_falls_back_to_always() {
+        let agy = json!([
+            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+        ]);
+        let choice = |options: &Value, allow| {
+            super::acp_permission_choice(options, allow)
+                .map(|choice| (choice.option_id.to_owned(), choice.always))
+        };
+        assert_eq!(choice(&agy, true), Some(("allow".to_owned(), false)));
+        assert_eq!(choice(&agy, false), Some(("deny".to_owned(), false)));
+        let always_only = json!([
+            {"optionId": "yes", "kind": "allow_always"},
+            {"optionId": "no", "kind": "reject_always"},
+        ]);
+        assert_eq!(choice(&always_only, true), Some(("yes".to_owned(), true)));
+        assert_eq!(choice(&always_only, false), Some(("no".to_owned(), true)));
+        assert_eq!(choice(&json!([]), true), None);
     }
 }

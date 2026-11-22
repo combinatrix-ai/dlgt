@@ -544,18 +544,19 @@ move keeps the caller's position instead of spending a new one.
 
 ## Authentication reporting
 
-Under the `subscription` policy, dlgt first runs `claude auth status` with
-inherited environment variables cleared and requires `loggedIn: true` and
-`authMethod: "claude.ai"`. It rejects non-empty API keys, custom endpoints,
-and provider-routing variables documented by Claude Code; provider-selection
-and auth-skipping flags must be false or unset. This preflight does not print
-variable values. On the provider process, `system/init` must explicitly report
-`apiKeySource: "none"`; a missing field or any other value fails the Session.
-With policy `any`, `apiKeySource: "none"` reports `auth: "subscription"`, and
-other values report `auth: "api_key"` with a notice. The process-level auth
-check and resolved model survive turn settlement, even when Claude emits
-`system/init` only once per process. Codex Sessions have no `auth` field. The
-launch policy for Claude authentication is defined in
+dlgt reports authentication and never enforces it. Before each process
+launch it matches the final launch environment against the Harness's list of
+credential-related variable names and records the non-empty ones as
+`auth_env`. A non-empty list adds a `warning` to the launch receipt and a
+`notice` message to the Session. Only names are recorded, never values. The
+list reflects the launch environment the client sent, not the daemon's own.
+
+For Claude, `system/init` is the second source. `apiKeySource: "none"` reports
+`auth: "subscription"`, and any other value reports `auth: "api_key"` with a
+notice. This catches API-key helpers and settings that no environment variable
+reveals. The process-level auth report and resolved model survive turn
+settlement, even when Claude emits `system/init` only once per process. Other
+Harnesses have no `auth` field. The variable lists are defined in
 [CLI](cli.md#profiles-and-launch-environment).
 
 ## Process ownership

@@ -21,7 +21,8 @@ pub enum Code {
     RequestFailed,
     RequestDeliveryFailed,
     CancelTimeout,
-    AuthMismatch,
+    Unsupported,
+    AuthRequired,
 }
 
 impl Code {
@@ -44,7 +45,8 @@ impl Code {
             Self::RequestFailed => "REQUEST_FAILED",
             Self::RequestDeliveryFailed => "REQUEST_DELIVERY_FAILED",
             Self::CancelTimeout => "CANCEL_TIMEOUT",
-            Self::AuthMismatch => "AUTH_MISMATCH",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::AuthRequired => "AUTH_REQUIRED",
         }
     }
 }
@@ -73,16 +75,9 @@ pub fn coded(code: Code, message: impl Into<String>) -> anyhow::Error {
 
 /// The code attached nearest to where the error was raised, if any.
 pub fn code_of(error: &anyhow::Error) -> Option<Code> {
-    error.chain().find_map(|cause| {
-        if cause
-            .downcast_ref::<crate::config::AuthMismatch>()
-            .is_some()
-        {
-            Some(Code::AuthMismatch)
-        } else {
-            cause.downcast_ref::<Coded>().map(|coded| coded.code)
-        }
-    })
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<Coded>().map(|coded| coded.code))
 }
 
 /// Return early with a coded error.
@@ -120,7 +115,7 @@ mod tests {
     fn a_code_survives_context_and_is_never_read_from_text() {
         let error = coded(Code::RequestBusy, "x").context("outer");
         assert_eq!(code_of(&error), Some(Code::RequestBusy));
-        let text = anyhow::anyhow!("AUTH_MISMATCH REQUEST_FAILED launch not found");
+        let text = anyhow::anyhow!("PROVIDER_STOP REQUEST_FAILED launch not found");
         assert_eq!(code_of(&text), None);
     }
 

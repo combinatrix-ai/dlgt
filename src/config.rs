@@ -10,25 +10,14 @@ use crate::error::{Code, WithCode, coded};
 use serde_json::{Map, Value, json};
 use toml_edit::{DocumentMut, Item, TableLike};
 
-use crate::protocol::{ApprovalsMode, AuthPolicy};
+use crate::protocol::{ApprovalsMode, HarnessSpec};
 
-const PROFILE_KEYS: &[&str] = &[
-    "harness",
-    "model",
-    "effort",
-    "approvals",
-    "auth",
-    "clean_env",
-    "pass_env",
-    "unset_env",
-    "env",
-    "harness_options",
-];
+const BUILTIN_HARNESSES: &[&str] = &["claude", "codex", "cursor", "grok", "agy", "opencode"];
+
 const DEFAULT_HARNESS_KEYS: &[&str] = &[
     "model",
     "effort",
     "approvals",
-    "auth",
     "clean_env",
     "pass_env",
     "unset_env",
@@ -36,12 +25,12 @@ const DEFAULT_HARNESS_KEYS: &[&str] = &[
     "harness_options",
 ];
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     profiles: BTreeMap<String, Profile>,
     approvals: Option<ApprovalsMode>,
-    claude: PartialLaunch,
-    codex: PartialLaunch,
+    defaults: BTreeMap<String, PartialLaunch>,
+    harnesses: BTreeMap<String, HarnessSpec>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,7 +45,6 @@ pub struct PartialLaunch {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub approvals: Option<ApprovalsMode>,
-    pub auth: Option<AuthPolicy>,
     pub clean_env: Option<bool>,
     pub env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
@@ -64,120 +52,138 @@ pub struct PartialLaunch {
     pub harness_options: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedLaunch {
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub approvals: ApprovalsMode,
-    pub auth: AuthPolicy,
+    /// `None` for an ACP Harness without an approvals mapping: the agent's
+    /// own configuration decides and dlgt requests nothing.
+    pub approvals: Option<ApprovalsMode>,
     pub clean_env: bool,
     pub harness_options: Vec<String>,
     pub environment: BTreeMap<String, String>,
+    /// Present for an ACP Harness.
+    pub harness_spec: Option<HarnessSpec>,
 }
 
-impl Default for ResolvedLaunch {
+impl Default for Config {
     fn default() -> Self {
+        let defaults = BUILTIN_HARNESSES
+            .iter()
+            .map(|name| ((*name).to_owned(), PartialLaunch::default()))
+            .collect();
         Self {
-            model: None,
-            effort: None,
-            approvals: ApprovalsMode::Auto,
-            auth: AuthPolicy::Subscription,
-            clean_env: false,
-            harness_options: Vec::new(),
-            environment: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            approvals: None,
+            defaults,
+            harnesses: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct AuthMismatch {
-    pub variables: Vec<String>,
+pub fn validate_harness_name(name: &str) -> Result<()> {
+    let mut characters = name.chars();
+    let valid_first = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase());
+    if !valid_first
+        || name.len() > 32
+        || !characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    {
+        bail!("Harness name must match [a-z][a-z0-9-]{{0,31}}");
+    }
+    Ok(())
 }
 
-impl AuthMismatch {
-    pub fn from_variables(variables: Vec<String>) -> Self {
-        Self { variables }
-    }
-
-    pub fn hint(&self) -> String {
-        if self.variables.is_empty() {
-            "Confirm Claude is logged in with a claude.ai subscription in the selected launch environment, or choose --auth any if another provider source is intended.".to_owned()
-        } else {
-            let unset_options = self
-                .variables
-                .iter()
-                .map(|name| format!("--unset-env {name}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "Unset the blocking environment variable(s) {} with {} (or unset them in [defaults.claude]); choose --auth any only if another provider source is intended.",
-                self.variables.join(", "),
-                unset_options,
-            )
-        }
-    }
+fn is_builtin_harness(name: &str) -> bool {
+    BUILTIN_HARNESSES.contains(&name)
 }
 
-impl fmt::Display for AuthMismatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.variables.is_empty() {
-            formatter.write_str(AUTH_MISMATCH_MESSAGE)
-        } else {
-            write!(
-                formatter,
-                "{AUTH_MISMATCH_MESSAGE}: {}",
-                self.variables.join(", ")
-            )
-        }
-    }
+pub fn is_acp_harness(name: &str) -> bool {
+    !matches!(name, "claude" | "codex")
 }
 
-impl Error for AuthMismatch {}
+fn builtin_harness(name: &str) -> Option<HarnessSpec> {
+    let argv = |words: &[&str]| {
+        words
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let (command, login) = match name {
+        "cursor" => (argv(&["cursor-agent", "acp"]), "cursor-agent login"),
+        "grok" => (argv(&["grok", "agent", "stdio"]), "grok login"),
+        "opencode" => (argv(&["opencode", "acp"]), "opencode auth login"),
+        "agy" => (argv(&["agy", "acp"]), "agy acp --login"),
+        _ => return None,
+    };
+    let mut spec = HarnessSpec {
+        command,
+        login: Some(login.to_owned()),
+        ..HarnessSpec::default()
+    };
+    if name == "agy" {
+        spec.approvals = BTreeMap::from([
+            (ApprovalsMode::Auto, "auto".to_owned()),
+            (ApprovalsMode::Ask, "default".to_owned()),
+        ]);
+        spec.resume = Some(argv(&["agy", "--conversation", "{id}"]));
+    }
+    Some(spec)
+}
 
-pub const AUTH_MISMATCH_MESSAGE: &str = "Claude subscription authentication could not be confirmed or a non-subscription provider source is configured";
+/// Credential-related environment names only; values remain in the child
+/// process environment and are never copied into a Session snapshot.
+pub fn auth_env_names<'a>(
+    harness: &str,
+    environment: impl Iterator<Item = (&'a String, &'a String)>,
+) -> Vec<String> {
+    const CLAUDE: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_FOUNDRY_API_KEY",
+    ];
+    const CODEX: &[&str] = &["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"];
+    const CURSOR: &[&str] = &["CURSOR_API_KEY"];
+    const GROK: &[&str] = &["XAI_API_KEY"];
+    const AGY: &[&str] = &[
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "AGY_ADC_AUTH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ];
+    environment
+        .filter(|(name, value)| {
+            if value.is_empty() {
+                return false;
+            }
+            match harness {
+                "claude" => CLAUDE.contains(&name.as_str()),
+                "codex" => CODEX.contains(&name.as_str()),
+                "cursor" => CURSOR.contains(&name.as_str()),
+                "grok" => GROK.contains(&name.as_str()),
+                "agy" => AGY.contains(&name.as_str()),
+                _ => api_key_environment_name(name),
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
 
-const SUBSCRIPTION_BLOCKING_ENV: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_AWS_API_KEY",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AWS_BASE_URL",
-    "ANTHROPIC_AWS_WORKSPACE_ID",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-    "ANTHROPIC_BEDROCK_REGION_PREFIX",
-    "ANTHROPIC_BEDROCK_SERVICE_TIER",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_FEDERATION_RULE_ID",
-    "ANTHROPIC_FOUNDRY_API_KEY",
-    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
-    "ANTHROPIC_FOUNDRY_BASE_URL",
-    "ANTHROPIC_FOUNDRY_RESOURCE",
-    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-    "ANTHROPIC_GOOGLE_CLOUD_LOCATION",
-    "ANTHROPIC_GOOGLE_CLOUD_PROJECT",
-    "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
-    "ANTHROPIC_ORGANIZATION_ID",
-    "ANTHROPIC_PROFILE",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
-    "ANTHROPIC_WORKSPACE_ID",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
-    "CLAUDE_CODE_SIMPLE",
-    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
-    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
-    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
-    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-];
+fn api_key_environment_name(name: &str) -> bool {
+    name.ends_with("_API_KEY")
+        && name.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
+}
 
 pub fn path() -> PathBuf {
     std::env::var_os("DLGT_CONFIG").map_or_else(
@@ -272,13 +278,27 @@ fn parse_toml_document_as(text: &str, subject: &str) -> Result<DocumentMut> {
 fn parse_document(document: &toml_edit::Table) -> Result<Config> {
     let mut config = Config::default();
     for (key, item) in document {
-        if !matches!(key, "defaults" | "profiles") {
+        if !matches!(key, "defaults" | "profiles" | "harnesses") {
             at_item(
                 item,
                 Err(anyhow!(
-                    "unknown top-level key {key:?}; expected [defaults] or [profiles]"
+                    "unknown top-level key {key:?}; expected [defaults], [profiles], or [harnesses]"
                 )),
             )?;
+        }
+    }
+
+    if let Some(harnesses) = document.get("harnesses") {
+        let table = at_item(
+            harnesses,
+            harnesses
+                .as_table_like()
+                .context("[harnesses] must be a table"),
+        )?;
+        for (name, item) in table.iter() {
+            let spec = at_item(item, parse_harness(name, item))?;
+            config.harnesses.insert(name.to_owned(), spec);
+            config.defaults.entry(name.to_owned()).or_default();
         }
     }
 
@@ -297,13 +317,17 @@ fn parse_document(document: &toml_edit::Table) -> Result<Config> {
                         "approvals" => {
                             config.approvals = Some(parse_approvals(item, "[defaults].approvals")?);
                         }
-                        "claude" => {
-                            config.claude = parse_defaults_harness(item, "defaults.claude", true)?;
+                        name => {
+                            validate_harness_name(name)?;
+                            let keys = config.launch_keys(name)?;
+                            let table = item
+                                .as_table_like()
+                                .with_context(|| format!("[defaults.{name}] must be a table"))?;
+                            config.defaults.insert(
+                                name.to_owned(),
+                                parse_settings(table, &format!("defaults.{name}"), &keys)?,
+                            );
                         }
-                        "codex" => {
-                            config.codex = parse_defaults_harness(item, "defaults.codex", false)?;
-                        }
-                        _ => bail!("unknown key {key:?} in [defaults]"),
                     }
                     Ok(())
                 })(),
@@ -324,11 +348,55 @@ fn parse_document(document: &toml_edit::Table) -> Result<Config> {
                 item.as_table_like()
                     .with_context(|| format!("profile {name:?} must be a table")),
             )?;
-            let profile = at_item(item, parse_profile(name, profile_table))?;
+            let profile = at_item(item, parse_profile(&config, name, profile_table))?;
             config.profiles.insert(name.to_owned(), profile);
         }
     }
     Ok(config)
+}
+
+/// One `[harnesses.<name>]` table. A built-in name keeps its built-in value
+/// for every key the table does not set.
+fn parse_harness(name: &str, item: &Item) -> Result<HarnessSpec> {
+    validate_harness_name(name)?;
+    if !is_acp_harness(name) {
+        bail!("[harnesses.{name}] cannot replace a native Harness");
+    }
+    let entry = item
+        .as_table_like()
+        .with_context(|| format!("[harnesses.{name}] must be a table"))?;
+    let mut spec = builtin_harness(name).unwrap_or_default();
+    for (key, value) in entry.iter() {
+        let key_name = format!("harnesses.{name}.{key}");
+        at_item(
+            value,
+            (|| {
+                match key {
+                    "command" => {
+                        spec.command = string_array(value, &key_name)?;
+                        if spec.command.first().is_none_or(String::is_empty) {
+                            bail!("{key_name} must name a program");
+                        }
+                    }
+                    "login" => spec.login = Some(required_string(value, &key_name)?),
+                    "approvals" => spec.approvals = parse_approvals_mapping(value, &key_name)?,
+                    "resume" => {
+                        let argv = string_array(value, &key_name)?;
+                        if argv.is_empty() {
+                            bail!("{key_name} must not be empty");
+                        }
+                        spec.resume = Some(argv);
+                    }
+                    _ => bail!("unknown key {key:?} in [harnesses.{name}]"),
+                }
+                Ok(())
+            })(),
+        )?;
+    }
+    if spec.command.is_empty() {
+        bail!("[harnesses.{name}] requires a command array");
+    }
+    Ok(spec)
 }
 
 impl Config {
@@ -353,14 +421,68 @@ impl Config {
     }
 
     pub fn resolved_defaults_value(&self) -> Value {
-        json!({
-            "claude": defaults_value(
-                self.approvals,
-                &self.claude,
-                Some(AuthPolicy::Subscription),
-            ),
-            "codex": defaults_value(self.approvals, &self.codex, None),
-        })
+        Value::Object(
+            self.defaults
+                .iter()
+                .map(|(name, settings)| {
+                    (
+                        name.clone(),
+                        defaults_value(
+                            self.takes_approvals(name)
+                                .then(|| self.approvals.unwrap_or(ApprovalsMode::Auto)),
+                            settings,
+                            is_acp_harness(name),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub fn harness_spec(&self, name: &str) -> Result<HarnessSpec> {
+        self.harnesses
+            .get(name)
+            .cloned()
+            .or_else(|| builtin_harness(name))
+            .with_context(|| format!("unknown Harness {name:?}; define it in [harnesses.{name}]"))
+            .code(Code::InvalidArgument)
+    }
+
+    /// Every built-in and configured ACP Harness name.
+    pub fn acp_harness_names(&self) -> Vec<String> {
+        let mut names = BUILTIN_HARNESSES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        names.extend(self.harnesses.keys().cloned());
+        names
+            .into_iter()
+            .filter(|name| is_acp_harness(name))
+            .collect()
+    }
+
+    /// Whether `--approvals` and its defaults apply to this Harness.
+    fn takes_approvals(&self, harness: &str) -> bool {
+        !is_acp_harness(harness)
+            || self
+                .harness_spec(harness)
+                .is_ok_and(|spec| !spec.approvals.is_empty())
+    }
+
+    /// The launch keys `[defaults.<harness>]` and a Profile accept.
+    fn launch_keys(&self, harness: &str) -> Result<Vec<&'static str>> {
+        if !is_builtin_harness(harness) && !self.harnesses.contains_key(harness) {
+            bail!("Harness {harness:?} has no [harnesses.{harness}] command");
+        }
+        Ok(DEFAULT_HARNESS_KEYS
+            .iter()
+            .copied()
+            .filter(|key| match *key {
+                "approvals" => self.takes_approvals(harness),
+                "harness_options" => !is_acp_harness(harness),
+                _ => true,
+            })
+            .collect())
     }
 
     pub fn resolve(
@@ -370,30 +492,52 @@ impl Config {
         explicit: &PartialLaunch,
         client_environment: &BTreeMap<String, String>,
     ) -> Result<ResolvedLaunch> {
-        let mut resolved = ResolvedLaunch::default();
-        if let Some(approvals) = self.approvals {
-            resolved.approvals = approvals;
+        let acp = is_acp_harness(harness);
+        let defaults = self.defaults_for(harness)?;
+        let takes_approvals = self.takes_approvals(harness);
+        let layers = [
+            Some(defaults),
+            profile.map(|profile| &profile.settings),
+            Some(explicit),
+        ];
+        let layers = || layers.iter().copied().flatten();
+        if acp && layers().any(|layer| !layer.harness_options.is_empty()) {
+            return Err(coded(
+                Code::Unsupported,
+                "ACP Harnesses do not support harness_options",
+            ));
         }
-        let defaults = match harness {
-            "claude" => &self.claude,
-            "codex" => &self.codex,
-            other => bail!("unsupported harness {other:?}; expected codex or claude"),
+        if !takes_approvals && layers().any(|layer| layer.approvals.is_some()) {
+            return Err(coded(
+                Code::Unsupported,
+                format!(
+                    "Harness {harness:?} has no approvals mapping and does not support --approvals"
+                ),
+            ));
+        }
+        let mut resolved = ResolvedLaunch {
+            approvals: takes_approvals.then(|| self.approvals.unwrap_or(ApprovalsMode::Auto)),
+            harness_spec: acp.then(|| self.harness_spec(harness)).transpose()?,
+            ..ResolvedLaunch::default()
         };
-        overlay(&mut resolved, defaults);
-        if let Some(profile) = profile {
-            if harness == "codex" && profile.settings.auth.is_some() {
-                bail!("profile auth is only valid with the Claude harness");
-            }
-            overlay(&mut resolved, &profile.settings);
+        for layer in layers() {
+            overlay(&mut resolved, layer);
         }
-        if harness == "codex" && explicit.auth.is_some() {
-            bail!("--auth is only valid with --harness claude");
+        if let (Some(spec), Some(approvals)) = (&resolved.harness_spec, resolved.approvals)
+            && !spec.approvals.contains_key(&approvals)
+        {
+            return Err(coded(
+                Code::Unsupported,
+                format!(
+                    "Harness {harness:?} has no approvals mapping for {:?}",
+                    approvals.as_str()
+                ),
+            ));
         }
-        overlay(&mut resolved, explicit);
 
         let clean_env = resolved.clean_env;
-        let pass_env = collect_pass_env(self, harness, profile, explicit);
-        let unset_env = collect_unset_env(self, harness, profile, explicit);
+        let pass_env = collect_pass_env(defaults, profile, explicit);
+        let unset_env = collect_unset_env(defaults, profile, explicit);
         let mut environment = if clean_env {
             BTreeMap::new()
         } else {
@@ -406,13 +550,7 @@ impl Config {
                 }
             }
         }
-        let mut assignments = BTreeMap::new();
-        assignments.extend(
-            defaults
-                .env
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        let mut assignments = defaults.env.clone();
         if let Some(profile) = profile {
             assignments.extend(
                 profile
@@ -435,39 +573,19 @@ impl Config {
         resolved.environment = environment;
         Ok(resolved)
     }
-}
 
-pub fn validate_auth_environment<'a>(
-    policy: AuthPolicy,
-    values: impl Iterator<Item = (&'a String, &'a String)>,
-) -> Result<()> {
-    let blocked = values
-        .filter(|(key, value)| {
-            SUBSCRIPTION_BLOCKING_ENV.contains(&key.as_str())
-                && if key.starts_with("CLAUDE_CODE_USE_")
-                    || key.starts_with("CLAUDE_CODE_SKIP_")
-                    || key.as_str() == "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
-                    || key.as_str() == "CLAUDE_CODE_SIMPLE"
-                {
-                    is_truthy(value)
-                } else {
-                    !value.is_empty()
-                }
-        })
-        .map(|(key, _)| key.as_str().to_owned())
-        .collect::<Vec<_>>();
-    if policy == AuthPolicy::Subscription && !blocked.is_empty() {
-        return Err(AuthMismatch::from_variables(blocked).into());
+    fn defaults_for(&self, harness: &str) -> Result<&PartialLaunch> {
+        if !is_builtin_harness(harness) && !self.harnesses.contains_key(harness) {
+            return Err(coded(
+                Code::InvalidArgument,
+                format!("unknown Harness {harness:?}; define it in [harnesses.{harness}]"),
+            ));
+        }
+        self.defaults
+            .get(harness)
+            .map_or_else(|| self.defaults.get("codex"), Some)
+            .context("built-in launch defaults are missing")
     }
-    Ok(())
-}
-
-fn is_truthy(value: &str) -> bool {
-    !value.is_empty()
-        && !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        )
 }
 
 pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
@@ -481,12 +599,11 @@ pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
 }
 
 fn collect_pass_env(
-    config: &Config,
-    harness: &str,
+    defaults: &PartialLaunch,
     profile: Option<&Profile>,
     explicit: &PartialLaunch,
 ) -> Vec<String> {
-    let mut values = config.defaults_for(harness).pass_env.clone();
+    let mut values = defaults.pass_env.clone();
     if let Some(profile) = profile {
         values.extend(profile.settings.pass_env.iter().cloned());
     }
@@ -495,27 +612,16 @@ fn collect_pass_env(
 }
 
 fn collect_unset_env(
-    config: &Config,
-    harness: &str,
+    defaults: &PartialLaunch,
     profile: Option<&Profile>,
     explicit: &PartialLaunch,
 ) -> Vec<String> {
-    let mut values = config.defaults_for(harness).unset_env.clone();
+    let mut values = defaults.unset_env.clone();
     if let Some(profile) = profile {
         values.extend(profile.settings.unset_env.iter().cloned());
     }
     values.extend(explicit.unset_env.iter().cloned());
     values
-}
-
-impl Config {
-    fn defaults_for(&self, harness: &str) -> &PartialLaunch {
-        if harness == "claude" {
-            &self.claude
-        } else {
-            &self.codex
-        }
-    }
 }
 
 fn overlay(resolved: &mut ResolvedLaunch, layer: &PartialLaunch) {
@@ -526,10 +632,7 @@ fn overlay(resolved: &mut ResolvedLaunch, layer: &PartialLaunch) {
         resolved.effort.clone_from(&Some(value.clone()));
     }
     if let Some(value) = layer.approvals {
-        resolved.approvals = value;
-    }
-    if let Some(value) = layer.auth {
-        resolved.auth = value;
+        resolved.approvals = Some(value);
     }
     if let Some(value) = layer.clean_env {
         resolved.clean_env = value;
@@ -539,22 +642,18 @@ fn overlay(resolved: &mut ResolvedLaunch, layer: &PartialLaunch) {
         .extend(layer.harness_options.iter().cloned());
 }
 
+/// `default_approvals` is `None` for a Harness that takes no approvals mode.
 fn defaults_value(
-    global_approvals: Option<ApprovalsMode>,
+    default_approvals: Option<ApprovalsMode>,
     settings: &PartialLaunch,
-    default_auth: Option<AuthPolicy>,
+    acp: bool,
 ) -> Value {
     let mut value = Map::new();
-    value.insert(
-        "approvals".to_owned(),
-        json!(
-            settings
-                .approvals
-                .unwrap_or(global_approvals.unwrap_or(ApprovalsMode::Auto))
-        ),
-    );
-    if let Some(auth) = settings.auth.or(default_auth) {
-        value.insert("auth".to_owned(), json!(auth.as_str()));
+    if let Some(approvals) = default_approvals {
+        value.insert(
+            "approvals".to_owned(),
+            json!(settings.approvals.unwrap_or(approvals)),
+        );
     }
     if let Some(model) = &settings.model {
         value.insert("model".to_owned(), json!(model));
@@ -568,44 +667,39 @@ fn defaults_value(
     );
     value.insert("pass_env".to_owned(), json!(settings.pass_env));
     value.insert("unset_env".to_owned(), json!(settings.unset_env));
-    value.insert(
-        "harness_options".to_owned(),
-        json!(settings.harness_options),
-    );
+    if !acp {
+        value.insert(
+            "harness_options".to_owned(),
+            json!(settings.harness_options),
+        );
+    }
     value.insert("env".to_owned(), redact_env(&settings.env));
     Value::Object(value)
 }
 
-fn parse_defaults_harness(item: &Item, name: &str, claude: bool) -> Result<PartialLaunch> {
-    let table = item
-        .as_table_like()
-        .with_context(|| format!("[{name}] must be a table"))?;
-    parse_settings(table, name, claude, DEFAULT_HARNESS_KEYS)
-}
-
-fn parse_profile(name: &str, table: &dyn TableLike) -> Result<Profile> {
+fn parse_profile(config: &Config, name: &str, table: &dyn TableLike) -> Result<Profile> {
     let profile_name = format!("profiles.{name}");
-    let settings = parse_settings(table, &profile_name, true, PROFILE_KEYS)?;
     let harness = table
         .get("harness")
         .map(|item| {
             at_item(
                 item,
                 required_string(item, &format!("{profile_name}.harness")).and_then(|harness| {
-                    if matches!(harness.as_str(), "claude" | "codex") {
-                        Ok(harness)
-                    } else {
-                        bail!("{profile_name}.harness must be \"claude\" or \"codex\"")
-                    }
+                    validate_harness_name(&harness)?;
+                    Ok(harness)
                 }),
             )
         })
         .transpose()?;
-    if harness.as_deref() == Some("codex")
-        && let Some(auth) = table.get("auth")
-    {
-        at_item(auth, Err(anyhow!("auth is only valid for Claude Profiles")))?;
-    }
+    let mut keys = match harness.as_deref() {
+        Some(harness) => at_item(
+            table.get("harness").unwrap_or(&Item::None),
+            config.launch_keys(harness),
+        )?,
+        None => DEFAULT_HARNESS_KEYS.to_vec(),
+    };
+    keys.push("harness");
+    let settings = parse_settings(table, &profile_name, &keys)?;
     let mut public = Map::new();
     for (key, item) in table.iter() {
         let value = if key == "env" {
@@ -626,7 +720,6 @@ fn parse_profile(name: &str, table: &dyn TableLike) -> Result<Profile> {
 fn parse_settings(
     table: &dyn TableLike,
     name: &str,
-    claude: bool,
     allowed_keys: &[&str],
 ) -> Result<PartialLaunch> {
     let mut settings = PartialLaunch::default();
@@ -634,7 +727,7 @@ fn parse_settings(
         at_item(
             item,
             (|| {
-                if !allowed_keys.contains(&key) || key == "auth" && !claude {
+                if !allowed_keys.contains(&key) {
                     bail!("unknown key {key:?} in [{name}]");
                 }
                 let key_name = format!("{name}.{key}");
@@ -642,12 +735,6 @@ fn parse_settings(
                     "model" => settings.model = Some(required_string(item, &key_name)?),
                     "effort" => settings.effort = Some(required_string(item, &key_name)?),
                     "approvals" => settings.approvals = Some(parse_approvals(item, &key_name)?),
-                    "auth" => {
-                        let value = required_string(item, &key_name)?;
-                        settings.auth = Some(AuthPolicy::parse(&value).with_context(|| {
-                            format!("{key_name} must be \"subscription\" or \"any\"")
-                        })?);
-                    }
                     "clean_env" => {
                         settings.clean_env = Some(
                             item.as_bool()
@@ -666,6 +753,28 @@ fn parse_settings(
         )?;
     }
     Ok(settings)
+}
+
+fn parse_approvals_mapping(item: &Item, name: &str) -> Result<BTreeMap<ApprovalsMode, String>> {
+    let table = item
+        .as_table_like()
+        .with_context(|| format!("{name} must be a table of approvals mode to agent mode"))?;
+    table
+        .iter()
+        .map(|(mode, value)| {
+            at_item(
+                value,
+                (|| {
+                    let mode = ApprovalsMode::parse(mode)
+                        .with_context(|| format!("{name} keys must be auto, ask, or bypass"))?;
+                    Ok((
+                        mode,
+                        required_string(value, &format!("{name}.{}", mode.as_str()))?,
+                    ))
+                })(),
+            )
+        })
+        .collect()
 }
 
 fn parse_approvals(item: &Item, name: &str) -> Result<ApprovalsMode> {
@@ -770,8 +879,8 @@ fn item_to_json(item: &Item) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMismatch, PartialLaunch, validate_auth_environment};
-    use crate::protocol::{ApprovalsMode, AuthPolicy};
+    use super::{PartialLaunch, auth_env_names};
+    use crate::protocol::ApprovalsMode;
     use std::collections::BTreeMap;
 
     fn client_environment(values: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -782,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn each_precedence_layer_overrides_scalars_and_concatenates_lists() -> anyhow::Result<()> {
+    fn launch_precedence_merges_environment_and_harness_options() -> anyhow::Result<()> {
         let config = super::parse(
             r#"
 [defaults]
@@ -792,7 +901,6 @@ approvals = "ask"
 model = "defaults-model"
 effort = "defaults-effort"
 approvals = "bypass"
-auth = "any"
 harness_options = ["defaults-option"]
 pass_env = ["DEFAULT_PASS"]
 unset_env = ["DEFAULT_UNSET"]
@@ -803,7 +911,6 @@ harness = "claude"
 model = "profile-model"
 effort = "profile-effort"
 approvals = "ask"
-auth = "subscription"
 harness_options = ["profile-option"]
 pass_env = ["PROFILE_PASS"]
 unset_env = ["PROFILE_UNSET"]
@@ -815,7 +922,6 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
             model: Some("cli-model".to_owned()),
             effort: Some("cli-effort".to_owned()),
             approvals: Some(ApprovalsMode::Auto),
-            auth: Some(AuthPolicy::Any),
             clean_env: Some(true),
             pass_env: vec!["CLI_PASS".to_owned()],
             unset_env: vec!["CLI_UNSET".to_owned()],
@@ -832,11 +938,9 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
             ("CLI_UNSET", "remove"),
         ]);
         let resolved = config.resolve("claude", Some(profile), &explicit, &client_env)?;
-
         assert_eq!(resolved.model.as_deref(), Some("cli-model"));
         assert_eq!(resolved.effort.as_deref(), Some("cli-effort"));
-        assert_eq!(resolved.approvals, ApprovalsMode::Auto);
-        assert_eq!(resolved.auth, AuthPolicy::Any);
+        assert_eq!(resolved.approvals, Some(ApprovalsMode::Auto));
         assert_eq!(
             resolved.harness_options,
             ["defaults-option", "profile-option", "cli-option"]
@@ -845,48 +949,219 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
             resolved.environment.get("LAYER").map(String::as_str),
             Some("cli")
         );
-        assert_eq!(
-            resolved.environment.get("DEFAULT_ONLY").map(String::as_str),
-            Some("yes")
-        );
-        assert_eq!(
-            resolved.environment.get("PROFILE_ONLY").map(String::as_str),
-            Some("yes")
-        );
-        assert_eq!(
-            resolved.environment.get("DEFAULT_PASS").map(String::as_str),
-            Some("default-pass")
-        );
-        assert_eq!(
-            resolved.environment.get("PROFILE_PASS").map(String::as_str),
-            Some("profile-pass")
-        );
-        assert_eq!(
-            resolved.environment.get("CLI_PASS").map(String::as_str),
-            Some("cli-pass")
-        );
+        for (key, expected) in [
+            ("DEFAULT_ONLY", "yes"),
+            ("PROFILE_ONLY", "yes"),
+            ("DEFAULT_PASS", "default-pass"),
+            ("PROFILE_PASS", "profile-pass"),
+            ("CLI_PASS", "cli-pass"),
+        ] {
+            assert_eq!(
+                resolved.environment.get(key).map(String::as_str),
+                Some(expected)
+            );
+        }
         for key in ["DEFAULT_UNSET", "PROFILE_UNSET", "CLI_UNSET"] {
             assert!(!resolved.environment.contains_key(key));
         }
+        Ok(())
+    }
 
-        let no_cli = config.resolve(
-            "claude",
-            Some(profile),
-            &PartialLaunch::default(),
-            &client_env,
+    #[test]
+    fn acp_harnesses_parse_defaults_and_resolve_commands() -> anyhow::Result<()> {
+        let config = super::parse(
+            r#"
+[harnesses.opencode]
+command = ["opencode", "acp"]
+login = "opencode auth login"
+
+[defaults.opencode]
+model = "opencode/big-pickle"
+effort = "high"
+clean_env = true
+env = { API_KEY = "hidden" }
+"#,
         )?;
-        assert_eq!(no_cli.model.as_deref(), Some("profile-model"));
-        assert_eq!(no_cli.approvals, ApprovalsMode::Ask);
-        assert_eq!(no_cli.auth, AuthPolicy::Subscription);
+        let resolved = config.resolve(
+            "opencode",
+            None,
+            &PartialLaunch::default(),
+            &client_environment(&[("PATH", "/bin")]),
+        )?;
+        assert_eq!(resolved.model.as_deref(), Some("opencode/big-pickle"));
+        let spec = resolved.harness_spec.unwrap_or_default();
+        assert_eq!(spec.command, ["opencode", "acp"]);
+        assert_eq!(spec.login.as_deref(), Some("opencode auth login"));
+        assert_eq!(
+            resolved.environment.get("API_KEY").map(String::as_str),
+            Some("hidden")
+        );
+        Ok(())
+    }
 
-        let no_profile = config.resolve("claude", None, &PartialLaunch::default(), &client_env)?;
-        assert_eq!(no_profile.model.as_deref(), Some("defaults-model"));
-        assert_eq!(no_profile.approvals, ApprovalsMode::Bypass);
-        assert_eq!(no_profile.auth, AuthPolicy::Any);
+    fn error_code(result: anyhow::Result<super::ResolvedLaunch>) -> Option<crate::error::Code> {
+        result.err().and_then(|error| crate::error::code_of(&error))
+    }
 
-        let codex = config.resolve("codex", None, &PartialLaunch::default(), &client_env)?;
-        assert_eq!(codex.approvals, ApprovalsMode::Ask);
-        assert_eq!(codex.auth, AuthPolicy::Subscription);
+    #[test]
+    fn a_harness_without_an_approvals_mapping_rejects_approvals_and_harness_options()
+    -> anyhow::Result<()> {
+        for text in [
+            "[defaults.opencode]\napprovals = \"ask\"",
+            "[profiles.p]\nharness = \"opencode\"\napprovals = \"ask\"",
+            "[profiles.p]\nharness = \"opencode\"\nharness_options = [\"x\"]",
+            "[profiles.p]\nharness = \"agy\"\nharness_options = [\"x\"]",
+        ] {
+            assert!(super::parse(text).is_err(), "accepted {text}");
+        }
+        let config = super::parse("[defaults]\napprovals = \"ask\"")?;
+        assert_eq!(
+            config
+                .resolve(
+                    "opencode",
+                    None,
+                    &PartialLaunch::default(),
+                    &BTreeMap::new()
+                )?
+                .approvals,
+            None
+        );
+        let explicit = PartialLaunch {
+            approvals: Some(ApprovalsMode::Ask),
+            ..PartialLaunch::default()
+        };
+        assert_eq!(
+            error_code(config.resolve("opencode", None, &explicit, &BTreeMap::new())),
+            Some(crate::error::Code::Unsupported)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agy_replaces_gemini_as_a_built_in_harness() -> anyhow::Result<()> {
+        let config = super::Config::default();
+        let launch = config.resolve("agy", None, &PartialLaunch::default(), &BTreeMap::new())?;
+        let spec = launch.harness_spec.unwrap_or_default();
+        assert_eq!(spec.command, ["agy", "acp"]);
+        assert_eq!(spec.login.as_deref(), Some("agy acp --login"));
+        assert_eq!(
+            spec.resume_command("cfa001bc-3ba3-4c63-b172-5f7f3a85bfd8")
+                .as_deref(),
+            Some("agy --conversation cfa001bc-3ba3-4c63-b172-5f7f3a85bfd8")
+        );
+        assert!(config.acp_harness_names().contains(&"agy".to_owned()));
+        assert!(!config.acp_harness_names().contains(&"gemini".to_owned()));
+        assert!(
+            config
+                .resolve("gemini", None, &PartialLaunch::default(), &BTreeMap::new())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_approvals_mapping_makes_approvals_apply_as_for_native_harnesses() -> anyhow::Result<()> {
+        let resolve = |config: &super::Config, profile: Option<&str>, approvals| {
+            let explicit = PartialLaunch {
+                approvals,
+                ..PartialLaunch::default()
+            };
+            let profile = profile.map(|name| config.profile(name)).transpose()?;
+            config.resolve("agy", profile, &explicit, &BTreeMap::new())
+        };
+        let config = super::Config::default();
+        let launch = resolve(&config, None, None)?;
+        assert_eq!(launch.approvals, Some(ApprovalsMode::Auto));
+        assert_eq!(
+            launch.harness_spec.unwrap_or_default().approvals,
+            BTreeMap::from([
+                (ApprovalsMode::Auto, "auto".to_owned()),
+                (ApprovalsMode::Ask, "default".to_owned()),
+            ])
+        );
+        assert_eq!(
+            resolve(&config, None, Some(ApprovalsMode::Ask))?.approvals,
+            Some(ApprovalsMode::Ask)
+        );
+        assert_eq!(
+            error_code(resolve(&config, None, Some(ApprovalsMode::Bypass))),
+            Some(crate::error::Code::Unsupported)
+        );
+
+        let config = super::parse(
+            "[defaults]\napprovals = \"ask\"\n[profiles.careful]\nharness = \"agy\"\napprovals = \"auto\"",
+        )?;
+        assert_eq!(
+            resolve(&config, None, None)?.approvals,
+            Some(ApprovalsMode::Ask)
+        );
+        assert_eq!(
+            resolve(&config, Some("careful"), None)?.approvals,
+            Some(ApprovalsMode::Auto)
+        );
+        assert_eq!(config.resolved_defaults_value()["agy"]["approvals"], "ask");
+        Ok(())
+    }
+
+    #[test]
+    fn a_configured_harness_carries_its_approvals_mapping_and_resume_command() -> anyhow::Result<()>
+    {
+        let config = super::parse(
+            r#"
+[harnesses.x]
+command = ["x", "acp"]
+approvals = { auto = "auto", ask = "default", bypass = "yolo" }
+resume = ["x", "resume", "--session={id}"]
+
+[defaults.x]
+approvals = "bypass"
+
+[harnesses.agy]
+command = ["/opt/agy", "acp"]
+"#,
+        )?;
+        let launch = config.resolve("x", None, &PartialLaunch::default(), &BTreeMap::new())?;
+        assert_eq!(launch.approvals, Some(ApprovalsMode::Bypass));
+        let spec = launch.harness_spec.unwrap_or_default();
+        assert_eq!(
+            spec.approvals
+                .get(&ApprovalsMode::Bypass)
+                .map(String::as_str),
+            Some("yolo")
+        );
+        assert_eq!(
+            spec.resume_command("ses_1").as_deref(),
+            Some("x resume --session=ses_1")
+        );
+        assert_eq!(spec.login, None);
+
+        let agy = config
+            .resolve("agy", None, &PartialLaunch::default(), &BTreeMap::new())?
+            .harness_spec
+            .unwrap_or_default();
+        assert_eq!(agy.command, ["/opt/agy", "acp"]);
+        assert_eq!(agy.login.as_deref(), Some("agy acp --login"));
+        assert_eq!(agy.approvals.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_harness_spec_survives_the_client_to_daemon_round_trip() -> anyhow::Result<()> {
+        let spec = super::Config::default().harness_spec("agy")?;
+        let wire = serde_json::to_value(&spec)?;
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "command": ["agy", "acp"],
+                "login": "agy acp --login",
+                "approvals": {"auto": "auto", "ask": "default"},
+                "resume": ["agy", "--conversation", "{id}"],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::protocol::HarnessSpec>(wire)?,
+            spec
+        );
         Ok(())
     }
 
@@ -895,165 +1170,109 @@ env = ["LAYER=profile", "PROFILE_ONLY=yes"]
         for (text, location) in [
             ("[defaults.claude]\nunknown = true", "2:"),
             ("[defaults.mystery]\nmodel = \"x\"", "1:"),
-            (
-                "[defaults]\napprovals = \"ask\"\n\n[defaults.claude]\nclean_env = \"mystery\"",
-                "5:",
-            ),
-            (
-                "[profiles.p]\nharness = \"claude\"\nmodel = \"m\"\nunknown = \"mystery\"",
-                "4:",
-            ),
-            ("# c\n\ndefaults = 3", "3:"),
-            ("# c\n\nprofiles = 3", "3:"),
-            ("[profiles]\n\nmystery = 3", "3:"),
-            ("[profiles.p]\nmodel = \"m\"\nharness = \"mystery\"", "3:"),
-            (
-                "[profiles.p]\nharness = \"claude\"\nenv = [\n  \"A=1\",\n  \"mystery\",\n]",
-                "5:",
-            ),
-            (
-                "[profiles.p]\nharness = \"claude\"\n[profiles.p.env]\nA = \"1\"\nB = 3",
-                "5:",
-            ),
-            (
-                "[profiles.p]\nharness = \"claude\"\nunset_env = [\n  \"A\",\n  3,\n]",
-                "5:",
-            ),
-            ("# c\n\n[defualts.codex]\napprovals = \"ask\"", "3:"),
             ("[profiles.p]\nharness = \"codex\"\nauth = \"any\"", "3:"),
-        ] {
-            let result = super::parse(text);
-            assert!(
-                result.is_err(),
-                "invalid defaults unexpectedly parsed: {text}"
-            );
-            let message = result.err().map_or_else(
-                || "invalid defaults unexpectedly parsed".to_owned(),
-                |error| error.to_string(),
-            );
-            assert!(
-                message.contains(&format!("at {location}")),
-                "wrong location for {text:?}: {message}"
-            );
-            assert!(
-                !message.contains("unknown") && !message.contains("mystery"),
-                "source text leaked in error: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_toml_errors_include_location_without_source_text() {
-        let secret = "super-secret-config-token";
-        let text = format!("[profiles.secret]\nvalue = \"{secret}\"\nthis is not TOML");
-        let Err(error) = super::parse(&text) else {
-            panic!("malformed configuration was accepted");
-        };
-        let message = error.to_string();
-        assert!(message.contains("3:"), "missing source location: {message}");
-        assert!(
-            !message.contains(secret),
-            "secret leaked in error: {message}"
-        );
-    }
-
-    #[test]
-    fn profile_output_redacts_environment_values() -> anyhow::Result<()> {
-        let config = super::parse(
-            "[profiles.safe]\nharness = \"claude\"\nenv = { API_KEY = \"secret-value\" }",
-        )?;
-        let rendered = config.profiles_value().to_string();
-        assert!(!rendered.contains("secret-value"));
-        assert!(rendered.contains("<redacted>"));
-        Ok(())
-    }
-
-    #[test]
-    fn resolved_defaults_include_builtins_and_specific_overrides() -> anyhow::Result<()> {
-        let config =
-            super::parse("[defaults]\napprovals = \"ask\"\n[defaults.claude]\nauth = \"any\"")?;
-        let defaults = config.resolved_defaults_value();
-        assert_eq!(defaults["claude"]["approvals"], "ask");
-        assert_eq!(defaults["claude"]["auth"], "any");
-        assert_eq!(defaults["codex"]["approvals"], "ask");
-        assert!(defaults["codex"].get("auth").is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn subscription_policy_rejects_api_keys_and_provider_routing_environment() {
-        for key in [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_AWS_BASE_URL",
-            "ANTHROPIC_BEDROCK_BASE_URL",
-            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-            "ANTHROPIC_FOUNDRY_BASE_URL",
-            "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-            "ANTHROPIC_VERTEX_BASE_URL",
-        ] {
-            let values = client_environment(&[(key, "sensitive-route-value")]);
-            let Err(error) = validate_auth_environment(AuthPolicy::Subscription, values.iter())
-            else {
-                panic!("subscription auth accepted {key}");
-            };
-            assert!(error.downcast_ref::<AuthMismatch>().is_some());
-            assert!(!error.to_string().contains("sensitive-route-value"));
-        }
-        for key in [
-            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_FOUNDRY",
-            "CLAUDE_CODE_USE_MANTLE",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
-            "CLAUDE_CODE_SIMPLE",
-        ] {
-            let values = client_environment(&[(key, "true")]);
-            assert!(
-                validate_auth_environment(AuthPolicy::Subscription, values.iter()).is_err(),
-                "subscription auth accepted {key}"
-            );
-            let false_values = client_environment(&[(key, "false")]);
-            assert!(
-                validate_auth_environment(AuthPolicy::Subscription, false_values.iter()).is_ok()
-            );
-        }
-        let values = client_environment(&[("ANTHROPIC_API_KEY", "dummy-not-a-key")]);
-        assert!(validate_auth_environment(AuthPolicy::Any, values.iter()).is_ok());
-        let empty = client_environment(&[("ANTHROPIC_API_KEY", "")]);
-        assert!(validate_auth_environment(AuthPolicy::Subscription, empty.iter()).is_ok());
-    }
-
-    #[test]
-    fn auth_mismatch_names_only_the_blocking_environment_variables() {
-        let entries = std::collections::BTreeMap::from([
+            ("[harnesses.bad_name]\ncommand = [\"x\"]", "1:"),
+            ("[harnesses.pi]\ncommand = []", "2:"),
+            ("[harnesses.pi]\ncommand = [\"x\"]\nunknown = 1", "3:"),
             (
-                "ANTHROPIC_BASE_URL".to_owned(),
-                "https://private.invalid".to_owned(),
+                "[harnesses.pi]\ncommand = [\"x\"]\napprovals = { yolo = \"y\" }",
+                "3:",
             ),
-            ("UNRELATED".to_owned(), "unrelated-secret".to_owned()),
-        ]);
-        let error = super::validate_auth_environment(AuthPolicy::Subscription, entries.iter())
-            .err()
-            .unwrap_or_else(|| panic!("blocked auth override was accepted"));
-        let message = format!("{error:#}");
-        assert!(message.contains("ANTHROPIC_BASE_URL"), "{message}");
-        assert!(!message.contains("https://private.invalid"), "{message}");
-        assert!(!message.contains("unrelated-secret"), "{message}");
-        assert!(
-            !message.contains("ANTHROPIC_API_KEY"),
-            "unrelated remedy: {message}"
+            ("[harnesses.pi]\ncommand = [\"x\"]\nresume = []", "3:"),
+            (
+                "[profiles.p]\nharness = \"opencode\"\napprovals = \"ask\"",
+                "3:",
+            ),
+            ("[profiles.p]\nharness = \"mystery\"", "2:"),
+        ] {
+            let Err(error) = super::parse(text) else {
+                panic!("accepted invalid config: {text}")
+            };
+            let message = error.to_string();
+            assert!(message.contains(&format!("at {location}")), "{message}");
+            assert!(!message.contains("bad_name"), "source leaked: {message}");
+        }
+    }
+
+    #[test]
+    fn profile_and_defaults_output_redact_environment_values() -> anyhow::Result<()> {
+        let config = super::parse(
+            "[defaults]\napprovals = \"ask\"\n[defaults.claude]\nenv = { API_KEY = \"secret-value\" }\n[profiles.safe]\nharness = \"claude\"\nenv = { KEY = \"profile-secret\" }",
+        )?;
+        let rendered = format!(
+            "{}{}",
+            config.profiles_value(),
+            config.resolved_defaults_value()
         );
-        let mismatch = error
-            .downcast_ref::<AuthMismatch>()
-            .unwrap_or_else(|| panic!("auth mismatch type was lost"));
-        let hint = mismatch.hint();
-        assert!(hint.contains("ANTHROPIC_BASE_URL"), "{hint}");
-        assert!(hint.contains("--unset-env ANTHROPIC_BASE_URL"), "{hint}");
-        assert!(!hint.contains("ANTHROPIC_API_KEY"), "{hint}");
-        assert!(!hint.contains("https://private.invalid"), "{hint}");
+        assert!(!rendered.contains("secret-value"));
+        assert!(!rendered.contains("profile-secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert_eq!(
+            config.resolved_defaults_value()["claude"]["approvals"],
+            "ask"
+        );
+        assert!(
+            config.resolved_defaults_value()["opencode"]
+                .get("approvals")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auth_env_reports_only_whitelisted_nonempty_names_after_options() -> anyhow::Result<()> {
+        let config = super::parse(
+            "[defaults.opencode]\nclean_env = true\npass_env = [\"GOOD_API_KEY\"]\n[profiles.p]\nharness = \"opencode\"\nenv = { ALSO_API_KEY = \"profile-secret\", BAD = \"bad-secret\" }",
+        )?;
+        let profile = config.profile("p")?;
+        let mut explicit = PartialLaunch::default();
+        explicit
+            .env
+            .insert("GOOD_API_KEY".into(), "cli-secret".into());
+        explicit.env.insert("EMPTY_API_KEY".into(), String::new());
+        let client = client_environment(&[
+            ("GOOD_API_KEY", "host-secret"),
+            ("IGNORED_API_KEY", "ignored-secret"),
+        ]);
+        let launch = config.resolve("opencode", Some(profile), &explicit, &client)?;
+        let names = auth_env_names("opencode", launch.environment.iter());
+        assert_eq!(names, ["ALSO_API_KEY", "GOOD_API_KEY"]);
+        let public = serde_json::to_string(&names)?;
+        assert!(!public.contains("secret"));
+        assert!(!public.contains("bad-secret"));
+        assert!(!public.contains("ignored-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn auth_env_uses_builtin_whitelists() {
+        let environment = client_environment(&[
+            ("ANTHROPIC_API_KEY", "a"),
+            ("AWS_BEARER_TOKEN_BEDROCK", "b"),
+            ("OPENAI_API_KEY", "c"),
+            ("CURSOR_API_KEY", "d"),
+            ("XAI_API_KEY", "e"),
+            ("GOOGLE_API_KEY", "f"),
+            ("GOOGLE_GENAI_USE_VERTEXAI", "true"),
+            ("RANDOM", "secret"),
+            ("EMPTY_API_KEY", ""),
+        ]);
+        assert_eq!(
+            auth_env_names("claude", environment.iter()),
+            ["ANTHROPIC_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"]
+        );
+        assert_eq!(
+            auth_env_names("codex", environment.iter()),
+            ["OPENAI_API_KEY"]
+        );
+        assert_eq!(
+            auth_env_names("cursor", environment.iter()),
+            ["CURSOR_API_KEY"]
+        );
+        assert_eq!(auth_env_names("grok", environment.iter()), ["XAI_API_KEY"]);
+        assert_eq!(
+            auth_env_names("agy", environment.iter()),
+            ["GOOGLE_API_KEY"]
+        );
     }
 }

@@ -462,10 +462,12 @@ Choose `--cwd` deliberately and constrain the worker in the prompt. A
 `completed` result with a non-zero `denied_requests` is not evidence the work
 was done: read the `approval` messages to see what was denied. The Session
 snapshot's `approvals.effective` says which mode the provider really runs.
-Claude defaults to subscription authentication and refuses a non-empty
-`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; use `--unset-env` to remove it
-or `--auth any` to opt out. With `--auth any`, `auth: "api_key"` means Claude
-uses an API key from the environment instead of the subscription.
+dlgt never refuses a launch because of how a Harness authenticates. The
+receipt and the Session snapshot list in `auth_env` the credential-related
+environment variables the Harness received, by name only. To run on the
+subscription instead, remove them with `--unset-env`. For Claude,
+`auth: "api_key"` means it reported using an API key instead of the
+subscription.
 
 ## Choose the lifecycle operation
 
@@ -483,9 +485,8 @@ uses an API key from the environment instead of the subscription.
 - `send --resume` relaunches the saved provider conversation and atomically
   submits the follow-up. An already-live matching Session is reused rather
   than duplicated. Claude may return a new canonical `session.id`; retain it.
-- `send --resume` keeps the Session's stored approvals and Claude auth policy
-  unless an explicit `--approvals`, `--auth`, or matching Profile supplies a
-  replacement. Built-in and `[defaults]` values do not overwrite retained
+- `send --resume` keeps the Session's stored approvals unless an explicit
+  `--approvals` or matching Profile supplies a replacement. Built-in and `[defaults]` values do not overwrite retained
   policy.
 - Keep one active execution per Session. `SESSION_BUSY` means observe until
   the current execution terminalizes. dlgt never queues prompts.
@@ -563,7 +564,8 @@ uses an API key from the environment instead of the subscription.
 | `CANCEL_TIMEOUT` | Cancellation continues. Keep fetching until a terminal result appears. |
 | `ALIAS_IN_USE` | The exact alias belongs to a non-terminal Session. Choose another alias or address by ID. |
 | `LAUNCH_FAILED` | The provider process could not be launched or never became ready. Read `error.detail`: it is the provider's own stderr tail. `show <launch_id or session_id>` keeps the same `launch_failure`. If the provider needs a login, a trust decision, or first-run setup, tell the user to run `error.action` (`claude` or `codex`) once by hand in that directory, then retry with a new `--request-id`. This differs from a process that launched and later failed: that execution failure appears in `results[].status`. |
-| `AUTH_MISMATCH` | Claude subscription auth could not be positively established. The error names blocking variables when present; remove only those variables with matching `--unset-env <NAME>` options. If no variable is named, confirm subscription login in the selected launch environment or choose `--auth any` for another provider source. |
+| `AUTH_REQUIRED` | An ACP Harness needs sign-in. Tell the user to run `error.action`, the Harness's login command, once by hand, then retry with a new `--request-id`. |
+| `UNSUPPORTED` | The Harness cannot do this: an approvals mode it has no mapping for, `--model` or `--effort` the agent does not expose, or `send --steer` on an ACP Harness. For steering, follow `error.action` (`send --steer --interrupt`). |
 
 ## Observation and control reference
 

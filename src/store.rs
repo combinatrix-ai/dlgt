@@ -132,7 +132,9 @@ impl Store {
                     harness_options: session.harness_options.to_vec(),
                     approvals: Approvals::new(session.approvals),
                     auth: None,
-                    auth_policy: None,
+                    auth_env: Vec::new(),
+                    harness_spec: None,
+                    agent_info: None,
                     resolved_model: None,
                     active_turn_id: None,
                     pid: None,
@@ -712,12 +714,31 @@ impl Store {
         final_message: Option<&str>,
         error: Option<&Value>,
     ) -> Result<bool> {
+        self.finish_provider_turn_if_matching(
+            id,
+            provider_turn_id,
+            state,
+            final_message,
+            false,
+            error,
+        )
+    }
+
+    pub fn finish_provider_turn_if_matching(
+        &self,
+        id: &str,
+        provider_turn_id: Option<&str>,
+        state: TurnState,
+        final_message: Option<&str>,
+        recovered: bool,
+        error: Option<&Value>,
+    ) -> Result<bool> {
         self.finish_turn(&FinishTurn {
             id,
             provider_turn_id,
             state,
             final_message,
-            recovered: false,
+            recovered,
             error,
         })
     }
@@ -734,7 +755,7 @@ impl Store {
             recovered,
             error,
         } = *finish;
-        if !state.is_provider_terminal() {
+        if !state.is_terminal() {
             fail!(
                 InvalidArgument,
                 "invalid terminal turn state {:?}",
@@ -1710,9 +1731,21 @@ impl Store {
         changed
     }
 
-    pub fn set_auth_policy(&self, session_id: &str, auth_policy: crate::protocol::AuthPolicy) {
+    pub fn set_auth_env(&self, session_id: &str, names: Vec<String>) {
         if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
-            session.record.auth_policy = Some(auth_policy);
+            session.record.auth_env = names;
+        }
+    }
+
+    pub fn set_harness_spec(&self, session_id: &str, spec: Option<crate::protocol::HarnessSpec>) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.harness_spec = spec;
+        }
+    }
+
+    pub fn set_agent_info(&self, session_id: &str, info: Option<Value>) {
+        if let Some(session) = self.state.borrow_mut().sessions.get_mut(session_id) {
+            session.record.agent_info = info;
         }
     }
 
@@ -2000,7 +2033,49 @@ mod tests {
     }
 
     #[test]
-    fn canceled_turn_is_not_a_provider_finish_state() {
+    fn a_provider_reported_cancel_ends_the_execution_as_canceled() {
+        let store = Store::new();
+        store
+            .insert_session(&NewSession {
+                id: "agy:conversation-1",
+                alias: "@test",
+                title: "test",
+                agent: "agy",
+                cwd: "/tmp",
+                model: None,
+                effort: None,
+                harness_options: &[],
+                approvals: ApprovalsMode::Auto,
+            })
+            .unwrap_or_else(|error| panic!("failed to insert session: {error}"));
+        mark_ready(&store, "agy:conversation-1");
+        store
+            .insert_turn("turn_1", "agy:conversation-1", "hello")
+            .unwrap_or_else(|error| panic!("failed to insert turn: {error}"));
+        assert!(store.mark_turn_started("turn_1", None));
+
+        let finished = store
+            .finish_turn_if_matching("turn_1", None, TurnState::Canceled, None, None)
+            .unwrap_or_else(|error| panic!("canceled provider finish was refused: {error}"));
+        assert!(finished);
+        assert_eq!(
+            store
+                .get_turn("turn_1")
+                .unwrap_or_else(|| panic!("turn missing"))
+                .state,
+            TurnState::Canceled
+        );
+        assert_eq!(
+            store
+                .get_session("agy:conversation-1")
+                .unwrap_or_else(|| panic!("session missing"))
+                .state,
+            SessionState::Idle
+        );
+    }
+
+    #[test]
+    fn an_active_state_is_not_a_provider_finish_state() {
         let store = Store::new();
         store
             .insert_session(&NewSession {
@@ -2025,16 +2100,13 @@ mod tests {
             .finish_turn_if_matching(
                 "turn_1",
                 Some("provider-turn"),
-                TurnState::Canceled,
+                TurnState::Running,
                 None,
                 None,
             )
             .err()
-            .unwrap_or_else(|| panic!("canceled provider finish unexpectedly succeeded"));
-        assert_eq!(
-            error.to_string(),
-            "invalid terminal turn state \"canceled\""
-        );
+            .unwrap_or_else(|| panic!("an active state was accepted as a finish"));
+        assert_eq!(error.to_string(), "invalid terminal turn state \"running\"");
         assert_eq!(
             store
                 .get_turn("turn_1")
